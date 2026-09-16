@@ -2,11 +2,11 @@
 
 A Redis-compatible key-value store written from scratch in Go, for people who want to read a database implementation rather than depend on one.
 
-Stash speaks RESP over TCP, so `redis-cli` and any RESP client connect to it unchanged. It implements strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial queries, and streams on top of a sharded in-memory store, with append-only-file durability, RDB snapshots, leader/follower replication, transactions, and pub/sub. It has no external dependencies — the entire server builds from the Go standard library.
+Stash speaks RESP over TCP, so `redis-cli` and other RESP clients connect without modification. It implements strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial queries, and streams on a sharded in-memory store. It also supports append-only-file durability, RDB snapshots, leader/follower replication, transactions, and pub/sub. The entire server builds from the Go standard library, with no external dependencies.
 
 ## Quick start
 
-**Prerequisite:** Go 1.21 or newer.
+You need Go 1.21 or newer.
 
 ```bash
 git clone https://github.com/maltemindedal/stash.git
@@ -56,7 +56,7 @@ go run ./cmd/stash --port 6379 \
 | [Getting started](docs/getting-started.md) | Zero to a running server with data in it |
 | [Guides](docs/README.md#how-to-guides) | Persistence, replication, security, memory, observability |
 | [Configuration](docs/reference/configuration.md) | Every flag, default, and validation rule |
-| [Commands](docs/reference/commands.md) | The full command surface |
+| [Commands](docs/reference/commands.md) | Every implemented command |
 | [Architecture](docs/architecture/overview.md) | How the packages fit together, and why |
 
 The full index is at [`docs/README.md`](docs/README.md).
@@ -85,7 +85,7 @@ Stash is an implementation exercise, not a production datastore. The notable gap
 - **No TLS and no ACLs.** A single `--requirepass` password, sent in plaintext.
 - **RESP2-centric.** RESP3 support exists in the protocol layer (booleans, nulls) but command behavior is RESP2.
 - **RDB covers string keys only**, in both directions. Use `--aof` for full-fidelity durability.
-- **Replication is partial** — `REPLCONF`, `PSYNC`, and `WAIT`, with no partial resync, chaining, or failover.
+- **Replication is partial.** Stash supports `REPLCONF`, `PSYNC`, and `WAIT`, but not partial resync, chaining, or failover.
 - **`--maxmemory` uses approximate keyspace accounting**, not process RSS.
 - **The `--event-loop` mode is opt-in** and supported on Linux (`epoll`) and macOS (`kqueue`); other platforms fall back to goroutine-per-connection with a startup warning.
 

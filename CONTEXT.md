@@ -1,8 +1,8 @@
-# Stash Context
+# Stash context
 
-Stash is a Go implementation of a Redis-compatible TCP key/value server. The project is intentionally implementation-led: each feature should preserve Redis wire compatibility where supported while keeping package boundaries small and explicit.
+Stash is a Go implementation of a Redis-compatible TCP key/value server. The project is intentionally implementation-led. Each feature should preserve Redis wire compatibility where supported while keeping package boundaries small and explicit.
 
-## Domain Glossary
+## Domain glossary
 
 - Stash: the server binary and codebase for the Redis-compatible store.
 - RESP: the Redis Serialization Protocol used on client, persistence, and replication command streams.
@@ -26,9 +26,9 @@ Stash is a Go implementation of a Redis-compatible TCP key/value server. The pro
 - Maxmemory: approximate keyspace memory pressure limit that triggers probabilistic LRU eviction.
 - HyperLogLog: fixed-size approximate cardinality register set stored as a string value and used by `PFADD` and `PFCOUNT`.
 - Geohash score: a 52-bit interleaved longitude/latitude encoding stored as a sorted-set score and used by `GEOADD`, `GEODIST`, and `GEORADIUS`.
-- Score-range scan: the sorted-set storage primitive that returns members whose scores fall in given intervals under a single lock acquisition, used by `GEORADIUS` to scan only the geohash cells covering a query radius instead of the whole set.
+- Score-range scan: the sorted-set storage operation that returns members whose scores fall in given intervals under a single lock acquisition. `GEORADIUS` uses it to scan only the geohash cells that cover a query radius instead of the whole set.
 
-## Current Capabilities
+## Current capabilities
 
 - RESP2-centric TCP server with one goroutine per client by default, an opt-in OS I/O multiplexing event loop, and graceful signal-driven shutdown.
 - Thread-safe sharded in-memory storage for strings, hashes, lists, sets, sorted sets, streams, and bitmap and HyperLogLog operations over string values.
@@ -40,15 +40,15 @@ Stash is a Go implementation of a Redis-compatible TCP key/value server. The pro
 ## Boundaries
 
 - RESP3 support is limited to protocol-layer boolean/null parsing, encoding, and coercion; command behavior remains RESP2-centric.
-- RDB loading supports DB `0` string keys only, and rejects rather than skips: a file selecting another database, carrying a non-string value type, or using an opcode the loader does not implement fails startup instead of loading partially. Snapshot *writing* is asymmetric — it warns and skips unsupported keys, because it can enumerate what it cannot encode, while the loader cannot skip a value whose encoding it cannot parse.
+- RDB loading supports string keys in DB `0` only. Startup fails instead of partially loading a file that selects another database, contains a non-string value, or uses an unsupported opcode. Snapshot *writing* behaves differently. It warns and skips unsupported keys because it can enumerate values that it cannot encode. The loader cannot skip a value whose encoding it cannot parse.
 - Memory accounting is approximate keyspace accounting, not exact process RSS accounting.
-- Replication supports the current `REPLCONF`, `PSYNC`, and `WAIT` surface but is not a complete Redis replication implementation.
+- Replication supports `REPLCONF`, `PSYNC`, and `WAIT`, but it is not a complete Redis replication implementation.
 - Redis compatibility is scoped to commands explicitly implemented in `internal/command`; unsupported modifiers should fail explicitly rather than being silently accepted.
 - The event loop is opt-in and supported on Linux (`epoll`) and macOS (`kqueue`); other platforms, including Windows, fall back to goroutine-per-connection networking with a startup warning.
 - In event-loop mode, commands execute inline on the loop goroutine, so a command that would block (`BLPOP` on an empty list, `WAIT` that must wait for replica acknowledgements) fails with an error instead of blocking; the immediately satisfiable forms still succeed.
 - Event-loop connections cap buffered response and push output per connection and disconnect consumers that stop draining their socket, in place of the per-write deadlines the goroutine path uses.
 
-## Documentation Rules
+## Documentation rules
 
 - Use the glossary terms above when naming issues, tests, refactors, and architecture notes.
 - Update this file when a new domain concept becomes stable in the codebase.

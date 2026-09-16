@@ -1,6 +1,6 @@
 # Observability
 
-Stash exposes three inspection surfaces: `INFO` for point-in-time stats, `SLOWLOG` for slow command history, and `MONITOR` for a live command stream.
+Stash provides `INFO` for current statistics, `SLOWLOG` for slow command history, and `MONITOR` for a live command stream.
 
 ## Inspect server state with INFO
 
@@ -49,7 +49,7 @@ Use `go_heap_alloc` and `go_heap_sys` for actual Go runtime memory.
 
 ## Find slow commands with SLOWLOG
 
-Commands slower than `--slowlog-log-slower-than` are recorded in a bounded in-memory ring buffer holding 128 entries — Redis' default length.
+Commands slower than `--slowlog-log-slower-than` are recorded in an in-memory ring buffer that holds 128 entries, matching Redis' default length.
 
 The threshold is in **microseconds** and defaults to `10000` (10ms):
 
@@ -84,7 +84,7 @@ OK
 redis-cli -p 6379 MONITOR
 ```
 
-The connection switches into monitoring mode and receives every command the server processes. A monitoring client may only issue `PING` — it cannot run other commands without reconnecting.
+The connection switches into monitoring mode and receives every command the server processes. A monitoring client may issue only `PING`. It must reconnect before running other commands.
 
 Two operational notes:
 
@@ -101,7 +101,7 @@ Logging uses Go's `log/slog` text handler writing to stdout. Set the level with 
 go run ./cmd/stash --log-level debug
 ```
 
-Notable events logged at `info`: listener startup, AOF/RDB load decisions, replica handshakes, replica disconnects, shutdown snapshots, and startup eviction.
+At `info`, Stash logs listener startup, AOF and RDB load decisions, replica handshakes and disconnects, shutdown snapshots, and startup eviction.
 
 ## Related
 

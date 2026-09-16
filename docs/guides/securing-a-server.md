@@ -1,10 +1,10 @@
 # Securing a server
 
-Stash defaults to a safe posture: it binds loopback and accepts no password. Both of those change the moment you make the server reachable from the network.
+By default, Stash binds to loopback and has no password. Configure authentication before making the server reachable from another machine.
 
 ## The default binding
 
-`--host` defaults to `127.0.0.1`, so a server started with no flags accepts connections only from the local machine. This is deliberate — an out-of-the-box Stash has no authentication, and binding a public interface without a password exposes an unauthenticated datastore.
+`--host` defaults to `127.0.0.1`, so a server started with no flags accepts connections only from the local machine. Stash has no authentication until you set `--requirepass`. Binding a public interface without a password exposes the datastore without authentication.
 
 ## Require a password
 
@@ -23,7 +23,7 @@ OK
 (nil)
 ```
 
-`AUTH` takes exactly one argument — the password form only. There are no usernames or ACLs.
+`AUTH` takes exactly one argument, the password. Stash has no usernames or ACLs.
 
 Unauthenticated clients may still issue `PING`. Every other command, including the replication handshake, requires authentication first.
 
@@ -57,7 +57,7 @@ go run ./cmd/stash --maxclients 1000
 
 ## What the slowlog stores
 
-`SLOWLOG` redacts `AUTH` arguments before recording command metadata, so passwords do not leak into the slow query log. Other command arguments are stored verbatim — anything you treat as a secret and pass as a command argument can appear in `SLOWLOG GET` output and in `MONITOR` streams.
+`SLOWLOG` redacts `AUTH` arguments before recording command metadata, so passwords do not appear in the slow query log. It stores other command arguments verbatim. Any secret passed as an argument can appear in `SLOWLOG GET` output and `MONITOR` streams.
 
 ## Known limitations
 
@@ -70,4 +70,4 @@ These are properties of the current implementation, not configuration mistakes:
 ## Related
 
 - [Configuration reference](../reference/configuration.md)
-- [Observability](observability.md) — what `MONITOR` and `SLOWLOG` expose
+- [Observability](observability.md) explains what `MONITOR` and `SLOWLOG` expose.

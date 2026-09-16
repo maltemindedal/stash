@@ -41,11 +41,10 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 	return ExecuteResult{Responses: responses}
 }
 
-// DeleteFrame builds the `DEL` command frame that stands for keys the server
-// removed without a client asking. Both callers that need one — the command
-// executor, for keys evicted under memory pressure, and the server, for keys
-// evicted once their TTL passed — propagate and persist the identical frame, so
-// they build it the same way.
+// DeleteFrame builds the `DEL` command frame for keys the server removed without
+// a client command. The command executor uses it for memory-pressure evictions.
+// The server uses it for active TTL evictions. Both callers propagate and
+// persist the same frame.
 func DeleteFrame(keys []string) protocol.Array {
 	elements := make([]protocol.Value, 0, len(keys)+1)
 	elements = append(elements, protocol.TextBulkString{Value: "DEL"})

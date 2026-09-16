@@ -68,7 +68,7 @@ func (s *Store) SetLogger(logger *slog.Logger) {
 //
 // Expiry is the one keyspace mutation the store performs on its own initiative
 // rather than on a caller's instruction, which makes it the one a caller cannot
-// otherwise see — and a caller that replicates and persists mutations has to see
+// otherwise see. A caller that replicates and persists mutations has to see
 // it. Two paths sweep for it: the background eviction loop, and the keyspace
 // recalculation every accounted write runs. Both report here.
 //

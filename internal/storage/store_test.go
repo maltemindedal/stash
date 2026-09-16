@@ -1072,7 +1072,7 @@ func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 // leaves by. With maxmemory on, every accounted write recalculates usage across
 // the whole keyspace and drops the expired keys it passes on the way. That is a
 // sweep, not this write's business, and it has to be reported like the
-// background loop's — otherwise the deletions reach nobody whenever maxmemory is
+// background loop's. Otherwise, the deletions reach nobody whenever maxmemory is
 // the thing driving them.
 func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
 	store := NewStore()

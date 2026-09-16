@@ -9,8 +9,8 @@ import (
 
 // TestSetBitConcurrentWithMaxMemoryToggle stresses SetBit while memory
 // accounting is toggled on and off. Before the fix, setBit read
-// maxMemoryEnabled() twice — once to pick the lock scope, once under the
-// narrower lock — so a toggle in that window let a single-shard SetBit enter the
+// maxMemoryEnabled() twice, once to pick the lock scope and once under the
+// narrower lock. A toggle in that window let a single-shard SetBit enter the
 // cross-shard recalculation path and read/delete other shards' maps without
 // holding their locks. This must run clean under the race detector.
 func TestSetBitConcurrentWithMaxMemoryToggle(t *testing.T) {

@@ -124,7 +124,7 @@ func (p *Parser) parseBulkString() (Value, error) {
 func (p *Parser) parseArray(depth int) (Value, error) {
 	// Parse recurses per nesting level, so an unbounded chain of "*1\r\n"
 	// headers would grow this goroutine's stack until the runtime's stack
-	// limit aborts the process — a fatal error no recover can catch. Decode
+	// limit aborts the process with a fatal error that recover cannot catch. Decode
 	// bounds the buffered path the same way with the same constant.
 	if depth >= maxNestingDepth {
 		return nil, fmt.Errorf("protocol: array nesting exceeds %d levels", maxNestingDepth)

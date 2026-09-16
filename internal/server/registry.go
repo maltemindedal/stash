@@ -6,11 +6,11 @@ import (
 	"sync"
 )
 
-// ClientConn is the connection surface the server tracks per client: enough
-// to close it and attribute it. Narrowing this from net.Conn keeps callers
-// from depending on direct socket I/O or deadlines, which the event-loop
-// networking mode does not expose — its connections are driven exclusively by
-// the loop goroutine.
+// ClientConn defines the operations the server tracks for each client. It can
+// close and identify the connection. This narrower alternative to net.Conn
+// prevents callers from depending on direct socket I/O or deadlines. The event
+// loop drives its connections exclusively from one goroutine and does not
+// expose those operations.
 type ClientConn interface {
 	Close() error
 	RemoteAddr() net.Addr

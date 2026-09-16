@@ -11,7 +11,7 @@ Issues and PRDs for this repo live as GitHub issues for `maltemindedal/stash`. U
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
 
-Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
+Infer the repository from `git remote -v`. The `gh` CLI does this automatically when run inside a clone.
 
 ## When a skill says "publish to the issue tracker"
 

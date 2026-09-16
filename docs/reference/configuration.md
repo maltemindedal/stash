@@ -2,7 +2,7 @@
 
 Stash is configured entirely through command-line flags. There is no configuration file and no environment-variable support.
 
-Source of truth: [`internal/config/config.go`](../../internal/config/config.go).
+[`internal/config/config.go`](../../internal/config/config.go) is the source of truth.
 
 ## Flags
 
@@ -29,7 +29,7 @@ Source of truth: [`internal/config/config.go`](../../internal/config/config.go).
 
 ### `--host`
 
-The default binds loopback deliberately: an out-of-the-box server with no `--requirepass` is not reachable from the network. Binding another interface without also setting a password exposes an unauthenticated datastore. See [Securing a server](../guides/securing-a-server.md).
+The default binds loopback deliberately. A server with no `--requirepass` is not reachable from the network unless you bind another interface. Doing so without a password exposes the datastore without authentication. See [Securing a server](../guides/securing-a-server.md).
 
 ### `--slowlog-log-slower-than`
 
@@ -63,7 +63,7 @@ Accounting is approximate keyspace accounting, not process RSS. When usage passe
 
 Supported on Linux (`epoll`) and macOS (`kqueue`). Every other platform, including Windows, logs a warning at startup and falls back to goroutine-per-connection, so the flag is safe to set anywhere.
 
-In event-loop mode, commands execute inline on the loop goroutine. Commands that would block — `BLPOP` on an empty list, `WAIT` that must wait for replica acknowledgements — return an explicit error instead of stalling every connection. Immediately satisfiable forms of both still succeed.
+In event-loop mode, commands execute inline on the loop goroutine. `BLPOP` on an empty list and `WAIT` for pending replica acknowledgements return an explicit error instead of stalling every connection. Immediately satisfiable forms of both commands still succeed.
 
 ## Startup validation
 

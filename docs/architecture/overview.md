@@ -1,6 +1,6 @@
 # Architecture overview
 
-This repository is structured as a phase-by-phase implementation of a Redis-compatible TCP server in Go. The codebase now covers the raw TCP server, RESP parsing/encoding, sharded in-memory storage, transactions, pub/sub, replication, RDB snapshots, append-only-file durability, memory-pressure eviction, and basic operational observability while still keeping clear package seams for later phases.
+This repository implements a Redis-compatible TCP server in Go one phase at a time. It now includes the TCP server, RESP parsing and encoding, sharded in-memory storage, transactions, pub/sub, replication, RDB snapshots, append-only-file durability, memory-pressure eviction, and basic operational metrics. Each package keeps a distinct responsibility so later phases can extend the server without mixing those concerns.
 
 For domain vocabulary, see [`CONTEXT.md`](../../CONTEXT.md) at the repository root.
 
@@ -76,7 +76,7 @@ Current responsibilities:
 
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
-Current command surface includes strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial commands, streams, transactions, pub/sub, replication handshakes, `WAIT`, `BGREWRITEAOF`, `INFO`, `SLOWLOG`, and `MONITOR`. Each command is registered in a single `commandSpecs` table carrying its handler, argument validator, and replication/durability flags; the [command reference](../reference/commands.md) is the reader-facing view of that table.
+Implemented commands cover strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial data, streams, transactions, pub/sub, replication handshakes, `WAIT`, `BGREWRITEAOF`, `INFO`, `SLOWLOG`, and `MONITOR`. The `commandSpecs` table registers each command with its handler, argument validator, and replication and durability flags. The [command reference](../reference/commands.md) documents that table for users.
 
 ### `internal/server`
 
@@ -115,16 +115,16 @@ The user requested RESP3-aware structure, but full RESP3 support is out of scope
 
 The `--event-loop` flag replaces goroutine-per-connection networking with a single event-loop goroutine backed by OS I/O multiplexing, so many idle connections cost file descriptors instead of goroutine stacks.
 
-Platform support boundary:
+Platform support is limited to the following systems:
 
 - Linux uses `epoll` and macOS uses `kqueue`, both through the standard-library `syscall` package with level-triggered readiness.
 - Every other platform (including Windows) logs a warning and falls back to the default goroutine-per-connection path, so the flag is safe to set everywhere.
 
-Inside the loop, each accepted socket is set non-blocking and owned by a connection state machine: readable sockets feed buffered bytes into request parsing and command execution, and writable sockets flush pending RESP output under backpressure. Asynchronous deliveries produced by other connections (pub/sub messages, monitor events, replication payloads) are handed to the loop through a locked per-connection push queue plus a poller wakeup, keeping all socket writes ordered through the machine's single write buffer.
+Inside the loop, each accepted socket is non-blocking and belongs to a connection state machine. Readable sockets feed buffered bytes into request parsing and command execution. Writable sockets flush pending RESP output under backpressure. Other connections can produce pub/sub messages, monitor events, and replication payloads. A locked push queue for each connection and a poller wakeup pass these deliveries to the loop, which orders all socket writes through the state machine's single write buffer.
 
-Backpressure and memory safety: requests are executed one at a time with flushes interleaved, and both reading and execution pause for a connection whose buffered output passes a high-water mark, resuming when the socket drains. Buffered output is capped per connection, so a consumer that stops draining its socket is disconnected instead of growing server memory — the event-loop replacement for the per-write deadlines the goroutine path applies to pub/sub and monitor deliveries. When the peer half-closes, the already-parsed pipeline tail is served and its replies drained before the connection closes.
+The event loop executes one request at a time and interleaves output flushes. It pauses reads and execution when a connection's buffered output passes a high-water mark, then resumes when the socket drains. Each connection has an output cap. A consumer that stops draining its socket is disconnected instead of consuming more server memory. This cap replaces the per-write deadlines that the goroutine path applies to pub/sub and monitor deliveries. When a peer half-closes, the server finishes the parsed pipeline and flushes its replies before closing the connection.
 
-Scope note: commands execute inline on the loop goroutine, so a command that would block (`BLPOP` on an empty list, `WAIT` that must wait for replica acknowledgements) fails with an explicit error in event-loop mode rather than stalling every connection; immediately satisfiable forms still succeed. The goroutine-per-connection path remains the default.
+Commands execute inline on the loop goroutine. In event-loop mode, a command that would block, such as `BLPOP` on an empty list or `WAIT` for pending replica acknowledgements, returns an explicit error instead of stalling every connection. Immediately satisfiable forms still succeed. The goroutine-per-connection path remains the default.
 
 ### Why keep persistence separate from replication?
 

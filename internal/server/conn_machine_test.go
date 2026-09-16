@@ -210,7 +210,7 @@ func TestConnMachineProtocolErrorClosesAfterOrderedReplies(t *testing.T) {
 
 // TestConnMachineFeedRejectsHostileFrames covers the frames a malicious peer can
 // send to make the machine allocate or recurse without bound. Feed itself always
-// succeeds — a hostile frame is reported by moving the machine to ConnStateClosing
+// succeeds. A hostile frame is reported by moving the machine to ConnStateClosing
 // with a recorded error, never by panicking or by buffering without limit.
 func TestConnMachineFeedRejectsHostileFrames(t *testing.T) {
 	deeplyNested := func() []byte {
@@ -238,7 +238,7 @@ func TestConnMachineFeedRejectsHostileFrames(t *testing.T) {
 			name:      "deeply nested array",
 			frame:     deeplyNested(),
 			wantState: ConnStateClosing,
-			reason:    "deep nesting must surface as a protocol error, not a stack overflow",
+			reason:    "deep nesting must return a protocol error, not cause a stack overflow",
 		},
 		{
 			name:          "buffered bytes exceed the read limit",

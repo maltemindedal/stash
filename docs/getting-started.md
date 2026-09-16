@@ -4,10 +4,10 @@ This tutorial takes you from a fresh clone to a running Stash server with data i
 
 ## Prerequisites
 
-- **Go 1.21 or newer** — the version is pinned in [`go.mod`](../go.mod). Check yours with `go version`.
+- **Go 1.21 or newer.** The version is pinned in [`go.mod`](../go.mod). Check yours with `go version`.
 - **A RESP client.** `redis-cli` is the easiest. Any RESP-capable TCP client works.
 
-Stash has no external dependencies — no database, no package downloads, no `go.sum`.
+Stash needs no database or package downloads and has no `go.sum`.
 
 ## 1. Clone and build
 
@@ -121,12 +121,12 @@ Restart it with that snapshot to confirm your data survived:
 go run ./cmd/stash --port 6379 --rdb dump.rdb
 ```
 
-> **Note:** RDB support covers string keys only, in both directions, but the two directions differ in strictness. The shutdown snapshot exports string values and logs a warning for every key of another type it skips. Startup loading restores DB `0` string keys and *refuses to start* if the file selects another database, holds a non-string value, or uses an unimplemented opcode — an unparseable value cannot be skipped without losing the rest of the stream, so loading a foreign Redis dump fails loudly rather than silently dropping data. For full-fidelity durability across all data types, use the [append-only file](guides/persistence.md) instead.
+> RDB support covers string keys only, but reading and writing differ in strictness. The shutdown snapshot exports string values and logs a warning for each key of another type that it skips. Startup restores string keys from DB `0`. It refuses to start if the file selects another database, contains a non-string value, or uses an unsupported opcode. The loader cannot skip an unparseable value without losing the rest of the stream, so it rejects an incompatible Redis dump instead of silently dropping data. For durability across all supported data types, use the [append-only file](guides/persistence.md).
 
 ## Where to go next
 
-- [Persistence](guides/persistence.md) — choose between AOF and RDB and configure durability
-- [Securing a server](guides/securing-a-server.md) — before binding anything but loopback
-- [Configuration reference](reference/configuration.md) — every flag and its default
-- [Command reference](reference/commands.md) — the full command surface
-- [Architecture overview](architecture/overview.md) — how the pieces fit together
+- [Persistence](guides/persistence.md) explains how to choose between AOF and RDB and configure durability.
+- [Securing a server](guides/securing-a-server.md) explains what to do before binding outside loopback.
+- [Configuration reference](reference/configuration.md) lists every flag and its default.
+- [Command reference](reference/commands.md) lists every implemented command.
+- [Architecture overview](architecture/overview.md) explains how the components fit together.

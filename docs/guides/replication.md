@@ -2,9 +2,9 @@
 
 Stash supports leader/follower replication over the standard Redis handshake (`REPLCONF`, `PSYNC`). A replica connects to a master, receives an RDB snapshot of current state, then applies a live stream of propagated commands. As in Redis, a full resync *replaces* the replica's dataset: whatever the replica loaded from its own AOF or RDB is discarded in favour of the master's snapshot.
 
-> **Scope:** replication covers the `REPLCONF`, `PSYNC`, and `WAIT` surface. It is not a complete Redis replication implementation — there is no partial resynchronization, no replica chaining, and no automatic failover.
+> Replication supports `REPLCONF`, `PSYNC`, and `WAIT`. It does not support partial resynchronization, replica chaining, or automatic failover.
 
-> **Snapshot fidelity:** the full-resync snapshot uses the same RDB encoder as shutdown snapshots, so it carries DB `0` string keys only. Collections that exist on the master before a replica attaches (hashes, lists, sets, sorted sets, streams) are *not* transferred by the handshake; the master logs a warning naming how many keys it skipped. Writes propagated after the handshake cover every type. To bring a replica fully into sync for collection keys, write them after the replica has attached.
+> The full-resync snapshot uses the same RDB encoder as shutdown snapshots, so it carries only string keys from DB `0`. The handshake does not transfer existing hashes, lists, sets, sorted sets, or streams. The master logs how many keys it skipped. Writes propagated after the handshake cover every supported type. To synchronize collection keys, write them after the replica attaches.
 
 ## Start a master and a replica
 
@@ -56,7 +56,7 @@ connected_slaves:1
 slave0:id=1,port=6380,offset=31
 ```
 
-> **TODO(verify):** the field names above are taken from `appendInfoReplication` in `internal/command/info.go`, but the sample values are illustrative rather than captured from a live master/replica pair. Run the two-server setup above and replace this block with real output.
+> TODO: The field names above come from `appendInfoReplication` in `internal/command/info.go`, but the values are examples rather than output from a live master and replica. Run the two-server setup above and replace this block with its output.
 
 ## Replicate against a protected master
 
@@ -85,7 +85,7 @@ OK
 
 The reply is the number of replicas that acknowledged, which may be lower than requested if the timeout fires first. A timeout of `0` returns the current count immediately without waiting.
 
-`WAIT` is not supported in `--event-loop` mode when it would actually have to wait — commands execute inline on the loop goroutine, so blocking would stall every connection. It returns an explicit error instead. The immediately satisfiable case (enough replicas already acknowledged, or a `0` timeout) still succeeds.
+In `--event-loop` mode, `WAIT` returns an error if it would have to block. Commands execute inline on the loop goroutine, so waiting would stall every connection. The command still succeeds when enough replicas have already acknowledged the write or when the timeout is `0`.
 
 ## What gets replicated
 
@@ -98,6 +98,6 @@ The full per-command breakdown is in the [command reference](../reference/comman
 
 ## Related
 
-- [Configuration reference](../reference/configuration.md) — `--replicaof`, `--masterauth`, `--requirepass`
+- [Configuration reference](../reference/configuration.md) documents `--replicaof`, `--masterauth`, and `--requirepass`.
 - [Securing a server](securing-a-server.md)
-- [Architecture overview](../architecture/overview.md) — why persistence and replication use separate paths
+- [Architecture overview](../architecture/overview.md) explains why persistence and replication use separate paths.

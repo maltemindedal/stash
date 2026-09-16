@@ -9,7 +9,7 @@ Stash offers two persistence mechanisms with different coverage. Choose based on
 | Read | At startup | At startup, DB `0` only |
 | Flags | `--aof`, `--appendfsync` | `--dump`, `--rdb` |
 
-The AOF is the durable option. RDB is useful for a fast string-only snapshot and for the replication handshake, but it silently omits lists, hashes, sets, sorted sets, and streams — it logs a warning naming the count of skipped keys.
+The AOF preserves all supported data types. RDB provides a fast string-only snapshot for startup and the replication handshake. It omits lists, hashes, sets, sorted sets, and streams, and logs the number of skipped keys.
 
 ## Enable the append-only file
 
@@ -36,7 +36,7 @@ The AOF grows without bound as commands accumulate. `BGREWRITEAOF` compacts it:
 Background append only file rewriting started
 ```
 
-The rewrite runs in the background: it snapshots live durable state, writes a minimal equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite.
+The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite.
 
 ## Understand the AOF/RDB precedence
 
@@ -63,7 +63,7 @@ go run ./cmd/stash --rdb /var/lib/stash/dump.rdb
 go run ./cmd/stash --dump ""
 ```
 
-Snapshots are written only on **graceful** shutdown (`SIGINT` or `SIGTERM`). A `SIGKILL` or a crash produces no snapshot — another reason to run with `--aof` if the data matters.
+Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
 
 ## What TTLs do across a restart
 
@@ -71,5 +71,5 @@ Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT`
 
 ## Related
 
-- [Configuration reference](../reference/configuration.md) — flag defaults and validation
-- [Replication](replication.md) — how replicas use the RDB snapshot during handshake
+- [Configuration reference](../reference/configuration.md) lists flag defaults and validation rules.
+- [Replication](replication.md) explains how replicas use the RDB snapshot during the handshake.

@@ -641,7 +641,7 @@ func (w *eventConnPushWriter) Write(p []byte) (int, error) {
 	return w.loop.queuePush(w.conn, p)
 }
 
-// eventConnHandle is the ClientConn surface registered with the client
+// eventConnHandle implements the ClientConn operations registered with the client
 // registry so shutdown, INFO connected-client counts, and replica bookkeeping
 // keep working for event-loop connections. Close hands the actual teardown to
 // the loop goroutine, which owns all socket I/O.

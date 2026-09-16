@@ -14,7 +14,7 @@ import (
 // TestLoaderRejectsOversizedString verifies a forged length prefix is rejected
 // against the object-length cap rather than pre-allocating a multi-gigabyte
 // buffer. The loader also runs on RDB payloads received from a replication
-// master, so this closes a network-reachable OOM vector.
+// master, so this prevents a network-triggered out-of-memory failure.
 func TestLoaderRejectsOversizedString(t *testing.T) {
 	var payload []byte
 	payload = append(payload, fileHeader...)
@@ -37,7 +37,7 @@ func TestLoaderRejectsOversizedString(t *testing.T) {
 // TestLoaderRejectsOversizedLZFString verifies the loader rejects a forged LZF
 // uncompressed length against the object-length cap before decompressLZF
 // allocates the output buffer. Like the raw-string path, this is reachable over
-// replication, so the cap closes the same OOM vector for compressed values.
+// replication, so the cap provides the same protection for compressed values.
 func TestLoaderRejectsOversizedLZFString(t *testing.T) {
 	var payload []byte
 	payload = append(payload, fileHeader...)

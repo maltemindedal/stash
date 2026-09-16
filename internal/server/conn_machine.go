@@ -132,7 +132,7 @@ func (m *ConnMachine) PendingOutputBytes() int {
 // more bytes arrive; the machine defers re-decoding until the buffer reaches
 // the byte count the pending frame is known to need, so a frame arriving in
 // many small chunks is not rescanned on every append. A permanent protocol
-// error — including a frame exceeding the read-buffer limit — queues an ordered
+// error, including a frame exceeding the read-buffer limit, queues an ordered
 // RESP error reply and transitions the machine to the closing state, so callers
 // should check State after feeding.
 func (m *ConnMachine) Feed(data []byte) error {

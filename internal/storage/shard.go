@@ -126,13 +126,12 @@ func (w keyWrite) commitString(length int, expiresAt int64, fill func(payload []
 // that a write of that key needs, and reports the keys evicted to make room for
 // it.
 //
-// It is the write-path counterpart to readKey, and owns everything a write of a
-// single key must get right before the operation itself: taking one clock
-// reading, reading the maxmemory setting once, locking the owning shard for
-// writing — or every shard, because eviction reaches across shards — reclaiming
-// the key if it is already past its TTL, and releasing the locks on every path.
-// fn therefore only ever sees a live value of unknown kind, or nil where the key
-// is absent.
+// It is the write-path counterpart to readKey. Before the operation runs, it
+// takes one clock reading, reads the maxmemory setting once, and locks the owning
+// shard for writing. It may lock every shard because eviction can cross shard
+// boundaries. It also reclaims the key when its TTL has passed and releases all
+// locks on every path. fn therefore sees either a live value of unknown kind or
+// nil when the key is absent.
 //
 // fn runs under the write locks and stores its result through the keyWrite it is
 // handed; it must not retain that keyWrite, or memory borrowed from the value,

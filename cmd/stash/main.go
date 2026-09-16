@@ -2,7 +2,7 @@
 //
 // It parses command-line configuration, wires the storage engine, command
 // executor, and TCP server together, and serves clients until a shutdown
-// signal arrives. See docs/reference/configuration.md for the flag surface.
+// signal arrives. See docs/reference/configuration.md for the available flags.
 package main
 
 import (

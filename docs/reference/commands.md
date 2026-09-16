@@ -2,7 +2,7 @@
 
 Every command Stash implements. Anything not listed here is unsupported and returns an unknown-command error.
 
-Source of truth: the command table at [`internal/command/types.go`](../../internal/command/types.go) (`commandSpecs`).
+The `commandSpecs` table in [`internal/command/types.go`](../../internal/command/types.go) is the source of truth.
 
 ## Conventions
 
@@ -80,7 +80,7 @@ Registers are a fixed-size approximate cardinality structure stored as a string 
 | `BLPOP <key>` | – | – |
 
 - `LPOP`/`RPOP` accept an optional count, which must be non-negative; a negative count returns `ERR value is out of range, must be positive`.
-- `BLPOP` takes a key and **no timeout argument** — this differs from Redis, where the timeout is mandatory. In `--event-loop` mode, a `BLPOP` that must block returns an error rather than waiting.
+- `BLPOP` takes a key and **no timeout argument**. Redis requires the timeout. In `--event-loop` mode, a `BLPOP` that must block returns an error rather than waiting.
 
 ## Sets
 
@@ -110,7 +110,7 @@ Integer-only sets use a compact sorted-slice encoding until they reach 512 membe
 | `GEODIST <key> <member1> <member2> [m\|km\|ft\|mi]` | – | – |
 | `GEORADIUS <key> <longitude> <latitude> <radius> <m\|km\|ft\|mi>` | – | – |
 
-Positions are stored as 52-bit interleaved geohash scores in a regular sorted set, so geospatial keys are readable with `ZRANGE`. `GEODIST` defaults to metres when no unit is given. `GEORADIUS` takes exactly five arguments — the optional Redis modifiers (`WITHCOORD`, `COUNT`, `ASC`, …) are not supported and return a syntax error.
+Positions are stored as 52-bit interleaved geohash scores in a regular sorted set, so geospatial keys are readable with `ZRANGE`. `GEODIST` defaults to metres when no unit is given. `GEORADIUS` takes exactly five arguments. Optional Redis modifiers such as `WITHCOORD`, `COUNT`, and `ASC` are not supported and return a syntax error.
 
 ## Streams
 
@@ -130,7 +130,7 @@ Positions are stored as 52-bit interleaved geohash scores in a regular sorted se
 | `DISCARD` | – | – |
 | `WATCH <key> [key ...]` | – | – |
 
-Queued commands propagate and persist individually when `EXEC` runs them. `WATCH` provides optimistic invalidation: if a watched key changes before `EXEC`, the transaction aborts.
+Queued commands propagate and persist individually when `EXEC` runs them. `WATCH` provides optimistic invalidation. If a watched key changes before `EXEC`, the transaction aborts.
 
 ## Pub/sub
 
