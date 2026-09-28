@@ -88,8 +88,9 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 		return s.approximateStringValueObjectSize(key, len(value.String), value.ExpiresAt)
 	case ValueKindList:
 		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead + int64(len(value.List))*approxListEntryOverhead
-		for _, item := range value.List {
+		list := value.liveList()
+		size += approxCollectionOverhead + int64(len(list))*approxListEntryOverhead
+		for _, item := range list {
 			size += int64(len(item))
 		}
 		return size

@@ -306,7 +306,7 @@ func (s *Store) LeftPop(key string) ([]byte, bool, error) {
 	item := list[0]
 	list[0] = nil
 	list = list[1:]
-	value.List = list
+	value.dropListFront(1)
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
@@ -352,7 +352,7 @@ func (s *Store) RightPop(key string) ([]byte, bool, error) {
 	item := list[last]
 	list[last] = nil
 	list = list[:last]
-	value.List = list
+	value.dropListEnd(1)
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
@@ -417,6 +417,7 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 			list[i] = nil
 		}
 		list = list[n:]
+		value.dropListFront(n)
 	} else {
 		for i := 0; i < n; i++ {
 			src := len(list) - 1 - i
@@ -424,9 +425,9 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 			list[src] = nil
 		}
 		list = list[:len(list)-n]
+		value.dropListEnd(n)
 	}
 
-	value.List = list
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
@@ -779,8 +780,9 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 			case ValueKindString:
 				valueArena, entry.String = appendClonedBytesArena(valueArena, value.String)
 			case ValueKindList:
-				entry.List = make([][]byte, len(value.List))
-				for j, item := range value.List {
+				list := value.liveList()
+				entry.List = make([][]byte, len(list))
+				for j, item := range list {
 					valueArena, entry.List[j] = appendClonedBytesArena(valueArena, item)
 				}
 			case ValueKindZSet:
@@ -1012,7 +1014,9 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 
 	length, evicted, err := writeKey(s, key, func(w keyWrite) (int64, []string, error) {
 		var (
-			list      [][]byte
+			list      [][]byte // the values of the list
+			full      [][]byte // the array they live in, ListHead dead slots ahead of them
+			head      int
 			expiresAt int64
 		)
 		if w.current != nil {
@@ -1025,28 +1029,35 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 			if w.accounting {
 				// Size the write against the pre-write list, and leave it untouched
 				// if it turns out to breach maxmemory, by appending to a copy rather
-				// than to the slice still stored under the key.
+				// than to the slice still stored under the key. The copy shares no
+				// array with the stored list, so there is nothing to reuse.
 				list = append([][]byte(nil), currentList...)
+			} else {
+				full, head = w.current.List, int(w.current.ListHead)
 			}
 		}
 
 		additions := cloneList(values)
 		if left {
-			combined := make([][]byte, len(list)+len(additions))
-			for i := range additions {
-				combined[i] = additions[len(additions)-1-i]
-			}
-			copy(combined[len(additions):], list)
-			list = combined
+			full, head = prependList(full, head, list, additions)
 		} else {
-			list = append(list, additions...)
+			grown := append(list, additions...)
+			if full != nil && len(list) > 0 && &grown[0] == &list[0] {
+				// It fitted: the list still lives in the same array, and so do the
+				// dead slots ahead of it.
+				full = full[:head+len(grown)]
+			} else {
+				full, head = grown, 0
+			}
 		}
 
-		evicted, err := w.commit(newListValue(list, expiresAt))
+		value := newListValue(full, expiresAt)
+		value.ListHead = int32(head)
+		evicted, err := w.commit(value)
 		if err != nil {
 			return 0, nil, err
 		}
-		return int64(len(list)), evicted, nil
+		return int64(len(full) - head), evicted, nil
 	})
 	if err != nil {
 		return 0, nil, err
@@ -1057,6 +1068,32 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 	// in the other order cannot deadlock against this one.
 	s.waiters.notifyOne(key)
 	return length, evicted, nil
+}
+
+// prependList puts additions in front of list, the last addition first, and
+// returns the array the result lives in and how many dead slots precede it. full
+// and head describe where list currently lives (see ValueObject.liveList); full
+// is nil when there is nothing to reuse. When the dead slots ahead of list are
+// enough it fills them and copies nothing. Otherwise it moves the list into a new
+// array with as much headroom as the list has values, so pushing to the front
+// copies the list once per doubling instead of once per push.
+func prependList(full [][]byte, head int, list, additions [][]byte) ([][]byte, int) {
+	k := len(additions)
+	if head >= k {
+		start := head - k
+		for i, item := range additions {
+			full[start+k-1-i] = item
+		}
+		return full, start
+	}
+
+	headroom := min(len(list), math.MaxInt32-k)
+	grown := make([][]byte, headroom+k+len(list))
+	for i, item := range additions {
+		grown[headroom+k-1-i] = item
+	}
+	copy(grown[headroom+k:], list)
+	return grown, headroom
 }
 
 func normalizeListRange(length int, start, stop int64) (int, int, bool) {
