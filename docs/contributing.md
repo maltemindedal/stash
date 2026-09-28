@@ -30,6 +30,8 @@ Race tests run in CI on every pull request and on pushes to `main`. Run them loc
 go test -race ./...
 ```
 
+The CI `race` job also runs the tests in random order (`-shuffle=on`) to catch tests that depend on each other. A failing run prints the shuffle seed; repeat it with `go test -race -shuffle=<seed> ./...`.
+
 Benchmarks for the parser and store:
 
 ```bash
