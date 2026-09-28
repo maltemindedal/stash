@@ -52,6 +52,10 @@ type executionEffects struct {
 	// frame reuses that exact value instead of re-deriving it from a later
 	// clock. Zero means no expiry (keep the verbatim frame).
 	setExpiryMillis int64
+	// streamID is the ID the XADD handler stored the entry under, so the logged
+	// frame can carry it in place of an auto-ID request ("*"). Empty when the
+	// command did not add a stream entry.
+	streamID string
 }
 
 type executionEffectsContextKey struct{}
@@ -315,6 +319,22 @@ func rewriteSetFrame(ctx context.Context, request *Request) (protocol.Array, boo
 	return protocol.Array{Elements: elements}, true
 }
 
+// rewriteXAddFrame replaces the ID argument of an XADD that asked for an
+// auto-generated ID with the one the handler stored. Replaying the verbatim
+// frame would generate a new ID from the clock at replay time, so entries came
+// back from the AOF under different IDs than the ones clients had been given.
+// An XADD with an explicit ID keeps its verbatim frame.
+func rewriteXAddFrame(ctx context.Context, request *Request) (protocol.Array, bool) {
+	effects := executionEffectsFromContext(ctx)
+	if effects == nil || effects.streamID == "" || effects.streamID == string(request.Args[1]) {
+		return protocol.Array{}, false
+	}
+
+	frame := propagationFrame(request)
+	frame.Elements[2] = protocol.TextBulkString{Value: effects.streamID}
+	return frame, true
+}
+
 func withExecutionEffects(ctx context.Context) (context.Context, *executionEffects) {
 	effects := &executionEffects{}
 	return context.WithValue(ctx, executionEffectsContextKey{}, effects), effects
@@ -531,9 +551,10 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate: validateGeoRadiusRequest,
 		},
 		"XADD": {
-			handler:  e.handleXAdd,
-			validate: validateXAddRequest,
-			durable:  true,
+			handler:      e.handleXAdd,
+			validate:     validateXAddRequest,
+			durable:      true,
+			rewriteFrame: rewriteXAddFrame,
 		},
 		"XREAD": {
 			handler:  e.handleXRead,

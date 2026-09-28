@@ -119,7 +119,7 @@ Positions are stored as 52-bit interleaved geohash scores in a regular sorted se
 | `XADD <key> <id\|*> <field> <value> [field value ...]` | – | yes |
 | `XREAD STREAMS <key> <id>` | – | – |
 
-`XADD` is written to the AOF but not forwarded to replicas. `XREAD` supports exactly one key and one ID, and requires the literal `STREAMS` keyword first; `BLOCK` and `COUNT` are not supported.
+`XADD` is written to the AOF but not forwarded to replicas. An auto-generated ID (`*`) is written to the AOF as the ID that was generated, so entries keep the IDs clients were given across a restart. `XREAD` supports exactly one key and one ID, and requires the literal `STREAMS` keyword first; `BLOCK` and `COUNT` are not supported.
 
 ## Transactions
 

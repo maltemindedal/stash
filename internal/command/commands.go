@@ -732,6 +732,9 @@ func (e *Executor) handleXAdd(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
+	if effects := executionEffectsFromContext(ctx); effects != nil {
+		effects.streamID = id
+	}
 	e.recordWriteEffects(ctx, key, evicted)
 	return protocol.TextBulkString{Value: id}, nil
 }

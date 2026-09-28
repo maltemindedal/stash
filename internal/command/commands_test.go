@@ -2485,6 +2485,73 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 	})
 }
 
+func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
+	// The durability frame is replayed at startup. Logging XADD's "*" verbatim
+	// makes replay mint a fresh ID from the clock at that moment, so every
+	// auto-ID entry came back under a different ID after a restart.
+	t.Run("auto ID is replaced by the ID that was generated", func(t *testing.T) {
+		executor := newTestExecutor()
+		result, err := executor.ExecuteDetailed(context.Background(), requestValue("XADD", "events", "*", "type", "start"))
+		if err != nil {
+			t.Fatalf("ExecuteDetailed(XADD *) error = %v", err)
+		}
+		id, ok := result.Responses[0].(protocol.TextBulkString)
+		if !ok || id.Value == "" || id.Value == "*" {
+			t.Fatalf("XADD * reply = %#v, want the generated ID", result.Responses[0])
+		}
+		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+
+		// Replaying the logged frame recreates the entry under the same ID.
+		replayed := newTestExecutor()
+		frame, ok := result.Durability[0].(protocol.Array)
+		if !ok {
+			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
+		}
+		if _, err := replayed.ExecuteDetailed(context.Background(), frame); err != nil {
+			t.Fatalf("replaying the logged frame: %v", err)
+		}
+		entries, err := replayed.store.XRead("events", "0-0")
+		if err != nil || len(entries) != 1 || entries[0].ID != id.Value {
+			t.Fatalf("XRead after replay = (%#v, %v), want one entry with ID %q", entries, err, id.Value)
+		}
+	})
+
+	t.Run("an XADD queued in a transaction is logged with its generated ID", func(t *testing.T) {
+		executor := newTestExecutor()
+		ctx := withClientStateForExecutor(context.Background(), executor, 3)
+		for _, step := range []protocol.Value{
+			requestValue("MULTI"),
+			requestValue("XADD", "events", "*", "type", "start"),
+		} {
+			if _, err := executor.ExecuteDetailed(ctx, step); err != nil {
+				t.Fatalf("ExecuteDetailed(%v) error = %v", step, err)
+			}
+		}
+		result, err := executor.ExecuteDetailed(ctx, requestValue("EXEC"))
+		if err != nil {
+			t.Fatalf("ExecuteDetailed(EXEC) error = %v", err)
+		}
+		replies, ok := result.Responses[0].(protocol.Array)
+		if !ok || len(replies.Elements) != 1 {
+			t.Fatalf("EXEC reply = %#v, want one queued reply", result.Responses[0])
+		}
+		id, ok := replies.Elements[0].(protocol.TextBulkString)
+		if !ok || id.Value == "" || id.Value == "*" {
+			t.Fatalf("queued XADD reply = %#v, want the generated ID", replies.Elements[0])
+		}
+		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+	})
+
+	t.Run("an explicit ID keeps its verbatim frame", func(t *testing.T) {
+		executor := newTestExecutor()
+		result, err := executor.ExecuteDetailed(context.Background(), requestValue("XADD", "events", "5-1", "type", "start"))
+		if err != nil {
+			t.Fatalf("ExecuteDetailed(XADD 5-1) error = %v", err)
+		}
+		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", "5-1", "type", "start"))
+	})
+}
+
 func newTestExecutor() *Executor {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewExecutor(storage.NewStore(), logger)
