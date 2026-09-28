@@ -608,3 +608,84 @@ func waitForSignal(t *testing.T, timeout time.Duration, signal <-chan struct{}, 
 		t.Fatalf("timed out waiting for %s", description)
 	}
 }
+
+// startBlockedReply starts a reply write that cannot finish, because the peer end
+// of the pipe never reads, and returns once that write holds the client's
+// response lock, the way a client that stopped draining its socket does.
+func startBlockedReply(t *testing.T) (*ClientState, <-chan error) {
+	t.Helper()
+
+	server, peer := net.Pipe()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = peer.Close()
+	})
+
+	state := &ClientState{ID: 9, Authenticated: true}
+	state.BindResponseWriter(bufio.NewWriter(server))
+	state.BindResponseConn(server)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- state.WriteResponses([]protocol.Value{protocol.SimpleString{Value: "PONG"}})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for state.responseMu.TryLock() {
+		state.responseMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("the reply write never took the response lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return state, done
+}
+
+func TestClientStatePushToBlockedReplyGivesUpAtDeadline(t *testing.T) {
+	// A client whose own reply flush is stuck holds its response lock. A publisher
+	// pushing to it must give up after its write timeout instead of queueing
+	// behind that flush, or one client that stops reading freezes every publisher.
+	state, _ := startBlockedReply(t)
+
+	result := make(chan error, 1)
+	start := time.Now()
+	go func() { result <- state.WriteEncodedWithDeadline([]byte("+pushed\r\n"), 100*time.Millisecond) }()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("WriteEncodedWithDeadline() error = nil, want a timeout while the reply flush holds the lock")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("WriteEncodedWithDeadline() took %v, want it bounded by its 100ms timeout", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteEncodedWithDeadline() is still blocked behind the stuck reply flush")
+	}
+}
+
+func TestClientStateDisconnectUnblocksStuckReplyWrite(t *testing.T) {
+	// Disconnect is what publishers call after a failed push. It must not wait
+	// for the stuck flush; closing the connection is what ends that flush.
+	state, replyDone := startBlockedReply(t)
+
+	disconnected := make(chan struct{})
+	go func() {
+		state.Disconnect()
+		close(disconnected)
+	}()
+
+	select {
+	case <-disconnected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect() is still blocked behind the stuck reply flush")
+	}
+	select {
+	case err := <-replyDone:
+		if err == nil {
+			t.Fatal("WriteResponses() error = nil, want the write to fail once the client is disconnected")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stuck reply write was never released")
+	}
+}

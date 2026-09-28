@@ -24,7 +24,11 @@ type ClientState struct {
 	ID         uint64
 	RemoteAddr string
 
-	mu         sync.RWMutex
+	mu sync.RWMutex
+	// responseMu guards responseWriter and writerClosed and is held across each
+	// whole-frame write, which blocks for as long as the peer does not read.
+	// responseConn is guarded by mu instead, so Disconnect can close it to end a
+	// write that holds responseMu.
 	responseMu sync.Mutex
 
 	watchRegistry *WatchRegistry
@@ -125,8 +129,8 @@ func (s *ClientState) BindResponseWriter(writer *bufio.Writer) {
 // BindResponseConn records the underlying connection used by the response
 // writer when one is available.
 func (s *ClientState) BindResponseConn(conn net.Conn) {
-	s.responseMu.Lock()
-	defer s.responseMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.responseConn = conn
 }
@@ -151,10 +155,19 @@ func (s *ClientState) Disconnect() {
 		return
 	}
 
+	// A reply flush stuck on a peer that stopped reading holds responseMu until
+	// the connection closes, so close it before waiting for the lock.
+	s.mu.Lock()
+	conn := s.responseConn
+	s.responseConn = nil
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+
 	s.responseMu.Lock()
 	s.writerClosed = true
 	s.responseWriter = nil
-	s.responseConn = nil
 	s.responseMu.Unlock()
 
 	s.ResetTransaction()
@@ -245,17 +258,25 @@ func (s *ClientState) WriteEncoded(payload []byte) error {
 }
 
 // WriteEncodedWithDeadline writes a pre-encoded RESP payload with a temporary
-// write deadline when the underlying connection is known.
+// write deadline when the underlying connection is known. Waiting for the
+// connection's writer counts against the same timeout, so a client whose own
+// reply is stuck cannot hold up the goroutine pushing to it.
 func (s *ClientState) WriteEncodedWithDeadline(payload []byte, timeout time.Duration) error {
-	s.responseMu.Lock()
+	if !s.lockResponses(timeout) {
+		return fmt.Errorf("client response writer busy for %v", timeout)
+	}
 	defer s.responseMu.Unlock()
 
 	if s.writerClosed || s.responseWriter == nil {
 		return fmt.Errorf("client response writer unavailable")
 	}
+	s.mu.RLock()
+	conn := s.responseConn
+	s.mu.RUnlock()
+
 	deadlineSet := false
-	if s.responseConn != nil && timeout > 0 {
-		if err := s.responseConn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	if conn != nil && timeout > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 			return err
 		}
 		deadlineSet = true
@@ -265,12 +286,37 @@ func (s *ClientState) WriteEncodedWithDeadline(payload []byte, timeout time.Dura
 		writeErr = s.responseWriter.Flush()
 	}
 	if deadlineSet {
-		if clearErr := s.responseConn.SetWriteDeadline(time.Time{}); writeErr == nil {
+		if clearErr := conn.SetWriteDeadline(time.Time{}); writeErr == nil {
 			writeErr = clearErr
 		}
 	}
 
 	return writeErr
+}
+
+// lockResponses takes responseMu and reports whether it got it within timeout.
+// A client whose own reply flush is blocked on a peer that stopped reading holds
+// responseMu for as long as that peer stays silent, so waiting for it without a
+// bound would let one such client stall everything that pushes to it (PUBLISH
+// and MONITOR fan-out run on other clients' request paths). A non-positive
+// timeout waits as long as it takes.
+func (s *ClientState) lockResponses(timeout time.Duration) bool {
+	if timeout <= 0 {
+		s.responseMu.Lock()
+		return true
+	}
+	if s.responseMu.TryLock() {
+		return true
+	}
+
+	deadline := time.Now().Add(timeout)
+	for wait := 50 * time.Microsecond; time.Now().Before(deadline); wait = min(2*wait, 5*time.Millisecond) {
+		time.Sleep(wait)
+		if s.responseMu.TryLock() {
+			return true
+		}
+	}
+	return false
 }
 
 // SetReplicaListeningPort records the port announced during REPLCONF listening-port.
