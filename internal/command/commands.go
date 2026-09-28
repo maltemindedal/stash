@@ -20,6 +20,11 @@ import (
 
 const pubSubWriteTimeout = 100 * time.Millisecond
 
+// maxWaitMillis is the longest WAIT timeout a time.Duration can represent, about
+// 292 years. A longer request is clamped to it: converting it as given overflowed
+// to a negative duration, so a WAIT asked to wait a very long time returned at once.
+const maxWaitMillis = math.MaxInt64 / int64(time.Millisecond)
+
 var cachedReplConfGetAckPayload = sync.OnceValues(func() ([]byte, error) {
 	return protocol.Encode(propagationFrame(&Request{
 		Name: "REPLCONF",
@@ -360,7 +365,7 @@ func (e *Executor) waitTargetOffset(ctx context.Context) int64 {
 }
 
 func (e *Executor) waitForReplicaAcknowledgements(ctx context.Context, replicas int64, timeoutMillis int64, targetOffset int64, startedAt time.Time) (server.ExecuteResult, error) {
-	timer := time.NewTimer(time.Duration(timeoutMillis) * time.Millisecond)
+	timer := time.NewTimer(time.Duration(min(timeoutMillis, maxWaitMillis)) * time.Millisecond)
 	defer timer.Stop()
 
 	for {

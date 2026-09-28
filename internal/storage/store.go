@@ -1110,6 +1110,18 @@ func isExpired(value *ValueObject, now int64) bool {
 	return value != nil && value.ExpiresAt > 0 && now > value.ExpiresAt
 }
 
+// deadlineAfter returns the Unix-millis deadline value units of millisPerUnit
+// after nowMillis, or ErrInvalidExpireTime when that does not fit in an int64.
+// It works in integer milliseconds because time.Duration, at nanosecond
+// resolution, wraps past about 292 years and turned a huge expiry into a
+// deadline in the past (or a negative one, which reads as "no expiry").
+func deadlineAfter(nowMillis, value, millisPerUnit int64) (int64, error) {
+	if value > (math.MaxInt64-nowMillis)/millisPerUnit {
+		return 0, ErrInvalidExpireTime
+	}
+	return nowMillis + value*millisPerUnit, nil
+}
+
 // ParseExpiryMillis parses Redis-style EX/PX/PXAT arguments into a Unix-millis deadline.
 func ParseExpiryMillis(args [][]byte) (int64, error) {
 	if len(args) == 0 {
@@ -1124,12 +1136,12 @@ func ParseExpiryMillis(args [][]byte) (int64, error) {
 		return 0, ErrInvalidExpireTime
 	}
 
-	now := time.Now()
+	nowMillis := time.Now().UnixMilli()
 	switch strings.ToUpper(string(args[0])) {
 	case "EX":
-		return now.Add(time.Duration(value) * time.Second).UnixMilli(), nil
+		return deadlineAfter(nowMillis, value, 1000)
 	case "PX":
-		return now.Add(time.Duration(value) * time.Millisecond).UnixMilli(), nil
+		return deadlineAfter(nowMillis, value, 1)
 	case "PXAT":
 		// Absolute expiry in Unix milliseconds. Used both by clients and by the
 		// frame the executor propagates/persists for SET, so replicas and AOF

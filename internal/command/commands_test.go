@@ -658,6 +658,26 @@ func TestExecutorExecute(t *testing.T) {
 			},
 		},
 		{
+			name:    "SET with an EX that overflows returns the invalid-expire sentinel",
+			request: requestValue("SET", "temp", "1", "EX", "9223372036854775807"),
+			assert: func(t *testing.T, _ protocol.Value, err error) {
+				t.Helper()
+				if !errors.Is(err, ErrInvalidExpireTime) {
+					t.Fatalf("Execute() error = %v, want ErrInvalidExpireTime (the deadline used to wrap into the past)", err)
+				}
+			},
+		},
+		{
+			name:    "SET with a PX that overflows returns the invalid-expire sentinel",
+			request: requestValue("SET", "temp", "1", "PX", "9223372036854775807"),
+			assert: func(t *testing.T, _ protocol.Value, err error) {
+				t.Helper()
+				if !errors.Is(err, ErrInvalidExpireTime) {
+					t.Fatalf("Execute() error = %v, want ErrInvalidExpireTime (the deadline used to wrap into the past)", err)
+				}
+			},
+		},
+		{
 			name:    "SET with invalid option returns syntax sentinel",
 			request: requestValue("SET", "temp", "1", "NX", "10"),
 			assert: func(t *testing.T, _ protocol.Value, err error) {
@@ -1210,6 +1230,39 @@ func TestExecutorWait(t *testing.T) {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
 		}
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
+	})
+
+	t.Run("WAIT with a timeout past what a duration can hold keeps waiting", func(t *testing.T) {
+		// 9223372036855 ms overflows time.Duration; it used to wrap negative, so the
+		// timer fired at once and WAIT answered without waiting at all.
+		executor := newTestExecutor()
+		replication := &server.ReplicationState{}
+		replication.AdvanceMasterOffset(5)
+		executor.SetReplicationState(replication)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "9223372036855"))
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			t.Fatalf("WAIT returned at once (error = %v), want it to keep waiting for its huge timeout", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("WAIT error after cancel = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("WAIT did not stop when its context was canceled")
+		}
 	})
 
 	t.Run("WAIT uses the calling client's last write offset", func(t *testing.T) {

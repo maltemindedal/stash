@@ -32,7 +32,7 @@ The `commandSpecs` table in [`internal/command/types.go`](../../internal/command
 | `DEL <key> [key ...]` | yes | yes |
 | `INCR <key>` | yes | yes |
 
-- Expiration takes exactly one option/value pair or none. The value must be a positive integer; `0` and negatives return an invalid-expire-time error, and an unrecognized option returns a syntax error.
+- Expiration takes exactly one option/value pair or none. The value must be a positive integer; `0` and negatives return an invalid-expire-time error, as does an `EX` or `PX` whose deadline does not fit in a 64-bit Unix-millisecond timestamp, and an unrecognized option returns a syntax error.
 - Relative `EX`/`PX` expirations are rewritten to an absolute `PXAT` frame before replication and AOF logging, so replicas and AOF replay anchor the TTL to the master's clock instead of restarting it.
 - `GET` on a missing key returns a null bulk string.
 - `DEL` ignores missing keys and returns the number of keys removed.
@@ -152,7 +152,7 @@ Subscriptions match exact channel names; there is no pattern subscription (`PSUB
 | `PSYNC ? -1` | – | – |
 | `WAIT <numreplicas> <timeout>` | – | – |
 
-`REPLCONF` supports the `LISTENING-PORT`, `GETACK`, and `ACK` subcommands. `WAIT` takes a replica count and a timeout in milliseconds, both non-negative; a timeout of `0` returns the current acknowledgement count immediately. On a password-protected master, replicas must authenticate before `REPLCONF` or `PSYNC`.
+`REPLCONF` supports the `LISTENING-PORT`, `GETACK`, and `ACK` subcommands. `WAIT` takes a replica count and a timeout in milliseconds, both non-negative; a timeout of `0` returns the current acknowledgement count immediately, and a timeout longer than about 292 years (the most a duration can hold) waits as long as that. On a password-protected master, replicas must authenticate before `REPLCONF` or `PSYNC`.
 
 See [Setting up replication](../guides/replication.md).
 
