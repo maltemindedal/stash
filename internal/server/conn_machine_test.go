@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 )
@@ -499,5 +500,70 @@ func TestConnMachineWriteBufferLimitRejectsOversizedPushFrames(t *testing.T) {
 	}
 	if machine.State() == ConnStateClosed {
 		t.Fatal("State() = ConnStateClosed, want machine left open for the caller to close")
+	}
+}
+
+// feedInChunks feeds data to the machine in chunk-sized pieces, the way socket
+// reads deliver a large pipelined request, and stops early once the machine
+// leaves the active state.
+func feedInChunks(t *testing.T, machine *ConnMachine, data []byte, chunk int) {
+	t.Helper()
+
+	for len(data) > 0 && machine.State() == ConnStateActive {
+		n := min(chunk, len(data))
+		if err := machine.Feed(data[:n]); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		data = data[n:]
+	}
+}
+
+func TestConnMachineFeedIsLinearInArrayFrameSize(t *testing.T) {
+	// One RPUSH-shaped request with hundreds of thousands of small arguments
+	// arrives across many reads. Re-decoding the whole prefix on every read made
+	// this cost seconds of event-loop CPU for a few megabytes of input; each byte
+	// must be examined once.
+	const args = 400_000
+	var frame bytes.Buffer
+	fmt.Fprintf(&frame, "*%d\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n", args+2)
+	for i := 0; i < args; i++ {
+		frame.WriteString("$1\r\nx\r\n")
+	}
+
+	machine := NewConnMachine(nil)
+	start := time.Now()
+	feedInChunks(t, machine, frame.Bytes(), 64*1024)
+	elapsed := time.Since(start)
+
+	if machine.State() != ConnStateActive || machine.PendingRequests() != 1 {
+		t.Fatalf("state = %d, pending = %d, want active with 1 request (err = %v)", machine.State(), machine.PendingRequests(), machine.Err())
+	}
+	if elapsed > time.Second {
+		t.Fatalf("feeding a %d byte array frame in 64 KiB reads took %v, want linear time (well under 1s)", frame.Len(), elapsed)
+	}
+}
+
+func TestConnMachineFeedRejectsUnboundedHeaderLines(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "line that never terminates", frame: append([]byte("+"), bytes.Repeat([]byte("A"), 1<<20)...)},
+		{name: "array length beyond the element limit", frame: []byte("*2000000\r\n")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			machine := NewConnMachine(nil)
+			start := time.Now()
+			feedInChunks(t, machine, tt.frame, 64*1024)
+
+			if machine.State() != ConnStateClosing || machine.Err() == nil {
+				t.Fatalf("State() = %d, Err() = %v, want a protocol error and the closing state", machine.State(), machine.Err())
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("rejecting the frame took %v, want it to be immediate", elapsed)
+			}
+		})
 	}
 }

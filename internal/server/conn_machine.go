@@ -78,6 +78,7 @@ type ConnMachine struct {
 	state          ConnMachineState
 	err            error
 	readBuf        []byte
+	decoder        protocol.Decoder
 	resumeAt       int
 	maxReadBuffer  int
 	maxWriteBuffer int
@@ -130,8 +131,9 @@ func (m *ConnMachine) PendingOutputBytes() int {
 // Feed appends readable bytes to the read buffer and parses every complete
 // RESP request they finish. Incomplete trailing frames stay buffered until
 // more bytes arrive; the machine defers re-decoding until the buffer reaches
-// the byte count the pending frame is known to need, so a frame arriving in
-// many small chunks is not rescanned on every append. A permanent protocol
+// the byte count the pending frame is known to need, and its decoder keeps its
+// place in the frame, so a frame arriving in many small chunks is not rescanned
+// on every append. A permanent protocol
 // error, including a frame exceeding the read-buffer limit, queues an ordered
 // RESP error reply and transitions the machine to the closing state, so callers
 // should check State after feeding.
@@ -147,7 +149,7 @@ func (m *ConnMachine) Feed(data []byte) error {
 
 	consumed := 0
 	for {
-		value, n, err := protocol.Decode(m.readBuf[consumed:])
+		value, n, err := m.decoder.Decode(m.readBuf[consumed:])
 		if errors.Is(err, protocol.ErrIncomplete) {
 			m.resumeAt = 0
 			var incomplete *protocol.IncompleteError
@@ -165,7 +167,9 @@ func (m *ConnMachine) Feed(data []byte) error {
 		consumed += n
 	}
 
-	m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+	if consumed > 0 {
+		m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+	}
 
 	if len(m.readBuf) > m.maxReadBuffer || m.resumeAt > m.maxReadBuffer {
 		m.enterProtocolError(fmt.Errorf("protocol: frame exceeds %d byte read-buffer limit", m.maxReadBuffer))
@@ -180,6 +184,7 @@ func (m *ConnMachine) enterProtocolError(err error) {
 	m.err = err
 	m.state = ConnStateClosing
 	m.readBuf = nil
+	m.decoder.Reset()
 	m.resumeAt = 0
 }
 
