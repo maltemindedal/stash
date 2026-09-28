@@ -409,11 +409,7 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 		oldSize = s.approximateValueObjectSize(key, value)
 	}
 
-	take := int64(len(list))
-	if count < take {
-		take = count
-	}
-	n := int(take)
+	n := int(min(int64(len(list)), count))
 	popped := make([][]byte, n)
 	if left {
 		for i := 0; i < n; i++ {
