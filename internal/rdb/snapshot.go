@@ -197,7 +197,7 @@ func replaceFile(tempPath string, targetPath string) error {
 
 		removeErr := removeFile(targetPath)
 		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("rdb: replace snapshot %q: rename error: %w; remove error: %v", targetPath, err, removeErr)
+			return fmt.Errorf("rdb: replace snapshot %q: rename error: %w; remove error: %w", targetPath, err, removeErr)
 		}
 		if retryErr := renameFile(tempPath, targetPath); retryErr != nil {
 			return fmt.Errorf("rdb: replace snapshot %q after removing existing target: %w", targetPath, retryErr)

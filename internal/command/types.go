@@ -724,18 +724,18 @@ func exactArgsValidator(name string, count int) commandValidator {
 	}
 }
 
-func maxArgsValidator(name string, max int) commandValidator {
+func maxArgsValidator(name string, maxArgs int) commandValidator {
 	return func(request *Request) error {
-		if len(request.Args) > max {
+		if len(request.Args) > maxArgs {
 			return wrongNumberOfArgumentsError(name)
 		}
 		return nil
 	}
 }
 
-func minArgsValidator(name string, min int) commandValidator {
+func minArgsValidator(name string, minArgs int) commandValidator {
 	return func(request *Request) error {
-		if len(request.Args) < min {
+		if len(request.Args) < minArgs {
 			return wrongNumberOfArgumentsError(name)
 		}
 		return nil

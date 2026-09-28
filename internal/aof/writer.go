@@ -427,7 +427,7 @@ func (w *Writer) swapRewriteFileLocked(tempPath string) error {
 	if err := replaceFile(tempPath, w.path); err != nil {
 		reopenErr := w.reopenAppendOnlyFileLocked()
 		if reopenErr != nil {
-			return fmt.Errorf("replace append-only file with rewrite: %w; reopen original file: %v", err, reopenErr)
+			return fmt.Errorf("replace append-only file with rewrite: %w; reopen original file: %w", err, reopenErr)
 		}
 		return fmt.Errorf("replace append-only file with rewrite: %w", err)
 	}
@@ -475,7 +475,7 @@ func replaceFile(tempPath string, targetPath string) error {
 
 		removeErr := removeFile(targetPath)
 		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("aof: replace %q: rename error: %w; remove error: %v", targetPath, err, removeErr)
+			return fmt.Errorf("aof: replace %q: rename error: %w; remove error: %w", targetPath, err, removeErr)
 		}
 		if retryErr := renameFile(tempPath, targetPath); retryErr != nil {
 			return fmt.Errorf("aof: replace %q after removing existing target: %w", targetPath, retryErr)

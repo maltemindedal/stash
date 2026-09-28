@@ -38,7 +38,7 @@ go test -run ^$ -bench . ./internal/protocol ./internal/storage
 
 ## Lint configuration
 
-[`.golangci.yml`](../.golangci.yml) enables `errcheck`, `govet`, `ineffassign`, `staticcheck`, and `unused` with a 2-minute timeout.
+[`.golangci.yml`](../.golangci.yml) enables `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `errorlint`, `makezero`, `nilnesserr`, `predeclared`, and `wastedassign` with a 2-minute timeout. `govet` runs every analyzer except `fieldalignment` and `shadow`, and `staticcheck` runs all of its checks.
 
 ## Test layout
 
