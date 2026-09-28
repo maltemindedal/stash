@@ -39,6 +39,11 @@ const eventLoopOutputHighWater = 1 << 20
 // backlog the loop cannot drain.
 const eventLoopAcceptRetryDelay = 100 * time.Millisecond
 
+// eventLoopKeepaliveSeconds is both the idle time before the first TCP keepalive
+// probe and the interval between probes, the values the net package uses for the
+// connections the default networking path accepts.
+const eventLoopKeepaliveSeconds = 15
+
 // pollEvent is one readiness notification translated from the OS poller.
 type pollEvent struct {
 	fd       int
@@ -362,6 +367,13 @@ func (l *eventLoop) acceptReady() error {
 		// Nagle's algorithm on accepted TCP connections.
 		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
 			l.srv.logger.Debug("failed to set TCP_NODELAY on accepted connection", "error", err)
+		}
+		// The net package also enables keepalive on accepted connections. Without
+		// it a peer that vanishes without a FIN (power loss, a dropped NAT entry)
+		// leaves the connection, its client state and any replica registration
+		// behind indefinitely.
+		if err := enableKeepalive(fd); err != nil {
+			l.srv.logger.Debug("failed to enable TCP keepalive on accepted connection", "error", err)
 		}
 
 		if l.srv.overConnectionLimit() {

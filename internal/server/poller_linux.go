@@ -118,3 +118,18 @@ func (p *epollPoller) Close() error {
 	p.wake.close()
 	return syscall.Close(p.epfd)
 }
+
+// enableKeepalive turns on TCP keepalive for an accepted socket, probing after
+// eventLoopKeepaliveSeconds of idleness and then at the same interval.
+func enableKeepalive(fd int) error {
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1); err != nil {
+		return fmt.Errorf("SO_KEEPALIVE: %w", err)
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, eventLoopKeepaliveSeconds); err != nil {
+		return fmt.Errorf("TCP_KEEPIDLE: %w", err)
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, eventLoopKeepaliveSeconds); err != nil {
+		return fmt.Errorf("TCP_KEEPINTVL: %w", err)
+	}
+	return nil
+}

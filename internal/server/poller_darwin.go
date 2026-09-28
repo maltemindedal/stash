@@ -144,3 +144,25 @@ func (p *kqueuePoller) Close() error {
 	p.wake.close()
 	return syscall.Close(p.kq)
 }
+
+// tcpKeepInterval is TCP_KEEPINTVL from <netinet/tcp.h>. The syscall package
+// lacks it on some darwin architectures (darwin/amd64), so the net package
+// defines it the same way for its own keepalive support.
+const tcpKeepInterval = 0x101
+
+// enableKeepalive turns on TCP keepalive for an accepted socket, probing after
+// eventLoopKeepaliveSeconds of idleness and then at the same interval. macOS
+// names the idle-time option TCP_KEEPALIVE. These are the calls the net package
+// makes for the connections it accepts.
+func enableKeepalive(fd int) error {
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1); err != nil {
+		return fmt.Errorf("SO_KEEPALIVE: %w", err)
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_KEEPALIVE, eventLoopKeepaliveSeconds); err != nil {
+		return fmt.Errorf("TCP_KEEPALIVE: %w", err)
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, tcpKeepInterval, eventLoopKeepaliveSeconds); err != nil {
+		return fmt.Errorf("TCP_KEEPINTVL: %w", err)
+	}
+	return nil
+}
