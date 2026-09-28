@@ -689,3 +689,60 @@ func TestClientStateDisconnectUnblocksStuckReplyWrite(t *testing.T) {
 		t.Fatal("the stuck reply write was never released")
 	}
 }
+
+func TestTryFlushResponsesDoesNotWaitForAStuckWriter(t *testing.T) {
+	// A push or replica propagation can be stuck writing to a peer that stopped
+	// reading, holding the response lock. The connection handler flushes before
+	// each read and must not park behind that writer: it would stop reading the
+	// peer's own requests, which for a replica are its acknowledgements.
+	state, _ := startBlockedReply(t)
+
+	done := make(chan error, 2)
+	go func() { done <- state.TryFlushResponses() }()
+	go func() { done <- FlushClientResponses(WithClientState(context.Background(), state)) }()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("flush behind a stuck writer error = %v, want it to be skipped", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("a flush waited behind a writer stuck holding the response lock")
+		}
+	}
+}
+
+func TestQueuedResponsesGoOutOnTheNextFlush(t *testing.T) {
+	var out bytes.Buffer
+	state := &ClientState{ID: 4}
+	state.BindResponseWriter(bufio.NewWriter(&out))
+
+	for i := 0; i < 3; i++ {
+		if err := state.QueueResponses([]protocol.Value{protocol.SimpleString{Value: "OK"}}); err != nil {
+			t.Fatalf("QueueResponses() error = %v", err)
+		}
+	}
+	if out.Len() != 0 {
+		t.Fatalf("output = %q before any flush, want the replies held back", out.String())
+	}
+	if err := state.TryFlushResponses(); err != nil {
+		t.Fatalf("TryFlushResponses() error = %v", err)
+	}
+	if got := out.String(); got != "+OK\r\n+OK\r\n+OK\r\n" {
+		t.Fatalf("output after the flush = %q, want the three queued replies in order", got)
+	}
+
+	// Nothing queued, or nothing to write to, is not an error.
+	if err := state.FlushResponses(); err != nil {
+		t.Fatalf("FlushResponses() with nothing queued error = %v", err)
+	}
+	state.Disconnect()
+	if err := state.FlushResponses(); err != nil {
+		t.Fatalf("FlushResponses() after Disconnect error = %v, want success", err)
+	}
+	var nilState *ClientState
+	if err := nilState.TryFlushResponses(); err != nil {
+		t.Fatalf("TryFlushResponses() on a nil state error = %v", err)
+	}
+}

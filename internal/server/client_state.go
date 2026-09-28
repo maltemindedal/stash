@@ -208,9 +208,71 @@ func (s *ClientState) IsAuthenticated() bool {
 	return s.Authenticated
 }
 
-// WriteResponses writes RESP values to the bound client writer without allowing
-// interleaving with other goroutines writing to the same connection.
+// WriteResponses writes RESP values to the bound client writer and flushes them,
+// without allowing interleaving with other goroutines writing to the same
+// connection.
 func (s *ClientState) WriteResponses(values []protocol.Value) error {
+	return s.writeResponses(values, true)
+}
+
+// QueueResponses writes RESP values to the bound client writer without flushing
+// them, so replies to a client that pipelines its requests leave in one write.
+// They are sent by the next flush: FlushResponses, a push to the client, or a
+// full buffer. The connection handler flushes just before it waits for more
+// input.
+func (s *ClientState) QueueResponses(values []protocol.Value) error {
+	return s.writeResponses(values, false)
+}
+
+// FlushResponses sends whatever has been queued for the client, waiting for any
+// other writer to finish first. Having nothing to send is success, including when
+// the client is already disconnected.
+func (s *ClientState) FlushResponses() error {
+	if s == nil {
+		return nil
+	}
+
+	s.responseMu.Lock()
+	defer s.responseMu.Unlock()
+
+	return s.flushLocked()
+}
+
+// TryFlushResponses is FlushResponses, except that it does nothing when another
+// goroutine is writing to the client at that moment. That writer (a push, replica
+// propagation) flushes the shared buffer itself, queued replies included, so
+// nothing is lost by not waiting; and waiting could park the connection handler
+// behind a peer that has stopped reading, so that it stops reading that peer's
+// own requests, which for a replica means its acknowledgements.
+func (s *ClientState) TryFlushResponses() error {
+	if s == nil || !s.responseMu.TryLock() {
+		return nil
+	}
+	defer s.responseMu.Unlock()
+
+	return s.flushLocked()
+}
+
+func (s *ClientState) flushLocked() error {
+	if s.writerClosed || s.responseWriter == nil {
+		return nil
+	}
+	return s.responseWriter.Flush()
+}
+
+// FlushClientResponses flushes the replies queued for the client that ctx belongs
+// to, without waiting for other writers (see TryFlushResponses). A command that is
+// about to block the connection calls it first, so replies to the requests before
+// it are not held back behind it.
+func FlushClientResponses(ctx context.Context) error {
+	state, ok := ClientStateFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return state.TryFlushResponses()
+}
+
+func (s *ClientState) writeResponses(values []protocol.Value, flush bool) error {
 	var payload []byte
 	if len(values) > 1 {
 		var err error
@@ -231,11 +293,12 @@ func (s *ClientState) WriteResponses(values []protocol.Value) error {
 		if err := protocol.WriteValue(s.responseWriter, values[0]); err != nil {
 			return err
 		}
-		return s.responseWriter.Flush()
+	} else if _, err := s.responseWriter.Write(payload); err != nil {
+		return err
 	}
 
-	if _, err := s.responseWriter.Write(payload); err != nil {
-		return err
+	if !flush {
+		return nil
 	}
 	return s.responseWriter.Flush()
 }

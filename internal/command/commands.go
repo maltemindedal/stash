@@ -329,6 +329,11 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 		return server.ExecuteResult{}, blockingNotSupportedError("WAIT")
 	}
 
+	// Replies to the requests pipelined ahead of this one must not wait behind it.
+	if err := server.FlushClientResponses(ctx); err != nil {
+		return server.ExecuteResult{}, err
+	}
+
 	if err := e.requestReplicaAcknowledgements(); err != nil {
 		return server.ExecuteResult{}, err
 	}

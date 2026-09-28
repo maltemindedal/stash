@@ -92,6 +92,12 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (protocol.
 			return nil, blockingNotSupportedError("BLPOP")
 		}
 
+		// Replies to the requests pipelined ahead of this one must not wait behind it.
+		if err := server.FlushClientResponses(ctx); err != nil {
+			e.store.UnsubscribeListPush(key, waiter)
+			return nil, err
+		}
+
 		select {
 		case <-waiter:
 			e.store.UnsubscribeListPush(key, waiter)

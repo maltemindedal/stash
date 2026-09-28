@@ -22,7 +22,14 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		}
 	}()
 
-	parser := protocol.NewParser(conn)
+	state := s.getClientState(clientID)
+	var input io.Reader = conn
+	if state != nil {
+		// Replies are queued while requests keep arriving and are sent when the
+		// handler is about to wait for more input.
+		input = flushBeforeRead{conn: conn, state: state}
+	}
+	parser := protocol.NewParser(input)
 	writer := bufio.NewWriter(conn)
 
 	remoteAddr := ""
@@ -30,7 +37,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		remoteAddr = addr.String()
 	}
 
-	if state := s.getClientState(clientID); state != nil {
+	if state != nil {
 		state.BindResponseWriter(writer)
 		state.BindResponseConn(conn)
 		state.SetRemoteAddr(remoteAddr)
@@ -52,6 +59,9 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		}
 	})
 	defer stopClose()
+	// Runs before the connection is closed (deferred after it): whatever replies
+	// are still queued when the handler leaves go out first, if the socket allows.
+	defer func() { _ = state.TryFlushResponses() }()
 
 	for {
 		value, err := parser.Parse()
@@ -79,11 +89,32 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		}
 		// Register only after the handshake response reached the socket, so a
 		// concurrently propagated command cannot precede the FULLRESYNC frames
-		// in the replica's stream.
+		// in the replica's stream. Replies are queued, so send them first.
 		if registerReplica {
+			if err := state.FlushResponses(); err != nil {
+				logger.Warn("failed to write handshake response", "error", err)
+				return
+			}
 			s.registerReplicaPeer(clientID, conn)
 		}
 	}
+}
+
+// flushBeforeRead is what the parser reads from. It sends the client's queued
+// replies before every read of the socket, so a reply is never held back while
+// the handler waits for the client's next request, which is when a client that
+// waits for its reply would deadlock with us. A read that finds the parser's
+// buffer empty is the only time the handler can block on input.
+type flushBeforeRead struct {
+	conn  net.Conn
+	state *ClientState
+}
+
+func (r flushBeforeRead) Read(p []byte) (int, error) {
+	if err := r.state.TryFlushResponses(); err != nil {
+		return 0, err
+	}
+	return r.conn.Read(p)
 }
 
 // executeClientRequest runs one parsed request through the command pipeline
@@ -123,7 +154,7 @@ func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn
 
 func (s *Server) writeClientResponses(ctx context.Context, writer *bufio.Writer, values []protocol.Value) error {
 	if state, ok := ClientStateFromContext(ctx); ok && state != nil {
-		return state.WriteResponses(values)
+		return state.QueueResponses(values)
 	}
 
 	return s.writeResponses(writer, values)
