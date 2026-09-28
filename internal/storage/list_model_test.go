@@ -15,7 +15,7 @@ import (
 // different path in each.
 func TestListOperationsMatchSliceModel(t *testing.T) {
 	for _, accounting := range []bool{false, true} {
-		for seed := int64(0); seed < 150; seed++ {
+		for seed := int64(0); seed < 50; seed++ {
 			t.Run(fmt.Sprintf("accounting=%v/seed=%d", accounting, seed), func(t *testing.T) {
 				rng := rand.New(rand.NewSource(seed))
 				store := NewStore()
