@@ -263,3 +263,29 @@ func BenchmarkStoreMaxMemory(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkStoreSnapshotAll(b *testing.B) {
+	value := []byte("value-of-about-thirty-two-bytes!")
+
+	// The 1,024-key case is BenchmarkStore's; this one is large enough for the
+	// value arena to grow many times.
+	for _, n := range []int{100_000} {
+		b.Run(fmt.Sprintf("%d strings", n), func(b *testing.B) {
+			store := NewStore()
+			for i := 0; i < n; i++ {
+				if _, err := store.Set(fmt.Sprintf("key-%d", i), value, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				entries, _ := store.SnapshotAll()
+				if len(entries) != n {
+					b.Fatalf("snapshot has %d entries, want %d", len(entries), n)
+				}
+			}
+		})
+	}
+}

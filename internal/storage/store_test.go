@@ -2342,3 +2342,54 @@ func TestStoreStreamBehavior(t *testing.T) {
 		}
 	})
 }
+
+// TestSnapshotAllCopiesValuesIntactAcrossArenaChunks snapshots values of every
+// size around the arena's chunk boundaries and checks each comes back byte for
+// byte, and that entries do not share room to grow into one another.
+func TestSnapshotAllCopiesValuesIntactAcrossArenaChunks(t *testing.T) {
+	sizes := []int{0, 1, 7, snapshotArenaMinChunk - 1, snapshotArenaMinChunk, snapshotArenaMinChunk + 1, 3000, 9000, 70_000, snapshotArenaMaxChunk - 1, snapshotArenaMaxChunk, snapshotArenaMaxChunk + 1, 2*snapshotArenaMaxChunk + 5}
+
+	store := NewStore()
+	want := make(map[string][]byte)
+	for round := 0; round < 3; round++ {
+		for _, size := range sizes {
+			key := fmt.Sprintf("k-%d-%d", round, size)
+			value := make([]byte, size)
+			for i := range value {
+				value[i] = byte(i*31 + size + round)
+			}
+			want[key] = value
+			if _, err := store.Set(key, value, 0); err != nil {
+				t.Fatalf("Set(%s) error = %v", key, err)
+			}
+		}
+	}
+	if _, _, err := store.RightPush("list", [][]byte{[]byte("a"), make([]byte, 5000), []byte("c")}); err != nil {
+		t.Fatalf("RightPush() error = %v", err)
+	}
+
+	entries, _ := store.SnapshotAll()
+	seen := 0
+	for _, entry := range entries {
+		if entry.Kind == ValueKindList {
+			if len(entry.List) != 3 || string(entry.List[0]) != "a" || len(entry.List[1]) != 5000 || string(entry.List[2]) != "c" {
+				t.Fatalf("list entry = %d values, want the three pushed", len(entry.List))
+			}
+			continue
+		}
+		expected, ok := want[entry.Key]
+		if !ok {
+			t.Fatalf("snapshot has unexpected key %q", entry.Key)
+		}
+		seen++
+		if !bytes.Equal(entry.String, expected) {
+			t.Fatalf("value of %q differs from what was stored (%d bytes, want %d)", entry.Key, len(entry.String), len(expected))
+		}
+		if cap(entry.String) != len(entry.String) {
+			t.Fatalf("value of %q has spare capacity %d, so appending to it would overwrite a neighbour", entry.Key, cap(entry.String)-len(entry.String))
+		}
+	}
+	if seen != len(want) {
+		t.Fatalf("snapshot has %d string entries, want %d", seen, len(want))
+	}
+}

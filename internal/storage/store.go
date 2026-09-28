@@ -981,11 +981,33 @@ func cloneBytes(src []byte) []byte {
 	return dst
 }
 
+const (
+	// snapshotArenaMinChunk and snapshotArenaMaxChunk bound the chunks a
+	// snapshot's values are copied into. Chunks start small, so a small snapshot
+	// does not pay for a large allocation, and double up to the maximum. A value
+	// larger than the next chunk gets a chunk of its own.
+	snapshotArenaMinChunk = 4 << 10
+	snapshotArenaMaxChunk = 1 << 20
+)
+
+// growArena returns an arena with room for n more bytes. When the current one is
+// full it starts a new chunk instead of growing it: appending would copy every
+// byte already handed out into a larger array, while the slices already returned
+// keep pointing into, and so keeping alive, the old one.
+func growArena(arena []byte, n int) []byte {
+	if n <= cap(arena)-len(arena) {
+		return arena
+	}
+	chunk := min(max(2*cap(arena), snapshotArenaMinChunk), snapshotArenaMaxChunk)
+	return make([]byte, 0, max(chunk, n))
+}
+
 func appendClonedBytesArena(arena []byte, src []byte) ([]byte, []byte) {
 	if src == nil {
 		return arena, nil
 	}
 
+	arena = growArena(arena, len(src))
 	start := len(arena)
 	arena = append(arena, src...)
 	cloned := arena[start:len(arena):len(arena)]
@@ -993,6 +1015,7 @@ func appendClonedBytesArena(arena []byte, src []byte) ([]byte, []byte) {
 }
 
 func appendClonedStringBytesArena(arena []byte, src string) ([]byte, []byte) {
+	arena = growArena(arena, len(src))
 	start := len(arena)
 	arena = append(arena, src...)
 	cloned := arena[start:len(arena):len(arena)]
