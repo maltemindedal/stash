@@ -10,7 +10,7 @@ cd stash
 go build ./cmd/stash
 ```
 
-For linting locally you also need [`golangci-lint`](https://golangci-lint.run/) **v2.11**, the version CI runs.
+For linting locally you also need [`golangci-lint`](https://golangci-lint.run/) **v2.13.2**, the version CI runs.
 
 ## Verification commands
 
