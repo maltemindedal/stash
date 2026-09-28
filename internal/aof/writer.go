@@ -406,6 +406,12 @@ func (w *Writer) appendBufferedRewriteLocked(tempFile *os.File) error {
 func (w *Writer) swapRewriteFileLocked(tempPath string) error {
 	oldFile := w.file
 	if oldFile != nil {
+		// Commands appended under everysec wait in the writer's buffer. If the swap
+		// fails, the original file is reopened with a fresh buffer and the rewrite
+		// buffer is discarded, so anything not flushed here would be lost.
+		if err := w.flushLocked(); err != nil {
+			return fmt.Errorf("flush append-only file before rewrite swap: %w", err)
+		}
 		if err := oldFile.Close(); err != nil {
 			return fmt.Errorf("close current append-only file before rewrite swap: %w", err)
 		}
