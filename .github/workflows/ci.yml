@@ -89,7 +89,7 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: |
-          for target in darwin/arm64 windows/amd64; do
+          for target in darwin/amd64 darwin/arm64 windows/amd64; do
             GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
           done
 
