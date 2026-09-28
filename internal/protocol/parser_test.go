@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
 )
 
 // TestParseMissingCRLFReturnsSentinel locks the typed ErrMissingCRLF sentinel
@@ -244,5 +248,107 @@ func TestParserAndDecodeShareNestingBound(t *testing.T) {
 				t.Fatalf("Decode() error = %v, wantErr %v", decodeErr, tt.wantErr)
 			}
 		})
+	}
+}
+
+// readSignal reports each Read on the wrapped reader, so a test can tell when the
+// parser has consumed what it was given and is blocked asking for more.
+type readSignal struct {
+	io.Reader
+	reads chan struct{}
+}
+
+func (r readSignal) Read(p []byte) (int, error) {
+	r.reads <- struct{}{}
+	return r.Reader.Read(p)
+}
+
+// TestParserAllocatesInProportionToBytesReceived guards against a forged bulk
+// length reserving memory up front: the header alone, sent by a client that then
+// stalls, must not cost anything close to the declared 512 MiB.
+func TestParserAllocatesInProportionToBytesReceived(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pr.Close() }()
+	reads := make(chan struct{}, 8)
+
+	parsed := make(chan error, 1)
+	go func() {
+		_, err := NewParser(readSignal{Reader: pr, reads: reads}).Parse()
+		parsed <- err
+	}()
+
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	if _, err := pw.Write([]byte("*1\r\n$536870000\r\n")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	// The first Read delivered the header; the second is the parser asking for the
+	// payload, so by then it has sized (or not sized) its payload buffer.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-reads:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the parser never asked for the bulk payload")
+		}
+	}
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if grown := after.TotalAlloc - before.TotalAlloc; grown > 16<<20 {
+		t.Fatalf("parsing only a bulk header allocated %d MiB, want it independent of the declared 512 MiB length", grown>>20)
+	}
+
+	pw.CloseWithError(io.ErrUnexpectedEOF)
+	if err := <-parsed; err == nil {
+		t.Fatal("Parse() error = nil, want an error once the stream ends before the payload")
+	}
+}
+
+func TestParserBulkPayloadAcrossAllocationBoundaries(t *testing.T) {
+	// Payloads larger than the first allocation are read in growing steps; check
+	// the sizes around every step keep their content, exact length and terminator.
+	for _, size := range []int{0, 1, bulkFirstAllocation - 1, bulkFirstAllocation, bulkFirstAllocation + 1, 3*bulkFirstAllocation + 7} {
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i*31 + i>>8)
+		}
+		input := fmt.Sprintf("$%d\r\n%s\r\n+next\r\n", size, payload)
+
+		for name, reader := range map[string]io.Reader{
+			"whole":     strings.NewReader(input),
+			"half-read": iotest.HalfReader(strings.NewReader(input)),
+			"one-byte":  iotest.OneByteReader(strings.NewReader(input)),
+		} {
+			if name == "one-byte" && size > bulkFirstAllocation {
+				continue // millions of one-byte reads add nothing the half-reader does not cover
+			}
+			parser := NewParser(reader)
+			value, err := parser.Parse()
+			if err != nil {
+				t.Fatalf("size %d (%s): Parse() error = %v", size, name, err)
+			}
+			bulk, ok := value.(BulkString)
+			if !ok || !bytes.Equal(bulk.Data, payload) || len(bulk.Data) != size {
+				t.Fatalf("size %d (%s): Parse() = %d bytes (ok=%v), want the exact %d byte payload", size, name, len(bulk.Data), ok, size)
+			}
+			if next, err := parser.Parse(); err != nil || next != (SimpleString{Value: "next"}) {
+				t.Fatalf("size %d (%s): the frame after the payload = (%#v, %v), want +next", size, name, next, err)
+			}
+		}
+	}
+}
+
+func TestParserTornBulkPayloadReportsUnexpectedEOF(t *testing.T) {
+	// AOF replay treats io.EOF as a clean end of file and io.ErrUnexpectedEOF as a
+	// torn trailing record, so a payload cut off at any point, including exactly
+	// where the buffer grows, must report the latter.
+	const declared = 3*bulkFirstAllocation + 7
+	for _, received := range []int{1, bulkFirstAllocation - 1, bulkFirstAllocation, bulkFirstAllocation + 1, 2 * bulkFirstAllocation, declared - 1} {
+		input := fmt.Sprintf("$%d\r\n%s", declared, strings.Repeat("x", received))
+		_, err := NewParser(strings.NewReader(input)).Parse()
+		if !errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			t.Fatalf("payload cut off after %d of %d bytes: error = %v, want io.ErrUnexpectedEOF and not io.EOF", received, declared, err)
+		}
 	}
 }

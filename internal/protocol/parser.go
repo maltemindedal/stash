@@ -28,6 +28,10 @@ const (
 	// length prefixes) so a stream that never sends a terminator cannot grow
 	// the line buffer without bound.
 	maxLineLength = 64 * 1024
+	// bulkFirstAllocation is the most a bulk string payload buffer is sized to
+	// before any payload byte has arrived. Larger payloads grow as bytes are
+	// received, so a forged length cannot reserve memory the sender never fills.
+	bulkFirstAllocation = 1024 * 1024
 )
 
 // NewParser constructs a Parser backed by a bufio.Reader.
@@ -110,8 +114,8 @@ func (p *Parser) parseBulkString() (Value, error) {
 		return nil, fmt.Errorf("protocol: bulk string length %d exceeds %d byte limit", length, maxBulkStringLength)
 	}
 
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(p.reader, payload); err != nil {
+	payload, err := p.readBulkPayload(length)
+	if err != nil {
 		return nil, fmt.Errorf("protocol: read bulk string payload: %w", err)
 	}
 	if err := p.expectCRLF(); err != nil {
@@ -119,6 +123,31 @@ func (p *Parser) parseBulkString() (Value, error) {
 	}
 
 	return BulkString{Data: payload}, nil
+}
+
+// readBulkPayload reads exactly length payload bytes. It sizes the buffer for at
+// most bulkFirstAllocation bytes up front and then doubles it as bytes arrive, so
+// memory tracks what the peer actually sent instead of the length it declared.
+// The returned slice has exactly length bytes of capacity.
+func (p *Parser) readBulkPayload(length int) ([]byte, error) {
+	payload := make([]byte, min(length, bulkFirstAllocation))
+	if _, err := io.ReadFull(p.reader, payload); err != nil {
+		return nil, err
+	}
+	for len(payload) < length {
+		grown := make([]byte, min(length, 2*len(payload)))
+		copy(grown, payload)
+		if _, err := io.ReadFull(p.reader, grown[len(payload):]); err != nil {
+			if errors.Is(err, io.EOF) {
+				// Some payload bytes were already read, so this is a torn
+				// payload; io.EOF would read as a clean end of stream.
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		payload = grown
+	}
+	return payload, nil
 }
 
 func (p *Parser) parseArray(depth int) (Value, error) {
