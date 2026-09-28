@@ -91,7 +91,7 @@ Two operational notes:
 - Monitor delivery uses a short write deadline. A monitor that stops draining its socket is disconnected rather than allowed to consume server memory.
 - In `--event-loop` mode, buffered output is capped per connection and slow consumers are disconnected on that cap instead of on a per-write deadline.
 
-`MONITOR` sees every command argument, so treat its output as sensitive.
+`MONITOR` shows every command argument except `AUTH` passwords, which it redacts, so treat its output as sensitive.
 
 ## Server logs
 

@@ -57,7 +57,7 @@ go run ./cmd/stash --maxclients 1000
 
 ## What the slowlog stores
 
-`SLOWLOG` redacts `AUTH` arguments before recording command metadata, so passwords do not appear in the slow query log. It stores other command arguments verbatim. Any secret passed as an argument can appear in `SLOWLOG GET` output and `MONITOR` streams.
+`SLOWLOG` and `MONITOR` redact `AUTH` arguments, so passwords do not appear in the slow query log or in a monitor stream, including for failed attempts. Both show other command arguments verbatim. Any other secret passed as an argument can appear in `SLOWLOG GET` output and `MONITOR` streams.
 
 ## Known limitations
 

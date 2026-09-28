@@ -45,6 +45,13 @@ func observeCommand(value protocol.Value, clientID uint64, conn ClientConn) obse
 	if len(parts) > 0 {
 		parts[0] = strings.ToUpper(parts[0])
 	}
+	if len(parts) > 0 && parts[0] == "AUTH" {
+		// SLOWLOG redacts AUTH arguments for the same reason: this stream reaches
+		// other clients, and it includes attempts that failed.
+		for i := 1; i < len(parts); i++ {
+			parts[i] = "[redacted]"
+		}
+	}
 
 	addr := ""
 	if conn != nil && conn.RemoteAddr() != nil {
