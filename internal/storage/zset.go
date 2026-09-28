@@ -20,16 +20,14 @@ type SortedSet struct {
 
 type zsetSkipList struct {
 	header *zsetNode
-	tail   *zsetNode
 	level  int
 	length int
 }
 
 type zsetNode struct {
-	member   string
-	score    float64
-	backward *zsetNode
-	levels   []zsetLevel
+	member string
+	score  float64
+	levels []zsetLevel
 }
 
 type zsetLevel struct {
@@ -154,17 +152,6 @@ func (sl *zsetSkipList) insert(score float64, member string) *zsetNode {
 		update[i].levels[i].span++
 	}
 
-	if update[0] == sl.header {
-		x.backward = nil
-	} else {
-		x.backward = update[0]
-	}
-	if x.levels[0].forward != nil {
-		x.levels[0].forward.backward = x
-	} else {
-		sl.tail = x
-	}
-
 	sl.length++
 	return x
 }
@@ -197,12 +184,6 @@ func (sl *zsetSkipList) deleteNode(node *zsetNode, update [zsetMaxLevel]*zsetNod
 		} else {
 			update[i].levels[i].span--
 		}
-	}
-
-	if node.levels[0].forward != nil {
-		node.levels[0].forward.backward = node.backward
-	} else {
-		sl.tail = node.backward
 	}
 
 	for sl.level > 1 && sl.header.levels[sl.level-1].forward == nil {
