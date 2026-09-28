@@ -4,7 +4,7 @@ By default, Stash binds to loopback and has no password. Configure authenticatio
 
 ## The default binding
 
-`--host` defaults to `127.0.0.1`, so a server started with no flags accepts connections only from the local machine. Stash has no authentication until you set `--requirepass`. Binding a public interface without a password exposes the datastore without authentication.
+`--host` defaults to `127.0.0.1`, so a server started with no flags accepts connections only from the local machine. Stash has no authentication until you set `--requirepass`. Binding a public interface without a password exposes the datastore without authentication, and Stash logs a warning at startup when it listens beyond loopback with no password.
 
 ## Require a password
 

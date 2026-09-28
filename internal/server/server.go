@@ -174,6 +174,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	defer s.shutdown()
 
 	s.logger.Info("Stash listening", "address", listener.Addr().String())
+	if s.cfg.RequirePass == "" && listensBeyondLoopback(listener.Addr()) {
+		s.logger.Warn(
+			"accepting connections from the network with no password; anyone who can reach this address has full access. Set --requirepass or bind a loopback address",
+			"address", listener.Addr().String(),
+		)
+	}
 	// The eviction loop runs on its own context so it can be stopped before the
 	// durability teardown below, on the path where serve fails without ctx ever
 	// being cancelled as much as on the ordinary one.
@@ -366,6 +372,14 @@ func (s *Server) Addr() string {
 	}
 
 	return s.listener.Addr().String()
+}
+
+// listensBeyondLoopback reports whether a listener bound to addr accepts
+// connections from other machines: any address that is not a loopback one,
+// including the unspecified addresses 0.0.0.0 and ::.
+func listensBeyondLoopback(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	return ok && !tcp.IP.IsLoopback()
 }
 
 func (s *Server) setListener(listener net.Listener) {
