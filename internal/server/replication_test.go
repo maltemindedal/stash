@@ -144,3 +144,42 @@ func newReplicaPeerStateForTest(id uint64, conn net.Conn) *ClientState {
 	state.BindResponseWriter(bufio.NewWriter(conn))
 	return state
 }
+
+// TestServerStatsConcurrentWithAckUpdates has INFO's data source read replica
+// offsets while acknowledgements arrive. ServerStats used to read AckOffset from
+// the shared peer without the registry lock that UpdateAck writes it under; the
+// race detector reports that, so this test is meaningful under -race.
+func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
+	srv := New(config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
+	srv.replicaPeers.Add(1, &stubConn{}, 6380, nil)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for offset := int64(1); ; offset++ {
+			select {
+			case <-stop:
+				return
+			default:
+				srv.replicaPeers.UpdateAck(1, offset)
+			}
+		}
+	}()
+
+	var last int64
+	for i := 0; i < 2000; i++ {
+		stats := srv.ServerStats()
+		if len(stats.Replicas) != 1 {
+			t.Fatalf("len(Replicas) = %d, want 1", len(stats.Replicas))
+		}
+		if got := stats.Replicas[0].AckOffset; got < last {
+			t.Fatalf("AckOffset went backwards from %d to %d", last, got)
+		} else {
+			last = got
+		}
+	}
+	close(stop)
+	wg.Wait()
+}

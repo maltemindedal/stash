@@ -520,7 +520,7 @@ func (s *Server) ServerStats() Stats {
 		replicas = append(replicas, ReplicaInfo{
 			ID:            peer.ID,
 			ListeningPort: peer.ListeningPort,
-			AckOffset:     peer.AckOffset,
+			AckOffset:     peer.AckOffset.Load(),
 		})
 	}
 

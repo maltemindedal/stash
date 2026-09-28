@@ -80,7 +80,10 @@ type ReplicaPeer struct {
 	ID            uint64
 	Conn          ClientConn
 	ListeningPort int
-	AckOffset     int64
+	// AckOffset is the latest replication offset the replica acknowledged. It is
+	// written under the registry lock but read through the peers Snapshot returns,
+	// so it is atomic.
+	AckOffset atomic.Int64
 
 	writer encodedReplicaWriter
 }
@@ -181,8 +184,8 @@ func (r *ReplicaRegistry) UpdateAck(id uint64, offset int64) bool {
 	if !ok {
 		return false
 	}
-	if offset > peer.AckOffset {
-		peer.AckOffset = offset
+	if offset > peer.AckOffset.Load() {
+		peer.AckOffset.Store(offset)
 		r.notifyChangedLocked()
 	}
 
@@ -209,7 +212,7 @@ func (r *ReplicaRegistry) CountReplicasAtOrAboveWithNotify(targetOffset int64) (
 func (r *ReplicaRegistry) countReplicasAtOrAboveLocked(targetOffset int64) int {
 	count := 0
 	for _, peer := range r.replicas {
-		if peer.AckOffset >= targetOffset {
+		if peer.AckOffset.Load() >= targetOffset {
 			count++
 		}
 	}
