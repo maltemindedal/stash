@@ -45,6 +45,11 @@ type Store struct {
 	keyKindCounts            [keyStatsKindCount]atomic.Int64
 	maxMemory                atomic.Int64
 	memoryEvictionSampleSize int
+	// nextExpiry is a lower bound on the earliest TTL deadline in the store, kept
+	// only while maxmemory is enabled. No key can have expired before it, so an
+	// accounted write can skip the sweep-and-recount until it passes. Zero, the
+	// initial value, means unknown and forces one recount, which sets it exactly.
+	nextExpiry atomic.Int64
 }
 
 // NewStore constructs an empty Store.

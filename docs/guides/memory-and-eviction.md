@@ -9,7 +9,7 @@ TTLs are stored internally as absolute Unix millisecond timestamps. Expired keys
 - **Passively**, when a read touches an expired key. The read behaves as though the key is gone.
 - **Actively**, by a background loop that samples keys on a fixed interval.
 
-Both are always on; there is no flag to disable them. With `--maxmemory` set there is a third: every accounted write re-measures the whole keyspace and drops the expired keys it passes, which reclaims them faster than sampling alone would.
+Both are always on; there is no flag to disable them. With `--maxmemory` set there is a third: the first accounted write after a key's TTL deadline has passed re-measures the whole keyspace and drops the expired keys it passes, which reclaims them faster than sampling alone would. Until a deadline passes, accounted writes rely on the running total and do not scan.
 
 ```bash
 # Sample 50 keys every 250ms instead of the default 20 every 100ms

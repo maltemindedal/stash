@@ -68,7 +68,7 @@ Current responsibilities:
 - support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
 - store TTLs in Unix milliseconds
 - perform passive eviction on reads
-- perform active eviction in a background loop, and again whenever an accounted write re-measures the keyspace, reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
+- perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed), reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
 - track approximate keyspace memory when `maxmemory` is enabled
 - evict sampled least-recently-used candidates under memory pressure
 

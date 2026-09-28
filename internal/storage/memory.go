@@ -215,6 +215,7 @@ func (s *Store) commitStringWithEvictionLocked(shard *Shard, key string, oldValu
 // of being folded into whatever the caller is returning.
 func (s *Store) recalculateUsedMemoryLocked(now int64) int64 {
 	used := int64(0)
+	next := maxInt64Value
 	var expired []string
 	for i := range s.shards {
 		shard := &s.shards[i]
@@ -225,11 +226,36 @@ func (s *Store) recalculateUsedMemoryLocked(now int64) int64 {
 				continue
 			}
 			used += s.approximateValueObjectSize(key, value)
+			if value.ExpiresAt > 0 && value.ExpiresAt < next {
+				next = value.ExpiresAt
+			}
 		}
 	}
 	s.usedMemory.Store(used)
+	s.nextExpiry.Store(next)
 	s.noteExpiredKeysLocked(expired)
 	return used
+}
+
+// noteExpiry lowers nextExpiry to expiresAt when a value with an earlier TTL
+// deadline is stored. It tracks nothing while maxmemory is off: enabling it
+// recounts the keyspace, which sets nextExpiry exactly.
+func (s *Store) noteExpiry(expiresAt int64) {
+	if expiresAt <= 0 || !s.maxMemoryEnabled() {
+		return
+	}
+	for {
+		current := s.nextExpiry.Load()
+		if expiresAt >= current || s.nextExpiry.CompareAndSwap(current, expiresAt) {
+			return
+		}
+	}
+}
+
+// mayHaveExpired reports whether some key may have passed its TTL deadline. When
+// it returns false no key has, so a sweep would find nothing.
+func (s *Store) mayHaveExpired(now int64) bool {
+	return now > s.nextExpiry.Load()
 }
 
 func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]struct{}) ([]string, error) {
@@ -237,7 +263,14 @@ func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]st
 		return nil, nil
 	}
 
-	current := s.recalculateUsedMemoryLocked(time.Now().UnixMilli())
+	// Sweep expired keys and re-measure the keyspace, but only when a TTL deadline
+	// has passed: until then the maintained counter is exact (see
+	// TestUsedMemoryCounterStaysExact), and the sweep would find nothing.
+	now := time.Now().UnixMilli()
+	current := s.usedMemory.Load()
+	if s.mayHaveExpired(now) {
+		current = s.recalculateUsedMemoryLocked(now)
+	}
 	limit := s.maxMemory.Load()
 	targetUsed := limit - delta
 	if targetUsed < 0 {
@@ -246,7 +279,9 @@ func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]st
 	if current <= targetUsed {
 		return nil, nil
 	}
-	if current-s.totalEvictableMemoryLocked(protected) > targetUsed {
+	// What cannot be evicted is the protected keys; if they alone are over the
+	// target, no amount of eviction makes room.
+	if s.protectedMemoryLocked(protected) > targetUsed {
 		return nil, ErrMemoryLimitExceeded
 	}
 
@@ -311,13 +346,13 @@ func (s *Store) findStalestCandidateLocked(protected map[string]struct{}) string
 	return stalestKey
 }
 
-func (s *Store) totalEvictableMemoryLocked(protected map[string]struct{}) int64 {
+// protectedMemoryLocked returns the memory held by the protected keys, which
+// eviction may not free. Everything else is evictable, so this is also what is
+// left of the used memory after evicting all of it.
+func (s *Store) protectedMemoryLocked(protected map[string]struct{}) int64 {
 	total := int64(0)
-	for i := range s.shards {
-		for key, value := range s.shards[i].data {
-			if _, blocked := protected[key]; blocked {
-				continue
-			}
+	for key := range protected {
+		if value, ok := s.shardForKey(key).data[key]; ok {
 			total += s.approximateValueObjectSize(key, value)
 		}
 	}
