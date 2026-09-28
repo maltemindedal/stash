@@ -30,7 +30,15 @@ var (
 // LoadStats summarizes AOF replay during startup.
 type LoadStats struct {
 	ReplayedCommands int
-	TruncatedTail    bool
+	// TruncatedTail reports that the file ended in data that could not be
+	// replayed, whether an unfinished command or a malformed terminator.
+	TruncatedTail bool
+	// ValidBytes is the size of the prefix of the file made of complete commands.
+	ValidBytes int64
+	// TornTail reports that everything after ValidBytes is one unfinished command
+	// that ran into the end of the file, which is what a crash mid-append leaves.
+	// That tail can be discarded without losing anything replayable.
+	TornTail bool
 }
 
 // RewriteStats summarizes BGREWRITEAOF payload generation.

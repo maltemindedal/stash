@@ -264,6 +264,51 @@ func TestServerBGRewriteAOFCompactsAndReloads(t *testing.T) {
 	waitForServerStop(t, restartErrCh)
 }
 
+func TestServerDiscardsTornAOFTailBeforeAppending(t *testing.T) {
+	// A crash mid-append leaves a partial command at the end of the file. Startup
+	// used to replay everything before it and then append new commands straight
+	// after the torn bytes, so the next restart read them as part of the torn
+	// command and silently dropped every write acknowledged in between.
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	complete, err := protocol.EncodeValues([]protocol.Value{request("SET", "a", "1"), request("SET", "b", "2")})
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	torn := []byte("*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$3\r\nva")
+	if err := os.WriteFile(aofPath, append(append([]byte{}, complete...), torn...), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) error = %v", addr, err)
+	}
+	parser := protocol.NewParser(conn)
+	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("2")}, "GET", "b")
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "d", "4")
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "e", "5")
+	closeTestResource(t, conn)
+	stop()
+	waitForServerStop(t, errCh)
+
+	restartAddr, restartStop, restartErrCh := startTestServer(t, testAOFConfig(aofPath))
+	restartConn, err := net.Dial("tcp", restartAddr)
+	if err != nil {
+		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+	}
+	defer closeTestResource(t, restartConn)
+	restartParser := protocol.NewParser(restartConn)
+
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "a")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("4")}, "GET", "d")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("5")}, "GET", "e")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "c")
+
+	restartStop()
+	waitForServerStop(t, restartErrCh)
+}
+
 func testAOFConfig(aofPath string) config.Config {
 	cfg := defaultTestConfig()
 	cfg.AOFPath = aofPath

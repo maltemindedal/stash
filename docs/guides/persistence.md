@@ -17,7 +17,7 @@ The AOF preserves all supported data types. RDB provides a fast string-only snap
 go run ./cmd/stash --port 6379 --aof appendonly.aof --appendfsync everysec
 ```
 
-Every successful mutating command is appended as a RESP frame. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace.
+Every successful mutating command is appended as a RESP frame. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace. If the file ends in a command that was only partly written, as after a crash in the middle of an append, Stash logs a warning, cuts the file back to the last complete command, and carries on, so commands appended afterwards are never mistaken for the rest of the torn one.
 
 ## Choose a fsync policy
 
