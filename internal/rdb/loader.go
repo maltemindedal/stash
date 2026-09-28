@@ -387,6 +387,12 @@ func (l *loader) readString() ([]byte, error) {
 // layer's 512 MiB bulk-string limit.
 const maxRDBObjectLength = 512 * 1024 * 1024
 
+// rdbFirstAllocation is the most readBytes sizes a buffer for before any of the
+// object's bytes have been read. A longer object grows the buffer as bytes
+// arrive, so a declared length that the input never backs cannot reserve up to
+// maxRDBObjectLength of memory.
+const rdbFirstAllocation = 1024 * 1024
+
 func (l *loader) readBytes(length uint64) ([]byte, error) {
 	if length == 0 {
 		return []byte{}, nil
@@ -395,9 +401,22 @@ func (l *loader) readBytes(length uint64) ([]byte, error) {
 		return nil, fmt.Errorf("rdb: declared object length %d exceeds %d byte limit", length, maxRDBObjectLength)
 	}
 
-	buffer := make([]byte, int(length))
+	buffer := make([]byte, min(length, rdbFirstAllocation))
 	if _, err := io.ReadFull(l.reader, buffer); err != nil {
 		return nil, err
+	}
+	for uint64(len(buffer)) < length {
+		grown := make([]byte, min(length, 2*uint64(len(buffer))))
+		copy(grown, buffer)
+		if _, err := io.ReadFull(l.reader, grown[len(buffer):]); err != nil {
+			if errors.Is(err, io.EOF) {
+				// Some of the object was already read, so it was cut short;
+				// io.EOF would read as a clean end of input.
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		buffer = grown
 	}
 
 	return buffer, nil
@@ -431,13 +450,15 @@ func (l *loader) readUint64LE() (uint64, error) {
 }
 
 func (l *loader) consumeChecksum() error {
-	rest, err := io.ReadAll(l.reader)
+	// Count what remains instead of buffering it: only 0 or 8 bytes are valid, and
+	// junk of any length must be reported without being held in memory.
+	remaining, err := io.Copy(io.Discard, l.reader)
 	if err != nil {
 		return fmt.Errorf("read trailing checksum: %w", err)
 	}
 
-	if len(rest) != 0 && len(rest) != 8 {
-		return fmt.Errorf("rdb: invalid trailing checksum length %d", len(rest))
+	if remaining != 0 && remaining != 8 {
+		return fmt.Errorf("rdb: invalid trailing checksum length %d", remaining)
 	}
 
 	return nil
