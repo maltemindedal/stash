@@ -60,12 +60,9 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 		if len(entry.List) == 0 {
 			return nil, nil
 		}
-		args := make([]protocol.Value, 0, len(entry.List)+1)
-		args = append(args, bulkString(entry.Key))
-		for _, item := range entry.List {
-			args = append(args, bulkBytes(item))
-		}
-		return []protocol.Value{rewriteCommand("RPUSH", args...)}, nil
+		return chunkedCommands("RPUSH", entry.Key, len(entry.List), 1, func(args []protocol.Value, i int) []protocol.Value {
+			return append(args, bulkBytes(entry.List[i]))
+		}), nil
 	case storage.ValueKindHash:
 		if len(entry.Hash) == 0 {
 			return nil, nil
@@ -75,12 +72,9 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 		sort.Slice(sorted, func(i, j int) bool {
 			return sorted[i].Field < sorted[j].Field
 		})
-		args := make([]protocol.Value, 0, len(sorted)*2+1)
-		args = append(args, bulkString(entry.Key))
-		for _, field := range sorted {
-			args = append(args, bulkString(field.Field), bulkBytes(field.Value))
-		}
-		return []protocol.Value{rewriteCommand("HSET", args...)}, nil
+		return chunkedCommands("HSET", entry.Key, len(sorted), 2, func(args []protocol.Value, i int) []protocol.Value {
+			return append(args, bulkString(sorted[i].Field), bulkBytes(sorted[i].Value))
+		}), nil
 	case storage.ValueKindSet:
 		if len(entry.Set) == 0 {
 			return nil, nil
@@ -90,22 +84,17 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 			members = append(members, string(member))
 		}
 		sort.Strings(members)
-		args := make([]protocol.Value, 0, len(members)+1)
-		args = append(args, bulkString(entry.Key))
-		for _, member := range members {
-			args = append(args, bulkString(member))
-		}
-		return []protocol.Value{rewriteCommand("SADD", args...)}, nil
+		return chunkedCommands("SADD", entry.Key, len(members), 1, func(args []protocol.Value, i int) []protocol.Value {
+			return append(args, bulkString(members[i]))
+		}), nil
 	case storage.ValueKindZSet:
 		if len(entry.ZSet) == 0 {
 			return nil, nil
 		}
-		args := make([]protocol.Value, 0, len(entry.ZSet)*2+1)
-		args = append(args, bulkString(entry.Key))
-		for _, zsetEntry := range entry.ZSet {
-			args = append(args, bulkString(strconv.FormatFloat(zsetEntry.Score, 'g', -1, 64)), bulkString(zsetEntry.Member))
-		}
-		return []protocol.Value{rewriteCommand("ZADD", args...)}, nil
+		return chunkedCommands("ZADD", entry.Key, len(entry.ZSet), 2, func(args []protocol.Value, i int) []protocol.Value {
+			zsetEntry := entry.ZSet[i]
+			return append(args, bulkString(strconv.FormatFloat(zsetEntry.Score, 'g', -1, 64)), bulkString(zsetEntry.Member))
+		}), nil
 	case storage.ValueKindStream:
 		frames := make([]protocol.Value, 0, len(entry.Stream))
 		for _, streamEntry := range entry.Stream {
@@ -120,6 +109,31 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 	default:
 		return nil, fmt.Errorf("aof: unsupported rewrite value kind %q for key %q", entry.Kind, entry.Key)
 	}
+}
+
+// rewriteItemsPerCommand bounds how many values (or field/value pairs) one
+// rewrite command carries. The loader's parser rejects a command array of more
+// than 1,048,576 elements, so one command per key made a collection of about a
+// million values, or half that many pairs, into an append-only file the server
+// could not read back at startup. Several bounded commands replay to the same
+// state; Redis's own rewrite groups items the same way.
+const rewriteItemsPerCommand = 1024
+
+// chunkedCommands emits name commands that together carry count items for key,
+// at most rewriteItemsPerCommand items each. appendItem adds the arguments of
+// item i, and argsPerItem is how many arguments that is.
+func chunkedCommands(name, key string, count, argsPerItem int, appendItem func(args []protocol.Value, i int) []protocol.Value) []protocol.Value {
+	frames := make([]protocol.Value, 0, (count+rewriteItemsPerCommand-1)/rewriteItemsPerCommand)
+	for start := 0; start < count; start += rewriteItemsPerCommand {
+		end := min(start+rewriteItemsPerCommand, count)
+		args := make([]protocol.Value, 0, (end-start)*argsPerItem+1)
+		args = append(args, bulkString(key))
+		for i := start; i < end; i++ {
+			args = appendItem(args, i)
+		}
+		frames = append(frames, rewriteCommand(name, args...))
+	}
+	return frames
 }
 
 func rewriteCommand(name string, args ...protocol.Value) protocol.Array {

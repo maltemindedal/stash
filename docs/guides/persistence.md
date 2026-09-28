@@ -36,7 +36,7 @@ The AOF grows without bound as commands accumulate. `BGREWRITEAOF` compacts it:
 Background append only file rewriting started
 ```
 
-The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite.
+The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite. A list, set, hash, or sorted set with more than 1,024 values is written as several commands, so the rewritten file stays loadable however large the collection grows.
 
 ## Understand the AOF/RDB precedence
 
