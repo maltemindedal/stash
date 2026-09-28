@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+
+	"github.com/maltemindedal/stash/internal/storage"
 )
 
 // TestReplaceFileDirectorySync covers the durability step of an AOF rewrite
@@ -110,5 +113,42 @@ func TestRewriteSwapFailureKeepsBufferedWrites(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("append-only file after the failed swap = %q, want the acknowledged command %q", got, payload)
+	}
+}
+
+// TestBeginRewriteConcurrentWithClose starts rewrites while the writer is being
+// closed. BeginRewrite added to the writer's WaitGroup after releasing the lock
+// that Close's Wait is ordered against, which the race detector reports as a
+// WaitGroup Add racing with Wait, so this test is meaningful under -race.
+func TestBeginRewriteConcurrentWithClose(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := storage.NewStore()
+
+	for i := 0; i < 500; i++ {
+		writer, err := OpenWriter(context.Background(), filepath.Join(t.TempDir(), "appendonly.aof"), PolicyNo, logger)
+		if err != nil {
+			t.Fatalf("OpenWriter() error = %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := writer.BeginRewrite(context.Background(), store); err != nil && !errors.Is(err, ErrClosed) && !errors.Is(err, ErrRewriteInProgress) {
+				t.Errorf("BeginRewrite() error = %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := writer.Close(); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		}()
+		wg.Wait()
+
+		// After Close, a further rewrite must be refused.
+		if err := writer.BeginRewrite(context.Background(), store); !errors.Is(err, ErrClosed) {
+			t.Fatalf("BeginRewrite() after Close error = %v, want ErrClosed", err)
+		}
 	}
 }

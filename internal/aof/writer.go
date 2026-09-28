@@ -60,6 +60,11 @@ type Writer struct {
 	closeOnce      sync.Once
 	closeCh        chan struct{}
 	wg             sync.WaitGroup
+
+	// closing is set, under mu, before Close waits for background work. Adds to wg
+	// happen under mu and only while closing is false, so they cannot race with
+	// that Wait.
+	closing bool
 }
 
 // OpenWriter opens or creates an append-only file writer for the supplied path.
@@ -126,6 +131,9 @@ func (w *Writer) Close() error {
 	}
 
 	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		w.closing = true
+		w.mu.Unlock()
 		close(w.closeCh)
 	})
 	w.wg.Wait()
@@ -165,7 +173,7 @@ func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
 	}
 
 	w.mu.Lock()
-	if w.closed {
+	if w.closing || w.closed {
 		w.mu.Unlock()
 		return ErrClosed
 	}
@@ -174,9 +182,9 @@ func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
 		return ErrRewriteInProgress
 	}
 	w.rewritePending = true
+	w.wg.Add(1)
 	w.mu.Unlock()
 
-	w.wg.Add(1)
 	go w.runRewrite(ctx, store)
 	return nil
 }
