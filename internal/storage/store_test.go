@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1065,6 +1066,54 @@ func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("active eviction did not report the expired key")
+	}
+}
+
+// TestStoreActiveEvictionSurvivesAPanickingListener pins that a panic in one
+// pass ends that pass, not the loop. The listener reaches replication and
+// durability sinks, so a bug there is the likely source; before, the recover sat
+// outside the loop and one panic silently stopped all active expiry for the life
+// of the process.
+func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
+	store := NewStore()
+	past := time.Now().Add(-time.Millisecond).UnixMilli()
+	_, _ = store.Set("first", []byte("1"), past)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reported := make(chan []string, 8)
+	var panicked atomic.Bool
+	store.SetExpirationListener(func(keys []string) {
+		reported <- keys
+		if panicked.CompareAndSwap(false, true) {
+			panic("listener bug")
+		}
+	})
+	done := store.StartEviction(ctx, 5*time.Millisecond, 10)
+
+	select {
+	case keys := <-reported:
+		if len(keys) != 1 || keys[0] != "first" {
+			t.Fatalf("first pass reported %v, want [first]", keys)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("active eviction did not report the first expired key")
+	}
+
+	_, _ = store.Set("second", []byte("2"), past)
+	select {
+	case keys := <-reported:
+		if len(keys) != 1 || keys[0] != "second" {
+			t.Fatalf("pass after the panic reported %v, want [second]", keys)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("active eviction stopped for good after a listener panic")
+	}
+	select {
+	case <-done:
+		t.Fatal("the eviction loop exited while its context was still live")
+	default:
 	}
 }
 

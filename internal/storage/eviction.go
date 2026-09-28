@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 )
 
@@ -26,11 +27,6 @@ func (s *Store) StartEviction(ctx context.Context, interval time.Duration, sampl
 
 	go func() {
 		defer close(done)
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				s.logError("background eviction loop panicked", "panic", fmt.Sprint(recovered))
-			}
-		}()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -42,21 +38,35 @@ func (s *Store) StartEviction(ctx context.Context, interval time.Duration, sampl
 				s.logDebug("background eviction loop stopped", "reason", ctx.Err())
 				return
 			case <-ticker.C:
-				expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
-				if len(expired) == 0 {
-					continue
-				}
-
-				s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
-				// Published once evictExpiredSample has released every shard lock
-				// it took: the listener reaches sinks outside the store, which
-				// must never be entered while holding one.
-				s.publishExpiredKeys()
+				s.evictionPass(sampleSize)
 			}
 		}
 	}()
 
 	return done
+}
+
+// evictionPass runs one background eviction pass. A panic in it, most likely
+// from the expiration listener, which reaches replication and durability sinks,
+// is logged and ends only this pass: recovering around the whole loop instead
+// would let one bug stop active expiry for the life of the process.
+func (s *Store) evictionPass(sampleSize int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logError("background eviction pass panicked", "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+		}
+	}()
+
+	expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
+	if len(expired) == 0 {
+		return
+	}
+
+	s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
+	// Published once evictExpiredSample has released every shard lock
+	// it took: the listener reaches sinks outside the store, which
+	// must never be entered while holding one.
+	s.publishExpiredKeys()
 }
 
 // evictExpiredSample removes the expired keys in one sample of the keyspace and
