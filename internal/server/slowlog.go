@@ -15,7 +15,6 @@ type SlowlogEntry struct {
 	Timestamp  time.Time
 	Duration   time.Duration
 	Command    []string
-	ClientID   uint64
 	ClientAddr string
 }
 

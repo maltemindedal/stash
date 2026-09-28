@@ -664,7 +664,6 @@ func (e *Executor) recordSlowCommand(ctx context.Context, request *Request, time
 		Command:   requestTokens(request),
 	}
 	if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
-		entry.ClientID = state.ID
 		entry.ClientAddr = state.RemoteAddress()
 	}
 	e.slowlogRegistry.Record(entry)
