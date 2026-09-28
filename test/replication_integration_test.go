@@ -757,8 +757,11 @@ func TestServerReplicaFullResyncReplacesExistingData(t *testing.T) {
 	defer closeTestResource(t, clientConn)
 	clientParser := protocol.NewParser(clientConn)
 
+	// The master finishing its write does not mean the replica has applied the
+	// snapshot yet, so wait for the master's data to appear. The keyspace is
+	// replaced as a whole, so once it has, the old local key must be gone.
+	assertEventuallyCommandResponse(t, clientConn, clientParser, protocol.BulkString{Data: []byte("from-master")}, 2*time.Second, "GET", "fresh")
 	assertCommandResponse(t, clientConn, clientParser, protocol.BulkString{Null: true}, "GET", "stale")
-	assertCommandResponse(t, clientConn, clientParser, protocol.BulkString{Data: []byte("from-master")}, "GET", "fresh")
 
 	close(masterStop)
 
