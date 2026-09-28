@@ -2,7 +2,7 @@
 
 ## Development setup
 
-Install **Go 1.21 or newer**. The version is pinned in [`go.mod`](../go.mod). Stash has no external module dependencies.
+Install **Go 1.21 or newer**. The minimum is the `go` directive in [`go.mod`](../go.mod); CI builds and tests on that minimum and on the two latest Go releases. Stash has no external module dependencies.
 
 ```bash
 git clone https://github.com/maltemindedal/stash.git
@@ -64,4 +64,4 @@ The integration suite covers AOF replay, RDB loading, replication, event-loop mo
 
 Issues are tracked in [GitHub Issues](https://github.com/maltemindedal/stash/issues). Triage uses the five canonical labels described in [`docs/agents/triage-labels.md`](agents/triage-labels.md): `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`.
 
-Pull requests run the `validate` job on every push. Pushes to `main` also run race tests.
+Pull requests run the `validate` job (on the minimum Go version) and the `test-latest` job (on the two latest Go releases, plus a `go vet` for macOS and Windows) on every push. Pushes to `main` also run race tests.
