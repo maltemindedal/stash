@@ -15,9 +15,20 @@ redis-cli -p 6379 INFO memory
 | `memory` | `used_memory`, `maxmemory`, Go heap stats, key counts per value kind |
 | `replication` | `role`, replication IDs and offsets, connected replicas |
 | `clients` | `connected_clients`, `monitoring_clients`, `total_commands_processed` |
+| `persistence` | `aof_enabled`, `aof_last_write_status` |
 | `default` / `all` | All of the above |
 
 An unrecognized section name returns an error rather than an empty response.
+
+### Reading the persistence section
+
+```
+# Persistence
+aof_enabled:1
+aof_last_write_status:ok
+```
+
+`aof_enabled` is `1` when `--aof` is set. `aof_last_write_status` is `err` from a failed write or fsync of the append-only file until the next one succeeds, and `ok` otherwise (always `ok` without an AOF). Under `--appendfsync everysec` and `no` a command is acknowledged before it is on disk, so a full or failing disk does not fail the command; the failure appears only here and as a `WARN` in the log. Alert on `err`. Under `--appendfsync always` a failed write is returned to the client as an error instead.
 
 ### Reading the memory section
 

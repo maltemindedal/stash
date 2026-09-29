@@ -1114,6 +1114,48 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 }
 
+func TestInfoPersistence(t *testing.T) {
+	info := func(t *testing.T, executor *Executor, args ...string) string {
+		t.Helper()
+
+		value, err := executor.Execute(context.Background(), requestValue(append([]string{"INFO"}, args...)...))
+		if err != nil {
+			t.Fatalf("INFO %v error = %v", args, err)
+		}
+		return mustBulkStringText(t, value)
+	}
+
+	t.Run("no server behind the executor reports no AOF and no failure", func(t *testing.T) {
+		text := info(t, newTestExecutor(), "persistence")
+		if want := "# Persistence\r\naof_enabled:0\r\naof_last_write_status:ok\r\n"; text != want {
+			t.Fatalf("INFO persistence = %q, want %q", text, want)
+		}
+	})
+
+	t.Run("a failed AOF write is reported as err", func(t *testing.T) {
+		executor := newTestExecutor()
+		executor.SetServerStatsProvider(func() server.Stats {
+			return server.Stats{Role: "master", AOFEnabled: true, AOFLastWriteOK: false}
+		})
+
+		text := info(t, executor, "persistence")
+		for _, want := range []string{"aof_enabled:1", "aof_last_write_status:err"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("INFO persistence = %q, missing %q", text, want)
+			}
+		}
+	})
+
+	t.Run("the default INFO includes the section after the existing ones", func(t *testing.T) {
+		text := info(t, newTestExecutor())
+		clients := strings.Index(text, "# Clients")
+		persistence := strings.Index(text, "# Persistence")
+		if clients < 0 || persistence < clients {
+			t.Fatalf("INFO = %q, want # Persistence after # Clients", text)
+		}
+	})
+}
+
 func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 	record := func(t *testing.T, args ...string) []string {
 		t.Helper()

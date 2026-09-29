@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -368,4 +369,57 @@ func testAOFConfig(aofPath string) config.Config {
 	cfg.AOFPath = aofPath
 	cfg.AppendFsync = "always"
 	return cfg
+}
+
+// TestInfoPersistenceReportsTheAOF covers INFO persistence over a real
+// connection: whether an append-only file is being written and whether its last
+// write succeeded.
+func TestInfoPersistenceReportsTheAOF(t *testing.T) {
+	infoPersistence := func(t *testing.T, cfg config.Config) string {
+		t.Helper()
+
+		addr, stop, errCh := startTestServer(t, cfg)
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		defer closeTestResource(t, conn)
+		parser := protocol.NewParser(conn)
+
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "k", "v")
+		if err := protocol.WriteValue(conn, request("INFO", "persistence")); err != nil {
+			t.Fatalf("WriteValue(INFO) error = %v", err)
+		}
+		got, err := parser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() error = %v", err)
+		}
+		text, _, ok := integrationBulkStringContent(got)
+		if !ok {
+			t.Fatalf("INFO persistence response type = %T, want a bulk string", got)
+		}
+		return text
+	}
+
+	t.Run("with an append-only file", func(t *testing.T) {
+		text := infoPersistence(t, testAOFConfig(filepath.Join(t.TempDir(), "appendonly.aof")))
+		for _, want := range []string{"# Persistence", "aof_enabled:1", "aof_last_write_status:ok"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("INFO persistence = %q, missing %q", text, want)
+			}
+		}
+	})
+
+	t.Run("without one", func(t *testing.T) {
+		text := infoPersistence(t, defaultTestConfig())
+		for _, want := range []string{"# Persistence", "aof_enabled:0", "aof_last_write_status:ok"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("INFO persistence = %q, missing %q", text, want)
+			}
+		}
+	})
 }

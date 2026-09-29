@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maltemindedal/stash/internal/storage"
@@ -64,6 +65,12 @@ type Writer struct {
 	// happen under mu and only while closing is false, so they cannot race with
 	// that Wait.
 	closing bool
+
+	// writeFailed is true from a failed write, flush or fsync until the next one
+	// that succeeds. Under everysec and no the server acknowledges a command before
+	// it is on disk, so this is how an operator finds out the log has stopped
+	// growing; see LastWriteOK.
+	writeFailed atomic.Bool
 }
 
 // OpenWriter opens or creates an append-only file writer for the supplied path.
@@ -111,6 +118,14 @@ func (w *Writer) Policy() Policy {
 	}
 
 	return w.policy
+}
+
+// LastWriteOK reports whether the most recent write, flush or fsync of the file
+// succeeded (INFO aof_last_write_status). Under everysec and no, Append
+// acknowledges a command before it is on disk, so a failure is otherwise visible
+// only in the log.
+func (w *Writer) LastWriteOK() bool {
+	return w == nil || !w.writeFailed.Load()
 }
 
 // Append writes a payload without forcing an immediate fsync.
@@ -199,6 +214,7 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 		return ErrClosed
 	}
 	if _, err := w.writer.Write(payload); err != nil {
+		w.writeFailed.Store(true)
 		return fmt.Errorf("aof: write %q: %w", w.path, err)
 	}
 	if w.rewriteActive {
@@ -210,7 +226,11 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 		return w.syncLocked()
 	}
 	if w.policy == PolicyNo {
-		return w.flushLocked()
+		// Handing the bytes to the OS is the whole durability step for this policy.
+		if err := w.flushLocked(); err != nil {
+			return err
+		}
+		w.writeFailed.Store(false)
 	}
 
 	return nil
@@ -251,14 +271,17 @@ func (w *Writer) syncLocked() error {
 		return err
 	}
 	if err := w.file.Sync(); err != nil {
+		w.writeFailed.Store(true)
 		return fmt.Errorf("aof: sync %q: %w", w.path, err)
 	}
+	w.writeFailed.Store(false)
 
 	return nil
 }
 
 func (w *Writer) flushLocked() error {
 	if err := w.writer.Flush(); err != nil {
+		w.writeFailed.Store(true)
 		return fmt.Errorf("aof: flush %q: %w", w.path, err)
 	}
 

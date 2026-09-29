@@ -20,6 +20,11 @@ type Stats struct {
 	MasterOffset        int64
 	ReplicaOffset       int64
 	Replicas            []ReplicaInfo
+	// AOFEnabled reports whether an append-only file is being written, and
+	// AOFLastWriteOK whether its most recent write and fsync succeeded (true when
+	// there is no AOF).
+	AOFEnabled     bool
+	AOFLastWriteOK bool
 }
 
 // ReplicaInfo describes one connected replica peer for INFO replication.

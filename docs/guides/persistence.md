@@ -65,6 +65,10 @@ go run ./cmd/stash --dump ""
 
 Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A second signal during shutdown ends the process at once, so it writes no snapshot either. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
 
+## Watching for write failures
+
+Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. `INFO persistence` reports `aof_last_write_status:err` from the first failed write or fsync until one succeeds again; see [Observability](observability.md).
+
 ## What TTLs do across a restart
 
 Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT` frame before being written to the AOF. Replay therefore anchors the TTL to the original clock rather than restarting the countdown, and keys that expired while the server was down are dropped instead of being resurrected with a fresh lease.

@@ -524,6 +524,7 @@ func (s *Server) ServerStats() Stats {
 		})
 	}
 
+	writer := s.aofWriter
 	return Stats{
 		ConnectedClients:    s.registry.Count(),
 		MonitoringClients:   s.monitorRegistry.Count(),
@@ -533,5 +534,7 @@ func (s *Server) ServerStats() Stats {
 		MasterOffset:        s.replication.MasterOffset(),
 		ReplicaOffset:       s.replication.ReplicaOffset(),
 		Replicas:            replicas,
+		AOFEnabled:          writer != nil,
+		AOFLastWriteOK:      writer.LastWriteOK(),
 	}
 }

@@ -161,7 +161,7 @@ See [Setting up replication](../guides/replication.md).
 | Command | Replicated | Durable |
 | --- | --- | --- |
 | `BGREWRITEAOF` | – | – |
-| `INFO [default\|all\|memory\|replication\|clients]` | – | – |
+| `INFO [default\|all\|memory\|replication\|clients\|persistence]` | – | – |
 | `SLOWLOG GET [count]` | – | – |
 | `SLOWLOG LEN` | – | – |
 | `SLOWLOG RESET` | – | – |
