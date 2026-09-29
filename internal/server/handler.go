@@ -70,12 +70,15 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 				return
 			}
 
+			// After a frame that cannot be parsed the stream is out of step and
+			// nothing that follows can be trusted, so answer once and close, as
+			// the event loop and Redis do. Carrying on made every further byte of
+			// the garbage draw its own error reply and log line.
 			logger.Warn("failed to parse request", "error", err)
 			if writeErr := s.writeClientResponses(ctx, writer, []protocol.Value{protocol.ErrorValue{Message: "ERR " + err.Error()}}); writeErr != nil {
 				logger.Warn("failed to write parser error", "parse_error", err, "write_error", writeErr)
-				return
 			}
-			continue
+			return
 		}
 
 		responses, registerReplica, execErr := s.executeClientRequest(ctx, clientID, conn, logger, value)

@@ -88,6 +88,7 @@ Current responsibilities:
 - accept client connections in a loop
 - spawn one goroutine per client (default networking mode), which queues each reply and sends the queue just before it would wait for more input, so a client that pipelines requests gets its replies in as few writes as the requests arrived in
 - parse → execute → respond for each request
+- answer a request it cannot parse with one error and close the connection, because the byte stream cannot be resynchronized (both networking modes)
 - provide a non-blocking connection state machine that buffers reads, parses complete requests, buffers responses, and flushes output incrementally
 - optionally serve all clients from one event-loop goroutine driven by OS readiness notifications (`--event-loop`), dispatching readable and writable sockets through per-connection state machines
 - maintain an active connection registry for shutdown

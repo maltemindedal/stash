@@ -62,12 +62,8 @@ type connEvent struct {
 // the connection closes.
 //
 // On a permanent protocol error the machine emits an ordered error reply and
-// then closes the connection. This intentionally diverges from the
-// goroutine-per-connection handler, which replies and keeps serving; closing
-// matches Redis, which terminates a connection after a protocol error because
-// the byte stream can no longer be resynchronized. The divergence is confined
-// to event-loop mode, which drives connections through this machine, and does
-// not affect the default networking path.
+// then closes the connection, as the goroutine-per-connection handler does and
+// as Redis does: the byte stream can no longer be resynchronized.
 //
 // A ConnMachine is not safe for concurrent use; a single driving loop must own
 // it. Cross-goroutine async deliveries continue to flow through ClientState,
