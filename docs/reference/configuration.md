@@ -13,7 +13,7 @@ Stash is configured entirely through command-line flags. There is no configurati
 | `--port` | int | `6379` | TCP port to listen on. Accepts `0`–`65535`; `0` asks the OS for an ephemeral port. |
 | `--log-level` | string | `info` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `--eviction-interval` | duration | `100ms` | Interval between active TTL eviction passes. |
-| `--eviction-sample-size` | int | `20` | Number of keys sampled on each eviction pass. |
+| `--eviction-sample-size` | int | `20` | Number of keys in each eviction sample. A pass samples again while over a quarter of the last sample had expired, for up to a quarter of `--eviction-interval`. |
 | `--rdb` | string | *(empty)* | Path to an RDB file to load before the listener opens. Empty disables startup RDB loading. |
 | `--dump` | string | `dump.rdb` | Path to write an RDB snapshot to during graceful shutdown. |
 | `--aof` | string | *(empty)* | Path to an append-only file for durable command logging. Empty disables AOF. |

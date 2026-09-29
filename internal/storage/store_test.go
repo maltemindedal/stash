@@ -1042,6 +1042,70 @@ func TestStoreActiveEvictionRemovesExpiredKeys(t *testing.T) {
 	t.Fatalf("Len() = %d, want 0 after active eviction", store.Len())
 }
 
+// TestStoreActiveEvictionKeepsUpWithAKeyspaceFullOfExpiredKeys pins that the
+// background loop does not clear expired keys at a fixed 20 per pass: with 50,000
+// of them and a 10 ms interval that would take about 25 seconds, all of it spent
+// serving expired data. Redis repeats the sample while a quarter of it had
+// expired, and so does the loop now.
+func TestStoreActiveEvictionKeepsUpWithAKeyspaceFullOfExpiredKeys(t *testing.T) {
+	store := NewStore()
+	expiredAt := time.Now().Add(-time.Second).UnixMilli()
+	for i := 0; i < 50_000; i++ {
+		_, _ = store.Set("key-"+strconv.Itoa(i), []byte("v"), expiredAt)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store.StartEviction(ctx, 10*time.Millisecond, 20)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if store.Len() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("Len() = %d after 3s, want every expired key cleared", store.Len())
+}
+
+func TestEvictionPassRepeatsWhileMostOfTheSampleHadExpiredAndStopsAtItsBudget(t *testing.T) {
+	store := NewStore()
+	expiredAt := time.Now().Add(-time.Second).UnixMilli()
+	for i := 0; i < 200_000; i++ {
+		_, _ = store.Set("key-"+strconv.Itoa(i), []byte("v"), expiredAt)
+	}
+
+	const budget = 20 * time.Millisecond
+	started := time.Now()
+	samples := store.evictionPass(20, budget)
+	elapsed := time.Since(started)
+
+	if samples < 2 {
+		t.Fatalf("evictionPass() took %d sample(s), want it to keep sampling while the keys it finds have expired", samples)
+	}
+	if store.Len() == 200_000 || store.Len() == 0 {
+		t.Fatalf("Len() = %d after one pass, want some but not all removed (the budget ends the pass)", store.Len())
+	}
+	// One sample past the deadline at most, with a wide margin for a loaded machine.
+	if elapsed > 10*budget {
+		t.Fatalf("evictionPass() took %v, want it to stop near its %v budget", elapsed, budget)
+	}
+}
+
+func TestEvictionPassTakesOneSampleWhenFewKeysHaveExpired(t *testing.T) {
+	store := NewStore()
+	for i := 0; i < 5_000; i++ {
+		_, _ = store.Set("live-"+strconv.Itoa(i), []byte("v"), 0)
+	}
+	_, _ = store.Set("dead", []byte("v"), time.Now().Add(-time.Second).UnixMilli())
+
+	// At most one key in any sample of 20 can have expired, far below the quarter
+	// that would justify sampling again.
+	if samples := store.evictionPass(20, time.Second); samples != 1 {
+		t.Fatalf("evictionPass() took %d samples, want 1", samples)
+	}
+}
+
 // TestStoreActiveEvictionReportsExpiredKeys pins that the background loop names
 // the keys it removed rather than only counting them: the caller turns them into
 // the DEL that reaches replicas, the AOF, and WATCH.

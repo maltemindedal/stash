@@ -25,6 +25,10 @@ func (s *Store) StartEviction(ctx context.Context, interval time.Duration, sampl
 		sampleSize = defaultSampleSize
 	}
 
+	// One pass may keep sampling for a quarter of the interval, the same share of
+	// time Redis gives its active expiry cycle.
+	budget := interval / 4
+
 	go func() {
 		defer close(done)
 
@@ -38,7 +42,7 @@ func (s *Store) StartEviction(ctx context.Context, interval time.Duration, sampl
 				s.logDebug("background eviction loop stopped", "reason", ctx.Err())
 				return
 			case <-ticker.C:
-				s.evictionPass(sampleSize)
+				s.evictionPass(sampleSize, budget)
 			}
 		}
 	}()
@@ -46,35 +50,54 @@ func (s *Store) StartEviction(ctx context.Context, interval time.Duration, sampl
 	return done
 }
 
-// evictionPass runs one background eviction pass. A panic in it, most likely
-// from the expiration listener, which reaches replication and durability sinks,
-// is logged and ends only this pass: recovering around the whole loop instead
-// would let one bug stop active expiry for the life of the process.
-func (s *Store) evictionPass(sampleSize int) {
+// expiredSampleRepeatDenominator sets the share of a sample that must have
+// expired for a pass to sample again: more than one in this many, a quarter, as
+// in Redis.
+const expiredSampleRepeatDenominator = 4
+
+// evictionPass runs one background eviction pass and returns how many samples it
+// took. A pass samples the keyspace and removes the expired keys it finds; if
+// more than a quarter of the sample had expired, the keyspace is probably full of
+// expired keys, so it samples again, until the sample is mostly live or the
+// budget is spent. Without the repetition a fixed sample per interval clears only
+// sampleSize keys per interval however many have expired.
+//
+// A panic in it, most likely from the expiration listener, which reaches
+// replication and durability sinks, is logged and ends only this pass:
+// recovering around the whole loop instead would let one bug stop active expiry
+// for the life of the process.
+func (s *Store) evictionPass(sampleSize int, budget time.Duration) (samples int) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logError("background eviction pass panicked", "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
 		}
 	}()
 
-	expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
-	if len(expired) == 0 {
-		return
-	}
+	deadline := time.Now().Add(budget)
+	for {
+		sampled, expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
+		samples++
 
-	s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
-	// Published once evictExpiredSample has released every shard lock
-	// it took: the listener reaches sinks outside the store, which
-	// must never be entered while holding one.
-	s.publishExpiredKeys()
+		if len(expired) > 0 {
+			s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
+			// Published once evictExpiredSample has released every shard lock
+			// it took: the listener reaches sinks outside the store, which
+			// must never be entered while holding one.
+			s.publishExpiredKeys()
+		}
+
+		if len(expired)*expiredSampleRepeatDenominator <= sampled || !time.Now().Before(deadline) {
+			return samples
+		}
+	}
 }
 
 // evictExpiredSample removes the expired keys in one sample of the keyspace and
-// returns them.
-func (s *Store) evictExpiredSample(now int64, sampleSize int) []string {
+// returns how many keys it sampled and the ones it removed.
+func (s *Store) evictExpiredSample(now int64, sampleSize int) (sampled int, expired []string) {
 	keys := s.snapshotKeys(sampleSize)
 	if len(keys) == 0 {
-		return nil
+		return 0, nil
 	}
 	if len(keys) == 1 {
 		shard := s.shardForKey(keys[0])
@@ -85,17 +108,17 @@ func (s *Store) evictExpiredSample(now int64, sampleSize int) []string {
 		if ok && isExpired(value, now) {
 			s.deleteKeyLocked(shard, keys[0])
 			s.noteExpiredKeysLocked(keys)
-			return keys
+			return 1, keys
 		}
 
-		return nil
+		return 1, nil
 	}
 
 	groups := s.groupKeysByShard(keys)
 	groups.lock(s)
 	defer groups.unlock(s)
 
-	expired := make([]string, 0, len(keys))
+	expired = make([]string, 0, len(keys))
 	for shardID, count := range groups.counts {
 		if count == 0 {
 			continue
@@ -112,5 +135,5 @@ func (s *Store) evictExpiredSample(now int64, sampleSize int) []string {
 	}
 
 	s.noteExpiredKeysLocked(expired)
-	return expired
+	return len(keys), expired
 }

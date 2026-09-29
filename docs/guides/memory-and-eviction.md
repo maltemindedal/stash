@@ -18,10 +18,10 @@ go run ./cmd/stash --eviction-interval 250ms --eviction-sample-size 50
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--eviction-interval` | `100ms` | Time between active eviction passes |
-| `--eviction-sample-size` | `20` | Keys sampled per pass |
+| `--eviction-interval` | `100ms` | Time between active eviction passes; a pass may run for up to a quarter of it |
+| `--eviction-sample-size` | `20` | Keys per sample; a pass takes more than one sample while over a quarter of the keys sampled have expired |
 
-The active loop samples rather than scanning the full keyspace, so expired keys that are never read are removed probabilistically rather than immediately. A larger sample size reclaims memory sooner at the cost of more work per pass. A non-positive sample size falls back to the built-in default.
+The active loop samples rather than scanning the full keyspace, so expired keys that are never read are removed probabilistically rather than immediately. When more than a quarter of a sample turns out to have expired, the keyspace is probably full of expired keys, and the pass samples again, as Redis does, until a sample is mostly live keys or the pass has used a quarter of `--eviction-interval` (25 ms at the default). A keyspace with many expired keys is therefore cleared in a few passes rather than `--eviction-sample-size` keys per interval. A larger sample size reclaims memory sooner at the cost of more work per sample. A non-positive sample size falls back to the built-in default.
 
 The server publishes removals from the background loop and the accounted-write recalculation like other writes. See [Evictions are replicated and made durable](#evictions-are-replicated-and-made-durable). It does not publish a passive removal because each server holding the key can read the same expiry timestamp.
 
