@@ -95,7 +95,7 @@ Current responsibilities:
 - append durable command frames and fan out replication writes after successful execution
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
-- stop cleanly when the process receives `SIGINT` or `SIGTERM`
+- stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck
 
 ### `test`
 

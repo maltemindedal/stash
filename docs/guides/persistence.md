@@ -63,7 +63,7 @@ go run ./cmd/stash --rdb /var/lib/stash/dump.rdb
 go run ./cmd/stash --dump ""
 ```
 
-Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
+Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A second signal during shutdown ends the process at once, so it writes no snapshot either. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
 
 ## What TTLs do across a restart
 
