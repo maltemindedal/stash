@@ -29,6 +29,8 @@ Stash is configured entirely through command-line flags. There is no configurati
 
 ### `--host`
 
+An IPv6 address can be written bare or in brackets, so `--host ::1` and `--host "[::1]"` are equivalent.
+
 The default binds loopback deliberately. A server with no `--requirepass` is not reachable from the network unless you bind another interface. Doing so without a password exposes the datastore without authentication. See [Securing a server](../guides/securing-a-server.md).
 
 ### `--slowlog-log-slower-than`

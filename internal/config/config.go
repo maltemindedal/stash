@@ -120,13 +120,15 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	return cfg, nil
 }
 
-// Address formats the listen address used by net.Listen.
+// Address formats the listen address used by net.Listen. An IPv6 literal may be
+// given bare (::1) or in brackets ([::1]); both produce the bracketed form.
 func (c Config) Address() string {
-	if c.Host == "" {
-		return fmt.Sprintf(":%d", c.Port)
+	host := c.Host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
 	}
 
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	return net.JoinHostPort(host, strconv.Itoa(c.Port))
 }
 
 // IsReplica reports whether the server should connect to an upstream master.

@@ -135,3 +135,30 @@ func TestParseFlags(t *testing.T) {
 		}
 	})
 }
+
+func TestAddress(t *testing.T) {
+	cases := []struct {
+		host string
+		port int
+		want string
+	}{
+		{"127.0.0.1", 6379, "127.0.0.1:6379"},
+		{"localhost", 6379, "localhost:6379"},
+		{"", 6379, ":6379"},
+		{"0.0.0.0", 0, "0.0.0.0:0"},
+		// An IPv6 literal works bare or in the brackets an earlier version required.
+		{"::1", 6379, "[::1]:6379"},
+		{"[::1]", 6379, "[::1]:6379"},
+		{"::", 6380, "[::]:6380"},
+		{"[::]", 6380, "[::]:6380"},
+		{"fe80::1%eth0", 6379, "[fe80::1%eth0]:6379"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			got := Config{Host: tc.host, Port: tc.port}.Address()
+			if got != tc.want {
+				t.Fatalf("Address() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
