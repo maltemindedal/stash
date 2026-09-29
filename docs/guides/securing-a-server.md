@@ -71,3 +71,7 @@ These are properties of the current implementation, not configuration mistakes:
 
 - [Configuration reference](../reference/configuration.md)
 - [Observability](observability.md) explains what `MONITOR` and `SLOWLOG` expose.
+
+## Reporting a vulnerability
+
+See [`SECURITY.md`](../../SECURITY.md) for how to report a vulnerability privately.

@@ -67,3 +67,7 @@ The integration suite covers AOF replay, RDB loading, replication, event-loop mo
 Issues are tracked in [GitHub Issues](https://github.com/maltemindedal/stash/issues). Triage uses the five canonical labels described in [`docs/agents/triage-labels.md`](agents/triage-labels.md): `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`.
 
 Pull requests run the `validate` job (on the minimum Go version) and the `test-latest` job (on the two latest Go releases, plus a `go vet` for macOS on both architectures and for Windows) on every push. The `race` job runs the tests under the race detector on both.
+
+## Dependency and vulnerability checks
+
+Stash has no module dependencies, so the moving parts are the Go toolchain and the GitHub Actions in `.github/workflows/`. Actions are pinned to commit SHAs; Dependabot proposes bumps weekly, waiting seven days after a release. A weekly workflow runs `govulncheck` against the latest stable Go. Run it locally with `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`.
