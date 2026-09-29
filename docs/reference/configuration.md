@@ -25,6 +25,7 @@ Stash is configured entirely through command-line flags. There is no configurati
 | `--masterauth` | string | *(empty)* | Password the replica uses to `AUTH` against a password-protected master. |
 | `--masterauth-file` | string | *(empty)* | Read the `--masterauth` password from this file. See [the note below](#--requirepass-file-and---masterauth-file). |
 | `--requirepass` | string | *(empty)* | Password clients must supply via `AUTH`. Empty disables authentication. |
+| `--auth-timeout` | duration | `30s` | With `--requirepass`, how long a client may stay connected without authenticating before the server closes the connection. `0` disables the limit. |
 | `--requirepass-file` | string | *(empty)* | Read the `--requirepass` password from this file. See [the note below](#--requirepass-file-and---masterauth-file). |
 | `--event-loop` | bool | `false` | Serve all clients from one event-loop goroutine using OS readiness notifications. |
 

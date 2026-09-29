@@ -37,6 +37,8 @@ Unauthenticated clients may still issue `PING`. Every other command, including t
 
 Until a client authenticates it is also held to small frames, the same limits Redis applies: an array of at most 10 elements and a bulk string of at most 16 KiB. Anything larger is answered with one protocol error and the connection is closed, before the server has read the rest of the frame, so someone who can reach the port cannot make it buffer large requests. `AUTH` and `PING` fit easily. The limits end once the client authenticates, and apply only when `--requirepass` is set; the frame that follows an `AUTH` in the same pipeline is judged after the `AUTH` has run.
 
+A client also has a limited time to authenticate. With `--requirepass` set, a connection that has not sent a successful `AUTH` within `--auth-timeout` (30 seconds by default) is closed, including one that is half way through sending its `AUTH`; `--auth-timeout 0` turns this off. Once a client has authenticated, an idle connection is left alone.
+
 ## Bind another interface
 
 Only after setting a password:

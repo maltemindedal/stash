@@ -264,3 +264,25 @@ func TestParseFlagsPasswordFiles(t *testing.T) {
 		}
 	})
 }
+
+func TestParseFlagsAuthTimeout(t *testing.T) {
+	parse := func(args ...string) (Config, error) {
+		fs := flag.NewFlagSet("stash-test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		return parseFlags(fs, args)
+	}
+
+	cfg, err := parse()
+	if err != nil || cfg.AuthTimeout != 30*time.Second {
+		t.Fatalf("default AuthTimeout = %v (error %v), want 30s", cfg.AuthTimeout, err)
+	}
+	if cfg, err = parse("--auth-timeout", "5s"); err != nil || cfg.AuthTimeout != 5*time.Second {
+		t.Fatalf("--auth-timeout 5s: AuthTimeout = %v (error %v), want 5s", cfg.AuthTimeout, err)
+	}
+	if cfg, err = parse("--auth-timeout", "0"); err != nil || cfg.AuthTimeout != 0 {
+		t.Fatalf("--auth-timeout 0: AuthTimeout = %v (error %v), want the limit disabled", cfg.AuthTimeout, err)
+	}
+	if _, err = parse("--auth-timeout", "-1s"); err == nil {
+		t.Fatal("--auth-timeout -1s: error = nil, want a validation failure")
+	}
+}

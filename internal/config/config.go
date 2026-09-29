@@ -31,6 +31,9 @@ type Config struct {
 	// AllowOpenBind lets the server listen beyond loopback with no
 	// --requirepass; without it that combination is refused at startup.
 	AllowOpenBind bool
+	// AuthTimeout is how long a client may stay connected without authenticating
+	// on a server that requires a password; zero disables the limit.
+	AuthTimeout time.Duration
 }
 
 // Default returns the default runtime configuration. The listener binds to
@@ -55,6 +58,7 @@ func Default() Config {
 		MaxClients:           10000,
 		SlowlogLogSlowerThan: 10 * time.Millisecond,
 		EventLoop:            false,
+		AuthTimeout:          30 * time.Second,
 	}
 }
 
@@ -89,6 +93,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	var requirePassFile, masterAuthFile string
 	fs.StringVar(&requirePassFile, "requirepass-file", "", "read the --requirepass password from this file instead of the command line, where it would be visible in the process list")
 	fs.StringVar(&masterAuthFile, "masterauth-file", "", "read the --masterauth password from this file instead of the command line")
+	fs.DurationVar(&cfg.AuthTimeout, "auth-timeout", cfg.AuthTimeout, "how long a client may stay connected without authenticating when --requirepass is set; 0 disables the limit")
 	fs.BoolVar(&cfg.AllowOpenBind, "allow-open-bind", cfg.AllowOpenBind, "allow listening on a non-loopback address with no --requirepass; without this flag the server refuses to start in that configuration")
 	fs.BoolVar(&cfg.EventLoop, "event-loop", cfg.EventLoop, "serve clients through an OS I/O multiplexing event loop; supported on Linux (epoll) and macOS (kqueue), other platforms fall back to one goroutine per connection")
 	fs.Func("slowlog-log-slower-than", "slow query threshold in microseconds; 0 logs all commands and negative disables slowlog", func(value string) error {
@@ -121,6 +126,9 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	}
 	if cfg.MaxMemory < 0 {
 		return Config{}, fmt.Errorf("invalid maxmemory %d: expected non-negative bytes", cfg.MaxMemory)
+	}
+	if cfg.AuthTimeout < 0 {
+		return Config{}, fmt.Errorf("invalid auth-timeout %v: expected a non-negative duration", cfg.AuthTimeout)
 	}
 	if cfg.MaxClients < 0 {
 		return Config{}, fmt.Errorf("invalid maxclients %d: expected a non-negative count", cfg.MaxClients)

@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 )
@@ -63,6 +65,17 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	// are still queued when the handler leaves go out first, if the socket allows.
 	defer func() { _ = state.TryFlushResponses() }()
 
+	// On a server that requires a password, a connection gets a limited time to
+	// authenticate. The deadline covers reads, including one that is half way
+	// through a frame, so a client cannot hold a connection slot by trickling
+	// bytes; it is lifted once the client authenticates.
+	authDeadlineSet := false
+	if s.authTimeoutApplies(state) {
+		if err := conn.SetReadDeadline(time.Now().Add(s.cfg.AuthTimeout)); err == nil {
+			authDeadlineSet = true
+		}
+	}
+
 	for {
 		// A client that has not authenticated may send only small frames; the
 		// limit is read before every frame because an AUTH lifts it.
@@ -70,6 +83,10 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		value, err := parser.Parse()
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if authDeadlineSet && errors.Is(err, os.ErrDeadlineExceeded) {
+				logger.Info("closing a connection that did not authenticate in time", "timeout", s.cfg.AuthTimeout)
 				return
 			}
 
@@ -89,6 +106,11 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			return
 		}
 
+		if authDeadlineSet && state.IsAuthenticated() {
+			_ = conn.SetReadDeadline(time.Time{})
+			authDeadlineSet = false
+		}
+
 		if err := s.writeClientResponses(ctx, writer, responses); err != nil {
 			logger.Warn("failed to write response", "error", err)
 			return
@@ -104,6 +126,12 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			s.registerReplicaPeer(clientID, conn)
 		}
 	}
+}
+
+// authTimeoutApplies reports whether a new connection must authenticate within
+// the configured time: only where a password is required and a timeout is set.
+func (s *Server) authTimeoutApplies(state *ClientState) bool {
+	return s.cfg.RequirePass != "" && s.cfg.AuthTimeout > 0 && state != nil && !state.IsAuthenticated()
 }
 
 // requestLimits returns what the client's next frame may declare. On a server

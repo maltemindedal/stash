@@ -178,6 +178,9 @@ type eventConn struct {
 	wantRead   bool
 	wantWrite  bool
 	peerClosed bool
+	// authTimer closes the connection if it has not authenticated in time; nil
+	// where no password is required.
+	authTimer *time.Timer
 
 	pushBuf        []byte
 	pushQueued     bool
@@ -436,6 +439,17 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 
 	l.conns[fd] = conn
 	conn.logger.Debug("client connected")
+
+	if l.srv.authTimeoutApplies(state) {
+		// The timer runs on its own goroutine, so it only asks the loop to close
+		// the connection; the loop does it on its next wakeup.
+		conn.authTimer = time.AfterFunc(l.srv.cfg.AuthTimeout, func() {
+			if !state.IsAuthenticated() {
+				conn.logger.Info("closing a connection that did not authenticate in time", "timeout", l.srv.cfg.AuthTimeout)
+				l.requestClose(conn)
+			}
+		})
+	}
 }
 
 func (l *eventLoop) connReadable(conn *eventConn) {
@@ -577,6 +591,9 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 		return
 	}
 	delete(l.conns, conn.fd)
+	if conn.authTimer != nil {
+		conn.authTimer.Stop()
+	}
 
 	l.mu.Lock()
 	conn.detached = true
