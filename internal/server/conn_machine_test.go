@@ -522,24 +522,36 @@ func TestConnMachineFeedIsLinearInArrayFrameSize(t *testing.T) {
 	// One RPUSH-shaped request with hundreds of thousands of small arguments
 	// arrives across many reads. Re-decoding the whole prefix on every read made
 	// this cost seconds of event-loop CPU for a few megabytes of input; each byte
-	// must be examined once.
-	const args = 400_000
-	var frame bytes.Buffer
-	fmt.Fprintf(&frame, "*%d\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n", args+2)
-	for i := 0; i < args; i++ {
-		frame.WriteString("$1\r\nx\r\n")
+	// must be examined once. Absolute times depend on the machine and on the race
+	// detector, so the test compares a frame with one four times its size: linear
+	// work takes about four times as long, quadratic work about sixteen times.
+	feed := func(args int) (time.Duration, int) {
+		var frame bytes.Buffer
+		fmt.Fprintf(&frame, "*%d\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n", args+2)
+		for i := 0; i < args; i++ {
+			frame.WriteString("$1\r\nx\r\n")
+		}
+
+		best := time.Duration(1<<63 - 1)
+		for run := 0; run < 3; run++ {
+			machine := NewConnMachine(nil)
+			start := time.Now()
+			feedInChunks(t, machine, frame.Bytes(), 64*1024)
+			if elapsed := time.Since(start); elapsed < best {
+				best = elapsed
+			}
+			if machine.State() != ConnStateActive || machine.PendingRequests() != 1 {
+				t.Fatalf("state = %d, pending = %d, want active with 1 request (err = %v)", machine.State(), machine.PendingRequests(), machine.Err())
+			}
+		}
+		return best, frame.Len()
 	}
 
-	machine := NewConnMachine(nil)
-	start := time.Now()
-	feedInChunks(t, machine, frame.Bytes(), 64*1024)
-	elapsed := time.Since(start)
+	small, _ := feed(100_000)
+	large, size := feed(400_000)
 
-	if machine.State() != ConnStateActive || machine.PendingRequests() != 1 {
-		t.Fatalf("state = %d, pending = %d, want active with 1 request (err = %v)", machine.State(), machine.PendingRequests(), machine.Err())
-	}
-	if elapsed > time.Second {
-		t.Fatalf("feeding a %d byte array frame in 64 KiB reads took %v, want linear time (well under 1s)", frame.Len(), elapsed)
+	if ratio := float64(large) / float64(small); ratio > 9 {
+		t.Fatalf("feeding a %d byte array frame took %v, %.1fx the time of a frame a quarter of the size (%v): want roughly 4x (linear), not 16x (quadratic)", size, large, ratio, small)
 	}
 }
 
