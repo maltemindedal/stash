@@ -79,7 +79,7 @@ func OpenWriter(ctx context.Context, path string, policy Policy, logger *slog.Lo
 	if dir == "" {
 		dir = "."
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("aof: create directory %q: %w", dir, err)
 	}
 

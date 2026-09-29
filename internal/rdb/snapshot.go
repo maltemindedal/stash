@@ -112,7 +112,7 @@ func SaveSnapshot(path string, entries []storage.StringSnapshotEntry) (stats Sna
 	if dir == "" {
 		dir = "."
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return SnapshotStats{}, fmt.Errorf("rdb: create snapshot directory %q: %w", dir, err)
 	}
 

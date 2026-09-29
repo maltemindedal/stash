@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -161,6 +162,28 @@ func TestSaveSnapshotReplacesExistingFile(t *testing.T) {
 	}
 	if !ok || string(got) != "Stash" {
 		t.Fatalf("Get() = (%q, %v), want (%q, true)", string(got), ok, "Stash")
+	}
+}
+
+// TestSaveSnapshotCreatesTheDirectoryPrivately pins that a snapshot directory the
+// server creates is not readable or searchable by other users; the snapshot
+// file itself is 0600.
+func TestSaveSnapshotCreatesTheDirectoryPrivately(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not use Unix permission bits")
+	}
+
+	dir := filepath.Join(t.TempDir(), "data", "rdb")
+	if _, err := SaveSnapshot(filepath.Join(dir, "dump.rdb"), nil); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", dir, err)
+	}
+	if extra := info.Mode().Perm() &^ 0o750; extra != 0 {
+		t.Fatalf("directory mode = %#o, want no bits outside 0750 (extra %#o)", info.Mode().Perm(), extra)
 	}
 }
 

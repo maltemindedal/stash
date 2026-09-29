@@ -55,6 +55,10 @@ See [Setting up replication](replication.md).
 go run ./cmd/stash --maxclients 1000
 ```
 
+## File permissions
+
+The append-only file and snapshots are created with mode `0600`. Parent directories that Stash has to create for them get `0750`, subject to the process umask; directories that already exist are left as they are.
+
 ## What the slowlog stores
 
 `SLOWLOG` and `MONITOR` redact `AUTH` arguments, so passwords do not appear in the slow query log or in a monitor stream, including for failed attempts. Both show other command arguments verbatim. Any other secret passed as an argument can appear in `SLOWLOG GET` output and `MONITOR` streams.
