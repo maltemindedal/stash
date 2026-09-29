@@ -162,3 +162,24 @@ func TestAddress(t *testing.T) {
 		})
 	}
 }
+
+func TestParseFlagsAllowOpenBind(t *testing.T) {
+	parse := func(args ...string) Config {
+		t.Helper()
+
+		fs := flag.NewFlagSet("stash-test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		cfg, err := parseFlags(fs, args)
+		if err != nil {
+			t.Fatalf("parseFlags(%v) error = %v", args, err)
+		}
+		return cfg
+	}
+
+	if parse().AllowOpenBind {
+		t.Fatal("AllowOpenBind = true by default, want false")
+	}
+	if !parse("--allow-open-bind").AllowOpenBind {
+		t.Fatal("AllowOpenBind = false with --allow-open-bind, want true")
+	}
+}

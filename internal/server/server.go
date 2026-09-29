@@ -150,6 +150,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			return fmt.Errorf("server: validate replica configuration: %w", err)
 		}
 	}
+	if err := s.checkBindSafety(); err != nil {
+		return err
+	}
 	if err := s.initializePersistence(ctx); err != nil {
 		return err
 	}
@@ -372,6 +375,24 @@ func (s *Server) Addr() string {
 	}
 
 	return s.listener.Addr().String()
+}
+
+// checkBindSafety refuses to start a server that would accept connections from
+// other machines with no password, unless --allow-open-bind says that is
+// intended. It runs before persistence is opened so a refused start has no side
+// effects. The address is resolved the way net.Listen will resolve it; if it
+// cannot be, the listen that follows reports the real error.
+func (s *Server) checkBindSafety() error {
+	if s.cfg.RequirePass != "" || s.cfg.AllowOpenBind {
+		return nil
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", s.cfg.Address())
+	if err != nil || !listensBeyondLoopback(addr) {
+		return nil
+	}
+
+	return fmt.Errorf("server: refusing to listen on %s with no password: anyone who can reach it would have full access. Set --requirepass, bind a loopback address, or pass --allow-open-bind to serve without a password anyway", s.cfg.Address())
 }
 
 // listensBeyondLoopback reports whether a listener bound to addr accepts

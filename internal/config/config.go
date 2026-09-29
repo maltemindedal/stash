@@ -28,13 +28,16 @@ type Config struct {
 	MaxClients           int
 	SlowlogLogSlowerThan time.Duration
 	EventLoop            bool
+	// AllowOpenBind lets the server listen beyond loopback with no
+	// --requirepass; without it that combination is refused at startup.
+	AllowOpenBind bool
 }
 
 // Default returns the default runtime configuration. The listener binds to
 // loopback (127.0.0.1) so an out-of-the-box server with no --requirepass is not
 // reachable from the network. Set --host explicitly (e.g. 0.0.0.0 or "") to bind
-// other interfaces; do so together with --requirepass to avoid exposing an
-// unauthenticated datastore.
+// other interfaces; that requires --requirepass unless --allow-open-bind says an
+// unauthenticated datastore is intended.
 func Default() Config {
 	return Config{
 		Host:                 "127.0.0.1",
@@ -83,6 +86,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	fs.StringVar(&cfg.ReplicaOf, "replicaof", cfg.ReplicaOf, "optional master address in host:port form for replica mode")
 	fs.StringVar(&cfg.MasterAuth, "masterauth", cfg.MasterAuth, "optional password used by replica mode to AUTH against a protected master")
 	fs.StringVar(&cfg.RequirePass, "requirepass", cfg.RequirePass, "optional password required for AUTH-protected client commands")
+	fs.BoolVar(&cfg.AllowOpenBind, "allow-open-bind", cfg.AllowOpenBind, "allow listening on a non-loopback address with no --requirepass; without this flag the server refuses to start in that configuration")
 	fs.BoolVar(&cfg.EventLoop, "event-loop", cfg.EventLoop, "serve clients through an OS I/O multiplexing event loop; supported on Linux (epoll) and macOS (kqueue), other platforms fall back to one goroutine per connection")
 	fs.Func("slowlog-log-slower-than", "slow query threshold in microseconds; 0 logs all commands and negative disables slowlog", func(value string) error {
 		threshold, err := parseSlowlogThreshold(value)

@@ -8,7 +8,8 @@ Stash is configured entirely through command-line flags. There is no configurati
 
 | Flag | Type | Default | Effect |
 | --- | --- | --- | --- |
-| `--host` | string | `127.0.0.1` | Interface the TCP listener binds to. An empty value binds all interfaces. |
+| `--host` | string | `127.0.0.1` | Interface the TCP listener binds to. An empty value binds all interfaces. Binding beyond loopback requires `--requirepass` or `--allow-open-bind`. |
+| `--allow-open-bind` | bool | `false` | Allow listening on a non-loopback address with no `--requirepass`. Without it the server refuses to start in that configuration. |
 | `--port` | int | `6379` | TCP port to listen on. Accepts `0`–`65535`; `0` asks the OS for an ephemeral port. |
 | `--log-level` | string | `info` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `--eviction-interval` | duration | `100ms` | Interval between active TTL eviction passes. |
@@ -31,7 +32,11 @@ Stash is configured entirely through command-line flags. There is no configurati
 
 An IPv6 address can be written bare or in brackets, so `--host ::1` and `--host "[::1]"` are equivalent.
 
-The default binds loopback deliberately. A server with no `--requirepass` is not reachable from the network unless you bind another interface. Doing so without a password exposes the datastore without authentication. See [Securing a server](../guides/securing-a-server.md).
+The default binds loopback deliberately. Binding any other address (including `0.0.0.0`, `::` and an empty host) without `--requirepass` is refused at startup, before any persistence is opened, unless you also pass `--allow-open-bind`. With that flag the server starts and logs a warning. See [Securing a server](../guides/securing-a-server.md).
+
+### `--allow-open-bind`
+
+Says that an unauthenticated server reachable from other machines is intended, for example on an isolated network or behind a firewall that does the access control. It has no effect when `--requirepass` is set or the server listens on loopback only.
 
 ### `--slowlog-log-slower-than`
 
