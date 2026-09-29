@@ -176,7 +176,7 @@ func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn
 
 	result, execErr := s.executor.ExecuteDetailed(ctx, request)
 	if execErr != nil {
-		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
+		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) || errors.Is(execErr, ErrClientDisconnected) {
 			return nil, false, execErr
 		}
 		logger.Debug("command execution failed", "error", execErr)

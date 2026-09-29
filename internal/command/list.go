@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/server"
@@ -64,6 +65,11 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
+	// While it waits, the command checks now and then that its client is still
+	// there. Otherwise the next push would wake it, it would pop the element, and
+	// the reply would go to a connection nobody is reading.
+	clientCheck := time.NewTicker(blockedClientCheckInterval)
+	defer clientCheck.Stop()
 	for {
 		waiter := e.store.SubscribeListPush(key)
 
@@ -98,15 +104,27 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (protocol.
 			return nil, err
 		}
 
-		select {
-		case <-waiter:
-			e.store.UnsubscribeListPush(key, waiter)
-		case <-ctx.Done():
-			e.store.UnsubscribeListPush(key, waiter)
-			return nil, ctx.Err()
+		for waiting := true; waiting; {
+			select {
+			case <-waiter:
+				waiting = false
+			case <-clientCheck.C:
+				if server.ClientDisconnected(ctx) {
+					e.store.UnsubscribeListPush(key, waiter)
+					return nil, server.ErrClientDisconnected
+				}
+			case <-ctx.Done():
+				e.store.UnsubscribeListPush(key, waiter)
+				return nil, ctx.Err()
+			}
 		}
+		e.store.UnsubscribeListPush(key, waiter)
 	}
 }
+
+// blockedClientCheckInterval is how often a blocked BLPOP checks that its client
+// is still connected.
+const blockedClientCheckInterval = 100 * time.Millisecond
 
 func (e *Executor) handleLPop(_ context.Context, request *Request) (protocol.Value, error) {
 	return e.popList(request, "LPOP", true)

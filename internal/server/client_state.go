@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -270,6 +271,31 @@ func FlushClientResponses(ctx context.Context) error {
 		return nil
 	}
 	return state.TryFlushResponses()
+}
+
+// ErrClientDisconnected reports that a command was waiting for something and
+// the client went away while it waited.
+var ErrClientDisconnected = errors.New("server: client disconnected")
+
+// ClientDisconnected reports whether the client behind ctx has closed its side of
+// the connection, without reading from it. A command that blocks for a long time
+// polls it, so it can stop waiting for a client that is not there. It is false
+// when there is no connection to look at (the event loop, an unsupported
+// platform, a context with no client) and while the client has sent requests the
+// server has not yet read.
+func ClientDisconnected(ctx context.Context) bool {
+	state, ok := ClientStateFromContext(ctx)
+	if !ok || state == nil {
+		return false
+	}
+
+	state.mu.RLock()
+	conn := state.responseConn
+	state.mu.RUnlock()
+	if conn == nil {
+		return false
+	}
+	return peerClosed(conn)
 }
 
 func (s *ClientState) writeResponses(values []protocol.Value, flush bool) error {

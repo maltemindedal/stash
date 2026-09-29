@@ -80,7 +80,7 @@ Registers are a fixed-size approximate cardinality structure stored as a string 
 | `BLPOP <key>` | – | – |
 
 - `LPOP`/`RPOP` accept an optional count, which must be non-negative; a negative count returns `ERR value is out of range, must be positive`.
-- `BLPOP` takes a key and **no timeout argument**. Redis requires the timeout. In `--event-loop` mode, a `BLPOP` that must block returns an error rather than waiting.
+- `BLPOP` takes a key and **no timeout argument**. Redis requires the timeout. In `--event-loop` mode, a `BLPOP` that must block returns an error rather than waiting. While a `BLPOP` waits, the server checks every 100 ms that the client is still connected (on Linux, macOS and FreeBSD) and drops it if the client has closed or half-closed its side, so an element pushed later is not consumed on behalf of a client that is gone. A client that half-closes its sending side right after sending `BLPOP` and still expects the reply no longer gets it; keep the connection open until the reply arrives, as Redis requires.
 
 ## Sets
 
