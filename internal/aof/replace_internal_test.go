@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/maltemindedal/stash/internal/storage"
@@ -64,6 +66,54 @@ func TestReplaceFileDirectorySync(t *testing.T) {
 			t.Fatalf("replaceFile() error = %v, want wrapped %v", err, sentinel)
 		}
 	})
+}
+
+// TestReplaceFileNeverRemovesTheTarget pins that a failed rename leaves the
+// existing append-only file in place. replaceFile used to answer an "already
+// exists" failure by removing the target and renaming again, which loses the
+// only copy of the log if the second rename fails too.
+func TestReplaceFileNeverRemovesTheTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		conflict error
+	}{
+		{name: "bare fs.ErrExist", conflict: fs.ErrExist},
+		{name: "LinkError wrapping EEXIST", conflict: &os.LinkError{Op: "rename", Err: syscall.EEXIST}},
+		{name: "other failure", conflict: errors.New("rename boom")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			target := filepath.Join(dir, "appendonly.aof")
+			temp := filepath.Join(dir, "appendonly.aof.tmp")
+			if err := os.WriteFile(temp, []byte("new"), 0o600); err != nil {
+				t.Fatalf("write temp: %v", err)
+			}
+			if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+				t.Fatalf("write target: %v", err)
+			}
+
+			renameCalls := 0
+			originalRename := renameFile
+			renameFile = func(_, _ string) error {
+				renameCalls++
+				return tt.conflict
+			}
+			defer func() { renameFile = originalRename }()
+
+			if err := replaceFile(temp, target); !errors.Is(err, tt.conflict) {
+				t.Fatalf("replaceFile() error = %v, want it to wrap %v", err, tt.conflict)
+			}
+			if renameCalls != 1 {
+				t.Fatalf("rename calls = %d, want 1", renameCalls)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil || string(got) != "old" {
+				t.Fatalf("target = (%q, %v), want the untouched original", got, err)
+			}
+		})
+	}
 }
 
 // TestRewriteSwapFailureKeepsBufferedWrites covers a rewrite whose file swap

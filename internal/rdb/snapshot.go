@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -189,19 +188,13 @@ func appendLength(dst []byte, length uint64) []byte {
 	return append(dst, buf...)
 }
 
+// replaceFile moves tempPath over targetPath with a single rename. os.Rename
+// replaces an existing file atomically on every supported platform, so there is
+// no remove-then-rename fallback: it opened a window in which a failed second
+// rename left no snapshot at all.
 func replaceFile(tempPath string, targetPath string) error {
 	if err := renameFile(tempPath, targetPath); err != nil {
-		if !isReplaceTargetExistsError(err) {
-			return fmt.Errorf("rdb: replace snapshot %q: %w", targetPath, err)
-		}
-
-		removeErr := removeFile(targetPath)
-		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("rdb: replace snapshot %q: rename error: %w; remove error: %w", targetPath, err, removeErr)
-		}
-		if retryErr := renameFile(tempPath, targetPath); retryErr != nil {
-			return fmt.Errorf("rdb: replace snapshot %q after removing existing target: %w", targetPath, retryErr)
-		}
+		return fmt.Errorf("rdb: replace snapshot %q: %w", targetPath, err)
 	}
 
 	// Persist the rename itself: the new directory entry is not crash-durable
@@ -211,12 +204,4 @@ func replaceFile(tempPath string, targetPath string) error {
 	}
 
 	return nil
-}
-
-func isReplaceTargetExistsError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return errors.Is(err, fs.ErrExist) || os.IsExist(err)
 }
