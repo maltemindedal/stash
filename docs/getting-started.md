@@ -4,7 +4,7 @@ This tutorial takes you from a fresh clone to a running Stash server with data i
 
 ## Prerequisites
 
-- **Go 1.21 or newer.** The version is pinned in [`go.mod`](../go.mod). Check yours with `go version`.
+- **Go 1.21 or newer.** The minimum is the `go` directive in [`go.mod`](../go.mod). Check yours with `go version`.
 - **A RESP client.** `redis-cli` is the easiest. Any RESP-capable TCP client works.
 
 Stash needs no database or package downloads and has no `go.sum`.

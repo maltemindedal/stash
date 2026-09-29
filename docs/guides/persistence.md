@@ -17,7 +17,7 @@ The AOF preserves all supported data types. RDB provides a fast string-only snap
 go run ./cmd/stash --port 6379 --aof appendonly.aof --appendfsync everysec
 ```
 
-Every successful mutating command is appended as a RESP frame. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace.
+Every successful mutating command is appended as a RESP frame. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace. If the file ends in a command that was only partly written, as after a crash in the middle of an append, Stash logs a warning, cuts the file back to the last complete command, and carries on, so commands appended afterwards are never mistaken for the rest of the torn one. Invalid data anywhere before the end of the file is different: see [Repairing a corrupt append-only file](#repairing-a-corrupt-append-only-file).
 
 ## Choose a fsync policy
 
@@ -36,7 +36,7 @@ The AOF grows without bound as commands accumulate. `BGREWRITEAOF` compacts it:
 Background append only file rewriting started
 ```
 
-The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite.
+The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite. A list, set, hash, or sorted set with more than 1,024 values is written as several commands, so the rewritten file stays loadable however large the collection grows.
 
 ## Understand the AOF/RDB precedence
 
@@ -63,7 +63,28 @@ go run ./cmd/stash --rdb /var/lib/stash/dump.rdb
 go run ./cmd/stash --dump ""
 ```
 
-Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
+Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A second signal during shutdown ends the process at once, so it writes no snapshot either. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
+
+## Repairing a corrupt append-only file
+
+An unfinished command at the very end of the file is normal after a crash and is cut off automatically. Invalid data with more file behind it is not: replaying only what precedes it would silently drop every later command, and new commands would be appended after the damage. Stash therefore refuses to start and leaves the file untouched:
+
+```
+server: load aof "appendonly.aof": aof: "appendonly.aof" is corrupt: the command after 1204 complete commands, starting at byte 88213, is not valid RESP: protocol: line missing CRLF terminator; the file was not modified, see "Repairing a corrupt append-only file" in docs/guides/persistence.md
+```
+
+The first `N` bytes (88213 here) are 1204 intact commands. To start again from them:
+
+```bash
+cp appendonly.aof appendonly.aof.damaged   # keep the original
+truncate -s 88213 appendonly.aof           # drop the damaged command and everything after it
+```
+
+That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server (or one loaded from `--rdb`).
+
+## Watching for write failures
+
+Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. `INFO persistence` reports `aof_last_write_status:err` from the first failed write or fsync until one succeeds again; see [Observability](observability.md).
 
 ## What TTLs do across a restart
 

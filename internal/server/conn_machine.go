@@ -62,12 +62,8 @@ type connEvent struct {
 // the connection closes.
 //
 // On a permanent protocol error the machine emits an ordered error reply and
-// then closes the connection. This intentionally diverges from the
-// goroutine-per-connection handler, which replies and keeps serving; closing
-// matches Redis, which terminates a connection after a protocol error because
-// the byte stream can no longer be resynchronized. The divergence is confined
-// to event-loop mode, which drives connections through this machine, and does
-// not affect the default networking path.
+// then closes the connection, as the goroutine-per-connection handler does and
+// as Redis does: the byte stream can no longer be resynchronized.
 //
 // A ConnMachine is not safe for concurrent use; a single driving loop must own
 // it. Cross-goroutine async deliveries continue to flow through ClientState,
@@ -78,12 +74,26 @@ type ConnMachine struct {
 	state          ConnMachineState
 	err            error
 	readBuf        []byte
+	decoder        protocol.Decoder
 	resumeAt       int
 	maxReadBuffer  int
 	maxWriteBuffer int
 	pending        []connEvent
 	writeBuf       []byte
 	writeOff       int
+
+	// requestLimits, when set, is asked before each frame is decoded what that
+	// frame may declare. decodePaused is set after a frame was decoded under
+	// limits, which hold further decoding back until that frame has run: the
+	// request may be the AUTH that lifts them.
+	requestLimits func() protocol.Limits
+	decodePaused  bool
+
+	// maxPushBuffer bounds pending output when an asynchronous push frame is
+	// added, which can be a tighter limit than maxWriteBuffer: a reply the client
+	// asked for can legitimately be as large as a stored value, but only a client
+	// that is not draining its socket lets pushes pile up.
+	maxPushBuffer int
 }
 
 // NewConnMachine constructs an active connection state machine bound to the
@@ -93,7 +103,15 @@ func NewConnMachine(client *ClientState) *ConnMachine {
 		client:         client,
 		maxReadBuffer:  defaultMaxReadBuffer,
 		maxWriteBuffer: defaultMaxWriteBuffer,
+		maxPushBuffer:  defaultMaxWriteBuffer,
 	}
+}
+
+// SetPushLimit changes how much output may be pending when an asynchronous push
+// frame is buffered (BufferEncoded). Replies to the client's own requests keep
+// the write-buffer limit.
+func (m *ConnMachine) SetPushLimit(limit int) {
+	m.maxPushBuffer = limit
 }
 
 // State returns the current lifecycle phase.
@@ -130,8 +148,9 @@ func (m *ConnMachine) PendingOutputBytes() int {
 // Feed appends readable bytes to the read buffer and parses every complete
 // RESP request they finish. Incomplete trailing frames stay buffered until
 // more bytes arrive; the machine defers re-decoding until the buffer reaches
-// the byte count the pending frame is known to need, so a frame arriving in
-// many small chunks is not rescanned on every append. A permanent protocol
+// the byte count the pending frame is known to need, and its decoder keeps its
+// place in the frame, so a frame arriving in many small chunks is not rescanned
+// on every append. A permanent protocol
 // error, including a frame exceeding the read-buffer limit, queues an ordered
 // RESP error reply and transitions the machine to the closing state, so callers
 // should check State after feeding.
@@ -141,13 +160,41 @@ func (m *ConnMachine) Feed(data []byte) error {
 	}
 
 	m.readBuf = append(m.readBuf, data...)
+	if m.decodePaused {
+		// The request decoded before these bytes has not run yet. Decoding
+		// resumes after it, under whatever limits apply then.
+		m.checkReadBufferLimit()
+		return nil
+	}
 	if m.resumeAt > 0 && len(m.readBuf) < m.resumeAt {
 		return nil
 	}
 
+	m.decodeBuffered()
+	return nil
+}
+
+// SetRequestLimits installs a function consulted before each frame is decoded.
+// It returns the limits that frame must respect, or the zero Limits for none.
+// The server uses it to hold a client that has not authenticated to small
+// frames.
+func (m *ConnMachine) SetRequestLimits(limits func() protocol.Limits) {
+	m.requestLimits = limits
+}
+
+// decodeBuffered parses every complete request at the front of the read buffer.
+// While limits apply it stops after one request, because that request may change
+// which limits apply to the next (see decodePaused).
+func (m *ConnMachine) decodeBuffered() {
 	consumed := 0
 	for {
-		value, n, err := protocol.Decode(m.readBuf[consumed:])
+		var limits protocol.Limits
+		if m.requestLimits != nil {
+			limits = m.requestLimits()
+		}
+		m.decoder.SetLimits(limits)
+
+		value, n, err := m.decoder.Decode(m.readBuf[consumed:])
 		if errors.Is(err, protocol.ErrIncomplete) {
 			m.resumeAt = 0
 			var incomplete *protocol.IncompleteError
@@ -158,19 +205,28 @@ func (m *ConnMachine) Feed(data []byte) error {
 		}
 		if err != nil {
 			m.enterProtocolError(err)
-			return nil
+			return
 		}
 
 		m.pending = append(m.pending, connEvent{request: value})
 		consumed += n
+		if limits != (protocol.Limits{}) {
+			m.decodePaused = true
+			break
+		}
 	}
 
-	m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+	if consumed > 0 {
+		m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+	}
 
+	m.checkReadBufferLimit()
+}
+
+func (m *ConnMachine) checkReadBufferLimit() {
 	if len(m.readBuf) > m.maxReadBuffer || m.resumeAt > m.maxReadBuffer {
 		m.enterProtocolError(fmt.Errorf("protocol: frame exceeds %d byte read-buffer limit", m.maxReadBuffer))
 	}
-	return nil
 }
 
 // enterProtocolError queues an ordered error reply, records the fatal cause,
@@ -180,7 +236,9 @@ func (m *ConnMachine) enterProtocolError(err error) {
 	m.err = err
 	m.state = ConnStateClosing
 	m.readBuf = nil
+	m.decoder.Reset()
 	m.resumeAt = 0
+	m.decodePaused = false
 }
 
 // ProcessPending executes parsed requests in arrival order through run and
@@ -236,6 +294,13 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 		return false, err
 	}
 
+	if m.decodePaused && len(m.pending) == 0 && m.state == ConnStateActive {
+		// The request that held decoding back has run; the bytes behind it are
+		// decoded now, under the limits that apply after it.
+		m.decodePaused = false
+		m.decodeBuffered()
+	}
+
 	return len(m.pending) > 0, nil
 }
 
@@ -284,8 +349,8 @@ func (m *ConnMachine) BufferEncoded(payload []byte) error {
 	if len(payload) == 0 {
 		return nil
 	}
-	if m.PendingOutputBytes()+len(payload) > m.maxWriteBuffer {
-		return fmt.Errorf("server: pending output exceeds %d byte write-buffer limit", m.maxWriteBuffer)
+	if limit := min(m.maxPushBuffer, m.maxWriteBuffer); m.PendingOutputBytes()+len(payload) > limit {
+		return fmt.Errorf("server: pending output exceeds %d byte limit for pushed frames", limit)
 	}
 
 	m.compactWriteBuf()
@@ -306,6 +371,7 @@ func (m *ConnMachine) Close(err error) {
 	m.state = ConnStateClosed
 	m.readBuf = nil
 	m.resumeAt = 0
+	m.decodePaused = false
 	m.pending = nil
 	m.writeBuf = nil
 	m.writeOff = 0

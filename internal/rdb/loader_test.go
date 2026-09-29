@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -329,4 +332,95 @@ func TestLoadReaderWithRealisticAbsoluteExpiry(t *testing.T) {
 		t.Fatalf("LoadedKeys = %d, want 1", stats.LoadedKeys)
 	}
 	assertStoredString(t, store, "ttl", "fresh")
+}
+
+// allocatedBy reports how many bytes fn allocated. It only counts allocations, so
+// the garbage collector cannot make a run look cheaper than it was.
+func allocatedBy(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestLoaderAllocatesInProportionToBytesPresent checks that a declared length
+// which is under the object cap but never backed by data does not reserve that
+// much memory: the loader also runs on the snapshot a replica receives from its
+// master, and on a file an operator points it at. The error type must not change
+// with it: a value with no bytes at all ends in io.EOF and a partial one in
+// io.ErrUnexpectedEOF, the way io.ReadFull reports them.
+func TestLoaderAllocatesInProportionToBytesPresent(t *testing.T) {
+	tests := []struct {
+		name    string
+		present int
+		wantErr error
+	}{
+		{name: "no value bytes", present: 0, wantErr: io.EOF},
+		{name: "exactly the first allocation", present: 1 << 20, wantErr: io.ErrUnexpectedEOF},
+		{name: "past the first allocation", present: 3 << 19, wantErr: io.ErrUnexpectedEOF},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var payload []byte
+			payload = append(payload, fileHeader...)
+			payload = append(payload, opcodeSelectDB)
+			payload = appendLength(payload, 0)
+			payload = append(payload, valueTypeString)
+			payload = appendString(payload, []byte("key"))
+			payload = appendLength(payload, 500*1024*1024) // under the cap
+			payload = append(payload, make([]byte, tt.present)...)
+
+			var err error
+			allocated := allocatedBy(func() {
+				_, err = LoadReader(bytes.NewReader(payload), storage.NewStore())
+			})
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("LoadReader() error = %v, want %v", err, tt.wantErr)
+			}
+			if allocated > 16<<20 {
+				t.Fatalf("loading a 500 MiB declared value with %d bytes present allocated %d MiB, want it tied to the bytes present", tt.present, allocated>>20)
+			}
+		})
+	}
+}
+
+func TestLoaderTrailerCheckDoesNotBufferTheRemainder(t *testing.T) {
+	// After the EOF opcode only an 8-byte checksum (or nothing) is valid. Junk
+	// there must be reported, with its length, without buffering all of it.
+	const junk = 16 << 20
+	payload := append(buildRDBPayload(), make([]byte, junk)...)
+
+	var err error
+	allocated := allocatedBy(func() {
+		_, err = LoadReader(bytes.NewReader(payload), storage.NewStore())
+	})
+	want := fmt.Sprintf("rdb: invalid trailing checksum length %d", 8+junk)
+	if err == nil || err.Error() != want {
+		t.Fatalf("LoadReader() error = %v, want %q", err, want)
+	}
+	if allocated > 8<<20 {
+		t.Fatalf("checking a %d MiB trailer allocated %d MiB, want a bounded amount", junk>>20, allocated>>20)
+	}
+}
+
+func TestLoadReaderStringsAcrossAllocationBoundaries(t *testing.T) {
+	// Values longer than the first allocation are read in growing steps; the sizes
+	// around each step must load byte for byte.
+	for _, size := range []int{rdbFirstAllocation - 1, rdbFirstAllocation, rdbFirstAllocation + 1, 3*rdbFirstAllocation + 7} {
+		value := make([]byte, size)
+		for i := range value {
+			value[i] = byte(i*31 + i>>8)
+		}
+
+		store := storage.NewStore()
+		if _, err := LoadReader(bytes.NewReader(buildRDBPayload(stringEntry(rawString([]byte("big")), rawString(value)))), store); err != nil {
+			t.Fatalf("size %d: LoadReader() error = %v", size, err)
+		}
+		got, ok, err := store.Get("big")
+		if err != nil || !ok || !bytes.Equal(got, value) {
+			t.Fatalf("size %d: Get(big) = (%d bytes, %v, %v), want the exact %d byte value", size, len(got), ok, err, size)
+		}
+	}
 }

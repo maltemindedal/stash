@@ -35,6 +35,10 @@ type commandSpec struct {
 	transactionControl bool
 	propagates         bool
 	durable            bool
+	// keys says which arguments are the keys the command writes, so that writes
+	// to different keys are not ordered against each other. Left unset, the
+	// command is ordered against every write.
+	keys keyShape
 	// rewriteFrame optionally replaces the verbatim command frame used for
 	// replication and AOF durability with a deterministic equivalent. It returns
 	// (frame, true) to substitute the frame, or (_, false) to keep the verbatim
@@ -52,6 +56,10 @@ type executionEffects struct {
 	// frame reuses that exact value instead of re-deriving it from a later
 	// clock. Zero means no expiry (keep the verbatim frame).
 	setExpiryMillis int64
+	// streamID is the ID the XADD handler stored the entry under, so the logged
+	// frame can carry it in place of an auto-ID request ("*"). Empty when the
+	// command did not add a stream entry.
+	streamID string
 }
 
 type executionEffectsContextKey struct{}
@@ -71,6 +79,7 @@ type Executor struct {
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
 	aofRewrite          func(context.Context) error
+	seq                 *sequencer
 }
 
 // NewExecutor constructs a command executor with the currently supported command set.
@@ -80,6 +89,7 @@ func NewExecutor(store *storage.Store, logger *slog.Logger) *Executor {
 		logger:         logger,
 		watchRegistry:  server.NewWatchRegistry(),
 		pubSubRegistry: server.NewPubSubRegistry(),
+		seq:            newSequencer(),
 	}
 	executor.commands = executor.commandSpecs()
 	return executor
@@ -315,6 +325,22 @@ func rewriteSetFrame(ctx context.Context, request *Request) (protocol.Array, boo
 	return protocol.Array{Elements: elements}, true
 }
 
+// rewriteXAddFrame replaces the ID argument of an XADD that asked for an
+// auto-generated ID with the one the handler stored. Replaying the verbatim
+// frame would generate a new ID from the clock at replay time, so entries came
+// back from the AOF under different IDs than the ones clients had been given.
+// An XADD with an explicit ID keeps its verbatim frame.
+func rewriteXAddFrame(ctx context.Context, request *Request) (protocol.Array, bool) {
+	effects := executionEffectsFromContext(ctx)
+	if effects == nil || effects.streamID == "" || effects.streamID == string(request.Args[1]) {
+		return protocol.Array{}, false
+	}
+
+	frame := propagationFrame(request)
+	frame.Elements[2] = protocol.TextBulkString{Value: effects.streamID}
+	return frame, true
+}
+
 func withExecutionEffects(ctx context.Context) (context.Context, *executionEffects) {
 	effects := &executionEffects{}
 	return context.WithValue(ctx, executionEffectsContextKey{}, effects), effects
@@ -433,6 +459,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates:   true,
 			durable:      true,
 			rewriteFrame: rewriteSetFrame,
+			keys:         keysFirstArg,
 		},
 		"GET": {
 			handler:  e.handleGet,
@@ -443,6 +470,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateSetBitRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"GETBIT": {
 			handler:  e.handleGetBit,
@@ -457,6 +485,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("PFADD", 1),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"PFCOUNT": {
 			handler:  e.handlePFCount,
@@ -467,24 +496,28 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("DEL", 1),
 			propagates: true,
 			durable:    true,
+			keys:       keysEveryArg,
 		},
 		"INCR": {
 			handler:    e.handleIncr,
 			validate:   exactArgsValidator("INCR", 1),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"LPUSH": {
 			handler:    e.handleLPush,
 			validate:   minArgsValidator("LPUSH", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"RPUSH": {
 			handler:    e.handleRPush,
 			validate:   minArgsValidator("RPUSH", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"LRANGE": {
 			handler:  e.handleLRange,
@@ -495,15 +528,17 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateLPopRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"RPOP": {
 			handler:    e.handleRPop,
 			validate:   validateRPopRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"BLPOP": {
-			handler:  e.handleBLPop,
+			detailed: e.handleBLPop,
 			validate: exactArgsValidator("BLPOP", 1),
 		},
 		"ZADD": {
@@ -511,6 +546,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateZAddRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"ZRANGE": {
 			handler:  e.handleZRange,
@@ -521,6 +557,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateGeoAddRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"GEODIST": {
 			handler:  e.handleGeoDist,
@@ -531,9 +568,11 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate: validateGeoRadiusRequest,
 		},
 		"XADD": {
-			handler:  e.handleXAdd,
-			validate: validateXAddRequest,
-			durable:  true,
+			handler:      e.handleXAdd,
+			validate:     validateXAddRequest,
+			durable:      true,
+			rewriteFrame: rewriteXAddFrame,
+			keys:         keysFirstArg,
 		},
 		"XREAD": {
 			handler:  e.handleXRead,
@@ -544,6 +583,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateHSetRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"HGET": {
 			handler:  e.handleHGet,
@@ -554,6 +594,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("HDEL", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"HGETALL": {
 			handler:  e.handleHGetAll,
@@ -564,6 +605,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("SADD", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"SISMEMBER": {
 			handler:  e.handleSIsMember,
@@ -574,6 +616,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("SREM", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"SMEMBERS": {
 			handler:  e.handleSMembers,
@@ -583,6 +626,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			handler:    e.handlePublish,
 			validate:   validatePublishRequest,
 			propagates: true,
+			keys:       keysFirstArg,
 		},
 		"REPLCONF": {
 			detailed: e.handleReplConf,
@@ -643,7 +687,6 @@ func (e *Executor) recordSlowCommand(ctx context.Context, request *Request, time
 		Command:   requestTokens(request),
 	}
 	if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
-		entry.ClientID = state.ID
 		entry.ClientAddr = state.RemoteAddress()
 	}
 	e.slowlogRegistry.Record(entry)
@@ -703,18 +746,18 @@ func exactArgsValidator(name string, count int) commandValidator {
 	}
 }
 
-func maxArgsValidator(name string, max int) commandValidator {
+func maxArgsValidator(name string, maxArgs int) commandValidator {
 	return func(request *Request) error {
-		if len(request.Args) > max {
+		if len(request.Args) > maxArgs {
 			return wrongNumberOfArgumentsError(name)
 		}
 		return nil
 	}
 }
 
-func minArgsValidator(name string, min int) commandValidator {
+func minArgsValidator(name string, minArgs int) commandValidator {
 	return func(request *Request) error {
-		if len(request.Args) < min {
+		if len(request.Args) < minArgs {
 			return wrongNumberOfArgumentsError(name)
 		}
 		return nil

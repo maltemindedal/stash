@@ -28,13 +28,19 @@ type Config struct {
 	MaxClients           int
 	SlowlogLogSlowerThan time.Duration
 	EventLoop            bool
+	// AllowOpenBind lets the server listen beyond loopback with no
+	// --requirepass; without it that combination is refused at startup.
+	AllowOpenBind bool
+	// AuthTimeout is how long a client may stay connected without authenticating
+	// on a server that requires a password; zero disables the limit.
+	AuthTimeout time.Duration
 }
 
 // Default returns the default runtime configuration. The listener binds to
 // loopback (127.0.0.1) so an out-of-the-box server with no --requirepass is not
 // reachable from the network. Set --host explicitly (e.g. 0.0.0.0 or "") to bind
-// other interfaces; do so together with --requirepass to avoid exposing an
-// unauthenticated datastore.
+// other interfaces; that requires --requirepass unless --allow-open-bind says an
+// unauthenticated datastore is intended.
 func Default() Config {
 	return Config{
 		Host:                 "127.0.0.1",
@@ -52,6 +58,7 @@ func Default() Config {
 		MaxClients:           10000,
 		SlowlogLogSlowerThan: 10 * time.Millisecond,
 		EventLoop:            false,
+		AuthTimeout:          30 * time.Second,
 	}
 }
 
@@ -83,6 +90,11 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	fs.StringVar(&cfg.ReplicaOf, "replicaof", cfg.ReplicaOf, "optional master address in host:port form for replica mode")
 	fs.StringVar(&cfg.MasterAuth, "masterauth", cfg.MasterAuth, "optional password used by replica mode to AUTH against a protected master")
 	fs.StringVar(&cfg.RequirePass, "requirepass", cfg.RequirePass, "optional password required for AUTH-protected client commands")
+	var requirePassFile, masterAuthFile string
+	fs.StringVar(&requirePassFile, "requirepass-file", "", "read the --requirepass password from this file instead of the command line, where it would be visible in the process list")
+	fs.StringVar(&masterAuthFile, "masterauth-file", "", "read the --masterauth password from this file instead of the command line")
+	fs.DurationVar(&cfg.AuthTimeout, "auth-timeout", cfg.AuthTimeout, "how long a client may stay connected without authenticating when --requirepass is set; 0 disables the limit")
+	fs.BoolVar(&cfg.AllowOpenBind, "allow-open-bind", cfg.AllowOpenBind, "allow listening on a non-loopback address with no --requirepass; without this flag the server refuses to start in that configuration")
 	fs.BoolVar(&cfg.EventLoop, "event-loop", cfg.EventLoop, "serve clients through an OS I/O multiplexing event loop; supported on Linux (epoll) and macOS (kqueue), other platforms fall back to one goroutine per connection")
 	fs.Func("slowlog-log-slower-than", "slow query threshold in microseconds; 0 logs all commands and negative disables slowlog", func(value string) error {
 		threshold, err := parseSlowlogThreshold(value)
@@ -106,8 +118,17 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	if err := readPasswordFile(&cfg.RequirePass, requirePassFile, "requirepass"); err != nil {
+		return Config{}, err
+	}
+	if err := readPasswordFile(&cfg.MasterAuth, masterAuthFile, "masterauth"); err != nil {
+		return Config{}, err
+	}
 	if cfg.MaxMemory < 0 {
 		return Config{}, fmt.Errorf("invalid maxmemory %d: expected non-negative bytes", cfg.MaxMemory)
+	}
+	if cfg.AuthTimeout < 0 {
+		return Config{}, fmt.Errorf("invalid auth-timeout %v: expected a non-negative duration", cfg.AuthTimeout)
 	}
 	if cfg.MaxClients < 0 {
 		return Config{}, fmt.Errorf("invalid maxclients %d: expected a non-negative count", cfg.MaxClients)
@@ -120,13 +141,41 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	return cfg, nil
 }
 
-// Address formats the listen address used by net.Listen.
-func (c Config) Address() string {
-	if c.Host == "" {
-		return fmt.Sprintf(":%d", c.Port)
+// readPasswordFile sets *password from path, when one is given. A password on the
+// command line is visible to every local user in the process list; a file is not.
+// The line ending that echo or an editor adds is dropped. An empty password would
+// mean "no authentication", so an empty file is an error rather than a silent
+// downgrade, and giving both the flag and the file is refused as ambiguous.
+func readPasswordFile(password *string, path string, name string) error {
+	if path == "" {
+		return nil
+	}
+	if *password != "" {
+		return fmt.Errorf("--%s and --%s-file are mutually exclusive", name, name)
 	}
 
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read --%s-file: %w", name, err)
+	}
+	value := strings.TrimRight(string(data), "\r\n")
+	if value == "" {
+		return fmt.Errorf("--%s-file %q is empty", name, path)
+	}
+
+	*password = value
+	return nil
+}
+
+// Address formats the listen address used by net.Listen. An IPv6 literal may be
+// given bare (::1) or in brackets ([::1]); both produce the bracketed form.
+func (c Config) Address() string {
+	host := c.Host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+
+	return net.JoinHostPort(host, strconv.Itoa(c.Port))
 }
 
 // IsReplica reports whether the server should connect to an upstream master.

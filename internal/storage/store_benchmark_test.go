@@ -197,3 +197,95 @@ func BenchmarkStore(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkStoreMaxMemory(b *testing.B) {
+	value := []byte("value-of-about-thirty-two-bytes!")
+
+	// New keys into a store that already holds n keys, with plenty of headroom.
+	for _, n := range []int{1_000, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("Insert new key with %d keys", n), func(b *testing.B) {
+			store := NewStore()
+			for i := 0; i < n; i++ {
+				if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+			store.ConfigureMaxMemory(1<<40, 16) // after seeding: with accounting on, each seed write is O(keys)
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				if _, err := store.Set(fmt.Sprintf("new-%d", i), value, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+
+	// Overwrite one key with a value of the same size.
+	b.Run("Overwrite with 10000 keys", func(b *testing.B) {
+		store := NewStore()
+		for i := 0; i < 10_000; i++ {
+			if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+		store.ConfigureMaxMemory(1<<40, 16)
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if _, err := store.Set("seed-1", value, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	// At the limit, every new key evicts an old one.
+	for _, n := range []int{1_000, 10_000} {
+		b.Run(fmt.Sprintf("Insert at the limit with %d keys", n), func(b *testing.B) {
+			store := NewStore()
+			for i := 0; i < n; i++ {
+				if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+			store.ConfigureMaxMemory(1<<40, 16)
+			store.ConfigureMaxMemory(store.UsedMemory(), 16)
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				if _, err := store.Set(fmt.Sprintf("new-%d", i), value, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkStoreSnapshotAll(b *testing.B) {
+	value := []byte("value-of-about-thirty-two-bytes!")
+
+	// The 1,024-key case is BenchmarkStore's; this one is large enough for the
+	// value arena to grow many times.
+	for _, n := range []int{100_000} {
+		b.Run(fmt.Sprintf("%d strings", n), func(b *testing.B) {
+			store := NewStore()
+			for i := 0; i < n; i++ {
+				if _, err := store.Set(fmt.Sprintf("key-%d", i), value, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				entries, _ := store.SnapshotAll()
+				if len(entries) != n {
+					b.Fatalf("snapshot has %d entries, want %d", len(entries), n)
+				}
+			}
+		})
+	}
+}

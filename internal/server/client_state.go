@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -24,7 +25,11 @@ type ClientState struct {
 	ID         uint64
 	RemoteAddr string
 
-	mu         sync.RWMutex
+	mu sync.RWMutex
+	// responseMu guards responseWriter and writerClosed and is held across each
+	// whole-frame write, which blocks for as long as the peer does not read.
+	// responseConn is guarded by mu instead, so Disconnect can close it to end a
+	// write that holds responseMu.
 	responseMu sync.Mutex
 
 	watchRegistry *WatchRegistry
@@ -125,8 +130,8 @@ func (s *ClientState) BindResponseWriter(writer *bufio.Writer) {
 // BindResponseConn records the underlying connection used by the response
 // writer when one is available.
 func (s *ClientState) BindResponseConn(conn net.Conn) {
-	s.responseMu.Lock()
-	defer s.responseMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.responseConn = conn
 }
@@ -151,10 +156,19 @@ func (s *ClientState) Disconnect() {
 		return
 	}
 
+	// A reply flush stuck on a peer that stopped reading holds responseMu until
+	// the connection closes, so close it before waiting for the lock.
+	s.mu.Lock()
+	conn := s.responseConn
+	s.responseConn = nil
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+
 	s.responseMu.Lock()
 	s.writerClosed = true
 	s.responseWriter = nil
-	s.responseConn = nil
 	s.responseMu.Unlock()
 
 	s.ResetTransaction()
@@ -195,9 +209,96 @@ func (s *ClientState) IsAuthenticated() bool {
 	return s.Authenticated
 }
 
-// WriteResponses writes RESP values to the bound client writer without allowing
-// interleaving with other goroutines writing to the same connection.
+// WriteResponses writes RESP values to the bound client writer and flushes them,
+// without allowing interleaving with other goroutines writing to the same
+// connection.
 func (s *ClientState) WriteResponses(values []protocol.Value) error {
+	return s.writeResponses(values, true)
+}
+
+// QueueResponses writes RESP values to the bound client writer without flushing
+// them, so replies to a client that pipelines its requests leave in one write.
+// They are sent by the next flush: FlushResponses, a push to the client, or a
+// full buffer. The connection handler flushes just before it waits for more
+// input.
+func (s *ClientState) QueueResponses(values []protocol.Value) error {
+	return s.writeResponses(values, false)
+}
+
+// FlushResponses sends whatever has been queued for the client, waiting for any
+// other writer to finish first. Having nothing to send is success, including when
+// the client is already disconnected.
+func (s *ClientState) FlushResponses() error {
+	if s == nil {
+		return nil
+	}
+
+	s.responseMu.Lock()
+	defer s.responseMu.Unlock()
+
+	return s.flushLocked()
+}
+
+// TryFlushResponses is FlushResponses, except that it does nothing when another
+// goroutine is writing to the client at that moment. That writer (a push, replica
+// propagation) flushes the shared buffer itself, queued replies included, so
+// nothing is lost by not waiting; and waiting could park the connection handler
+// behind a peer that has stopped reading, so that it stops reading that peer's
+// own requests, which for a replica means its acknowledgements.
+func (s *ClientState) TryFlushResponses() error {
+	if s == nil || !s.responseMu.TryLock() {
+		return nil
+	}
+	defer s.responseMu.Unlock()
+
+	return s.flushLocked()
+}
+
+func (s *ClientState) flushLocked() error {
+	if s.writerClosed || s.responseWriter == nil {
+		return nil
+	}
+	return s.responseWriter.Flush()
+}
+
+// FlushClientResponses flushes the replies queued for the client that ctx belongs
+// to, without waiting for other writers (see TryFlushResponses). A command that is
+// about to block the connection calls it first, so replies to the requests before
+// it are not held back behind it.
+func FlushClientResponses(ctx context.Context) error {
+	state, ok := ClientStateFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return state.TryFlushResponses()
+}
+
+// ErrClientDisconnected reports that a command was waiting for something and
+// the client went away while it waited.
+var ErrClientDisconnected = errors.New("server: client disconnected")
+
+// ClientDisconnected reports whether the client behind ctx has closed its side of
+// the connection, without reading from it. A command that blocks for a long time
+// polls it, so it can stop waiting for a client that is not there. It is false
+// when there is no connection to look at (the event loop, an unsupported
+// platform, a context with no client) and while the client has sent requests the
+// server has not yet read.
+func ClientDisconnected(ctx context.Context) bool {
+	state, ok := ClientStateFromContext(ctx)
+	if !ok || state == nil {
+		return false
+	}
+
+	state.mu.RLock()
+	conn := state.responseConn
+	state.mu.RUnlock()
+	if conn == nil {
+		return false
+	}
+	return peerClosed(conn)
+}
+
+func (s *ClientState) writeResponses(values []protocol.Value, flush bool) error {
 	var payload []byte
 	if len(values) > 1 {
 		var err error
@@ -218,11 +319,12 @@ func (s *ClientState) WriteResponses(values []protocol.Value) error {
 		if err := protocol.WriteValue(s.responseWriter, values[0]); err != nil {
 			return err
 		}
-		return s.responseWriter.Flush()
+	} else if _, err := s.responseWriter.Write(payload); err != nil {
+		return err
 	}
 
-	if _, err := s.responseWriter.Write(payload); err != nil {
-		return err
+	if !flush {
+		return nil
 	}
 	return s.responseWriter.Flush()
 }
@@ -245,17 +347,25 @@ func (s *ClientState) WriteEncoded(payload []byte) error {
 }
 
 // WriteEncodedWithDeadline writes a pre-encoded RESP payload with a temporary
-// write deadline when the underlying connection is known.
+// write deadline when the underlying connection is known. Waiting for the
+// connection's writer counts against the same timeout, so a client whose own
+// reply is stuck cannot hold up the goroutine pushing to it.
 func (s *ClientState) WriteEncodedWithDeadline(payload []byte, timeout time.Duration) error {
-	s.responseMu.Lock()
+	if !s.lockResponses(timeout) {
+		return fmt.Errorf("client response writer busy for %v", timeout)
+	}
 	defer s.responseMu.Unlock()
 
 	if s.writerClosed || s.responseWriter == nil {
 		return fmt.Errorf("client response writer unavailable")
 	}
+	s.mu.RLock()
+	conn := s.responseConn
+	s.mu.RUnlock()
+
 	deadlineSet := false
-	if s.responseConn != nil && timeout > 0 {
-		if err := s.responseConn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	if conn != nil && timeout > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 			return err
 		}
 		deadlineSet = true
@@ -265,12 +375,37 @@ func (s *ClientState) WriteEncodedWithDeadline(payload []byte, timeout time.Dura
 		writeErr = s.responseWriter.Flush()
 	}
 	if deadlineSet {
-		if clearErr := s.responseConn.SetWriteDeadline(time.Time{}); writeErr == nil {
+		if clearErr := conn.SetWriteDeadline(time.Time{}); writeErr == nil {
 			writeErr = clearErr
 		}
 	}
 
 	return writeErr
+}
+
+// lockResponses takes responseMu and reports whether it got it within timeout.
+// A client whose own reply flush is blocked on a peer that stopped reading holds
+// responseMu for as long as that peer stays silent, so waiting for it without a
+// bound would let one such client stall everything that pushes to it (PUBLISH
+// and MONITOR fan-out run on other clients' request paths). A non-positive
+// timeout waits as long as it takes.
+func (s *ClientState) lockResponses(timeout time.Duration) bool {
+	if timeout <= 0 {
+		s.responseMu.Lock()
+		return true
+	}
+	if s.responseMu.TryLock() {
+		return true
+	}
+
+	deadline := time.Now().Add(timeout)
+	for wait := 50 * time.Microsecond; time.Now().Before(deadline); wait = min(2*wait, 5*time.Millisecond) {
+		time.Sleep(wait)
+		if s.responseMu.TryLock() {
+			return true
+		}
+	}
+	return false
 }
 
 // SetReplicaListeningPort records the port announced during REPLCONF listening-port.

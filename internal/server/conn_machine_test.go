@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 )
@@ -499,5 +500,243 @@ func TestConnMachineWriteBufferLimitRejectsOversizedPushFrames(t *testing.T) {
 	}
 	if machine.State() == ConnStateClosed {
 		t.Fatal("State() = ConnStateClosed, want machine left open for the caller to close")
+	}
+}
+
+// feedInChunks feeds data to the machine in chunk-sized pieces, the way socket
+// reads deliver a large pipelined request, and stops early once the machine
+// leaves the active state.
+func feedInChunks(t *testing.T, machine *ConnMachine, data []byte, chunk int) {
+	t.Helper()
+
+	for len(data) > 0 && machine.State() == ConnStateActive {
+		n := min(chunk, len(data))
+		if err := machine.Feed(data[:n]); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		data = data[n:]
+	}
+}
+
+func TestConnMachineFeedIsLinearInArrayFrameSize(t *testing.T) {
+	// One RPUSH-shaped request with hundreds of thousands of small arguments
+	// arrives across many reads. Re-decoding the whole prefix on every read made
+	// this cost seconds of event-loop CPU for a few megabytes of input; each byte
+	// must be examined once. Absolute times depend on the machine and on the race
+	// detector, so the test compares a frame with one four times its size: linear
+	// work takes about four times as long, quadratic work about sixteen times.
+	feed := func(args int) (time.Duration, int) {
+		var frame bytes.Buffer
+		fmt.Fprintf(&frame, "*%d\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n", args+2)
+		for i := 0; i < args; i++ {
+			frame.WriteString("$1\r\nx\r\n")
+		}
+
+		best := time.Duration(1<<63 - 1)
+		for run := 0; run < 3; run++ {
+			machine := NewConnMachine(nil)
+			start := time.Now()
+			feedInChunks(t, machine, frame.Bytes(), 64*1024)
+			if elapsed := time.Since(start); elapsed < best {
+				best = elapsed
+			}
+			if machine.State() != ConnStateActive || machine.PendingRequests() != 1 {
+				t.Fatalf("state = %d, pending = %d, want active with 1 request (err = %v)", machine.State(), machine.PendingRequests(), machine.Err())
+			}
+		}
+		return best, frame.Len()
+	}
+
+	small, _ := feed(100_000)
+	large, size := feed(400_000)
+
+	if ratio := float64(large) / float64(small); ratio > 9 {
+		t.Fatalf("feeding a %d byte array frame took %v, %.1fx the time of a frame a quarter of the size (%v): want roughly 4x (linear), not 16x (quadratic)", size, large, ratio, small)
+	}
+}
+
+func TestConnMachineFeedRejectsUnboundedHeaderLines(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "line that never terminates", frame: append([]byte("+"), bytes.Repeat([]byte("A"), 1<<20)...)},
+		{name: "array length beyond the element limit", frame: []byte("*2000000\r\n")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			machine := NewConnMachine(nil)
+			start := time.Now()
+			feedInChunks(t, machine, tt.frame, 64*1024)
+
+			if machine.State() != ConnStateClosing || machine.Err() == nil {
+				t.Fatalf("State() = %d, Err() = %v, want a protocol error and the closing state", machine.State(), machine.Err())
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("rejecting the frame took %v, want it to be immediate", elapsed)
+			}
+		})
+	}
+}
+
+func machineFrame(args ...string) []byte {
+	var frame bytes.Buffer
+	fmt.Fprintf(&frame, "*%d\r\n", len(args))
+	for _, arg := range args {
+		fmt.Fprintf(&frame, "$%d\r\n%s\r\n", len(arg), arg)
+	}
+	return frame.Bytes()
+}
+
+func commandNames(requests []protocol.Value) []string {
+	names := make([]string, 0, len(requests))
+	for _, request := range requests {
+		array, ok := request.(protocol.Array)
+		if !ok || len(array.Elements) == 0 {
+			names = append(names, "?")
+			continue
+		}
+		bulk, _ := array.Elements[0].(protocol.BulkString)
+		names = append(names, string(bulk.Data))
+	}
+	return names
+}
+
+func TestConnMachineDecodesOneRequestAtATimeWhileLimitsApply(t *testing.T) {
+	// Requests behind an AUTH must be decoded under the limits that hold after the
+	// AUTH has run, not the ones that held when they arrived. So while limits
+	// apply the machine decodes one request, waits for it to run, and decodes the
+	// next.
+	limited := true
+	newMachine := func() *ConnMachine {
+		limited = true
+		machine := NewConnMachine(nil)
+		machine.SetRequestLimits(func() protocol.Limits {
+			if limited {
+				return protocol.UnauthenticatedLimits
+			}
+			return protocol.Limits{}
+		})
+		return machine
+	}
+	bigValue := string(bytes.Repeat([]byte("v"), 100*1024))
+
+	t.Run("a large request behind a successful AUTH is decoded under the lifted limits", func(t *testing.T) {
+		machine := newMachine()
+		var executed []protocol.Value
+		run := func(_ context.Context, request protocol.Value) ([]protocol.Value, error) {
+			executed = append(executed, request)
+			if names := commandNames(executed); names[len(names)-1] == "AUTH" {
+				limited = false // the AUTH succeeded
+			}
+			return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+		}
+
+		input := append(append(machineFrame("AUTH", "secret"), machineFrame("SET", "key", bigValue)...), machineFrame("PING")...)
+		if err := machine.Feed(input); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if got := machine.PendingRequests(); got != 1 {
+			t.Fatalf("PendingRequests() after Feed = %d, want only the AUTH decoded", got)
+		}
+
+		if err := machine.ProcessPending(context.Background(), run); err != nil {
+			t.Fatalf("ProcessPending() error = %v", err)
+		}
+		if got := fmt.Sprint(commandNames(executed)); got != "[AUTH SET PING]" {
+			t.Fatalf("executed = %s, want [AUTH SET PING]", got)
+		}
+		if machine.State() != ConnStateActive {
+			t.Fatalf("State() = %d, want active (err = %v)", machine.State(), machine.Err())
+		}
+	})
+
+	t.Run("bytes that arrive while the request is waiting are kept for later", func(t *testing.T) {
+		machine := newMachine()
+		run, executed := echoRunner(t)
+
+		if err := machine.Feed(machineFrame("PING")); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		// The PING has not run yet, so nothing more is decoded, but the bytes stay.
+		if err := machine.Feed(machineFrame("PING")); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if got := machine.PendingRequests(); got != 1 {
+			t.Fatalf("PendingRequests() = %d, want 1 while limits apply", got)
+		}
+		if err := machine.ProcessPending(context.Background(), run); err != nil {
+			t.Fatalf("ProcessPending() error = %v", err)
+		}
+		if len(*executed) != 2 {
+			t.Fatalf("executed %d requests, want both PINGs", len(*executed))
+		}
+	})
+
+	t.Run("a large request behind a failed AUTH is refused when it is reached", func(t *testing.T) {
+		machine := newMachine()
+		run, executed := echoRunner(t) // the AUTH does not lift the limits
+
+		input := append(machineFrame("AUTH", "wrong"), machineFrame("SET", "key", bigValue)...)
+		if err := machine.Feed(input); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if err := machine.ProcessPending(context.Background(), run); err != nil {
+			t.Fatalf("ProcessPending() error = %v", err)
+		}
+		if len(*executed) != 1 {
+			t.Fatalf("executed %d requests, want only the AUTH", len(*executed))
+		}
+		if machine.State() != ConnStateClosing {
+			t.Fatalf("State() = %d, want closing after the oversized request", machine.State())
+		}
+		out := string(flushAll(t, machine))
+		if want := "+OK\r\n-ERR protocol: parse array element 2: protocol: bulk string length 102400 exceeds 16384 byte limit for a client that has not authenticated\r\n"; out != want {
+			t.Fatalf("output = %q, want %q", out, want)
+		}
+	})
+
+	t.Run("without limits every complete request is decoded at once", func(t *testing.T) {
+		machine := NewConnMachine(nil)
+		machine.SetRequestLimits(func() protocol.Limits { return protocol.Limits{} })
+
+		input := append(append(machineFrame("PING"), machineFrame("PING")...), machineFrame("PING")...)
+		if err := machine.Feed(input); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if got := machine.PendingRequests(); got != 3 {
+			t.Fatalf("PendingRequests() = %d, want 3", got)
+		}
+	})
+}
+
+func TestConnMachinePushLimitDoesNotApplyToReplies(t *testing.T) {
+	// A reply can be as large as a stored value; only pushed frames are held to
+	// the tighter limit.
+	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
+		return []protocol.Value{protocol.BulkString{Data: bytes.Repeat([]byte("x"), 1024)}}, nil
+	}
+	machine := NewConnMachine(nil)
+	machine.SetPushLimit(64)
+
+	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v, want a reply above the push limit accepted", err)
+	}
+	if got := machine.PendingOutputBytes(); got <= 64 {
+		t.Fatalf("PendingOutputBytes() = %d, want the 1 KiB reply buffered", got)
+	}
+
+	if err := machine.BufferEncoded([]byte("+push\r\n")); err == nil {
+		t.Fatal("BufferEncoded() error = nil, want a push refused while output above the push limit is pending")
+	}
+
+	// Once the reply has drained, a small push fits again.
+	flushAll(t, machine)
+	if err := machine.BufferEncoded([]byte("+push\r\n")); err != nil {
+		t.Fatalf("BufferEncoded() after draining error = %v", err)
 	}
 }

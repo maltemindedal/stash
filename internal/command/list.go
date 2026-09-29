@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/server"
@@ -58,30 +59,61 @@ func (e *Executor) handleLRange(_ context.Context, request *Request) (protocol.V
 	return listResponse(values), nil
 }
 
-func (e *Executor) handleBLPop(ctx context.Context, request *Request) (protocol.Value, error) {
+func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.ExecuteResult, error) {
 	if len(request.Args) != 1 {
-		return nil, wrongNumberOfArgumentsError("BLPOP")
+		return server.ExecuteResult{}, wrongNumberOfArgumentsError("BLPOP")
 	}
 
 	key := string(request.Args[0])
+	// Inside a transaction EXEC holds the sequencer exclusively, so nothing could
+	// push and wake this command: it answers from what is there, as in Redis.
+	inTransaction := inTransactionExecution(ctx)
+
+	// While it waits, the command checks now and then that its client is still
+	// there. Otherwise the next push would wake it, it would pop the element, and
+	// the reply would go to a connection nobody is reading.
+	clientCheck := time.NewTicker(blockedClientCheckInterval)
+	defer clientCheck.Stop()
 	for {
 		waiter := e.store.SubscribeListPush(key)
 
+		// The pop is a write: it is ordered with the others, and stays so until
+		// the caller has logged it (result.Release). Waiting is done with nothing
+		// held, or a transaction could never start.
+		release := e.beginWrite(ctx, keysFirstArg, request.Args)
 		value, ok, err := e.store.LeftPop(key)
 		if err != nil {
+			release()
 			e.store.UnsubscribeListPush(key, waiter)
 			if errors.Is(err, storage.ErrWrongType) {
-				return nil, ErrWrongTypeError()
+				return server.ExecuteResult{}, ErrWrongTypeError()
 			}
-			return nil, err
+			return server.ExecuteResult{}, err
 		}
 		if ok {
 			e.store.UnsubscribeListPush(key, waiter)
 			e.touchWatchKeys(key)
-			return protocol.Array{Elements: []protocol.Value{
+			result := server.SingleResponse(protocol.Array{Elements: []protocol.Value{
 				protocol.BulkString{Data: clone(request.Args[0])},
 				protocol.BulkString{Data: value},
-			}}, nil
+			}})
+			if !inTransaction {
+				result.Release = release
+			}
+			// The pop is a write like LPOP: log and replicate it as one, or a
+			// restart, or a replica, would still have the element.
+			frame := propagationFrame(&Request{Name: "LPOP", Args: [][]byte{clone(request.Args[0])}})
+			result.Durability = []protocol.Value{frame}
+			if !server.IsReplicationOrigin(ctx) {
+				result.Propagation = []protocol.Value{frame}
+			}
+			return result, nil
+		}
+		release()
+
+		if inTransaction {
+			e.store.UnsubscribeListPush(key, waiter)
+			return server.SingleResponse(protocol.Array{Null: true}), nil
 		}
 
 		// On the event loop, blocking would deadlock the whole server: the
@@ -89,18 +121,36 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (protocol.
 		// this command is blocking.
 		if server.IsInlineExecution(ctx) {
 			e.store.UnsubscribeListPush(key, waiter)
-			return nil, blockingNotSupportedError("BLPOP")
+			return server.ExecuteResult{}, blockingNotSupportedError("BLPOP")
 		}
 
-		select {
-		case <-waiter:
+		// Replies to the requests pipelined ahead of this one must not wait behind it.
+		if err := server.FlushClientResponses(ctx); err != nil {
 			e.store.UnsubscribeListPush(key, waiter)
-		case <-ctx.Done():
-			e.store.UnsubscribeListPush(key, waiter)
-			return nil, ctx.Err()
+			return server.ExecuteResult{}, err
 		}
+
+		for waiting := true; waiting; {
+			select {
+			case <-waiter:
+				waiting = false
+			case <-clientCheck.C:
+				if server.ClientDisconnected(ctx) {
+					e.store.UnsubscribeListPush(key, waiter)
+					return server.ExecuteResult{}, server.ErrClientDisconnected
+				}
+			case <-ctx.Done():
+				e.store.UnsubscribeListPush(key, waiter)
+				return server.ExecuteResult{}, ctx.Err()
+			}
+		}
+		e.store.UnsubscribeListPush(key, waiter)
 	}
 }
+
+// blockedClientCheckInterval is how often a blocked BLPOP checks that its client
+// is still connected.
+const blockedClientCheckInterval = 100 * time.Millisecond
 
 func (e *Executor) handleLPop(_ context.Context, request *Request) (protocol.Value, error) {
 	return e.popList(request, "LPOP", true)

@@ -21,7 +21,7 @@ The `commandSpecs` table in [`internal/command/types.go`](../../internal/command
 
 `PING` accepts at most one payload and returns it as a bulk string. Unauthenticated clients on a password-protected server may still use `PING`.
 
-`SLOWLOG` redacts `AUTH` arguments before storing command metadata.
+`SLOWLOG` redacts `AUTH` arguments and truncates long commands (32 tokens of 128 bytes each) before storing command metadata.
 
 ## Strings
 
@@ -32,7 +32,7 @@ The `commandSpecs` table in [`internal/command/types.go`](../../internal/command
 | `DEL <key> [key ...]` | yes | yes |
 | `INCR <key>` | yes | yes |
 
-- Expiration takes exactly one option/value pair or none. The value must be a positive integer; `0` and negatives return an invalid-expire-time error, and an unrecognized option returns a syntax error.
+- Expiration takes exactly one option/value pair or none. The value must be a positive integer; `0` and negatives return an invalid-expire-time error, as does an `EX` or `PX` whose deadline does not fit in a 64-bit Unix-millisecond timestamp, and an unrecognized option returns a syntax error.
 - Relative `EX`/`PX` expirations are rewritten to an absolute `PXAT` frame before replication and AOF logging, so replicas and AOF replay anchor the TTL to the master's clock instead of restarting it.
 - `GET` on a missing key returns a null bulk string.
 - `DEL` ignores missing keys and returns the number of keys removed.
@@ -77,10 +77,10 @@ Registers are a fixed-size approximate cardinality structure stored as a string 
 | `LPOP <key> [count]` | yes | yes |
 | `RPOP <key> [count]` | yes | yes |
 | `LRANGE <key> <start> <stop>` | – | – |
-| `BLPOP <key>` | – | – |
+| `BLPOP <key>` | yes (as `LPOP`) | yes (as `LPOP`) |
 
 - `LPOP`/`RPOP` accept an optional count, which must be non-negative; a negative count returns `ERR value is out of range, must be positive`.
-- `BLPOP` takes a key and **no timeout argument**. Redis requires the timeout. In `--event-loop` mode, a `BLPOP` that must block returns an error rather than waiting.
+- `BLPOP` takes a key and **no timeout argument**. Redis requires the timeout. In `--event-loop` mode, a `BLPOP` that must block returns an error rather than waiting. While a `BLPOP` waits, the server checks every 100 ms that the client is still connected (on Linux, macOS and FreeBSD) and drops it if the client has closed or half-closed its side, so an element pushed later is not consumed on behalf of a client that is gone. A client that half-closes its sending side right after sending `BLPOP` and still expects the reply no longer gets it; keep the connection open until the reply arrives, as Redis requires.
 
 ## Sets
 
@@ -119,7 +119,7 @@ Positions are stored as 52-bit interleaved geohash scores in a regular sorted se
 | `XADD <key> <id\|*> <field> <value> [field value ...]` | – | yes |
 | `XREAD STREAMS <key> <id>` | – | – |
 
-`XADD` is written to the AOF but not forwarded to replicas. `XREAD` supports exactly one key and one ID, and requires the literal `STREAMS` keyword first; `BLOCK` and `COUNT` are not supported.
+`XADD` is written to the AOF but not forwarded to replicas. An auto-generated ID (`*`) is written to the AOF as the ID that was generated, so entries keep the IDs clients were given across a restart. `XREAD` supports exactly one key and one ID, and requires the literal `STREAMS` keyword first; `BLOCK` and `COUNT` are not supported.
 
 ## Transactions
 
@@ -131,6 +131,8 @@ Positions are stored as 52-bit interleaved geohash scores in a regular sorted se
 | `WATCH <key> [key ...]` | – | – |
 
 Queued commands propagate and persist individually when `EXEC` runs them. `WATCH` provides optimistic invalidation. If a watched key changes before `EXEC`, the transaction aborts.
+
+`EXEC` runs alone: no other client's command executes while it does, so a watched key cannot change between `EXEC`'s check and its queued commands, and no other client can observe the transaction half way through. Because of that, a blocking command queued in a transaction does not wait: `BLPOP` on an empty list returns a null array, and `WAIT` returns the number of replicas that have acknowledged so far, as in Redis.
 
 ## Pub/sub
 
@@ -152,7 +154,7 @@ Subscriptions match exact channel names; there is no pattern subscription (`PSUB
 | `PSYNC ? -1` | – | – |
 | `WAIT <numreplicas> <timeout>` | – | – |
 
-`REPLCONF` supports the `LISTENING-PORT`, `GETACK`, and `ACK` subcommands. `WAIT` takes a replica count and a timeout in milliseconds, both non-negative; a timeout of `0` returns the current acknowledgement count immediately. On a password-protected master, replicas must authenticate before `REPLCONF` or `PSYNC`.
+`REPLCONF` supports the `LISTENING-PORT`, `GETACK`, and `ACK` subcommands. `WAIT` takes a replica count and a timeout in milliseconds, both non-negative; a timeout of `0` returns the current acknowledgement count immediately, and a timeout longer than about 292 years (the most a duration can hold) waits as long as that. On a password-protected master, replicas must authenticate before `REPLCONF` or `PSYNC`.
 
 See [Setting up replication](../guides/replication.md).
 
@@ -161,7 +163,7 @@ See [Setting up replication](../guides/replication.md).
 | Command | Replicated | Durable |
 | --- | --- | --- |
 | `BGREWRITEAOF` | – | – |
-| `INFO [default\|all\|memory\|replication\|clients]` | – | – |
+| `INFO [default\|all\|memory\|replication\|clients\|persistence]` | – | – |
 | `SLOWLOG GET [count]` | – | – |
 | `SLOWLOG LEN` | – | – |
 | `SLOWLOG RESET` | – | – |

@@ -22,6 +22,24 @@ type executor interface {
 	ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error)
 }
 
+// sequencedExecutor is an executor that can order requests against one another.
+// Its results carry a Release function that the caller calls once it has applied
+// the result's durability and propagation frames.
+type sequencedExecutor interface {
+	ExecuteSequenced(context.Context, protocol.Value) (ExecuteResult, error)
+}
+
+type writeOrderingSetter interface {
+	SetWriteOrdering(func() bool)
+}
+
+// backgroundWriteSequencer orders work the server does on its own (the expiry
+// sweep, the snapshot of an AOF rewrite) against client requests. The returned
+// function is called when that work's frames have been applied.
+type backgroundWriteSequencer interface {
+	BeginBackgroundWrite() (release func())
+}
+
 type watchRegistryProvider interface {
 	WatchRegistry() *WatchRegistry
 }
@@ -106,9 +124,13 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 		replication:     newReplicationState(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
+	srv.replicaPeers.SetFeedErrorHandler(srv.dropReplica)
 	if store != nil {
 		store.SetLogger(logger)
 		store.SetExpirationListener(srv.recordExpiredKeys)
+		if sequencer, ok := executor.(backgroundWriteSequencer); ok {
+			store.SetEvictionGuard(sequencer.BeginBackgroundWrite)
+		}
 	}
 	if provider, ok := executor.(watchRegistryProvider); ok {
 		srv.watchRegistry = provider.WatchRegistry()
@@ -121,6 +143,9 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 	}
 	if setter, ok := executor.(replicaRegistrySetter); ok {
 		setter.SetReplicaRegistry(srv.replicaPeers)
+	}
+	if setter, ok := executor.(writeOrderingSetter); ok {
+		setter.SetWriteOrdering(srv.recordsWrites)
 	}
 	if setter, ok := executor.(authConfigSetter); ok {
 		setter.SetRequirePass(cfg.RequirePass)
@@ -150,6 +175,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			return fmt.Errorf("server: validate replica configuration: %w", err)
 		}
 	}
+	if err := s.checkBindSafety(); err != nil {
+		return err
+	}
 	if err := s.initializePersistence(ctx); err != nil {
 		return err
 	}
@@ -174,6 +202,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	defer s.shutdown()
 
 	s.logger.Info("Stash listening", "address", listener.Addr().String())
+	if s.cfg.RequirePass == "" && listensBeyondLoopback(listener.Addr()) {
+		s.logger.Warn(
+			"accepting connections from the network with no password; anyone who can reach this address has full access. Set --requirepass or bind a loopback address",
+			"address", listener.Addr().String(),
+		)
+	}
 	// The eviction loop runs on its own context so it can be stopped before the
 	// durability teardown below, on the path where serve fails without ctx ever
 	// being cancelled as much as on the ordinary one.
@@ -368,6 +402,32 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
+// checkBindSafety refuses to start a server that would accept connections from
+// other machines with no password, unless --allow-open-bind says that is
+// intended. It runs before persistence is opened so a refused start has no side
+// effects. The address is resolved the way net.Listen will resolve it; if it
+// cannot be, the listen that follows reports the real error.
+func (s *Server) checkBindSafety() error {
+	if s.cfg.RequirePass != "" || s.cfg.AllowOpenBind {
+		return nil
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", s.cfg.Address())
+	if err != nil || !listensBeyondLoopback(addr) {
+		return nil
+	}
+
+	return fmt.Errorf("server: refusing to listen on %s with no password: anyone who can reach it would have full access. Set --requirepass, bind a loopback address, or pass --allow-open-bind to serve without a password anyway", s.cfg.Address())
+}
+
+// listensBeyondLoopback reports whether a listener bound to addr accepts
+// connections from other machines: any address that is not a loopback one,
+// including the unspecified addresses 0.0.0.0 and ::.
+func listensBeyondLoopback(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	return ok && !tcp.IP.IsLoopback()
+}
+
 func (s *Server) setListener(listener net.Listener) {
 	s.listenerMu.Lock()
 	defer s.listenerMu.Unlock()
@@ -375,9 +435,18 @@ func (s *Server) setListener(listener net.Listener) {
 	s.listener = listener
 }
 
+// replicaShutdownGrace is how long shutdown waits for replicas to take the
+// propagated commands still queued for them.
+const replicaShutdownGrace = time.Second
+
 func (s *Server) shutdown() {
 	s.shutdownOnce.Do(func() {
 		s.closeUpstreamConn()
+		// Commands already propagated are written to the replicas before their
+		// sockets are closed, as they were when propagation wrote them directly.
+		if unfinished := s.replicaPeers.StopFeeds(replicaShutdownGrace); unfinished > 0 {
+			s.logger.Warn("some replicas did not receive the last propagated commands before shutdown", "replicas", unfinished)
+		}
 
 		s.listenerMu.RLock()
 		listener := s.listener
@@ -506,10 +575,11 @@ func (s *Server) ServerStats() Stats {
 		replicas = append(replicas, ReplicaInfo{
 			ID:            peer.ID,
 			ListeningPort: peer.ListeningPort,
-			AckOffset:     peer.AckOffset,
+			AckOffset:     peer.AckOffset.Load(),
 		})
 	}
 
+	writer := s.aofWriter
 	return Stats{
 		ConnectedClients:    s.registry.Count(),
 		MonitoringClients:   s.monitorRegistry.Count(),
@@ -519,5 +589,7 @@ func (s *Server) ServerStats() Stats {
 		MasterOffset:        s.replication.MasterOffset(),
 		ReplicaOffset:       s.replication.ReplicaOffset(),
 		Replicas:            replicas,
+		AOFEnabled:          writer != nil,
+		AOFLastWriteOK:      writer.LastWriteOK(),
 	}
 }

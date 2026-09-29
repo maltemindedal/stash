@@ -41,10 +41,16 @@ type Store struct {
 	expirationMu             sync.Mutex
 	expirationListener       func(keys []string)
 	pendingExpired           []string
+	evictionGuard            func() (release func())
 	usedMemory               atomic.Int64
 	keyKindCounts            [keyStatsKindCount]atomic.Int64
 	maxMemory                atomic.Int64
 	memoryEvictionSampleSize int
+	// nextExpiry is a lower bound on the earliest TTL deadline in the store, kept
+	// only while maxmemory is enabled. No key can have expired before it, so an
+	// accounted write can skip the sweep-and-recount until it passes. Zero, the
+	// initial value, means unknown and forces one recount, which sets it exactly.
+	nextExpiry atomic.Int64
 }
 
 // NewStore constructs an empty Store.
@@ -84,6 +90,31 @@ func (s *Store) SetExpirationListener(listener func(keys []string)) {
 	s.expirationMu.Lock()
 	defer s.expirationMu.Unlock()
 	s.expirationListener = listener
+}
+
+// SetEvictionGuard registers a function the background eviction loop calls before
+// each sample and whose result it calls once the sample's removals have been
+// handed to the expiration listener. It lets the owner of the listener order those
+// removals against the writes it is also logging: a key expiring and being set
+// again must reach the log in the order they happened.
+func (s *Store) SetEvictionGuard(guard func() (release func())) {
+	if s == nil {
+		return
+	}
+
+	s.expirationMu.Lock()
+	defer s.expirationMu.Unlock()
+	s.evictionGuard = guard
+}
+
+func (s *Store) acquireEvictionGuard() func() {
+	s.expirationMu.Lock()
+	guard := s.evictionGuard
+	s.expirationMu.Unlock()
+	if guard == nil {
+		return func() {}
+	}
+	return guard()
 }
 
 // noteExpiredKeysLocked queues keys removed for expiry while shard locks are
@@ -306,7 +337,7 @@ func (s *Store) LeftPop(key string) ([]byte, bool, error) {
 	item := list[0]
 	list[0] = nil
 	list = list[1:]
-	value.List = list
+	value.dropListFront(1)
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
@@ -352,7 +383,7 @@ func (s *Store) RightPop(key string) ([]byte, bool, error) {
 	item := list[last]
 	list[last] = nil
 	list = list[:last]
-	value.List = list
+	value.dropListEnd(1)
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
@@ -421,6 +452,7 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 			list[i] = nil
 		}
 		list = list[n:]
+		value.dropListFront(n)
 	} else {
 		for i := 0; i < n; i++ {
 			src := len(list) - 1 - i
@@ -428,9 +460,9 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 			list[src] = nil
 		}
 		list = list[:len(list)-n]
+		value.dropListEnd(n)
 	}
 
-	value.List = list
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
@@ -783,8 +815,9 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 			case ValueKindString:
 				valueArena, entry.String = appendClonedBytesArena(valueArena, value.String)
 			case ValueKindList:
-				entry.List = make([][]byte, len(value.List))
-				for j, item := range value.List {
+				list := value.liveList()
+				entry.List = make([][]byte, len(list))
+				for j, item := range list {
 					valueArena, entry.List[j] = appendClonedBytesArena(valueArena, item)
 				}
 			case ValueKindZSet:
@@ -978,11 +1011,33 @@ func cloneBytes(src []byte) []byte {
 	return dst
 }
 
+const (
+	// snapshotArenaMinChunk and snapshotArenaMaxChunk bound the chunks a
+	// snapshot's values are copied into. Chunks start small, so a small snapshot
+	// does not pay for a large allocation, and double up to the maximum. A value
+	// larger than the next chunk gets a chunk of its own.
+	snapshotArenaMinChunk = 4 << 10
+	snapshotArenaMaxChunk = 1 << 20
+)
+
+// growArena returns an arena with room for n more bytes. When the current one is
+// full it starts a new chunk instead of growing it: appending would copy every
+// byte already handed out into a larger array, while the slices already returned
+// keep pointing into, and so keeping alive, the old one.
+func growArena(arena []byte, n int) []byte {
+	if n <= cap(arena)-len(arena) {
+		return arena
+	}
+	chunk := min(max(2*cap(arena), snapshotArenaMinChunk), snapshotArenaMaxChunk)
+	return make([]byte, 0, max(chunk, n))
+}
+
 func appendClonedBytesArena(arena []byte, src []byte) ([]byte, []byte) {
 	if src == nil {
 		return arena, nil
 	}
 
+	arena = growArena(arena, len(src))
 	start := len(arena)
 	arena = append(arena, src...)
 	cloned := arena[start:len(arena):len(arena)]
@@ -990,6 +1045,7 @@ func appendClonedBytesArena(arena []byte, src []byte) ([]byte, []byte) {
 }
 
 func appendClonedStringBytesArena(arena []byte, src string) ([]byte, []byte) {
+	arena = growArena(arena, len(src))
 	start := len(arena)
 	arena = append(arena, src...)
 	cloned := arena[start:len(arena):len(arena)]
@@ -1016,7 +1072,9 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 
 	length, evicted, err := writeKey(s, key, func(w keyWrite) (int64, []string, error) {
 		var (
-			list      [][]byte
+			list      [][]byte // the values of the list
+			full      [][]byte // the array they live in, ListHead dead slots ahead of them
+			head      int
 			expiresAt int64
 		)
 		if w.current != nil {
@@ -1029,28 +1087,35 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 			if w.accounting {
 				// Size the write against the pre-write list, and leave it untouched
 				// if it turns out to breach maxmemory, by appending to a copy rather
-				// than to the slice still stored under the key.
+				// than to the slice still stored under the key. The copy shares no
+				// array with the stored list, so there is nothing to reuse.
 				list = append([][]byte(nil), currentList...)
+			} else {
+				full, head = w.current.List, int(w.current.ListHead)
 			}
 		}
 
 		additions := cloneList(values)
 		if left {
-			combined := make([][]byte, len(list)+len(additions))
-			for i := range additions {
-				combined[i] = additions[len(additions)-1-i]
-			}
-			copy(combined[len(additions):], list)
-			list = combined
+			full, head = prependList(full, head, list, additions)
 		} else {
-			list = append(list, additions...)
+			grown := append(list, additions...)
+			if full != nil && len(list) > 0 && &grown[0] == &list[0] {
+				// It fitted: the list still lives in the same array, and so do the
+				// dead slots ahead of it.
+				full = full[:head+len(grown)]
+			} else {
+				full, head = grown, 0
+			}
 		}
 
-		evicted, err := w.commit(newListValue(list, expiresAt))
+		value := newListValue(full, expiresAt)
+		value.ListHead = int32(head)
+		evicted, err := w.commit(value)
 		if err != nil {
 			return 0, nil, err
 		}
-		return int64(len(list)), evicted, nil
+		return int64(len(full) - head), evicted, nil
 	})
 	if err != nil {
 		return 0, nil, err
@@ -1061,6 +1126,32 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 	// in the other order cannot deadlock against this one.
 	s.waiters.notifyOne(key)
 	return length, evicted, nil
+}
+
+// prependList puts additions in front of list, the last addition first, and
+// returns the array the result lives in and how many dead slots precede it. full
+// and head describe where list currently lives (see ValueObject.liveList); full
+// is nil when there is nothing to reuse. When the dead slots ahead of list are
+// enough it fills them and copies nothing. Otherwise it moves the list into a new
+// array with as much headroom as the list has values, so pushing to the front
+// copies the list once per doubling instead of once per push.
+func prependList(full [][]byte, head int, list, additions [][]byte) ([][]byte, int) {
+	k := len(additions)
+	if head >= k {
+		start := head - k
+		for i, item := range additions {
+			full[start+k-1-i] = item
+		}
+		return full, start
+	}
+
+	headroom := min(len(list), math.MaxInt32-k)
+	grown := make([][]byte, headroom+k+len(list))
+	for i, item := range additions {
+		grown[headroom+k-1-i] = item
+	}
+	copy(grown[headroom+k:], list)
+	return grown, headroom
 }
 
 func normalizeListRange(length int, start, stop int64) (int, int, bool) {
@@ -1110,6 +1201,18 @@ func isExpired(value *ValueObject, now int64) bool {
 	return value != nil && value.ExpiresAt > 0 && now > value.ExpiresAt
 }
 
+// deadlineAfter returns the Unix-millis deadline value units of millisPerUnit
+// after nowMillis, or ErrInvalidExpireTime when that does not fit in an int64.
+// It works in integer milliseconds because time.Duration, at nanosecond
+// resolution, wraps past about 292 years and turned a huge expiry into a
+// deadline in the past (or a negative one, which reads as "no expiry").
+func deadlineAfter(nowMillis, value, millisPerUnit int64) (int64, error) {
+	if value > (math.MaxInt64-nowMillis)/millisPerUnit {
+		return 0, ErrInvalidExpireTime
+	}
+	return nowMillis + value*millisPerUnit, nil
+}
+
 // ParseExpiryMillis parses Redis-style EX/PX/PXAT arguments into a Unix-millis deadline.
 func ParseExpiryMillis(args [][]byte) (int64, error) {
 	if len(args) == 0 {
@@ -1124,12 +1227,12 @@ func ParseExpiryMillis(args [][]byte) (int64, error) {
 		return 0, ErrInvalidExpireTime
 	}
 
-	now := time.Now()
+	nowMillis := time.Now().UnixMilli()
 	switch strings.ToUpper(string(args[0])) {
 	case "EX":
-		return now.Add(time.Duration(value) * time.Second).UnixMilli(), nil
+		return deadlineAfter(nowMillis, value, 1000)
 	case "PX":
-		return now.Add(time.Duration(value) * time.Millisecond).UnixMilli(), nil
+		return deadlineAfter(nowMillis, value, 1)
 	case "PXAT":
 		// Absolute expiry in Unix milliseconds. Used both by clients and by the
 		// frame the executor propagates/persists for SET, so replicas and AOF

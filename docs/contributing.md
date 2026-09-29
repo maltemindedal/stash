@@ -2,7 +2,7 @@
 
 ## Development setup
 
-Install **Go 1.21 or newer**. The version is pinned in [`go.mod`](../go.mod). Stash has no external module dependencies.
+Install **Go 1.21 or newer**. The minimum is the `go` directive in [`go.mod`](../go.mod); CI builds and tests on that minimum and on the two latest Go releases. Stash has no external module dependencies.
 
 ```bash
 git clone https://github.com/maltemindedal/stash.git
@@ -10,7 +10,7 @@ cd stash
 go build ./cmd/stash
 ```
 
-For linting locally you also need [`golangci-lint`](https://golangci-lint.run/) **v2.11**, the version CI runs.
+For linting locally you also need [`golangci-lint`](https://golangci-lint.run/) **v2.13.2**, the version CI runs.
 
 ## Verification commands
 
@@ -24,11 +24,13 @@ go test ./...
 golangci-lint run
 ```
 
-Race tests run in CI on pushes to `main` only, but run them locally when touching concurrency:
+Race tests run in CI on every pull request and on pushes to `main`. Run them locally when touching concurrency:
 
 ```bash
 go test -race ./...
 ```
+
+The CI `race` job also runs the tests in random order (`-shuffle=on`) to catch tests that depend on each other. A failing run prints the shuffle seed; repeat it with `go test -race -shuffle=<seed> ./...`.
 
 Benchmarks for the parser and store:
 
@@ -38,7 +40,7 @@ go test -run ^$ -bench . ./internal/protocol ./internal/storage
 
 ## Lint configuration
 
-[`.golangci.yml`](../.golangci.yml) enables `errcheck`, `govet`, `ineffassign`, `staticcheck`, and `unused` with a 2-minute timeout.
+[`.golangci.yml`](../.golangci.yml) enables `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `errorlint`, `makezero`, `nilnesserr`, `predeclared`, and `wastedassign` with a 2-minute timeout. `govet` runs every analyzer except `fieldalignment` and `shadow`, and `staticcheck` runs all of its checks.
 
 ## Test layout
 
@@ -64,4 +66,8 @@ The integration suite covers AOF replay, RDB loading, replication, event-loop mo
 
 Issues are tracked in [GitHub Issues](https://github.com/maltemindedal/stash/issues). Triage uses the five canonical labels described in [`docs/agents/triage-labels.md`](agents/triage-labels.md): `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`.
 
-Pull requests run the `validate` job on every push. Pushes to `main` also run race tests.
+Pull requests run the `validate` job (on the minimum Go version) and the `test-latest` job (on the two latest Go releases, plus a `go vet` for macOS on both architectures and for Windows) on every push. The `race` job runs the tests under the race detector on both.
+
+## Dependency and vulnerability checks
+
+Stash has no module dependencies, so the moving parts are the Go toolchain and the GitHub Actions in `.github/workflows/`. Actions are pinned to commit SHAs; Dependabot proposes bumps weekly, waiting seven days after a release. A weekly workflow runs `govulncheck` against the latest stable Go. Run it locally with `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`.

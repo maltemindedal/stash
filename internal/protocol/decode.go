@@ -51,11 +51,105 @@ const maxNestingDepth = 128
 // not yet hold a complete frame, Decode returns ErrIncomplete and consumes
 // nothing. Any other error is a permanent protocol error. Returned values do
 // not retain buf, so callers may reuse or compact it after Decode returns.
+//
+// Decode keeps no state between calls, so retrying it on a growing buffer
+// re-reads the whole frame each time. Use a Decoder for that.
 func Decode(buf []byte) (Value, int, error) {
-	return decode(buf, 0)
+	var d Decoder
+	return d.Decode(buf)
 }
 
-func decode(buf []byte, depth int) (Value, int, error) {
+// Decoder decodes RESP values from a buffer that grows between calls. It
+// remembers how far into an unfinished frame it got, so each byte of a frame
+// that arrives over many reads is examined once rather than once per read. A
+// Decoder is not safe for concurrent use; the zero value is ready to use.
+type Decoder struct {
+	// open holds the arrays whose elements are still arriving, outermost first.
+	open []openArray
+	// pos counts the bytes of the current frame already folded into open.
+	pos int
+	// limits tightens what the frames decoded next may declare.
+	limits Limits
+}
+
+// SetLimits tightens what the following frames may declare, until it is called
+// again. The zero Limits restores the defaults. It is meant to be called between
+// frames: array and bulk headers already read are not checked again.
+func (d *Decoder) SetLimits(limits Limits) {
+	d.limits = limits
+}
+
+// openArray is an array whose header has been read but whose elements have not
+// all arrived.
+type openArray struct {
+	want     int
+	elements []Value
+}
+
+// Decode parses one RESP value from the front of buf, with the semantics of the
+// package-level Decode. After ErrIncomplete the Decoder keeps its progress, so
+// the next call must pass a buffer that starts with the same bytes plus
+// whatever arrived since. After a value or a permanent error it starts over.
+func (d *Decoder) Decode(buf []byte) (Value, int, error) {
+	for {
+		value, n, err := d.token(buf[d.pos:])
+		if err != nil {
+			return nil, 0, d.fail(err)
+		}
+		d.pos += n
+		if value == nil {
+			// The header of a non-empty array; its elements follow.
+			continue
+		}
+
+		for {
+			if len(d.open) == 0 {
+				consumed := d.pos
+				d.Reset()
+				return value, consumed, nil
+			}
+			top := &d.open[len(d.open)-1]
+			top.elements = append(top.elements, value)
+			if len(top.elements) < top.want {
+				break
+			}
+			value = Array{Elements: top.elements}
+			*top = openArray{}
+			d.open = d.open[:len(d.open)-1]
+		}
+	}
+}
+
+// Reset discards any partially decoded frame.
+func (d *Decoder) Reset() {
+	clear(d.open)
+	d.open = d.open[:0]
+	d.pos = 0
+}
+
+// fail turns a token error into the error Decode reports. An incomplete frame
+// keeps the decoder's progress and carries a byte hint for the whole frame. A
+// permanent error is wrapped once per enclosing array, innermost first, and
+// discards the partial frame.
+func (d *Decoder) fail(err error) error {
+	if errors.Is(err, ErrIncomplete) {
+		var incomplete *IncompleteError
+		if errors.As(err, &incomplete) {
+			return incompleteNeed(d.pos + incomplete.Need)
+		}
+		return ErrIncomplete
+	}
+
+	for i := len(d.open) - 1; i >= 0; i-- {
+		err = fmt.Errorf("protocol: parse array element %d: %w", len(d.open[i].elements), err)
+	}
+	d.Reset()
+	return err
+}
+
+// token reads the next value or array header from the front of buf. It returns
+// a nil Value, and the header's size, when it opened a non-empty array.
+func (d *Decoder) token(buf []byte) (Value, int, error) {
 	if len(buf) == 0 {
 		return nil, 0, ErrIncomplete
 	}
@@ -104,15 +198,15 @@ func decode(buf []byte, depth int) (Value, int, error) {
 		}
 		return value, 1 + n, nil
 	case '$':
-		return decodeBulkString(buf)
+		return d.decodeBulkString(buf)
 	case '*':
-		return decodeArray(buf, depth)
+		return d.openArray(buf)
 	default:
 		return nil, 0, fmt.Errorf("protocol: unsupported frame prefix %q", string(prefix))
 	}
 }
 
-func decodeBulkString(buf []byte) (Value, int, error) {
+func (d *Decoder) decodeBulkString(buf []byte) (Value, int, error) {
 	line, n, err := decodeLine(buf[1:])
 	if err != nil {
 		return nil, 0, err
@@ -129,6 +223,13 @@ func decodeBulkString(buf []byte) (Value, int, error) {
 	if length < -1 {
 		return nil, 0, fmt.Errorf("protocol: invalid bulk string length %d", length)
 	}
+	// Only a tightened limit is checked here. The default is left to the caller's
+	// buffer limit, which also bounds a length too large to add up as a hint.
+	if d.limits.bulkLength() < maxBulkStringLength {
+		if err := d.limits.checkBulkLength(length); err != nil {
+			return nil, 0, err
+		}
+	}
 
 	remaining := buf[consumed:]
 	if length > len(remaining)-2 {
@@ -141,8 +242,10 @@ func decodeBulkString(buf []byte) (Value, int, error) {
 	return BulkString{Data: bytes.Clone(remaining[:length])}, consumed + length + 2, nil
 }
 
-func decodeArray(buf []byte, depth int) (Value, int, error) {
-	if depth >= maxNestingDepth {
+// openArray reads an array header. A null or empty array is a complete value; a
+// non-empty one is pushed onto the open stack and reported as a nil Value.
+func (d *Decoder) openArray(buf []byte) (Value, int, error) {
+	if len(d.open) >= maxNestingDepth {
 		return nil, 0, fmt.Errorf("protocol: array nesting exceeds %d levels", maxNestingDepth)
 	}
 
@@ -162,32 +265,27 @@ func decodeArray(buf []byte, depth int) (Value, int, error) {
 	if count < -1 {
 		return nil, 0, fmt.Errorf("protocol: invalid array length %d", count)
 	}
-
-	elements := make([]Value, 0, min(count, 64))
-	for i := 0; i < count; i++ {
-		element, elementN, err := decode(buf[consumed:], depth+1)
-		if err != nil {
-			if errors.Is(err, ErrIncomplete) {
-				var incomplete *IncompleteError
-				if errors.As(err, &incomplete) {
-					return nil, 0, incompleteNeed(consumed + incomplete.Need)
-				}
-				return nil, 0, ErrIncomplete
-			}
-			return nil, 0, fmt.Errorf("protocol: parse array element %d: %w", i, err)
-		}
-		elements = append(elements, element)
-		consumed += elementN
+	if err := d.limits.checkArrayLength(count); err != nil {
+		return nil, 0, err
+	}
+	if count == 0 {
+		return Array{Elements: []Value{}}, consumed, nil
 	}
 
-	return Array{Elements: elements}, consumed, nil
+	d.open = append(d.open, openArray{want: count, elements: make([]Value, 0, min(count, 64))})
+	return nil, consumed, nil
 }
 
 // decodeLine locates a CRLF-terminated line at the front of buf and returns
 // the line content and the number of bytes consumed including the terminator.
 func decodeLine(buf []byte) ([]byte, int, error) {
-	idx := bytes.IndexByte(buf, '\n')
+	// Look for the terminator only within the line limit, so a stream that never
+	// sends one is rejected instead of rescanned on every read.
+	idx := bytes.IndexByte(buf[:min(len(buf), maxLineLength)], '\n')
 	if idx < 0 {
+		if len(buf) >= maxLineLength {
+			return nil, 0, fmt.Errorf("protocol: line exceeds %d byte limit", maxLineLength)
+		}
 		return nil, 0, ErrIncomplete
 	}
 

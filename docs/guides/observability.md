@@ -15,9 +15,20 @@ redis-cli -p 6379 INFO memory
 | `memory` | `used_memory`, `maxmemory`, Go heap stats, key counts per value kind |
 | `replication` | `role`, replication IDs and offsets, connected replicas |
 | `clients` | `connected_clients`, `monitoring_clients`, `total_commands_processed` |
+| `persistence` | `aof_enabled`, `aof_last_write_status` |
 | `default` / `all` | All of the above |
 
 An unrecognized section name returns an error rather than an empty response.
+
+### Reading the persistence section
+
+```
+# Persistence
+aof_enabled:1
+aof_last_write_status:ok
+```
+
+`aof_enabled` is `1` when `--aof` is set. `aof_last_write_status` is `err` from a failed write or fsync of the append-only file until the next one succeeds, and `ok` otherwise (always `ok` without an AOF). Under `--appendfsync everysec` and `no` a command is acknowledged before it is on disk, so a full or failing disk does not fail the command; the failure appears only here and as a `WARN` in the log. Alert on `err`. Under `--appendfsync always` a failed write is returned to the client as an error instead.
 
 ### Reading the memory section
 
@@ -76,7 +87,7 @@ OK
 
 `SLOWLOG GET` takes an optional non-negative count; without one it returns all buffered entries. Each entry is a six-element array, matching the Redis reply shape: an ID, a Unix timestamp, a duration in microseconds, the command arguments, the client address, and a client name. Stash does not implement `CLIENT SETNAME`, so the client-name field is always an empty string.
 
-`AUTH` arguments are redacted before storage. Other arguments are stored verbatim.
+`AUTH` arguments are redacted before storage. Each entry keeps at most 32 tokens, the command name included, and at most 128 bytes of each token, as Redis does. A longer token is stored as its first 128 bytes followed by `... (N more bytes)`. A command with more than 32 tokens is stored as its first 31 followed by `... (N more arguments)`.
 
 ## Stream live commands with MONITOR
 
@@ -91,7 +102,7 @@ Two operational notes:
 - Monitor delivery uses a short write deadline. A monitor that stops draining its socket is disconnected rather than allowed to consume server memory.
 - In `--event-loop` mode, buffered output is capped per connection and slow consumers are disconnected on that cap instead of on a per-write deadline.
 
-`MONITOR` sees every command argument, so treat its output as sensitive.
+`MONITOR` shows every command argument except `AUTH` passwords, which it redacts, so treat its output as sensitive.
 
 ## Server logs
 

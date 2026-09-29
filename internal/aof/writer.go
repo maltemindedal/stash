@@ -6,12 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maltemindedal/stash/internal/storage"
@@ -60,6 +60,21 @@ type Writer struct {
 	closeOnce      sync.Once
 	closeCh        chan struct{}
 	wg             sync.WaitGroup
+
+	// closing is set, under mu, before Close waits for background work. Adds to wg
+	// happen under mu and only while closing is false, so they cannot race with
+	// that Wait.
+	closing bool
+
+	// writeFailed is true from a failed write, flush or fsync until the next one
+	// that succeeds. Under everysec and no the server acknowledges a command before
+	// it is on disk, so this is how an operator finds out the log has stopped
+	// growing; see LastWriteOK.
+	writeFailed atomic.Bool
+
+	// rewriteGuard, when set, is held across the snapshot a rewrite takes. See
+	// SetRewriteGuard.
+	rewriteGuard func() (release func())
 }
 
 // OpenWriter opens or creates an append-only file writer for the supplied path.
@@ -75,7 +90,7 @@ func OpenWriter(ctx context.Context, path string, policy Policy, logger *slog.Lo
 	if dir == "" {
 		dir = "."
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("aof: create directory %q: %w", dir, err)
 	}
 
@@ -109,6 +124,40 @@ func (w *Writer) Policy() Policy {
 	return w.policy
 }
 
+// SetRewriteGuard registers a function a rewrite calls before it snapshots the
+// store, and whose result it calls when the snapshot is done. The snapshot and
+// the switch to buffering new commands are atomic with respect to the store, but
+// a command that had updated the store and not yet appended its frame would then
+// be in the snapshot and in the rewrite buffer both, and replay twice. The owner
+// of the append path passes a guard that waits for such commands to finish.
+func (w *Writer) SetRewriteGuard(guard func() (release func())) {
+	if w == nil {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.rewriteGuard = guard
+}
+
+func (w *Writer) acquireRewriteGuard() func() {
+	w.mu.Lock()
+	guard := w.rewriteGuard
+	w.mu.Unlock()
+	if guard == nil {
+		return func() {}
+	}
+	return guard()
+}
+
+// LastWriteOK reports whether the most recent write, flush or fsync of the file
+// succeeded (INFO aof_last_write_status). Under everysec and no, Append
+// acknowledges a command before it is on disk, so a failure is otherwise visible
+// only in the log.
+func (w *Writer) LastWriteOK() bool {
+	return w == nil || !w.writeFailed.Load()
+}
+
 // Append writes a payload without forcing an immediate fsync.
 func (w *Writer) Append(payload []byte) error {
 	return w.append(payload, false)
@@ -126,6 +175,9 @@ func (w *Writer) Close() error {
 	}
 
 	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		w.closing = true
+		w.mu.Unlock()
 		close(w.closeCh)
 	})
 	w.wg.Wait()
@@ -165,7 +217,7 @@ func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
 	}
 
 	w.mu.Lock()
-	if w.closed {
+	if w.closing || w.closed {
 		w.mu.Unlock()
 		return ErrClosed
 	}
@@ -174,9 +226,9 @@ func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
 		return ErrRewriteInProgress
 	}
 	w.rewritePending = true
+	w.wg.Add(1)
 	w.mu.Unlock()
 
-	w.wg.Add(1)
 	go w.runRewrite(ctx, store)
 	return nil
 }
@@ -192,6 +244,7 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 		return ErrClosed
 	}
 	if _, err := w.writer.Write(payload); err != nil {
+		w.writeFailed.Store(true)
 		return fmt.Errorf("aof: write %q: %w", w.path, err)
 	}
 	if w.rewriteActive {
@@ -203,7 +256,11 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 		return w.syncLocked()
 	}
 	if w.policy == PolicyNo {
-		return w.flushLocked()
+		// Handing the bytes to the OS is the whole durability step for this policy.
+		if err := w.flushLocked(); err != nil {
+			return err
+		}
+		w.writeFailed.Store(false)
 	}
 
 	return nil
@@ -244,14 +301,17 @@ func (w *Writer) syncLocked() error {
 		return err
 	}
 	if err := w.file.Sync(); err != nil {
+		w.writeFailed.Store(true)
 		return fmt.Errorf("aof: sync %q: %w", w.path, err)
 	}
+	w.writeFailed.Store(false)
 
 	return nil
 }
 
 func (w *Writer) flushLocked() error {
 	if err := w.writer.Flush(); err != nil {
+		w.writeFailed.Store(true)
 		return fmt.Errorf("aof: flush %q: %w", w.path, err)
 	}
 
@@ -293,6 +353,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 	}()
 
 	activated := false
+	releaseGuard := w.acquireRewriteGuard()
 	entries, snapshotStats := store.SnapshotAllWithWriteBarrier(func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -306,6 +367,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 		w.rewriteBuffer.Reset()
 		activated = true
 	})
+	releaseGuard()
 	if !activated {
 		_ = tempFile.Close()
 		return
@@ -406,6 +468,12 @@ func (w *Writer) appendBufferedRewriteLocked(tempFile *os.File) error {
 func (w *Writer) swapRewriteFileLocked(tempPath string) error {
 	oldFile := w.file
 	if oldFile != nil {
+		// Commands appended under everysec wait in the writer's buffer. If the swap
+		// fails, the original file is reopened with a fresh buffer and the rewrite
+		// buffer is discarded, so anything not flushed here would be lost.
+		if err := w.flushLocked(); err != nil {
+			return fmt.Errorf("flush append-only file before rewrite swap: %w", err)
+		}
 		if err := oldFile.Close(); err != nil {
 			return fmt.Errorf("close current append-only file before rewrite swap: %w", err)
 		}
@@ -413,7 +481,7 @@ func (w *Writer) swapRewriteFileLocked(tempPath string) error {
 	if err := replaceFile(tempPath, w.path); err != nil {
 		reopenErr := w.reopenAppendOnlyFileLocked()
 		if reopenErr != nil {
-			return fmt.Errorf("replace append-only file with rewrite: %w; reopen original file: %v", err, reopenErr)
+			return fmt.Errorf("replace append-only file with rewrite: %w; reopen original file: %w", err, reopenErr)
 		}
 		return fmt.Errorf("replace append-only file with rewrite: %w", err)
 	}
@@ -453,19 +521,13 @@ func (w *Writer) logError(msg string, args ...any) {
 	}
 }
 
+// replaceFile moves tempPath over targetPath with a single rename. os.Rename
+// replaces an existing file atomically on every supported platform, so there is
+// no remove-then-rename fallback: it opened a window in which a failed second
+// rename left no append-only file at all.
 func replaceFile(tempPath string, targetPath string) error {
 	if err := renameFile(tempPath, targetPath); err != nil {
-		if !isReplaceTargetExistsError(err) {
-			return fmt.Errorf("aof: replace %q: %w", targetPath, err)
-		}
-
-		removeErr := removeFile(targetPath)
-		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("aof: replace %q: rename error: %w; remove error: %v", targetPath, err, removeErr)
-		}
-		if retryErr := renameFile(tempPath, targetPath); retryErr != nil {
-			return fmt.Errorf("aof: replace %q after removing existing target: %w", targetPath, retryErr)
-		}
+		return fmt.Errorf("aof: replace %q: %w", targetPath, err)
 	}
 
 	// Persist the rename itself: the new directory entry is not crash-durable
@@ -475,12 +537,4 @@ func replaceFile(tempPath string, targetPath string) error {
 	}
 
 	return nil
-}
-
-func isReplaceTargetExistsError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return errors.Is(err, fs.ErrExist) || os.IsExist(err)
 }

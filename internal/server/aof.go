@@ -63,6 +63,10 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			return replayErr
 		})
 		if err != nil {
+			var corrupt *aof.CorruptError
+			if errors.As(err, &corrupt) {
+				return fmt.Errorf("server: load aof %q: %w; the file was not modified, see \"Repairing a corrupt append-only file\" in docs/guides/persistence.md", s.cfg.AOFPath, err)
+			}
 			return fmt.Errorf("server: load aof %q: %w", s.cfg.AOFPath, err)
 		}
 
@@ -73,6 +77,18 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			"truncated_tail", stats.TruncatedTail,
 			"duration", time.Since(startedAt),
 		)
+		if stats.TornTail {
+			// New commands are appended to this file, so a torn command left in
+			// place would swallow them on the next restart.
+			if err := aof.TruncateTail(s.cfg.AOFPath, stats.ValidBytes); err != nil {
+				return fmt.Errorf("server: discard torn tail of aof %q: %w", s.cfg.AOFPath, err)
+			}
+			s.logger.Warn(
+				"discarded an unfinished command at the end of the append-only file",
+				"path", s.cfg.AOFPath,
+				"kept_bytes", stats.ValidBytes,
+			)
+		}
 	} else if err := loadRDB(); err != nil {
 		return err
 	}
@@ -86,8 +102,17 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			s.logger.Warn("failed to close stale AOF writer before reopening", "path", s.cfg.AOFPath, "error", closeErr)
 		}
 	}
+	if sequencer, ok := s.executor.(backgroundWriteSequencer); ok {
+		writer.SetRewriteGuard(sequencer.BeginBackgroundWrite)
+	}
 	s.aofWriter = writer
 	return nil
+}
+
+// recordsWrites reports whether anything is recording the writes clients make, so
+// that their order matters: an append-only file or a replica.
+func (s *Server) recordsWrites() bool {
+	return s.aofWriter != nil || s.replicaPeers.Count() > 0
 }
 
 func (s *Server) beginAOFRewrite(_ context.Context) error {

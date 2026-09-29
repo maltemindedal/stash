@@ -58,9 +58,19 @@ slave0:id=1,port=6380,offset=31
 
 > TODO: The field names above come from `appendInfoReplication` in `internal/command/info.go`, but the values are examples rather than output from a live master and replica. Run the two-server setup above and replace this block with its output.
 
+## How the stream reaches a replica, and when a replica is dropped
+
+Writes on the master are queued for each replica and sent by a goroutine of that replica's own, in order and several at a time. A slow or stalled replica therefore never holds up clients writing to the master, and one healthy replica costs the master little (with one replica attached, a benchmark of pipelined `SET` went from about 127,000 to about 220,000 operations per second on the same machine).
+
+The queue for a replica is limited to 256 MiB, and a replica that will not accept 1 MiB of the stream within 30 seconds is considered stalled. In either case the master logs `dropping a replica` and closes the connection. On a graceful shutdown the master gives the replicas up to a second to take what is queued before it closes their sockets.
+
+## When the link to the master drops
+
+A replica that loses its master, or cannot reach it at startup, waits one second and tries again, doubling the wait up to 30 seconds after each failure and starting over once a link has completed its handshake. Every attempt begins with a full resynchronisation, which replaces the replica's dataset with the master's snapshot, so a reconnected replica never keeps data from before the drop. Only an invalid `--replicaof` address stops the retries.
+
 ## Replicate against a protected master
 
-A password-protected master requires the replica to authenticate before `REPLCONF` or `PSYNC`. Supply the password with `--masterauth`:
+A password-protected master requires the replica to authenticate before `REPLCONF` or `PSYNC`. Supply the password with `--masterauth` (or keep it out of the process list with `--masterauth-file`, see [Securing a server](securing-a-server.md)):
 
 ```bash
 # Master

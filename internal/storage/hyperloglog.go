@@ -151,10 +151,7 @@ func hyperLogLogPosition(element []byte) (int, byte) {
 	sum := mix64(hasher.Sum64())
 
 	index := int(sum >> (64 - hllIndexBits))
-	rank := bits.LeadingZeros64(sum<<hllIndexBits) + 1
-	if rank > hllMaxRank {
-		rank = hllMaxRank
-	}
+	rank := min(bits.LeadingZeros64(sum<<hllIndexBits)+1, hllMaxRank)
 	return index, byte(rank)
 }
 

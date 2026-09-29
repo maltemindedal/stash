@@ -68,7 +68,7 @@ Current responsibilities:
 - support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
 - store TTLs in Unix milliseconds
 - perform passive eviction on reads
-- perform active eviction in a background loop, and again whenever an accounted write re-measures the keyspace, reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
+- perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed), reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
 - track approximate keyspace memory when `maxmemory` is enabled
 - evict sampled least-recently-used candidates under memory pressure
 
@@ -86,8 +86,11 @@ Current responsibilities:
 
 - create the listener with `net.Listen`
 - accept client connections in a loop
-- spawn one goroutine per client (default networking mode)
+- spawn one goroutine per client (default networking mode), which queues each reply and sends the queue just before it would wait for more input, so a client that pipelines requests gets its replies in as few writes as the requests arrived in
 - parse → execute → respond for each request
+- answer a request it cannot parse with one error and close the connection, because the byte stream cannot be resynchronized (both networking modes)
+- close a connection that has not authenticated within `--auth-timeout` when a password is required (a read deadline in the default mode, a timer that asks the loop to close in event-loop mode)
+- hold a client that has not authenticated to small frames (arrays of at most 10 elements, bulk strings of at most 16 KiB) when a password is required; in event-loop mode the connection decodes one request at a time until then, so a request behind an `AUTH` is decoded under the limits in force after it
 - provide a non-blocking connection state machine that buffers reads, parses complete requests, buffers responses, and flushes output incrementally
 - optionally serve all clients from one event-loop goroutine driven by OS readiness notifications (`--event-loop`), dispatching readable and writable sockets through per-connection state machines
 - maintain an active connection registry for shutdown
@@ -95,7 +98,7 @@ Current responsibilities:
 - append durable command frames and fan out replication writes after successful execution
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
-- stop cleanly when the process receives `SIGINT` or `SIGTERM`
+- stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck
 
 ### `test`
 
@@ -122,9 +125,17 @@ Platform support is limited to the following systems:
 
 Inside the loop, each accepted socket is non-blocking and belongs to a connection state machine. Readable sockets feed buffered bytes into request parsing and command execution. Writable sockets flush pending RESP output under backpressure. Other connections can produce pub/sub messages, monitor events, and replication payloads. A locked push queue for each connection and a poller wakeup pass these deliveries to the loop, which orders all socket writes through the state machine's single write buffer.
 
-The event loop executes one request at a time and interleaves output flushes. It pauses reads and execution when a connection's buffered output passes a high-water mark, then resumes when the socket drains. Each connection has an output cap. A consumer that stops draining its socket is disconnected instead of consuming more server memory. This cap replaces the per-write deadlines that the goroutine path applies to pub/sub and monitor deliveries. When a peer half-closes, the server finishes the parsed pipeline and flushes its replies before closing the connection.
+The event loop executes one request at a time and interleaves output flushes. It pauses reads and execution when a connection's buffered output passes a high-water mark, then resumes when the socket drains. Output that nobody asked for is capped. A client that receives pub/sub messages or monitor events is disconnected once 32 MiB of them are waiting for it (a replica gets 256 MiB, as in Redis), and all such clients together may hold 128 MiB: past that, the loop closes the one with the most waiting until the total fits, so fanning a message out to many slow subscribers cannot multiply memory. Replies to a client's own requests are not subject to these caps, because a reply can be as large as a stored value; only the 512 MiB per-connection limit applies to them. These caps replace the per-write deadlines that the goroutine path applies to pub/sub and monitor deliveries. When a peer half-closes, the server finishes the parsed pipeline and flushes its replies before closing the connection.
 
 Commands execute inline on the loop goroutine. In event-loop mode, a command that would block, such as `BLPOP` on an empty list or `WAIT` for pending replica acknowledgements, returns an explicit error instead of stalling every connection. Immediately satisfiable forms still succeed. The goroutine-per-connection path remains the default.
+
+### Why order writes and transactions explicitly?
+
+The sharded store makes each operation atomic, but two clients' operations can still interleave. Two things depend on their order: `EXEC`, which must see its watched keys unchanged and its queued commands run without others in between, and the AOF and replicas, which must see two writes to one key in the order they were applied.
+
+The command executor therefore has a sequencer. Every request holds a read-write lock shared while it executes; `EXEC` holds it exclusive. A request that writes also holds the lock for the stripe (one of 64) of each key it writes, from before it executes until its frames have been appended to the AOF and handed to the replicas. Writers to different keys still run in parallel; writers to the same key, and any write whose keys the command table does not declare, are ordered. The expiry sweep and the snapshot an AOF rewrite takes hold every stripe for a moment, so that an expiry and a later write of the same key, or a snapshot and a command halfway to the log, cannot be reordered. When there is no AOF and no replica there is nothing to order, and the stripes are skipped.
+
+A blocking command (`BLPOP`, `WAIT`) waits with nothing held and takes the locks only for each attempt; inside a transaction it does not wait at all.
 
 ### Why keep persistence separate from replication?
 

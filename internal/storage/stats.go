@@ -45,6 +45,7 @@ func (s *Store) setKeyLocked(shard *Shard, key string, value *ValueObject) {
 		s.adjustKeyKindCount(value, 1)
 	}
 	shard.data[key] = value
+	s.noteExpiry(value.ExpiresAt)
 }
 
 func (s *Store) removeKeyLocked(shard *Shard, key string) {

@@ -10,3 +10,18 @@ linters:
     - ineffassign
     - staticcheck
     - unused
+    - errorlint
+    - makezero
+    - nilnesserr
+    - predeclared
+    - wastedassign
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # Struct layout and shadowing findings are style, not defects, and would
+        # need churn across the tree to satisfy.
+        - fieldalignment
+        - shadow
+    staticcheck:
+      checks: ["all"]

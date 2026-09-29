@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,6 +39,30 @@ const eventLoopOutputHighWater = 1 << 20
 // runs out of file descriptors, preventing a level-triggered busy loop on a
 // backlog the loop cannot drain.
 const eventLoopAcceptRetryDelay = 100 * time.Millisecond
+
+// eventLoopKeepaliveSeconds is both the idle time before the first TCP keepalive
+// probe and the interval between probes, the values the net package uses for the
+// connections the default networking path accepts.
+const eventLoopKeepaliveSeconds = 15
+
+// eventLoopPushLimit is how much output may be waiting for a client that
+// receives asynchronous pushes (pub/sub messages, MONITOR events) before the
+// loop closes it. It is Redis's pub/sub hard limit: a subscriber that has not
+// drained 32 MiB is not keeping up. Replies to a client's own requests are not
+// subject to it, since those can be as large as a stored value.
+const eventLoopPushLimit = 32 << 20
+
+// eventLoopReplicaPushLimit is the same limit for a replica, which is expected
+// to fall further behind during a burst of writes; it is Redis's replica hard
+// limit.
+const eventLoopReplicaPushLimit = 256 << 20
+
+// eventLoopPushBudget bounds the output waiting for all push-receiving clients
+// together (replicas excluded, they have their own limit). Every message
+// published is copied once per subscriber, so many slow subscribers each below
+// their own limit could otherwise hold many times the memory of one. When the
+// budget is exceeded the loop closes the client with the most output waiting.
+const eventLoopPushBudget = 128 << 20
 
 // pollEvent is one readiness notification translated from the OS poller.
 type pollEvent struct {
@@ -131,6 +156,9 @@ func (s *Server) connCommandRunner(clientID uint64, conn ClientConn, logger *slo
 		}
 		if registerReplica {
 			s.registerReplicaPeer(clientID, conn)
+			if handle, ok := conn.(*eventConnHandle); ok {
+				handle.conn.replica.Store(true)
+			}
 		}
 		return responses, nil
 	}
@@ -152,6 +180,9 @@ type eventLoop struct {
 	events       []pollEvent
 	readBuf      []byte
 	acceptPaused bool
+	// pushOutput is the output waiting for the push-receiving connections that
+	// are not replicas, as last accounted by accountPushOutput.
+	pushOutput int
 
 	mu           sync.Mutex
 	pushed       []*eventConn
@@ -173,6 +204,16 @@ type eventConn struct {
 	wantRead   bool
 	wantWrite  bool
 	peerClosed bool
+	// authTimer closes the connection if it has not authenticated in time; nil
+	// where no password is required.
+	authTimer *time.Timer
+	// receivesPushes is set once a push frame has been buffered for the
+	// connection; pushAccounted is its share of eventLoop.pushOutput.
+	receivesPushes bool
+	pushAccounted  int
+	// replica is set once the connection has become a replica peer. It is read
+	// from other goroutines (queuePush), hence atomic.
+	replica atomic.Bool
 
 	pushBuf        []byte
 	pushQueued     bool
@@ -259,11 +300,14 @@ func (l *eventLoop) applyQueuedWork() {
 		if l.conns[push.conn.fd] != push.conn {
 			continue
 		}
+		push.conn.machine.SetPushLimit(push.conn.pushLimit())
 		if err := push.conn.machine.BufferEncoded(push.data); err != nil {
 			l.closeConn(push.conn, err)
 			continue
 		}
+		push.conn.receivesPushes = true
 		l.finishConnEvent(push.conn)
+		l.enforcePushBudget()
 	}
 
 	for _, conn := range closes {
@@ -281,6 +325,15 @@ func (l *eventLoop) applyQueuedWork() {
 	}
 }
 
+// pushLimit is how much output may wait for the connection before it is closed:
+// the replica limit once it has become a replica, the subscriber limit before.
+func (c *eventConn) pushLimit() int {
+	if c.replica.Load() {
+		return eventLoopReplicaPushLimit
+	}
+	return eventLoopPushLimit
+}
+
 // queuePush appends an async push frame (pub/sub message, monitor event, or
 // replication payload) for delivery by the loop goroutine. Safe for concurrent
 // use; the per-client responseMu already serializes whole frames. A
@@ -293,10 +346,10 @@ func (l *eventLoop) queuePush(conn *eventConn, payload []byte) (int, error) {
 		l.mu.Unlock()
 		return 0, net.ErrClosed
 	}
-	if len(conn.pushBuf)+len(payload) > defaultMaxWriteBuffer {
+	if limit := conn.pushLimit(); len(conn.pushBuf)+len(payload) > limit {
 		l.mu.Unlock()
 		l.requestClose(conn)
-		return 0, fmt.Errorf("server: push buffer exceeds %d byte write-buffer limit", defaultMaxWriteBuffer)
+		return 0, fmt.Errorf("server: push buffer exceeds %d byte limit", limit)
 	}
 	conn.pushBuf = append(conn.pushBuf, payload...)
 	alreadyQueued := conn.pushQueued
@@ -363,6 +416,13 @@ func (l *eventLoop) acceptReady() error {
 		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
 			l.srv.logger.Debug("failed to set TCP_NODELAY on accepted connection", "error", err)
 		}
+		// The net package also enables keepalive on accepted connections. Without
+		// it a peer that vanishes without a FIN (power loss, a dropped NAT entry)
+		// leaves the connection, its client state and any replica registration
+		// behind indefinitely.
+		if err := enableKeepalive(fd); err != nil {
+			l.srv.logger.Debug("failed to enable TCP keepalive on accepted connection", "error", err)
+		}
 
 		if l.srv.overConnectionLimit() {
 			l.srv.logger.Warn("connection limit reached; refusing connection", "max_clients", l.srv.cfg.MaxClients)
@@ -409,6 +469,8 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	state.SetRemoteAddr(remoteAddrText)
 
 	conn.machine = NewConnMachine(state)
+	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
+	conn.machine.SetPushLimit(eventLoopPushLimit)
 	conn.ctx = WithInlineExecution(WithClientState(l.ctx, state))
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
 	conn.run = l.srv.connCommandRunner(clientID, handle, conn.logger)
@@ -423,6 +485,17 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 
 	l.conns[fd] = conn
 	conn.logger.Debug("client connected")
+
+	if l.srv.authTimeoutApplies(state) {
+		// The timer runs on its own goroutine, so it only asks the loop to close
+		// the connection; the loop does it on its next wakeup.
+		conn.authTimer = time.AfterFunc(l.srv.cfg.AuthTimeout, func() {
+			if !state.IsAuthenticated() {
+				conn.logger.Info("closing a connection that did not authenticate in time", "timeout", l.srv.cfg.AuthTimeout)
+				l.requestClose(conn)
+			}
+		})
+	}
 }
 
 func (l *eventLoop) connReadable(conn *eventConn) {
@@ -531,6 +604,7 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 	if !l.flushOnce(conn) {
 		return
 	}
+	l.accountPushOutput(conn)
 	if conn.machine.State() == ConnStateClosed {
 		l.closeConn(conn, conn.machine.Err())
 		return
@@ -564,6 +638,11 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 		return
 	}
 	delete(l.conns, conn.fd)
+	if conn.authTimer != nil {
+		conn.authTimer.Stop()
+	}
+	l.pushOutput -= conn.pushAccounted
+	conn.pushAccounted = 0
 
 	l.mu.Lock()
 	conn.detached = true
@@ -577,6 +656,40 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 	closeIgnoringError(conn.fd)
 
 	l.srv.teardownClient(conn.clientID, conn.logger)
+}
+
+// accountPushOutput brings the loop's total of push-receiving output up to date
+// with what is waiting for conn now. Replicas are left out: they have their own
+// limit, and a replica catching up should not push subscribers out.
+func (l *eventLoop) accountPushOutput(conn *eventConn) {
+	if !conn.receivesPushes || conn.replica.Load() {
+		return
+	}
+	pending := conn.machine.PendingOutputBytes()
+	l.pushOutput += pending - conn.pushAccounted
+	conn.pushAccounted = pending
+}
+
+// enforcePushBudget closes push-receiving clients, the one with the most output
+// waiting first, until the total is back within eventLoopPushBudget.
+func (l *eventLoop) enforcePushBudget() {
+	for l.pushOutput > eventLoopPushBudget {
+		var victim *eventConn
+		for _, conn := range l.conns {
+			if conn.pushAccounted > 0 && (victim == nil || conn.pushAccounted > victim.pushAccounted) {
+				victim = conn
+			}
+		}
+		if victim == nil {
+			return
+		}
+		victim.logger.Warn(
+			"closing a client that is not keeping up with pushed messages: the event loop's total output budget for such clients is exhausted",
+			"pending_bytes", victim.pushAccounted,
+			"budget_bytes", eventLoopPushBudget,
+		)
+		l.closeConn(victim, fmt.Errorf("server: closed to stay within the %d byte budget for pushed output", eventLoopPushBudget))
+	}
 }
 
 func (l *eventLoop) cleanup() {

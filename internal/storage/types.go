@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -123,12 +124,15 @@ type SnapshotStats struct {
 // milliseconds. Reads refresh it with atomic stores so shard read paths can
 // keep their RLock fast path while still providing data for approximate LRU
 // eviction.
+//
+// A list keeps its values in List[ListHead:]; see liveList.
 type ValueObject struct {
 	String         []byte
 	List           [][]byte
 	ZSet           *SortedSet
 	CompactZSet    *CompactZSet
 	ZSetEncoding   ValueEncoding
+	ListHead       int32
 	Stream         *StreamValue
 	Hash           map[string][]byte
 	CompactHash    *CompactHash
@@ -178,7 +182,34 @@ func (v *ValueObject) ListValue() ([][]byte, error) {
 		return nil, ErrWrongType
 	}
 
-	return v.List, nil
+	return v.liveList(), nil
+}
+
+// liveList returns the values of a list value. List holds the whole array the
+// list lives in and ListHead counts the dead (nil) slots at its front, left by
+// pops from the left. LPUSH refills those slots, so a list used from its left end
+// is neither copied on push nor left holding memory it no longer needs.
+func (v *ValueObject) liveList() [][]byte {
+	return v.List[v.ListHead:]
+}
+
+// dropListFront removes the n left-most values of a list without copying: their
+// slots become dead, and a later LPUSH can refill them.
+func (v *ValueObject) dropListFront(n int) {
+	if head := int(v.ListHead) + n; head <= math.MaxInt32 {
+		v.ListHead = int32(head)
+		return
+	}
+
+	// Two billion pops from the left with no append moving the list into a new
+	// array: copy what is left instead of letting the head overflow.
+	v.List = append([][]byte(nil), v.List[int(v.ListHead)+n:]...)
+	v.ListHead = 0
+}
+
+// dropListEnd removes the n right-most values of a list.
+func (v *ValueObject) dropListEnd(n int) {
+	v.List = v.List[:len(v.List)-n]
 }
 
 // ZSetValue returns the general sorted-set payload for a sorted-set value.

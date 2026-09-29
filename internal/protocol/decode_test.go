@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"errors"
 	"reflect"
 	"testing"
@@ -259,6 +260,141 @@ func TestDecodeProtocolErrors(t *testing.T) {
 			}
 			if consumed != 0 {
 				t.Fatalf("Decode(%q) consumed = %d, want 0", tt.input, consumed)
+			}
+		})
+	}
+}
+
+func TestDecoderResumesAcrossArbitrarySplits(t *testing.T) {
+	frames := []string{
+		"+OK\r\n",
+		"$5\r\nhello\r\n",
+		"*0\r\n",
+		"*-1\r\n",
+		"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+		"*3\r\n$3\r\nSET\r\n*2\r\n:1\r\n$2\r\nhi\r\n$-1\r\n",
+		"*2\r\n*1\r\n*1\r\n:1\r\n+done\r\n",
+	}
+
+	for _, frame := range frames {
+		want, wantN, err := Decode([]byte(frame))
+		if err != nil {
+			t.Fatalf("Decode(%q) error = %v", frame, err)
+		}
+
+		for step := 1; step <= 4; step++ {
+			var d Decoder
+			var got Value
+			var gotN int
+			for end := step; ; end += step {
+				end = min(end, len(frame))
+				got, gotN, err = d.Decode([]byte(frame[:end]))
+				if !errors.Is(err, ErrIncomplete) {
+					break
+				}
+				if end == len(frame) {
+					t.Fatalf("Decode(%q) still incomplete at the full frame", frame)
+				}
+			}
+			if err != nil {
+				t.Fatalf("step %d: Decode(%q) error = %v", step, frame, err)
+			}
+			if !reflect.DeepEqual(got, want) || gotN != wantN {
+				t.Fatalf("step %d: Decode(%q) = (%#v, %d), want (%#v, %d)", step, frame, got, gotN, want, wantN)
+			}
+		}
+	}
+}
+
+func TestDecoderKeepsItsPlaceInAnUnfinishedFrame(t *testing.T) {
+	// The decoder must never look at a byte twice: after each read it has folded
+	// in everything up to the last incomplete token, so the work per read does not
+	// grow with the bytes already received.
+	const args = 5000
+	var frame []byte
+	frame = append(frame, "*5000\r\n"...)
+	for i := 0; i < args; i++ {
+		frame = append(frame, "$1\r\nx\r\n"...)
+	}
+
+	var d Decoder
+	lastPos := 0
+	for end := 100; end < len(frame); end += 100 {
+		_, _, err := d.Decode(frame[:end])
+		if !errors.Is(err, ErrIncomplete) {
+			t.Fatalf("Decode(frame[:%d]) error = %v, want ErrIncomplete", end, err)
+		}
+		if d.pos < lastPos {
+			t.Fatalf("progress moved backwards from %d to %d", lastPos, d.pos)
+		}
+		if lag := end - d.pos; lag >= len("$1\r\nx\r\n") {
+			t.Fatalf("after %d bytes the decoder had only consumed %d, want it within one token of the end", end, d.pos)
+		}
+		lastPos = d.pos
+	}
+
+	value, n, err := d.Decode(frame)
+	if err != nil {
+		t.Fatalf("Decode(full frame) error = %v", err)
+	}
+	if array, ok := value.(Array); !ok || len(array.Elements) != args || n != len(frame) {
+		t.Fatalf("Decode(full frame) = (%d elements?, %d), want %d elements and %d bytes", len(array.Elements), n, args, len(frame))
+	}
+}
+
+func TestDecoderStartsOverAfterAnError(t *testing.T) {
+	var d Decoder
+	if _, _, err := d.Decode([]byte("*2\r\n:1\r\nX")); err == nil || errors.Is(err, ErrIncomplete) {
+		t.Fatalf("Decode(bad element) error = %v, want permanent protocol error", err)
+	}
+
+	value, n, err := d.Decode([]byte("+OK\r\n"))
+	if err != nil || n != len("+OK\r\n") || value != (SimpleString{Value: "OK"}) {
+		t.Fatalf("Decode(after error) = (%#v, %d, %v), want a clean decode of the next frame", value, n, err)
+	}
+}
+
+func TestDecodeErrorNamesEveryEnclosingArrayElement(t *testing.T) {
+	_, _, err := Decode([]byte("*3\r\n:1\r\n*2\r\n:2\r\nX\r\n"))
+	want := `protocol: parse array element 1: protocol: parse array element 1: protocol: unsupported frame prefix "X"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("Decode() error = %v, want %q", err, want)
+	}
+}
+
+func TestDecodeBoundsLinesAndArrayLengths(t *testing.T) {
+	line := func(prefix string, bodyLen int, terminated bool) []byte {
+		frame := append([]byte(prefix), bytes.Repeat([]byte("A"), bodyLen)...)
+		if terminated {
+			frame = append(frame, "\r\n"...)
+		}
+		return frame
+	}
+
+	tests := []struct {
+		name         string
+		input        []byte
+		wantComplete bool
+		wantErr      bool
+	}{
+		{name: "line at the limit decodes", input: line("+", maxLineLength-2, true), wantComplete: true},
+		{name: "line one byte under the limit still waits for its terminator", input: line("+", maxLineLength-1, false)},
+		{name: "unterminated line at the limit is an error", input: line("+", maxLineLength, false), wantErr: true},
+		{name: "terminated line over the limit is an error", input: line("+", maxLineLength-1, true), wantErr: true},
+		{name: "array header at the element limit waits for elements", input: []byte("*1048576\r\n")},
+		{name: "array header over the element limit is an error", input: []byte("*1048577\r\n"), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := Decode(tt.input)
+			switch {
+			case tt.wantComplete && err != nil:
+				t.Fatalf("Decode() error = %v, want a complete value", err)
+			case tt.wantErr && (err == nil || errors.Is(err, ErrIncomplete)):
+				t.Fatalf("Decode() error = %v, want a permanent protocol error", err)
+			case !tt.wantComplete && !tt.wantErr && !errors.Is(err, ErrIncomplete):
+				t.Fatalf("Decode() error = %v, want ErrIncomplete", err)
 			}
 		})
 	}

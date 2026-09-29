@@ -1,10 +1,13 @@
 package aof_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/maltemindedal/stash/internal/aof"
@@ -92,6 +95,156 @@ func TestLoadFile(t *testing.T) {
 			t.Fatalf("LoadFile() error = %v, want context.Canceled", err)
 		}
 	})
+}
+
+func TestLoadFileReportsWhereCompleteCommandsEnd(t *testing.T) {
+	// Startup truncates a torn tail at ValidBytes before it appends anything, so
+	// ValidBytes must be exactly the end of the last complete command, and TornTail
+	// must only be set when the bytes after it are provably one unfinished command
+	// that ran into the end of the file.
+	first := mustEncodeValues(t, request("SET", "name", "Stash"))
+	second := mustEncodeValues(t, request("INCR", "counter"))
+
+	tests := []struct {
+		name         string
+		tail         []byte
+		wantTornTail bool
+		wantTrunc    bool // the pre-existing TruncatedTail flag
+	}{
+		{name: "complete file", tail: second},
+		{name: "cut inside a bulk payload", tail: second[:len(second)-3], wantTornTail: true, wantTrunc: true},
+		{name: "cut between array elements", tail: []byte("*2\r\n$4\r\nINCR\r\n"), wantTornTail: true, wantTrunc: true},
+		{name: "cut inside a header line", tail: []byte("*2\r"), wantTornTail: true, wantTrunc: true},
+		{name: "cut between CR and LF of a payload terminator", tail: []byte("*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r"), wantTornTail: true, wantTrunc: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTempAOF(t, append(bytes.Clone(first), tt.tail...))
+
+			stats, err := aof.LoadFile(context.Background(), path, func(context.Context, protocol.Value) error { return nil })
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+
+			wantValid := int64(len(first))
+			if tt.name == "complete file" {
+				wantValid += int64(len(second))
+			}
+			if stats.ValidBytes != wantValid {
+				t.Fatalf("stats.ValidBytes = %d, want %d", stats.ValidBytes, wantValid)
+			}
+			if stats.TornTail != tt.wantTornTail {
+				t.Fatalf("stats.TornTail = %v, want %v", stats.TornTail, tt.wantTornTail)
+			}
+			if stats.TruncatedTail != tt.wantTrunc {
+				t.Fatalf("stats.TruncatedTail = %v, want %v", stats.TruncatedTail, tt.wantTrunc)
+			}
+		})
+	}
+}
+
+func TestLoadFileFailsOnCorruptionBeforeTheEnd(t *testing.T) {
+	// Bad bytes with more data behind them are not a torn write. Replaying only
+	// what precedes them would silently drop every command that follows (and new
+	// commands would be appended after the damage), so the load fails and reports
+	// where the damage starts. The file is never modified.
+	first := mustEncodeValues(t, request("SET", "name", "Stash"))
+	second := mustEncodeValues(t, request("INCR", "counter"))
+
+	tests := []struct {
+		name string
+		tail []byte
+	}{
+		{name: "bad payload terminator followed by more commands", tail: append([]byte("*2\r\n$4\r\nINCR\r\n$3\r\nabXY"), second...)},
+		{name: "bad payload terminator at the very end", tail: []byte("*2\r\n$4\r\nINCR\r\n$3\r\nabXYZ")},
+		{name: "unknown type byte", tail: append([]byte("?garbage\r\n"), second...)},
+		{name: "bare newline in a header", tail: append([]byte("*2\n"), second...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := append(bytes.Clone(first), tt.tail...)
+			path := writeTempAOF(t, content)
+
+			replayed := 0
+			stats, err := aof.LoadFile(context.Background(), path, func(context.Context, protocol.Value) error {
+				replayed++
+				return nil
+			})
+			var corrupt *aof.CorruptError
+			if !errors.As(err, &corrupt) {
+				t.Fatalf("LoadFile() error = %v, want a *aof.CorruptError", err)
+			}
+			if corrupt.Offset != int64(len(first)) {
+				t.Fatalf("CorruptError.Offset = %d, want %d (the end of the last good command)", corrupt.Offset, len(first))
+			}
+			if corrupt.Commands != 1 || replayed != 1 || stats.ReplayedCommands != 1 {
+				t.Fatalf("commands = %d (error), %d (replayed), %d (stats), want 1", corrupt.Commands, replayed, stats.ReplayedCommands)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "byte "+strconv.Itoa(len(first))) || !strings.Contains(msg, path) {
+				t.Fatalf("error text %q does not name the file and the byte offset", msg)
+			}
+			after, readErr := os.ReadFile(path)
+			if readErr != nil || !bytes.Equal(after, content) {
+				t.Fatalf("file changed by a failed load (read error %v)", readErr)
+			}
+		})
+	}
+}
+
+func TestLoadFileTornTailAtEveryCutPoint(t *testing.T) {
+	// Cut a file of mixed commands at every byte. ValidBytes must always be the
+	// last command boundary at or before the cut, and the tail may be reported as
+	// torn (and so discarded) exactly when the cut is not on a boundary.
+	frames := [][]byte{
+		mustEncodeValues(t, request("SET", "name", "Stash")),
+		mustEncodeValues(t, request("RPUSH", "letters", "a", "b", "c")),
+		mustEncodeValues(t, request("SET", "empty", "")),
+		mustEncodeValues(t, request("INCR", "counter")),
+	}
+	var boundaries []int
+	var full []byte
+	for _, frame := range frames {
+		full = append(full, frame...)
+		boundaries = append(boundaries, len(full))
+	}
+
+	for cut := 0; cut <= len(full); cut++ {
+		wantValid := 0
+		for _, boundary := range boundaries {
+			if boundary <= cut {
+				wantValid = boundary
+			}
+		}
+
+		path := writeTempAOF(t, full[:cut])
+		stats, err := aof.LoadFile(context.Background(), path, func(context.Context, protocol.Value) error { return nil })
+		if err != nil {
+			t.Fatalf("cut %d: LoadFile() error = %v", cut, err)
+		}
+		if stats.ValidBytes != int64(wantValid) {
+			t.Fatalf("cut %d: ValidBytes = %d, want %d", cut, stats.ValidBytes, wantValid)
+		}
+		if wantTorn := cut != wantValid; stats.TornTail != wantTorn {
+			t.Fatalf("cut %d: TornTail = %v, want %v", cut, stats.TornTail, wantTorn)
+		}
+	}
+}
+
+func TestTruncateTailCutsTheFileAtTheGivenSize(t *testing.T) {
+	path := writeTempAOF(t, []byte("0123456789"))
+
+	if err := aof.TruncateTail(path, 4); err != nil {
+		t.Fatalf("TruncateTail() error = %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(got) != "0123" {
+		t.Fatalf("file after TruncateTail(4) = %q, want %q", got, "0123")
+	}
 }
 
 func writeTempAOF(t *testing.T, payload []byte) string {

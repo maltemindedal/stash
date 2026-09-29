@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Actions are pinned to commit SHAs, so nothing moves unless a bump is proposed here.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7

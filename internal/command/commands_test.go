@@ -658,6 +658,26 @@ func TestExecutorExecute(t *testing.T) {
 			},
 		},
 		{
+			name:    "SET with an EX that overflows returns the invalid-expire sentinel",
+			request: requestValue("SET", "temp", "1", "EX", "9223372036854775807"),
+			assert: func(t *testing.T, _ protocol.Value, err error) {
+				t.Helper()
+				if !errors.Is(err, ErrInvalidExpireTime) {
+					t.Fatalf("Execute() error = %v, want ErrInvalidExpireTime (the deadline used to wrap into the past)", err)
+				}
+			},
+		},
+		{
+			name:    "SET with a PX that overflows returns the invalid-expire sentinel",
+			request: requestValue("SET", "temp", "1", "PX", "9223372036854775807"),
+			assert: func(t *testing.T, _ protocol.Value, err error) {
+				t.Helper()
+				if !errors.Is(err, ErrInvalidExpireTime) {
+					t.Fatalf("Execute() error = %v, want ErrInvalidExpireTime (the deadline used to wrap into the past)", err)
+				}
+			},
+		},
+		{
 			name:    "SET with invalid option returns syntax sentinel",
 			request: requestValue("SET", "temp", "1", "NX", "10"),
 			assert: func(t *testing.T, _ protocol.Value, err error) {
@@ -1094,6 +1114,129 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 }
 
+func TestInfoPersistence(t *testing.T) {
+	info := func(t *testing.T, executor *Executor, args ...string) string {
+		t.Helper()
+
+		value, err := executor.Execute(context.Background(), requestValue(append([]string{"INFO"}, args...)...))
+		if err != nil {
+			t.Fatalf("INFO %v error = %v", args, err)
+		}
+		return mustBulkStringText(t, value)
+	}
+
+	t.Run("no server behind the executor reports no AOF and no failure", func(t *testing.T) {
+		text := info(t, newTestExecutor(), "persistence")
+		if want := "# Persistence\r\naof_enabled:0\r\naof_last_write_status:ok\r\n"; text != want {
+			t.Fatalf("INFO persistence = %q, want %q", text, want)
+		}
+	})
+
+	t.Run("a failed AOF write is reported as err", func(t *testing.T) {
+		executor := newTestExecutor()
+		executor.SetServerStatsProvider(func() server.Stats {
+			return server.Stats{Role: "master", AOFEnabled: true, AOFLastWriteOK: false}
+		})
+
+		text := info(t, executor, "persistence")
+		for _, want := range []string{"aof_enabled:1", "aof_last_write_status:err"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("INFO persistence = %q, missing %q", text, want)
+			}
+		}
+	})
+
+	t.Run("the default INFO includes the section after the existing ones", func(t *testing.T) {
+		text := info(t, newTestExecutor())
+		clients := strings.Index(text, "# Clients")
+		persistence := strings.Index(text, "# Persistence")
+		if clients < 0 || persistence < clients {
+			t.Fatalf("INFO = %q, want # Persistence after # Clients", text)
+		}
+	})
+}
+
+func TestSlowlogTruncatesLargeCommands(t *testing.T) {
+	record := func(t *testing.T, args ...string) []string {
+		t.Helper()
+
+		executor := newTestExecutor()
+		registry := server.NewSlowlogRegistry()
+		executor.SetSlowlogConfig(registry, 0)
+		if _, err := executor.Execute(context.Background(), requestValue(args...)); err != nil {
+			t.Fatalf("%s error = %v", args[0], err)
+		}
+		entries := registry.Entries(1)
+		if len(entries) != 1 {
+			t.Fatalf("len(slowlog entries) = %d, want 1", len(entries))
+		}
+		return entries[0].Command
+	}
+
+	t.Run("an argument over 128 bytes keeps its first 128 and the count of the rest", func(t *testing.T) {
+		value := strings.Repeat("x", 128+172)
+		got := record(t, "SET", "key", value)
+
+		want := []string{"SET", "key", strings.Repeat("x", 128) + "... (172 more bytes)"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("slowlog command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("an argument of exactly 128 bytes is kept whole", func(t *testing.T) {
+		value := strings.Repeat("y", 128)
+		got := record(t, "SET", "key", value)
+
+		if want := []string{"SET", "key", value}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("slowlog command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("more than 32 arguments keep 31 and summarise the rest", func(t *testing.T) {
+		request := []string{"RPUSH", "list"}
+		for i := 0; i < 48; i++ {
+			request = append(request, "v"+strconv.Itoa(i))
+		}
+		got := record(t, request...)
+
+		// 50 tokens in all (name, key, 48 values): 31 kept, the last slot says
+		// how many were dropped, counting the one it replaces.
+		if len(got) != 32 {
+			t.Fatalf("len(slowlog command) = %d, want 32", len(got))
+		}
+		if !reflect.DeepEqual(got[:31], request[:31]) {
+			t.Fatalf("first 31 tokens = %q, want %q", got[:31], request[:31])
+		}
+		if want := "... (19 more arguments)"; got[31] != want {
+			t.Fatalf("last token = %q, want %q", got[31], want)
+		}
+	})
+
+	t.Run("exactly 32 arguments are kept whole", func(t *testing.T) {
+		request := []string{"RPUSH", "list"}
+		for i := 0; i < 30; i++ {
+			request = append(request, "v"+strconv.Itoa(i))
+		}
+		got := record(t, request...)
+
+		if !reflect.DeepEqual(got, request) {
+			t.Fatalf("slowlog command = %q, want %q", got, request)
+		}
+	})
+
+	t.Run("a stored entry does not retain a huge value", func(t *testing.T) {
+		got := record(t, "SET", "key", strings.Repeat("z", 8<<20))
+
+		total := 0
+		for _, token := range got {
+			total += len(token)
+		}
+		if total > 1024 {
+			t.Fatalf("slowlog entry holds %d bytes, want it bounded by the truncation limits", total)
+		}
+	})
+}
+
 func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	t.Run("replica-origin GETACK emits upstream ACK reply", func(t *testing.T) {
 		executor := newTestExecutor()
@@ -1210,6 +1353,39 @@ func TestExecutorWait(t *testing.T) {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
 		}
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
+	})
+
+	t.Run("WAIT with a timeout past what a duration can hold keeps waiting", func(t *testing.T) {
+		// 9223372036855 ms overflows time.Duration; it used to wrap negative, so the
+		// timer fired at once and WAIT answered without waiting at all.
+		executor := newTestExecutor()
+		replication := &server.ReplicationState{}
+		replication.AdvanceMasterOffset(5)
+		executor.SetReplicationState(replication)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "9223372036855"))
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			t.Fatalf("WAIT returned at once (error = %v), want it to keep waiting for its huge timeout", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("WAIT error after cancel = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("WAIT did not stop when its context was canceled")
+		}
 	})
 
 	t.Run("WAIT uses the calling client's last write offset", func(t *testing.T) {
@@ -2429,6 +2605,73 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 			t.Fatalf("ExecuteDetailed(GET) error = %v", err)
 		}
 		assertValueEqual(t, got.Responses[0], protocol.BulkString{Data: []byte("v")})
+	})
+}
+
+func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
+	// The durability frame is replayed at startup. Logging XADD's "*" verbatim
+	// makes replay mint a fresh ID from the clock at that moment, so every
+	// auto-ID entry came back under a different ID after a restart.
+	t.Run("auto ID is replaced by the ID that was generated", func(t *testing.T) {
+		executor := newTestExecutor()
+		result, err := executor.ExecuteDetailed(context.Background(), requestValue("XADD", "events", "*", "type", "start"))
+		if err != nil {
+			t.Fatalf("ExecuteDetailed(XADD *) error = %v", err)
+		}
+		id, ok := result.Responses[0].(protocol.TextBulkString)
+		if !ok || id.Value == "" || id.Value == "*" {
+			t.Fatalf("XADD * reply = %#v, want the generated ID", result.Responses[0])
+		}
+		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+
+		// Replaying the logged frame recreates the entry under the same ID.
+		replayed := newTestExecutor()
+		frame, ok := result.Durability[0].(protocol.Array)
+		if !ok {
+			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
+		}
+		if _, err := replayed.ExecuteDetailed(context.Background(), frame); err != nil {
+			t.Fatalf("replaying the logged frame: %v", err)
+		}
+		entries, err := replayed.store.XRead("events", "0-0")
+		if err != nil || len(entries) != 1 || entries[0].ID != id.Value {
+			t.Fatalf("XRead after replay = (%#v, %v), want one entry with ID %q", entries, err, id.Value)
+		}
+	})
+
+	t.Run("an XADD queued in a transaction is logged with its generated ID", func(t *testing.T) {
+		executor := newTestExecutor()
+		ctx := withClientStateForExecutor(context.Background(), executor, 3)
+		for _, step := range []protocol.Value{
+			requestValue("MULTI"),
+			requestValue("XADD", "events", "*", "type", "start"),
+		} {
+			if _, err := executor.ExecuteDetailed(ctx, step); err != nil {
+				t.Fatalf("ExecuteDetailed(%v) error = %v", step, err)
+			}
+		}
+		result, err := executor.ExecuteDetailed(ctx, requestValue("EXEC"))
+		if err != nil {
+			t.Fatalf("ExecuteDetailed(EXEC) error = %v", err)
+		}
+		replies, ok := result.Responses[0].(protocol.Array)
+		if !ok || len(replies.Elements) != 1 {
+			t.Fatalf("EXEC reply = %#v, want one queued reply", result.Responses[0])
+		}
+		id, ok := replies.Elements[0].(protocol.TextBulkString)
+		if !ok || id.Value == "" || id.Value == "*" {
+			t.Fatalf("queued XADD reply = %#v, want the generated ID", replies.Elements[0])
+		}
+		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+	})
+
+	t.Run("an explicit ID keeps its verbatim frame", func(t *testing.T) {
+		executor := newTestExecutor()
+		result, err := executor.ExecuteDetailed(context.Background(), requestValue("XADD", "events", "5-1", "type", "start"))
+		if err != nil {
+			t.Fatalf("ExecuteDetailed(XADD 5-1) error = %v", err)
+		}
+		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", "5-1", "type", "start"))
 	})
 }
 

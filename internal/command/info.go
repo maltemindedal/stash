@@ -15,13 +15,13 @@ import (
 )
 
 func (e *Executor) handleInfo(_ context.Context, request *Request) (protocol.Value, error) {
-	sections := []string{"memory", "replication", "clients"}
+	sections := []string{"memory", "replication", "clients", "persistence"}
 	if len(request.Args) == 1 {
 		section := strings.ToLower(string(request.Args[0]))
 		switch section {
 		case "default", "all":
 			// Keep all implemented sections.
-		case "memory", "replication", "clients":
+		case "memory", "replication", "clients", "persistence":
 			sections = []string{section}
 		default:
 			return nil, ErrSyntaxError()
@@ -40,6 +40,8 @@ func (e *Executor) handleInfo(_ context.Context, request *Request) (protocol.Val
 			e.appendInfoReplication(&buf)
 		case "clients":
 			e.appendInfoClients(&buf)
+		case "persistence":
+			e.appendInfoPersistence(&buf)
 		}
 	}
 
@@ -118,9 +120,29 @@ func (e *Executor) appendInfoClients(buf *bytes.Buffer) {
 	appendInfoField(buf, "total_commands_processed", stats.CommandsProcessed)
 }
 
+func (e *Executor) appendInfoPersistence(buf *bytes.Buffer) {
+	stats := e.serverStats()
+
+	status := "ok"
+	if !stats.AOFLastWriteOK {
+		status = "err"
+	}
+
+	buf.WriteString("# Persistence\r\n")
+	appendInfoField(buf, "aof_enabled", boolToInt(stats.AOFEnabled))
+	appendInfoField(buf, "aof_last_write_status", status)
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func (e *Executor) serverStats() server.Stats {
 	if e.serverStatsProvider == nil {
-		return server.Stats{Role: "master"}
+		return server.Stats{Role: "master", AOFLastWriteOK: true}
 	}
 
 	return e.serverStatsProvider()

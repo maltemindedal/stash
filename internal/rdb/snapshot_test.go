@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -165,83 +165,74 @@ func TestSaveSnapshotReplacesExistingFile(t *testing.T) {
 	}
 }
 
-// TestReplaceFileRetriesAfterExistConflict covers the Windows path where rename
-// onto an existing target fails: replaceFile must remove the target once and
-// retry. The conflict reaches it in more than one shape depending on the
-// platform, so every shape must be recognised.
-func TestReplaceFileRetriesAfterExistConflict(t *testing.T) {
+// TestSaveSnapshotCreatesTheDirectoryPrivately pins that a snapshot directory the
+// server creates is not readable or searchable by other users; the snapshot
+// file itself is 0600.
+func TestSaveSnapshotCreatesTheDirectoryPrivately(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not use Unix permission bits")
+	}
+
+	dir := filepath.Join(t.TempDir(), "data", "rdb")
+	if _, err := SaveSnapshot(filepath.Join(dir, "dump.rdb"), nil); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", dir, err)
+	}
+	if extra := info.Mode().Perm() &^ 0o750; extra != 0 {
+		t.Fatalf("directory mode = %#o, want no bits outside 0750 (extra %#o)", info.Mode().Perm(), extra)
+	}
+}
+
+// TestReplaceFileNeverRemovesTheTarget pins that a failed rename leaves the
+// existing snapshot in place. replaceFile used to answer an "already exists"
+// failure by removing the target and renaming again, which loses the only
+// snapshot if the second rename fails too.
+func TestReplaceFileNeverRemovesTheTarget(t *testing.T) {
 	tests := []struct {
 		name     string
-		conflict func(oldpath, newpath string) error
+		conflict error
 	}{
-		{
-			name:     "bare fs.ErrExist",
-			conflict: func(_, _ string) error { return fs.ErrExist },
-		},
-		{
-			name: "LinkError wrapping EEXIST",
-			conflict: func(oldpath, newpath string) error {
-				return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EEXIST}
-			},
-		},
+		{name: "bare fs.ErrExist", conflict: fs.ErrExist},
+		{name: "LinkError wrapping EEXIST", conflict: &os.LinkError{Op: "rename", Err: syscall.EEXIST}},
+		{name: "other failure", conflict: errors.New("rename boom")},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tempPath, targetPath, originalRename, originalRemove := replaceFileTestFixture(t)
+			tempPath, targetPath := replaceFileTestFixture(t)
 
 			renameCalls := 0
-			removeCalls := 0
-			renameFile = func(oldpath string, newpath string) error {
+			renameFile = func(_, _ string) error {
 				renameCalls++
-				if renameCalls == 1 {
-					return tt.conflict(oldpath, newpath)
-				}
-				return originalRename(oldpath, newpath)
-			}
-			removeFile = func(name string) error {
-				removeCalls++
-				return originalRemove(name)
+				return tt.conflict
 			}
 
-			if err := replaceFile(tempPath, targetPath); err != nil {
-				t.Fatalf("replaceFile() error = %v", err)
+			err := replaceFile(tempPath, targetPath)
+			if !errors.Is(err, tt.conflict) {
+				t.Fatalf("replaceFile() error = %v, want it to wrap %v", err, tt.conflict)
 			}
-			if renameCalls != 2 {
-				t.Fatalf("rename calls = %d, want 2", renameCalls)
+			if renameCalls != 1 {
+				t.Fatalf("rename calls = %d, want 1", renameCalls)
 			}
-			if removeCalls != 1 {
-				t.Fatalf("remove calls = %d, want 1", removeCalls)
-			}
-			assertFileContents(t, targetPath, "new")
+			assertFileContents(t, targetPath, "old")
 		})
 	}
 }
 
-func TestReplaceFilePreservesExistingFileOnUnexpectedRenameFailure(t *testing.T) {
-	tempPath, targetPath, _, originalRemove := replaceFileTestFixture(t)
+func TestReplaceFileReplacesAnExistingTarget(t *testing.T) {
+	tempPath, targetPath := replaceFileTestFixture(t)
 
-	boom := errors.New("rename boom")
-	removeCalled := false
-	renameFile = func(_, _ string) error {
-		return boom
+	if err := replaceFile(tempPath, targetPath); err != nil {
+		t.Fatalf("replaceFile() error = %v", err)
 	}
-	removeFile = func(name string) error {
-		removeCalled = true
-		return originalRemove(name)
-	}
-
-	err := replaceFile(tempPath, targetPath)
-	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
-		t.Fatalf("replaceFile() error = %v, want rename boom", err)
-	}
-	if removeCalled {
-		t.Fatal("replaceFile() removed existing target on unexpected rename failure")
-	}
-	assertFileContents(t, targetPath, "old")
+	assertFileContents(t, targetPath, "new")
 }
 
-func replaceFileTestFixture(t *testing.T) (string, string, func(string, string) error, func(string) error) {
+func replaceFileTestFixture(t *testing.T) (string, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -255,13 +246,9 @@ func replaceFileTestFixture(t *testing.T) (string, string, func(string, string) 
 	}
 
 	originalRename := renameFile
-	originalRemove := removeFile
-	t.Cleanup(func() {
-		renameFile = originalRename
-		removeFile = originalRemove
-	})
+	t.Cleanup(func() { renameFile = originalRename })
 
-	return tempPath, targetPath, originalRename, originalRemove
+	return tempPath, targetPath
 }
 
 func assertFileContents(t *testing.T, path string, want string) {
