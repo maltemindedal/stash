@@ -710,3 +710,33 @@ func TestConnMachineDecodesOneRequestAtATimeWhileLimitsApply(t *testing.T) {
 		}
 	})
 }
+
+func TestConnMachinePushLimitDoesNotApplyToReplies(t *testing.T) {
+	// A reply can be as large as a stored value; only pushed frames are held to
+	// the tighter limit.
+	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
+		return []protocol.Value{protocol.BulkString{Data: bytes.Repeat([]byte("x"), 1024)}}, nil
+	}
+	machine := NewConnMachine(nil)
+	machine.SetPushLimit(64)
+
+	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v, want a reply above the push limit accepted", err)
+	}
+	if got := machine.PendingOutputBytes(); got <= 64 {
+		t.Fatalf("PendingOutputBytes() = %d, want the 1 KiB reply buffered", got)
+	}
+
+	if err := machine.BufferEncoded([]byte("+push\r\n")); err == nil {
+		t.Fatal("BufferEncoded() error = nil, want a push refused while output above the push limit is pending")
+	}
+
+	// Once the reply has drained, a small push fits again.
+	flushAll(t, machine)
+	if err := machine.BufferEncoded([]byte("+push\r\n")); err != nil {
+		t.Fatalf("BufferEncoded() after draining error = %v", err)
+	}
+}

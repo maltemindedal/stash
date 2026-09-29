@@ -88,6 +88,12 @@ type ConnMachine struct {
 	// request may be the AUTH that lifts them.
 	requestLimits func() protocol.Limits
 	decodePaused  bool
+
+	// maxPushBuffer bounds pending output when an asynchronous push frame is
+	// added, which can be a tighter limit than maxWriteBuffer: a reply the client
+	// asked for can legitimately be as large as a stored value, but only a client
+	// that is not draining its socket lets pushes pile up.
+	maxPushBuffer int
 }
 
 // NewConnMachine constructs an active connection state machine bound to the
@@ -97,7 +103,15 @@ func NewConnMachine(client *ClientState) *ConnMachine {
 		client:         client,
 		maxReadBuffer:  defaultMaxReadBuffer,
 		maxWriteBuffer: defaultMaxWriteBuffer,
+		maxPushBuffer:  defaultMaxWriteBuffer,
 	}
+}
+
+// SetPushLimit changes how much output may be pending when an asynchronous push
+// frame is buffered (BufferEncoded). Replies to the client's own requests keep
+// the write-buffer limit.
+func (m *ConnMachine) SetPushLimit(limit int) {
+	m.maxPushBuffer = limit
 }
 
 // State returns the current lifecycle phase.
@@ -335,8 +349,8 @@ func (m *ConnMachine) BufferEncoded(payload []byte) error {
 	if len(payload) == 0 {
 		return nil
 	}
-	if m.PendingOutputBytes()+len(payload) > m.maxWriteBuffer {
-		return fmt.Errorf("server: pending output exceeds %d byte write-buffer limit", m.maxWriteBuffer)
+	if limit := min(m.maxPushBuffer, m.maxWriteBuffer); m.PendingOutputBytes()+len(payload) > limit {
+		return fmt.Errorf("server: pending output exceeds %d byte limit for pushed frames", limit)
 	}
 
 	m.compactWriteBuf()
