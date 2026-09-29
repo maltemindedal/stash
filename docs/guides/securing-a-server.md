@@ -35,6 +35,8 @@ For a replica, use `--masterauth-file` the same way. Startup fails if the file i
 
 Unauthenticated clients may still issue `PING`. Every other command, including the replication handshake, requires authentication first.
 
+Until a client authenticates it is also held to small frames, the same limits Redis applies: an array of at most 10 elements and a bulk string of at most 16 KiB. Anything larger is answered with one protocol error and the connection is closed, before the server has read the rest of the frame, so someone who can reach the port cannot make it buffer large requests. `AUTH` and `PING` fit easily. The limits end once the client authenticates, and apply only when `--requirepass` is set; the frame that follows an `AUTH` in the same pipeline is judged after the `AUTH` has run.
+
 ## Bind another interface
 
 Only after setting a password:

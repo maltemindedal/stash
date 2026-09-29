@@ -68,6 +68,15 @@ type Decoder struct {
 	open []openArray
 	// pos counts the bytes of the current frame already folded into open.
 	pos int
+	// limits tightens what the frames decoded next may declare.
+	limits Limits
+}
+
+// SetLimits tightens what the following frames may declare, until it is called
+// again. The zero Limits restores the defaults. It is meant to be called between
+// frames: array and bulk headers already read are not checked again.
+func (d *Decoder) SetLimits(limits Limits) {
+	d.limits = limits
 }
 
 // openArray is an array whose header has been read but whose elements have not
@@ -189,7 +198,7 @@ func (d *Decoder) token(buf []byte) (Value, int, error) {
 		}
 		return value, 1 + n, nil
 	case '$':
-		return decodeBulkString(buf)
+		return d.decodeBulkString(buf)
 	case '*':
 		return d.openArray(buf)
 	default:
@@ -197,7 +206,7 @@ func (d *Decoder) token(buf []byte) (Value, int, error) {
 	}
 }
 
-func decodeBulkString(buf []byte) (Value, int, error) {
+func (d *Decoder) decodeBulkString(buf []byte) (Value, int, error) {
 	line, n, err := decodeLine(buf[1:])
 	if err != nil {
 		return nil, 0, err
@@ -213,6 +222,13 @@ func decodeBulkString(buf []byte) (Value, int, error) {
 	}
 	if length < -1 {
 		return nil, 0, fmt.Errorf("protocol: invalid bulk string length %d", length)
+	}
+	// Only a tightened limit is checked here. The default is left to the caller's
+	// buffer limit, which also bounds a length too large to add up as a hint.
+	if d.limits.bulkLength() < maxBulkStringLength {
+		if err := d.limits.checkBulkLength(length); err != nil {
+			return nil, 0, err
+		}
 	}
 
 	remaining := buf[consumed:]
@@ -249,8 +265,8 @@ func (d *Decoder) openArray(buf []byte) (Value, int, error) {
 	if count < -1 {
 		return nil, 0, fmt.Errorf("protocol: invalid array length %d", count)
 	}
-	if count > maxArrayElements {
-		return nil, 0, fmt.Errorf("protocol: array length %d exceeds %d element limit", count, maxArrayElements)
+	if err := d.limits.checkArrayLength(count); err != nil {
+		return nil, 0, err
 	}
 	if count == 0 {
 		return Array{Elements: []Value{}}, consumed, nil

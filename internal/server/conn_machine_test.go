@@ -579,3 +579,134 @@ func TestConnMachineFeedRejectsUnboundedHeaderLines(t *testing.T) {
 		})
 	}
 }
+
+func machineFrame(args ...string) []byte {
+	var frame bytes.Buffer
+	fmt.Fprintf(&frame, "*%d\r\n", len(args))
+	for _, arg := range args {
+		fmt.Fprintf(&frame, "$%d\r\n%s\r\n", len(arg), arg)
+	}
+	return frame.Bytes()
+}
+
+func commandNames(requests []protocol.Value) []string {
+	names := make([]string, 0, len(requests))
+	for _, request := range requests {
+		array, ok := request.(protocol.Array)
+		if !ok || len(array.Elements) == 0 {
+			names = append(names, "?")
+			continue
+		}
+		bulk, _ := array.Elements[0].(protocol.BulkString)
+		names = append(names, string(bulk.Data))
+	}
+	return names
+}
+
+func TestConnMachineDecodesOneRequestAtATimeWhileLimitsApply(t *testing.T) {
+	// Requests behind an AUTH must be decoded under the limits that hold after the
+	// AUTH has run, not the ones that held when they arrived. So while limits
+	// apply the machine decodes one request, waits for it to run, and decodes the
+	// next.
+	limited := true
+	newMachine := func() *ConnMachine {
+		limited = true
+		machine := NewConnMachine(nil)
+		machine.SetRequestLimits(func() protocol.Limits {
+			if limited {
+				return protocol.UnauthenticatedLimits
+			}
+			return protocol.Limits{}
+		})
+		return machine
+	}
+	bigValue := string(bytes.Repeat([]byte("v"), 100*1024))
+
+	t.Run("a large request behind a successful AUTH is decoded under the lifted limits", func(t *testing.T) {
+		machine := newMachine()
+		var executed []protocol.Value
+		run := func(_ context.Context, request protocol.Value) ([]protocol.Value, error) {
+			executed = append(executed, request)
+			if names := commandNames(executed); names[len(names)-1] == "AUTH" {
+				limited = false // the AUTH succeeded
+			}
+			return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+		}
+
+		input := append(append(machineFrame("AUTH", "secret"), machineFrame("SET", "key", bigValue)...), machineFrame("PING")...)
+		if err := machine.Feed(input); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if got := machine.PendingRequests(); got != 1 {
+			t.Fatalf("PendingRequests() after Feed = %d, want only the AUTH decoded", got)
+		}
+
+		if err := machine.ProcessPending(context.Background(), run); err != nil {
+			t.Fatalf("ProcessPending() error = %v", err)
+		}
+		if got := fmt.Sprint(commandNames(executed)); got != "[AUTH SET PING]" {
+			t.Fatalf("executed = %s, want [AUTH SET PING]", got)
+		}
+		if machine.State() != ConnStateActive {
+			t.Fatalf("State() = %d, want active (err = %v)", machine.State(), machine.Err())
+		}
+	})
+
+	t.Run("bytes that arrive while the request is waiting are kept for later", func(t *testing.T) {
+		machine := newMachine()
+		run, executed := echoRunner(t)
+
+		if err := machine.Feed(machineFrame("PING")); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		// The PING has not run yet, so nothing more is decoded, but the bytes stay.
+		if err := machine.Feed(machineFrame("PING")); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if got := machine.PendingRequests(); got != 1 {
+			t.Fatalf("PendingRequests() = %d, want 1 while limits apply", got)
+		}
+		if err := machine.ProcessPending(context.Background(), run); err != nil {
+			t.Fatalf("ProcessPending() error = %v", err)
+		}
+		if len(*executed) != 2 {
+			t.Fatalf("executed %d requests, want both PINGs", len(*executed))
+		}
+	})
+
+	t.Run("a large request behind a failed AUTH is refused when it is reached", func(t *testing.T) {
+		machine := newMachine()
+		run, executed := echoRunner(t) // the AUTH does not lift the limits
+
+		input := append(machineFrame("AUTH", "wrong"), machineFrame("SET", "key", bigValue)...)
+		if err := machine.Feed(input); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if err := machine.ProcessPending(context.Background(), run); err != nil {
+			t.Fatalf("ProcessPending() error = %v", err)
+		}
+		if len(*executed) != 1 {
+			t.Fatalf("executed %d requests, want only the AUTH", len(*executed))
+		}
+		if machine.State() != ConnStateClosing {
+			t.Fatalf("State() = %d, want closing after the oversized request", machine.State())
+		}
+		out := string(flushAll(t, machine))
+		if want := "+OK\r\n-ERR protocol: parse array element 2: protocol: bulk string length 102400 exceeds 16384 byte limit for a client that has not authenticated\r\n"; out != want {
+			t.Fatalf("output = %q, want %q", out, want)
+		}
+	})
+
+	t.Run("without limits every complete request is decoded at once", func(t *testing.T) {
+		machine := NewConnMachine(nil)
+		machine.SetRequestLimits(func() protocol.Limits { return protocol.Limits{} })
+
+		input := append(append(machineFrame("PING"), machineFrame("PING")...), machineFrame("PING")...)
+		if err := machine.Feed(input); err != nil {
+			t.Fatalf("Feed() error = %v", err)
+		}
+		if got := machine.PendingRequests(); got != 3 {
+			t.Fatalf("PendingRequests() = %d, want 3", got)
+		}
+	})
+}

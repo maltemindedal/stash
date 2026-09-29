@@ -421,6 +421,7 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	state.SetRemoteAddr(remoteAddrText)
 
 	conn.machine = NewConnMachine(state)
+	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
 	conn.ctx = WithInlineExecution(WithClientState(l.ctx, state))
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
 	conn.run = l.srv.connCommandRunner(clientID, handle, conn.logger)

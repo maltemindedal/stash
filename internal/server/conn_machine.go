@@ -81,6 +81,13 @@ type ConnMachine struct {
 	pending        []connEvent
 	writeBuf       []byte
 	writeOff       int
+
+	// requestLimits, when set, is asked before each frame is decoded what that
+	// frame may declare. decodePaused is set after a frame was decoded under
+	// limits, which hold further decoding back until that frame has run: the
+	// request may be the AUTH that lifts them.
+	requestLimits func() protocol.Limits
+	decodePaused  bool
 }
 
 // NewConnMachine constructs an active connection state machine bound to the
@@ -139,12 +146,40 @@ func (m *ConnMachine) Feed(data []byte) error {
 	}
 
 	m.readBuf = append(m.readBuf, data...)
+	if m.decodePaused {
+		// The request decoded before these bytes has not run yet. Decoding
+		// resumes after it, under whatever limits apply then.
+		m.checkReadBufferLimit()
+		return nil
+	}
 	if m.resumeAt > 0 && len(m.readBuf) < m.resumeAt {
 		return nil
 	}
 
+	m.decodeBuffered()
+	return nil
+}
+
+// SetRequestLimits installs a function consulted before each frame is decoded.
+// It returns the limits that frame must respect, or the zero Limits for none.
+// The server uses it to hold a client that has not authenticated to small
+// frames.
+func (m *ConnMachine) SetRequestLimits(limits func() protocol.Limits) {
+	m.requestLimits = limits
+}
+
+// decodeBuffered parses every complete request at the front of the read buffer.
+// While limits apply it stops after one request, because that request may change
+// which limits apply to the next (see decodePaused).
+func (m *ConnMachine) decodeBuffered() {
 	consumed := 0
 	for {
+		var limits protocol.Limits
+		if m.requestLimits != nil {
+			limits = m.requestLimits()
+		}
+		m.decoder.SetLimits(limits)
+
 		value, n, err := m.decoder.Decode(m.readBuf[consumed:])
 		if errors.Is(err, protocol.ErrIncomplete) {
 			m.resumeAt = 0
@@ -156,21 +191,28 @@ func (m *ConnMachine) Feed(data []byte) error {
 		}
 		if err != nil {
 			m.enterProtocolError(err)
-			return nil
+			return
 		}
 
 		m.pending = append(m.pending, connEvent{request: value})
 		consumed += n
+		if limits != (protocol.Limits{}) {
+			m.decodePaused = true
+			break
+		}
 	}
 
 	if consumed > 0 {
 		m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
 	}
 
+	m.checkReadBufferLimit()
+}
+
+func (m *ConnMachine) checkReadBufferLimit() {
 	if len(m.readBuf) > m.maxReadBuffer || m.resumeAt > m.maxReadBuffer {
 		m.enterProtocolError(fmt.Errorf("protocol: frame exceeds %d byte read-buffer limit", m.maxReadBuffer))
 	}
-	return nil
 }
 
 // enterProtocolError queues an ordered error reply, records the fatal cause,
@@ -182,6 +224,7 @@ func (m *ConnMachine) enterProtocolError(err error) {
 	m.readBuf = nil
 	m.decoder.Reset()
 	m.resumeAt = 0
+	m.decodePaused = false
 }
 
 // ProcessPending executes parsed requests in arrival order through run and
@@ -235,6 +278,13 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	if err := m.bufferResponses(responses); err != nil {
 		m.Close(err)
 		return false, err
+	}
+
+	if m.decodePaused && len(m.pending) == 0 && m.state == ConnStateActive {
+		// The request that held decoding back has run; the bytes behind it are
+		// decoded now, under the limits that apply after it.
+		m.decodePaused = false
+		m.decodeBuffered()
 	}
 
 	return len(m.pending) > 0, nil
@@ -307,6 +357,7 @@ func (m *ConnMachine) Close(err error) {
 	m.state = ConnStateClosed
 	m.readBuf = nil
 	m.resumeAt = 0
+	m.decodePaused = false
 	m.pending = nil
 	m.writeBuf = nil
 	m.writeOff = 0

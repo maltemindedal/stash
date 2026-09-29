@@ -13,6 +13,7 @@ import (
 type Parser struct {
 	reader  *bufio.Reader
 	lineBuf []byte
+	limits  Limits
 }
 
 const (
@@ -41,6 +42,13 @@ func NewParser(reader io.Reader) *Parser {
 	}
 
 	return &Parser{reader: bufio.NewReader(reader)}
+}
+
+// SetLimits tightens what the following frames may declare, until it is called
+// again. The zero Limits restores the defaults. It is meant to be called between
+// frames.
+func (p *Parser) SetLimits(limits Limits) {
+	p.limits = limits
 }
 
 // Parse reads the next RESP value from the underlying reader.
@@ -110,8 +118,8 @@ func (p *Parser) parseBulkString() (Value, error) {
 	if length < -1 {
 		return nil, fmt.Errorf("protocol: invalid bulk string length %d", length)
 	}
-	if length > maxBulkStringLength {
-		return nil, fmt.Errorf("protocol: bulk string length %d exceeds %d byte limit", length, maxBulkStringLength)
+	if err := p.limits.checkBulkLength(length); err != nil {
+		return nil, err
 	}
 
 	payload, err := p.readBulkPayload(length)
@@ -174,8 +182,8 @@ func (p *Parser) parseArray(depth int) (Value, error) {
 	if count < -1 {
 		return nil, fmt.Errorf("protocol: invalid array length %d", count)
 	}
-	if count > maxArrayElements {
-		return nil, fmt.Errorf("protocol: array length %d exceeds %d element limit", count, maxArrayElements)
+	if err := p.limits.checkArrayLength(count); err != nil {
+		return nil, err
 	}
 
 	elements := make([]Value, 0, min(count, 64))

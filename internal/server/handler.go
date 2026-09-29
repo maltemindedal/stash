@@ -64,6 +64,9 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	defer func() { _ = state.TryFlushResponses() }()
 
 	for {
+		// A client that has not authenticated may send only small frames; the
+		// limit is read before every frame because an AUTH lifts it.
+		parser.SetLimits(s.requestLimits(state))
 		value, err := parser.Parse()
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -101,6 +104,17 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			s.registerReplicaPeer(clientID, conn)
 		}
 	}
+}
+
+// requestLimits returns what the client's next frame may declare. On a server
+// that requires a password, a client that has not authenticated gets the small
+// pre-AUTH limits, so it cannot make the server buffer large requests for
+// commands it is not allowed to run.
+func (s *Server) requestLimits(state *ClientState) protocol.Limits {
+	if s.cfg.RequirePass == "" || state == nil || state.IsAuthenticated() {
+		return protocol.Limits{}
+	}
+	return protocol.UnauthenticatedLimits
 }
 
 // flushBeforeRead is what the parser reads from. It sends the client's queued
