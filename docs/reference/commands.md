@@ -21,7 +21,7 @@ The `commandSpecs` table in [`internal/command/types.go`](../../internal/command
 
 `PING` accepts at most one payload and returns it as a bulk string. Unauthenticated clients on a password-protected server may still use `PING`.
 
-`SLOWLOG` redacts `AUTH` arguments before storing command metadata.
+`SLOWLOG` redacts `AUTH` arguments and truncates long commands (32 tokens of 128 bytes each) before storing command metadata.
 
 ## Strings
 

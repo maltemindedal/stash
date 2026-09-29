@@ -1114,6 +1114,87 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 }
 
+func TestSlowlogTruncatesLargeCommands(t *testing.T) {
+	record := func(t *testing.T, args ...string) []string {
+		t.Helper()
+
+		executor := newTestExecutor()
+		registry := server.NewSlowlogRegistry()
+		executor.SetSlowlogConfig(registry, 0)
+		if _, err := executor.Execute(context.Background(), requestValue(args...)); err != nil {
+			t.Fatalf("%s error = %v", args[0], err)
+		}
+		entries := registry.Entries(1)
+		if len(entries) != 1 {
+			t.Fatalf("len(slowlog entries) = %d, want 1", len(entries))
+		}
+		return entries[0].Command
+	}
+
+	t.Run("an argument over 128 bytes keeps its first 128 and the count of the rest", func(t *testing.T) {
+		value := strings.Repeat("x", 128+172)
+		got := record(t, "SET", "key", value)
+
+		want := []string{"SET", "key", strings.Repeat("x", 128) + "... (172 more bytes)"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("slowlog command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("an argument of exactly 128 bytes is kept whole", func(t *testing.T) {
+		value := strings.Repeat("y", 128)
+		got := record(t, "SET", "key", value)
+
+		if want := []string{"SET", "key", value}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("slowlog command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("more than 32 arguments keep 31 and summarise the rest", func(t *testing.T) {
+		request := []string{"RPUSH", "list"}
+		for i := 0; i < 48; i++ {
+			request = append(request, "v"+strconv.Itoa(i))
+		}
+		got := record(t, request...)
+
+		// 50 tokens in all (name, key, 48 values): 31 kept, the last slot says
+		// how many were dropped, counting the one it replaces.
+		if len(got) != 32 {
+			t.Fatalf("len(slowlog command) = %d, want 32", len(got))
+		}
+		if !reflect.DeepEqual(got[:31], request[:31]) {
+			t.Fatalf("first 31 tokens = %q, want %q", got[:31], request[:31])
+		}
+		if want := "... (19 more arguments)"; got[31] != want {
+			t.Fatalf("last token = %q, want %q", got[31], want)
+		}
+	})
+
+	t.Run("exactly 32 arguments are kept whole", func(t *testing.T) {
+		request := []string{"RPUSH", "list"}
+		for i := 0; i < 30; i++ {
+			request = append(request, "v"+strconv.Itoa(i))
+		}
+		got := record(t, request...)
+
+		if !reflect.DeepEqual(got, request) {
+			t.Fatalf("slowlog command = %q, want %q", got, request)
+		}
+	})
+
+	t.Run("a stored entry does not retain a huge value", func(t *testing.T) {
+		got := record(t, "SET", "key", strings.Repeat("z", 8<<20))
+
+		total := 0
+		for _, token := range got {
+			total += len(token)
+		}
+		if total > 1024 {
+			t.Fatalf("slowlog entry holds %d bytes, want it bounded by the truncation limits", total)
+		}
+	})
+}
+
 func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	t.Run("replica-origin GETACK emits upstream ACK reply", func(t *testing.T) {
 		executor := newTestExecutor()

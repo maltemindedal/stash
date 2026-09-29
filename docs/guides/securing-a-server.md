@@ -61,7 +61,7 @@ The append-only file and snapshots are created with mode `0600`. Parent director
 
 ## What the slowlog stores
 
-`SLOWLOG` and `MONITOR` redact `AUTH` arguments, so passwords do not appear in the slow query log or in a monitor stream, including for failed attempts. Both show other command arguments verbatim. Any other secret passed as an argument can appear in `SLOWLOG GET` output and `MONITOR` streams.
+`SLOWLOG` and `MONITOR` redact `AUTH` arguments, so passwords do not appear in the slow query log or in a monitor stream, including for failed attempts. `MONITOR` shows other command arguments verbatim; `SLOWLOG` shows the first 128 bytes of each of the first 31 tokens (the command name counts as one). Any other secret passed as an argument can appear in `SLOWLOG GET` output and `MONITOR` streams.
 
 ## Known limitations
 

@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	"github.com/maltemindedal/stash/internal/protocol"
@@ -91,24 +92,49 @@ func slowlogEntriesResponse(entries []server.SlowlogEntry) protocol.Array {
 	return protocol.Array{Elements: elements}
 }
 
+// Limits on what one slowlog entry keeps, the same as Redis': a command is
+// stored with at most this many tokens (its name included), and each token is cut
+// to this many bytes. The log holds 128 entries, so without them a slow command
+// carrying a large value pins that value in memory for as long as it stays there.
+const (
+	slowlogMaxTokens     = 32
+	slowlogMaxTokenBytes = 128
+)
+
+// requestTokens returns the command as the slowlog stores it. When the command
+// has more than slowlogMaxTokens tokens the last kept slot reports how many were
+// left out, counting the one it replaces; a longer token keeps its first
+// slowlogMaxTokenBytes bytes and the count of the rest.
 func requestTokens(request *Request) []string {
 	if request == nil {
 		return nil
 	}
 
-	tokens := make([]string, 0, len(request.Args)+1)
-	tokens = append(tokens, request.Name)
-	if isSensitiveSlowlogCommand(request.Name) {
-		for range request.Args {
-			tokens = append(tokens, "[redacted]")
-		}
-		return tokens
-	}
+	total := len(request.Args) + 1
+	kept := min(total, slowlogMaxTokens)
+	sensitive := isSensitiveSlowlogCommand(request.Name)
 
-	for _, arg := range request.Args {
-		tokens = append(tokens, string(arg))
+	tokens := make([]string, 0, kept)
+	for i := 0; i < kept; i++ {
+		switch {
+		case i == kept-1 && kept != total:
+			tokens = append(tokens, "... ("+strconv.Itoa(total-kept+1)+" more arguments)")
+		case i == 0:
+			tokens = append(tokens, request.Name)
+		case sensitive:
+			tokens = append(tokens, "[redacted]")
+		default:
+			tokens = append(tokens, truncateSlowlogToken(request.Args[i-1]))
+		}
 	}
 	return tokens
+}
+
+func truncateSlowlogToken(arg []byte) string {
+	if len(arg) <= slowlogMaxTokenBytes {
+		return string(arg)
+	}
+	return string(arg[:slowlogMaxTokenBytes]) + "... (" + strconv.Itoa(len(arg)-slowlogMaxTokenBytes) + " more bytes)"
 }
 
 func isSensitiveSlowlogCommand(name string) bool {

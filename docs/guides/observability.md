@@ -76,7 +76,7 @@ OK
 
 `SLOWLOG GET` takes an optional non-negative count; without one it returns all buffered entries. Each entry is a six-element array, matching the Redis reply shape: an ID, a Unix timestamp, a duration in microseconds, the command arguments, the client address, and a client name. Stash does not implement `CLIENT SETNAME`, so the client-name field is always an empty string.
 
-`AUTH` arguments are redacted before storage. Other arguments are stored verbatim.
+`AUTH` arguments are redacted before storage. Each entry keeps at most 32 tokens, the command name included, and at most 128 bytes of each token, as Redis does. A longer token is stored as its first 128 bytes followed by `... (N more bytes)`. A command with more than 32 tokens is stored as its first 31 followed by `... (N more arguments)`.
 
 ## Stream live commands with MONITOR
 
