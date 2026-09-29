@@ -41,6 +41,7 @@ type Store struct {
 	expirationMu             sync.Mutex
 	expirationListener       func(keys []string)
 	pendingExpired           []string
+	evictionGuard            func() (release func())
 	usedMemory               atomic.Int64
 	keyKindCounts            [keyStatsKindCount]atomic.Int64
 	maxMemory                atomic.Int64
@@ -89,6 +90,31 @@ func (s *Store) SetExpirationListener(listener func(keys []string)) {
 	s.expirationMu.Lock()
 	defer s.expirationMu.Unlock()
 	s.expirationListener = listener
+}
+
+// SetEvictionGuard registers a function the background eviction loop calls before
+// each sample and whose result it calls once the sample's removals have been
+// handed to the expiration listener. It lets the owner of the listener order those
+// removals against the writes it is also logging: a key expiring and being set
+// again must reach the log in the order they happened.
+func (s *Store) SetEvictionGuard(guard func() (release func())) {
+	if s == nil {
+		return
+	}
+
+	s.expirationMu.Lock()
+	defer s.expirationMu.Unlock()
+	s.evictionGuard = guard
+}
+
+func (s *Store) acquireEvictionGuard() func() {
+	s.expirationMu.Lock()
+	guard := s.evictionGuard
+	s.expirationMu.Unlock()
+	if guard == nil {
+		return func() {}
+	}
+	return guard()
 }
 
 // noteExpiredKeysLocked queues keys removed for expiry while shard locks are

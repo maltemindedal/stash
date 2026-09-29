@@ -102,8 +102,17 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			s.logger.Warn("failed to close stale AOF writer before reopening", "path", s.cfg.AOFPath, "error", closeErr)
 		}
 	}
+	if sequencer, ok := s.executor.(backgroundWriteSequencer); ok {
+		writer.SetRewriteGuard(sequencer.BeginBackgroundWrite)
+	}
 	s.aofWriter = writer
 	return nil
+}
+
+// recordsWrites reports whether anything is recording the writes clients make, so
+// that their order matters: an append-only file or a replica.
+func (s *Server) recordsWrites() bool {
+	return s.aofWriter != nil || s.replicaPeers.Count() > 0
 }
 
 func (s *Server) beginAOFRewrite(_ context.Context) error {

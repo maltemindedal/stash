@@ -22,6 +22,24 @@ type executor interface {
 	ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error)
 }
 
+// sequencedExecutor is an executor that can order requests against one another.
+// Its results carry a Release function that the caller calls once it has applied
+// the result's durability and propagation frames.
+type sequencedExecutor interface {
+	ExecuteSequenced(context.Context, protocol.Value) (ExecuteResult, error)
+}
+
+type writeOrderingSetter interface {
+	SetWriteOrdering(func() bool)
+}
+
+// backgroundWriteSequencer orders work the server does on its own (the expiry
+// sweep, the snapshot of an AOF rewrite) against client requests. The returned
+// function is called when that work's frames have been applied.
+type backgroundWriteSequencer interface {
+	BeginBackgroundWrite() (release func())
+}
+
 type watchRegistryProvider interface {
 	WatchRegistry() *WatchRegistry
 }
@@ -109,6 +127,9 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 	if store != nil {
 		store.SetLogger(logger)
 		store.SetExpirationListener(srv.recordExpiredKeys)
+		if sequencer, ok := executor.(backgroundWriteSequencer); ok {
+			store.SetEvictionGuard(sequencer.BeginBackgroundWrite)
+		}
 	}
 	if provider, ok := executor.(watchRegistryProvider); ok {
 		srv.watchRegistry = provider.WatchRegistry()
@@ -121,6 +142,9 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 	}
 	if setter, ok := executor.(replicaRegistrySetter); ok {
 		setter.SetReplicaRegistry(srv.replicaPeers)
+	}
+	if setter, ok := executor.(writeOrderingSetter); ok {
+		setter.SetWriteOrdering(srv.recordsWrites)
 	}
 	if setter, ok := executor.(authConfigSetter); ok {
 		setter.SetRequirePass(cfg.RequirePass)

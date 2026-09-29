@@ -132,6 +132,8 @@ Positions are stored as 52-bit interleaved geohash scores in a regular sorted se
 
 Queued commands propagate and persist individually when `EXEC` runs them. `WATCH` provides optimistic invalidation. If a watched key changes before `EXEC`, the transaction aborts.
 
+`EXEC` runs alone: no other client's command executes while it does, so a watched key cannot change between `EXEC`'s check and its queued commands, and no other client can observe the transaction half way through. Because of that, a blocking command queued in a transaction does not wait: `BLPOP` on an empty list returns a null array, and `WAIT` returns the number of replicas that have acknowledged so far, as in Redis.
+
 ## Pub/sub
 
 | Command | Replicated | Durable |

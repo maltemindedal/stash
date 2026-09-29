@@ -174,7 +174,12 @@ func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn
 		s.broadcastMonitorEvent(observeCommand(request, clientID, conn))
 	}
 
-	result, execErr := s.executor.ExecuteDetailed(ctx, request)
+	result, execErr := s.executeRequest(ctx, request)
+	// Until the result's frames have been logged and sent to the replicas, no
+	// other write may run; see sequencer in the command package.
+	if result.Release != nil {
+		defer result.Release()
+	}
 	if execErr != nil {
 		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) || errors.Is(execErr, ErrClientDisconnected) {
 			return nil, false, execErr
@@ -195,6 +200,15 @@ func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn
 	s.commandsProcessed.Add(1)
 
 	return result.Responses, result.RegisterReplica, nil
+}
+
+// executeRequest runs one request through the executor, ordered against other
+// requests when the executor supports it.
+func (s *Server) executeRequest(ctx context.Context, request protocol.Value) (ExecuteResult, error) {
+	if sequenced, ok := s.executor.(sequencedExecutor); ok {
+		return sequenced.ExecuteSequenced(ctx, request)
+	}
+	return s.executor.ExecuteDetailed(ctx, request)
 }
 
 func (s *Server) writeClientResponses(ctx context.Context, writer *bufio.Writer, values []protocol.Value) error {

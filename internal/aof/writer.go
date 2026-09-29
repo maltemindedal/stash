@@ -71,6 +71,10 @@ type Writer struct {
 	// it is on disk, so this is how an operator finds out the log has stopped
 	// growing; see LastWriteOK.
 	writeFailed atomic.Bool
+
+	// rewriteGuard, when set, is held across the snapshot a rewrite takes. See
+	// SetRewriteGuard.
+	rewriteGuard func() (release func())
 }
 
 // OpenWriter opens or creates an append-only file writer for the supplied path.
@@ -118,6 +122,32 @@ func (w *Writer) Policy() Policy {
 	}
 
 	return w.policy
+}
+
+// SetRewriteGuard registers a function a rewrite calls before it snapshots the
+// store, and whose result it calls when the snapshot is done. The snapshot and
+// the switch to buffering new commands are atomic with respect to the store, but
+// a command that had updated the store and not yet appended its frame would then
+// be in the snapshot and in the rewrite buffer both, and replay twice. The owner
+// of the append path passes a guard that waits for such commands to finish.
+func (w *Writer) SetRewriteGuard(guard func() (release func())) {
+	if w == nil {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.rewriteGuard = guard
+}
+
+func (w *Writer) acquireRewriteGuard() func() {
+	w.mu.Lock()
+	guard := w.rewriteGuard
+	w.mu.Unlock()
+	if guard == nil {
+		return func() {}
+	}
+	return guard()
 }
 
 // LastWriteOK reports whether the most recent write, flush or fsync of the file
@@ -323,6 +353,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 	}()
 
 	activated := false
+	releaseGuard := w.acquireRewriteGuard()
 	entries, snapshotStats := store.SnapshotAllWithWriteBarrier(func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -336,6 +367,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 		w.rewriteBuffer.Reset()
 		activated = true
 	})
+	releaseGuard()
 	if !activated {
 		_ = tempFile.Close()
 		return

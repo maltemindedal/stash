@@ -162,6 +162,9 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 	}
 	state.UnwatchAll()
 
+	// The queued commands run with the sequencer held exclusively; none of them
+	// may wait for another request (see withTransactionExecution).
+	ctx = withTransactionExecution(ctx)
 	queued := state.DrainTransaction()
 	responses := make([]protocol.Value, 0, len(queued))
 	propagation := make([]protocol.Value, 0, len(queued))
@@ -318,7 +321,10 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 		"target_offset", targetOffset,
 		"currently_acked", ackedReplicas,
 	)
-	if int64(ackedReplicas) >= replicas || timeoutMillis == 0 {
+	// Inside a transaction the sequencer is held exclusively, which would keep the
+	// replicas' acknowledgements from being processed, so it reports what is
+	// acknowledged now instead of waiting, as in Redis.
+	if int64(ackedReplicas) >= replicas || timeoutMillis == 0 || inTransactionExecution(ctx) {
 		return e.finishWaitResult(replicas, ackedReplicas, targetOffset, startedAt, false), nil
 	}
 

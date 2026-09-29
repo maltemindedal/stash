@@ -27,6 +27,12 @@ type ExecuteResult struct {
 	Propagation     []protocol.Value
 	Durability      []protocol.Value
 	RegisterReplica bool
+	// Release, when set, must be called by whoever applies Durability and
+	// Propagation, after it has done so. It ends the exclusion that keeps other
+	// writes (and transactions) from running until those frames are in the log
+	// and on their way to replicas. It is set only by an executor's sequenced
+	// entry point.
+	Release func()
 }
 
 // SingleResponse wraps a standard single RESP value as an execution result.
@@ -557,7 +563,7 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 			"replica_offset", replicaOffset,
 		)
 
-		result, execErr := s.executor.ExecuteDetailed(replicationCtx, value)
+		result, execErr := s.executeRequest(replicationCtx, value)
 		if execErr != nil {
 			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
 				return
@@ -566,8 +572,12 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
 			return
 		}
-		if err := s.persistDurabilityFrames(result.Durability); err != nil {
-			s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", err)
+		persistErr := s.persistDurabilityFrames(result.Durability)
+		if result.Release != nil {
+			result.Release()
+		}
+		if persistErr != nil {
+			s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", persistErr)
 			return
 		}
 		if len(result.UpstreamReplies) > 0 {

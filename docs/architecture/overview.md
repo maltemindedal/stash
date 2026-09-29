@@ -129,6 +129,14 @@ The event loop executes one request at a time and interleaves output flushes. It
 
 Commands execute inline on the loop goroutine. In event-loop mode, a command that would block, such as `BLPOP` on an empty list or `WAIT` for pending replica acknowledgements, returns an explicit error instead of stalling every connection. Immediately satisfiable forms still succeed. The goroutine-per-connection path remains the default.
 
+### Why order writes and transactions explicitly?
+
+The sharded store makes each operation atomic, but two clients' operations can still interleave. Two things depend on their order: `EXEC`, which must see its watched keys unchanged and its queued commands run without others in between, and the AOF and replicas, which must see two writes to one key in the order they were applied.
+
+The command executor therefore has a sequencer. Every request holds a read-write lock shared while it executes; `EXEC` holds it exclusive. A request that writes also holds the lock for the stripe (one of 64) of each key it writes, from before it executes until its frames have been appended to the AOF and handed to the replicas. Writers to different keys still run in parallel; writers to the same key, and any write whose keys the command table does not declare, are ordered. The expiry sweep and the snapshot an AOF rewrite takes hold every stripe for a moment, so that an expiry and a later write of the same key, or a snapshot and a command halfway to the log, cannot be reordered. When there is no AOF and no replica there is nothing to order, and the stripes are skipped.
+
+A blocking command (`BLPOP`, `WAIT`) waits with nothing held and takes the locks only for each attempt; inside a transaction it does not wait at all.
+
 ### Why keep persistence separate from replication?
 
 Replication and AOF both reuse RESP-encoded command frames, but they serve different correctness goals:

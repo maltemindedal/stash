@@ -35,6 +35,10 @@ type commandSpec struct {
 	transactionControl bool
 	propagates         bool
 	durable            bool
+	// keys says which arguments are the keys the command writes, so that writes
+	// to different keys are not ordered against each other. Left unset, the
+	// command is ordered against every write.
+	keys keyShape
 	// rewriteFrame optionally replaces the verbatim command frame used for
 	// replication and AOF durability with a deterministic equivalent. It returns
 	// (frame, true) to substitute the frame, or (_, false) to keep the verbatim
@@ -75,6 +79,7 @@ type Executor struct {
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
 	aofRewrite          func(context.Context) error
+	seq                 *sequencer
 }
 
 // NewExecutor constructs a command executor with the currently supported command set.
@@ -84,6 +89,7 @@ func NewExecutor(store *storage.Store, logger *slog.Logger) *Executor {
 		logger:         logger,
 		watchRegistry:  server.NewWatchRegistry(),
 		pubSubRegistry: server.NewPubSubRegistry(),
+		seq:            newSequencer(),
 	}
 	executor.commands = executor.commandSpecs()
 	return executor
@@ -453,6 +459,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates:   true,
 			durable:      true,
 			rewriteFrame: rewriteSetFrame,
+			keys:         keysFirstArg,
 		},
 		"GET": {
 			handler:  e.handleGet,
@@ -463,6 +470,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateSetBitRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"GETBIT": {
 			handler:  e.handleGetBit,
@@ -477,6 +485,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("PFADD", 1),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"PFCOUNT": {
 			handler:  e.handlePFCount,
@@ -487,24 +496,28 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("DEL", 1),
 			propagates: true,
 			durable:    true,
+			keys:       keysEveryArg,
 		},
 		"INCR": {
 			handler:    e.handleIncr,
 			validate:   exactArgsValidator("INCR", 1),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"LPUSH": {
 			handler:    e.handleLPush,
 			validate:   minArgsValidator("LPUSH", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"RPUSH": {
 			handler:    e.handleRPush,
 			validate:   minArgsValidator("RPUSH", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"LRANGE": {
 			handler:  e.handleLRange,
@@ -515,15 +528,17 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateLPopRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"RPOP": {
 			handler:    e.handleRPop,
 			validate:   validateRPopRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"BLPOP": {
-			handler:  e.handleBLPop,
+			detailed: e.handleBLPop,
 			validate: exactArgsValidator("BLPOP", 1),
 		},
 		"ZADD": {
@@ -531,6 +546,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateZAddRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"ZRANGE": {
 			handler:  e.handleZRange,
@@ -541,6 +557,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateGeoAddRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"GEODIST": {
 			handler:  e.handleGeoDist,
@@ -555,6 +572,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:     validateXAddRequest,
 			durable:      true,
 			rewriteFrame: rewriteXAddFrame,
+			keys:         keysFirstArg,
 		},
 		"XREAD": {
 			handler:  e.handleXRead,
@@ -565,6 +583,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   validateHSetRequest,
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"HGET": {
 			handler:  e.handleHGet,
@@ -575,6 +594,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("HDEL", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"HGETALL": {
 			handler:  e.handleHGetAll,
@@ -585,6 +605,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("SADD", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"SISMEMBER": {
 			handler:  e.handleSIsMember,
@@ -595,6 +616,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate:   minArgsValidator("SREM", 2),
 			propagates: true,
 			durable:    true,
+			keys:       keysFirstArg,
 		},
 		"SMEMBERS": {
 			handler:  e.handleSMembers,
@@ -604,6 +626,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			handler:    e.handlePublish,
 			validate:   validatePublishRequest,
 			propagates: true,
+			keys:       keysFirstArg,
 		},
 		"REPLCONF": {
 			detailed: e.handleReplConf,

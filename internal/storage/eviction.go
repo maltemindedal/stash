@@ -75,21 +75,33 @@ func (s *Store) evictionPass(sampleSize int, budget time.Duration) (samples int)
 
 	deadline := time.Now().Add(budget)
 	for {
-		sampled, expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
+		sampled, removed := s.sweepSample(sampleSize)
 		samples++
 
-		if len(expired) > 0 {
-			s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
-			// Published once evictExpiredSample has released every shard lock
-			// it took: the listener reaches sinks outside the store, which
-			// must never be entered while holding one.
-			s.publishExpiredKeys()
-		}
-
-		if len(expired)*expiredSampleRepeatDenominator <= sampled || !time.Now().Before(deadline) {
+		if removed*expiredSampleRepeatDenominator <= sampled || !time.Now().Before(deadline) {
 			return samples
 		}
 	}
+}
+
+// sweepSample takes one sample, removes its expired keys, and publishes the
+// removals, all inside the eviction guard so that they reach the listener in
+// order with the writes the guard's owner is logging. It returns how many keys
+// it sampled and how many it removed.
+func (s *Store) sweepSample(sampleSize int) (sampled, removed int) {
+	release := s.acquireEvictionGuard()
+	defer release()
+
+	sampled, expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
+	if len(expired) > 0 {
+		s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
+		// Published once evictExpiredSample has released every shard lock
+		// it took: the listener reaches sinks outside the store, which
+		// must never be entered while holding one.
+		s.publishExpiredKeys()
+	}
+
+	return sampled, len(expired)
 }
 
 // evictExpiredSample removes the expired keys in one sample of the keyspace and
