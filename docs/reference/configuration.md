@@ -21,7 +21,7 @@ Stash is configured entirely through command-line flags. There is no configurati
 | `--maxmemory` | int64 | `0` | Approximate keyspace memory limit in bytes. `0` disables memory-pressure eviction. Negative values are rejected. |
 | `--maxclients` | int | `10000` | Maximum concurrent client connections. `0` disables the limit. Negative values are rejected. |
 | `--slowlog-log-slower-than` | int | `10000` | Slowlog threshold in **microseconds**. `0` logs every command; any negative value disables the slowlog. See the [note below](#--slowlog-log-slower-than). |
-| `--replicaof` | string | *(empty)* | Upstream master address in `host:port` form. Setting it puts the server in replica mode. |
+| `--replicaof` | string | *(empty)* | Upstream master address in `host:port` form. Setting it puts the server in replica mode. The replica reconnects, with a growing wait of 1 to 30 seconds, if the link drops. |
 | `--masterauth` | string | *(empty)* | Password the replica uses to `AUTH` against a password-protected master. |
 | `--masterauth-file` | string | *(empty)* | Read the `--masterauth` password from this file. See [the note below](#--requirepass-file-and---masterauth-file). |
 | `--requirepass` | string | *(empty)* | Password clients must supply via `AUTH`. Empty disables authentication. |

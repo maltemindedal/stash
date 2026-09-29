@@ -66,18 +66,24 @@ func TestServerPropagateToReplicasRemovesFailingReplica(t *testing.T) {
 	failingConn := &stubConn{writeErr: errors.New("write boom")}
 	srv.replicaPeers.Add(2, failingConn, 6381, newReplicaPeerStateForTest(2, failingConn))
 
+	// Propagating only queues the command for each replica; the replica whose
+	// socket fails is found out, and dropped, by its feed.
 	report := srv.propagateToReplicas([]protocol.Value{protocol.SimpleString{Value: "OK"}})
 	if report.attempted != 2 {
 		t.Fatalf("report.attempted = %d, want 2", report.attempted)
 	}
-	if report.succeeded != 1 {
-		t.Fatalf("report.succeeded = %d, want 1", report.succeeded)
+	if report.succeeded != 2 || report.failed != 0 {
+		t.Fatalf("report = %+v, want both queued", report)
 	}
-	if report.failed != 1 {
-		t.Fatalf("report.failed = %d, want 1", report.failed)
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.replicaPeers.Count() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
 	if srv.replicaPeers.Count() != 1 {
-		t.Fatalf("replicaPeers.Count() = %d, want 1", srv.replicaPeers.Count())
+		t.Fatalf("replicaPeers.Count() = %d, want the failing replica dropped", srv.replicaPeers.Count())
+	}
+	for len(serverConn.Bytes()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	parser := protocol.NewParser(bytes.NewReader(serverConn.Bytes()))

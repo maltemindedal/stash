@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
@@ -92,10 +93,16 @@ type ReplicaPeer struct {
 	AckOffset atomic.Int64
 
 	writer encodedReplicaWriter
+	feed   *replicaFeed
 }
 
 type encodedReplicaWriter interface {
 	WriteEncoded([]byte) error
+}
+
+// deadlineReplicaWriter is a writer that can bound how long one write may take.
+type deadlineReplicaWriter interface {
+	WriteEncodedWithDeadline([]byte, time.Duration) error
 }
 
 type propagationReport struct {
@@ -106,18 +113,24 @@ type propagationReport struct {
 	endOffset   int64
 }
 
-const (
-	replicaFanoutAsyncThreshold = 8
-	replicaFanoutMaxWorkers     = 32
-)
-
-// WriteEncoded writes a pre-encoded RESP payload to the replica socket.
+// WriteEncoded queues a pre-encoded RESP payload for the replica, which the peer's
+// feed writes to its socket in order. It does not wait for the socket, and fails
+// only if the replica is gone or has fallen too far behind.
 func (p *ReplicaPeer) WriteEncoded(payload []byte) error {
-	if p == nil || p.writer == nil {
+	if p == nil || p.writer == nil || p.feed == nil {
 		return fmt.Errorf("replica response writer unavailable")
 	}
 
-	return p.writer.WriteEncoded(payload)
+	return p.feed.enqueue(payload)
+}
+
+// send writes one stretch of the stream to the replica's socket, giving up if the
+// replica does not take it in time.
+func (p *ReplicaPeer) send(chunk []byte) error {
+	if writer, ok := p.writer.(deadlineReplicaWriter); ok {
+		return writer.WriteEncodedWithDeadline(chunk, replicaFeedWriteTimeout)
+	}
+	return p.writer.WriteEncoded(chunk)
 }
 
 // ReplicaRegistry tracks replica peers connected to a master server.
@@ -125,6 +138,10 @@ type ReplicaRegistry struct {
 	mu       sync.RWMutex
 	replicas map[uint64]*ReplicaPeer
 	changed  chan struct{}
+
+	// onFeedError is called, on the feed's own goroutine, when a replica's feed
+	// stops because a write to it failed.
+	onFeedError func(id uint64, err error)
 }
 
 func newReplicationState() *ReplicationState {
@@ -158,6 +175,16 @@ func (s *ReplicationState) ReplicaOffset() int64 {
 	return s.replicaOffset.Load()
 }
 
+// ResetReplicaOffset starts the replica's processed offset again from zero, as it
+// must when a full resynchronisation begins a new stream.
+func (s *ReplicationState) ResetReplicaOffset() {
+	if s == nil {
+		return
+	}
+
+	s.replicaOffset.Store(0)
+}
+
 // AdvanceReplicaOffset increments the replica's processed upstream replication offset.
 func (s *ReplicationState) AdvanceReplicaOffset(delta int64) int64 {
 	if s == nil || delta <= 0 {
@@ -174,11 +201,46 @@ func NewReplicaRegistry() *ReplicaRegistry {
 
 // Add stores or updates a replica peer.
 func (r *ReplicaRegistry) Add(id uint64, conn ClientConn, listeningPort int, writer encodedReplicaWriter) {
+	peer := &ReplicaPeer{ID: id, Conn: conn, ListeningPort: listeningPort, writer: writer, feed: newReplicaFeed(replicaFeedLimit)}
+
+	r.mu.Lock()
+	previous := r.replicas[id]
+	r.replicas[id] = peer
+	onFeedError := r.onFeedError
+	r.notifyChangedLocked()
+	r.mu.Unlock()
+
+	if previous != nil {
+		previous.feed.close(0)
+	}
+	go func() {
+		if err := peer.feed.run(peer.send); err != nil && onFeedError != nil {
+			onFeedError(id, err)
+		}
+	}()
+}
+
+// SetFeedErrorHandler registers what happens when writing a replica's stream
+// fails: the server drops the replica.
+func (r *ReplicaRegistry) SetFeedErrorHandler(handler func(id uint64, err error)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.onFeedError = handler
+}
 
-	r.replicas[id] = &ReplicaPeer{ID: id, Conn: conn, ListeningPort: listeningPort, writer: writer}
-	r.notifyChangedLocked()
+// StopFeeds gives every replica's feed up to grace to write what is queued for it
+// and then stops them, returning how many had not finished. The server calls it
+// on shutdown, before it closes the sockets, so that commands already propagated
+// are not lost to a graceful stop.
+func (r *ReplicaRegistry) StopFeeds(grace time.Duration) (unfinished int) {
+	peers := r.Snapshot()
+	deadline := time.Now().Add(grace)
+	for _, peer := range peers {
+		if peer.feed != nil && !peer.feed.close(time.Until(deadline)) {
+			unfinished++
+		}
+	}
+	return unfinished
 }
 
 // UpdateAck records the latest processed replication offset for a replica peer.
@@ -235,6 +297,9 @@ func (r *ReplicaRegistry) Remove(id uint64) *ReplicaPeer {
 	delete(r.replicas, id)
 	if peer != nil {
 		r.notifyChangedLocked()
+		if peer.feed != nil {
+			peer.feed.close(0)
+		}
 	}
 	return peer
 }
@@ -350,43 +415,10 @@ func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport 
 	return report
 }
 
+// writePropagationPayload queues payload for every replica. Queueing is a copy
+// into each replica's feed and never waits on a socket, so there is nothing to
+// gain from doing it concurrently.
 func (s *Server) writePropagationPayload(payload []byte, peers []*ReplicaPeer) (int, int) {
-	if len(peers) == 0 {
-		return 0, 0
-	}
-	if len(peers) < replicaFanoutAsyncThreshold {
-		return s.writePropagationPayloadSequential(payload, peers)
-	}
-
-	workerCount := min(len(peers), replicaFanoutMaxWorkers)
-	jobs := make(chan *ReplicaPeer, len(peers))
-	var succeeded atomic.Int64
-	var failed atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(workerCount)
-	for i := 0; i < workerCount; i++ {
-		go func() {
-			defer wg.Done()
-			for peer := range jobs {
-				if s.writePropagationPayloadToReplica(peer, payload) {
-					succeeded.Add(1)
-				} else {
-					failed.Add(1)
-				}
-			}
-		}()
-	}
-
-	for _, peer := range peers {
-		jobs <- peer
-	}
-	close(jobs)
-	wg.Wait()
-
-	return int(succeeded.Load()), int(failed.Load())
-}
-
-func (s *Server) writePropagationPayloadSequential(payload []byte, peers []*ReplicaPeer) (int, int) {
 	succeeded := 0
 	failed := 0
 	for _, peer := range peers {
@@ -405,14 +437,24 @@ func (s *Server) writePropagationPayloadToReplica(peer *ReplicaPeer, payload []b
 		return false
 	}
 	if err := peer.WriteEncoded(payload); err != nil {
-		s.logger.Warn("failed to propagate command to replica", "replica_id", peer.ID, "error", err)
-		if closeErr := s.replicaPeers.RemoveAndClose(peer.ID); closeErr != nil {
-			s.logger.Debug("failed to close replica after propagation failure", "replica_id", peer.ID, "error", closeErr)
-		}
+		s.dropReplica(peer.ID, err)
 		return false
 	}
 
 	return true
+}
+
+// dropReplica logs why a replica can no longer be fed and closes it. It has to
+// synchronise again from the start.
+func (s *Server) dropReplica(id uint64, cause error) {
+	peer := s.replicaPeers.Remove(id)
+	if peer == nil {
+		return
+	}
+	s.logger.Warn("dropping a replica: it can no longer be fed the propagated stream", "replica_id", id, "error", cause)
+	if err := peer.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		s.logger.Debug("failed to close replica after propagation failure", "replica_id", id, "error", err)
+	}
 }
 
 func (s *Server) recordClientWriteOffset(ctx context.Context, offset int64) {
@@ -457,6 +499,18 @@ func (s *Server) closeUpstreamConn() {
 	}
 }
 
+// How long a replica waits before trying its master again, and the most that
+// wait grows to.
+const (
+	replicaReconnectInitial = time.Second
+	replicaReconnectMax     = 30 * time.Second
+)
+
+// startReplicaLink keeps the replica attached to its master: it connects,
+// synchronises, applies the stream, and when the link ends for any reason other
+// than shutdown it waits and starts again from a full resynchronisation. The wait
+// doubles up to replicaReconnectMax and starts over after a link that got as far
+// as a completed handshake. Only an unusable configuration ends it.
 func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 	defer s.handlerWG.Done()
 
@@ -472,6 +526,29 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 		return
 	}
 
+	delay := replicaReconnectInitial
+	for {
+		synchronised := s.runReplicaLink(ctx, masterAddr, listeningPort)
+		if ctx.Err() != nil {
+			return
+		}
+		if synchronised {
+			delay = replicaReconnectInitial
+		}
+
+		s.logger.Warn("the link to the master ended; retrying", "master_addr", masterAddr, "retry_in", delay)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+		delay = min(delay*2, replicaReconnectMax)
+	}
+}
+
+// runReplicaLink makes one attempt to attach to the master and applies its
+// stream until the link ends. It reports whether the handshake completed.
+func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listeningPort int) (synchronised bool) {
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", masterAddr)
 	if err != nil {
@@ -534,7 +611,10 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 		return
 	}
 
+	// The stream that follows a full resynchronisation counts from zero.
+	s.replication.ResetReplicaOffset()
 	s.logger.Info("replica handshake completed", "master_addr", masterAddr, "listening_port", listeningPort)
+	synchronised = true
 
 	replicationCtx := WithReplicationOrigin(ctx)
 

@@ -124,6 +124,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 		replication:     newReplicationState(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
+	srv.replicaPeers.SetFeedErrorHandler(srv.dropReplica)
 	if store != nil {
 		store.SetLogger(logger)
 		store.SetExpirationListener(srv.recordExpiredKeys)
@@ -434,9 +435,18 @@ func (s *Server) setListener(listener net.Listener) {
 	s.listener = listener
 }
 
+// replicaShutdownGrace is how long shutdown waits for replicas to take the
+// propagated commands still queued for them.
+const replicaShutdownGrace = time.Second
+
 func (s *Server) shutdown() {
 	s.shutdownOnce.Do(func() {
 		s.closeUpstreamConn()
+		// Commands already propagated are written to the replicas before their
+		// sockets are closed, as they were when propagation wrote them directly.
+		if unfinished := s.replicaPeers.StopFeeds(replicaShutdownGrace); unfinished > 0 {
+			s.logger.Warn("some replicas did not receive the last propagated commands before shutdown", "replicas", unfinished)
+		}
 
 		s.listenerMu.RLock()
 		listener := s.listener
