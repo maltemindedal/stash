@@ -100,6 +100,13 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 			if !inTransaction {
 				result.Release = release
 			}
+			// The pop is a write like LPOP: log and replicate it as one, or a
+			// restart, or a replica, would still have the element.
+			frame := propagationFrame(&Request{Name: "LPOP", Args: [][]byte{clone(request.Args[0])}})
+			result.Durability = []protocol.Value{frame}
+			if !server.IsReplicationOrigin(ctx) {
+				result.Propagation = []protocol.Value{frame}
+			}
 			return result, nil
 		}
 		release()
