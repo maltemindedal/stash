@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/maltemindedal/stash/internal/aof"
@@ -114,10 +116,6 @@ func TestLoadFileReportsWhereCompleteCommandsEnd(t *testing.T) {
 		{name: "cut between array elements", tail: []byte("*2\r\n$4\r\nINCR\r\n"), wantTornTail: true, wantTrunc: true},
 		{name: "cut inside a header line", tail: []byte("*2\r"), wantTornTail: true, wantTrunc: true},
 		{name: "cut between CR and LF of a payload terminator", tail: []byte("*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r"), wantTornTail: true, wantTrunc: true},
-		// Bad bytes with more data behind them are corruption (or a tail an older
-		// version already glued new commands onto), not a torn write: the file is not
-		// cut, so nothing after them is destroyed.
-		{name: "bad terminator followed by more commands", tail: append([]byte("*2\r\n$4\r\nINCR\r\n$3\r\nabXY"), second...), wantTrunc: true},
 	}
 
 	for _, tt := range tests {
@@ -141,6 +139,55 @@ func TestLoadFileReportsWhereCompleteCommandsEnd(t *testing.T) {
 			}
 			if stats.TruncatedTail != tt.wantTrunc {
 				t.Fatalf("stats.TruncatedTail = %v, want %v", stats.TruncatedTail, tt.wantTrunc)
+			}
+		})
+	}
+}
+
+func TestLoadFileFailsOnCorruptionBeforeTheEnd(t *testing.T) {
+	// Bad bytes with more data behind them are not a torn write. Replaying only
+	// what precedes them would silently drop every command that follows (and new
+	// commands would be appended after the damage), so the load fails and reports
+	// where the damage starts. The file is never modified.
+	first := mustEncodeValues(t, request("SET", "name", "Stash"))
+	second := mustEncodeValues(t, request("INCR", "counter"))
+
+	tests := []struct {
+		name string
+		tail []byte
+	}{
+		{name: "bad payload terminator followed by more commands", tail: append([]byte("*2\r\n$4\r\nINCR\r\n$3\r\nabXY"), second...)},
+		{name: "bad payload terminator at the very end", tail: []byte("*2\r\n$4\r\nINCR\r\n$3\r\nabXYZ")},
+		{name: "unknown type byte", tail: append([]byte("?garbage\r\n"), second...)},
+		{name: "bare newline in a header", tail: append([]byte("*2\n"), second...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := append(bytes.Clone(first), tt.tail...)
+			path := writeTempAOF(t, content)
+
+			replayed := 0
+			stats, err := aof.LoadFile(context.Background(), path, func(context.Context, protocol.Value) error {
+				replayed++
+				return nil
+			})
+			var corrupt *aof.CorruptError
+			if !errors.As(err, &corrupt) {
+				t.Fatalf("LoadFile() error = %v, want a *aof.CorruptError", err)
+			}
+			if corrupt.Offset != int64(len(first)) {
+				t.Fatalf("CorruptError.Offset = %d, want %d (the end of the last good command)", corrupt.Offset, len(first))
+			}
+			if corrupt.Commands != 1 || replayed != 1 || stats.ReplayedCommands != 1 {
+				t.Fatalf("commands = %d (error), %d (replayed), %d (stats), want 1", corrupt.Commands, replayed, stats.ReplayedCommands)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "byte "+strconv.Itoa(len(first))) || !strings.Contains(msg, path) {
+				t.Fatalf("error text %q does not name the file and the byte offset", msg)
+			}
+			after, readErr := os.ReadFile(path)
+			if readErr != nil || !bytes.Equal(after, content) {
+				t.Fatalf("file changed by a failed load (read error %v)", readErr)
 			}
 		})
 	}

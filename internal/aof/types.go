@@ -27,11 +27,30 @@ var (
 	ErrClosed = errors.New("aof: writer closed")
 )
 
+// CorruptError reports an append-only file with invalid data before its end. The
+// commands after the damage cannot be replayed safely, so loading stops.
+type CorruptError struct {
+	Path string
+	// Offset is where the damaged command starts: the size of the prefix made of
+	// complete commands.
+	Offset int64
+	// Commands is the number of complete commands before the damage.
+	Commands int
+	// Err is the parse failure.
+	Err error
+}
+
+func (e *CorruptError) Error() string {
+	return fmt.Sprintf("aof: %q is corrupt: the command after %d complete commands, starting at byte %d, is not valid RESP: %v", e.Path, e.Commands, e.Offset, e.Err)
+}
+
+func (e *CorruptError) Unwrap() error { return e.Err }
+
 // LoadStats summarizes AOF replay during startup.
 type LoadStats struct {
 	ReplayedCommands int
-	// TruncatedTail reports that the file ended in data that could not be
-	// replayed, whether an unfinished command or a malformed terminator.
+	// TruncatedTail reports that the file ended in an unfinished command. It is
+	// always set together with TornTail.
 	TruncatedTail bool
 	// ValidBytes is the size of the prefix of the file made of complete commands.
 	ValidBytes int64

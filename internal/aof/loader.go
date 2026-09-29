@@ -51,12 +51,11 @@ func LoadFile(ctx context.Context, path string, replay func(context.Context, pro
 				}
 				return stats, nil
 			}
-			if isRecoverableTruncation(parseErr) {
-				stats.TruncatedTail = true
-				return stats, nil
-			}
 
-			return stats, fmt.Errorf("aof: parse %q after %d commands: %w", path, stats.ReplayedCommands, parseErr)
+			// Anything else is damage with the rest of the file behind it, not a
+			// torn write. Skipping it would silently drop every later command, so
+			// stop and say where it starts.
+			return stats, &CorruptError{Path: path, Offset: stats.ValidBytes, Commands: stats.ReplayedCommands, Err: parseErr}
 		}
 		stats.ValidBytes = counter.n - int64(reader.Buffered())
 		if replayErr := replay(ctx, value); replayErr != nil {
@@ -101,18 +100,4 @@ func TruncateTail(path string, size int64) (err error) {
 		return fmt.Errorf("aof: sync %q after truncate: %w", path, err)
 	}
 	return nil
-}
-
-func isRecoverableTruncation(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-
-	// A frame whose final CRLF terminator never arrived is a torn trailing write,
-	// not corruption. The parser reports it with the typed ErrMissingCRLF
-	// sentinel, so match on that rather than the error message text.
-	return errors.Is(err, protocol.ErrMissingCRLF)
 }
