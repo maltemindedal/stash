@@ -25,6 +25,14 @@ OK
 
 `AUTH` takes exactly one argument, the password. Stash has no usernames or ACLs.
 
+A password on the command line is visible to every local user in the process list (`ps`). Keep it out of there by reading it from a file, mode `0600` and owned by the user that runs Stash:
+
+```bash
+go run ./cmd/stash --requirepass-file /etc/stash/password
+```
+
+For a replica, use `--masterauth-file` the same way. Startup fails if the file is empty or unreadable, and if you give both `--requirepass` and `--requirepass-file`.
+
 Unauthenticated clients may still issue `PING`. Every other command, including the replication handshake, requires authentication first.
 
 ## Bind another interface
@@ -39,7 +47,7 @@ An empty `--host` also binds all interfaces. Without `--requirepass` these addre
 
 ## Authenticate replicas
 
-A replica of a protected master needs `--masterauth` to complete its handshake:
+A replica of a protected master needs `--masterauth` (or `--masterauth-file`) to complete its handshake:
 
 ```bash
 go run ./cmd/stash --port 6380 --replicaof 127.0.0.1:6379 --masterauth "$STASH_PASSWORD"

@@ -86,6 +86,9 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	fs.StringVar(&cfg.ReplicaOf, "replicaof", cfg.ReplicaOf, "optional master address in host:port form for replica mode")
 	fs.StringVar(&cfg.MasterAuth, "masterauth", cfg.MasterAuth, "optional password used by replica mode to AUTH against a protected master")
 	fs.StringVar(&cfg.RequirePass, "requirepass", cfg.RequirePass, "optional password required for AUTH-protected client commands")
+	var requirePassFile, masterAuthFile string
+	fs.StringVar(&requirePassFile, "requirepass-file", "", "read the --requirepass password from this file instead of the command line, where it would be visible in the process list")
+	fs.StringVar(&masterAuthFile, "masterauth-file", "", "read the --masterauth password from this file instead of the command line")
 	fs.BoolVar(&cfg.AllowOpenBind, "allow-open-bind", cfg.AllowOpenBind, "allow listening on a non-loopback address with no --requirepass; without this flag the server refuses to start in that configuration")
 	fs.BoolVar(&cfg.EventLoop, "event-loop", cfg.EventLoop, "serve clients through an OS I/O multiplexing event loop; supported on Linux (epoll) and macOS (kqueue), other platforms fall back to one goroutine per connection")
 	fs.Func("slowlog-log-slower-than", "slow query threshold in microseconds; 0 logs all commands and negative disables slowlog", func(value string) error {
@@ -110,6 +113,12 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	if err := readPasswordFile(&cfg.RequirePass, requirePassFile, "requirepass"); err != nil {
+		return Config{}, err
+	}
+	if err := readPasswordFile(&cfg.MasterAuth, masterAuthFile, "masterauth"); err != nil {
+		return Config{}, err
+	}
 	if cfg.MaxMemory < 0 {
 		return Config{}, fmt.Errorf("invalid maxmemory %d: expected non-negative bytes", cfg.MaxMemory)
 	}
@@ -122,6 +131,32 @@ func parseFlags(fs *flag.FlagSet, args []string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// readPasswordFile sets *password from path, when one is given. A password on the
+// command line is visible to every local user in the process list; a file is not.
+// The line ending that echo or an editor adds is dropped. An empty password would
+// mean "no authentication", so an empty file is an error rather than a silent
+// downgrade, and giving both the flag and the file is refused as ambiguous.
+func readPasswordFile(password *string, path string, name string) error {
+	if path == "" {
+		return nil
+	}
+	if *password != "" {
+		return fmt.Errorf("--%s and --%s-file are mutually exclusive", name, name)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read --%s-file: %w", name, err)
+	}
+	value := strings.TrimRight(string(data), "\r\n")
+	if value == "" {
+		return fmt.Errorf("--%s-file %q is empty", name, path)
+	}
+
+	*password = value
+	return nil
 }
 
 // Address formats the listen address used by net.Listen. An IPv6 literal may be

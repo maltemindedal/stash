@@ -23,7 +23,9 @@ Stash is configured entirely through command-line flags. There is no configurati
 | `--slowlog-log-slower-than` | int | `10000` | Slowlog threshold in **microseconds**. `0` logs every command; any negative value disables the slowlog. See the [note below](#--slowlog-log-slower-than). |
 | `--replicaof` | string | *(empty)* | Upstream master address in `host:port` form. Setting it puts the server in replica mode. |
 | `--masterauth` | string | *(empty)* | Password the replica uses to `AUTH` against a password-protected master. |
+| `--masterauth-file` | string | *(empty)* | Read the `--masterauth` password from this file. See [the note below](#--requirepass-file-and---masterauth-file). |
 | `--requirepass` | string | *(empty)* | Password clients must supply via `AUTH`. Empty disables authentication. |
+| `--requirepass-file` | string | *(empty)* | Read the `--requirepass` password from this file. See [the note below](#--requirepass-file-and---masterauth-file). |
 | `--event-loop` | bool | `false` | Serve all clients from one event-loop goroutine using OS readiness notifications. |
 
 ## Notes on individual flags
@@ -37,6 +39,16 @@ The default binds loopback deliberately. Binding any other address (including `0
 ### `--allow-open-bind`
 
 Says that an unauthenticated server reachable from other machines is intended, for example on an isolated network or behind a firewall that does the access control. It has no effect when `--requirepass` is set or the server listens on loopback only.
+
+### `--requirepass-file` and `--masterauth-file`
+
+A password given as `--requirepass` or `--masterauth` is visible to every local user in the process list. These flags read it from a file instead, which suits a Docker or Kubernetes secret mount:
+
+```bash
+go run ./cmd/stash --requirepass-file /run/secrets/stash_password
+```
+
+The file holds the password and nothing else; the line ending that `echo` or an editor adds is dropped. Giving both the flag and its file is an error, and so is an empty or unreadable file: an empty password would mean "no authentication", so an empty secret mount fails startup instead of opening the server.
 
 ### `--slowlog-log-slower-than`
 
