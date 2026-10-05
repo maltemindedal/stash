@@ -44,6 +44,6 @@ The "why" behind the design. For contributors and anyone reading the source.
 
 | Document | What it covers |
 | --- | --- |
-| [Contributing](contributing.md) | Dev setup, the verification commands CI runs, test layout, and project conventions. |
+| [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Dev setup, the verification commands CI runs, test layout, and project conventions. |
 | [`AGENTS.md`](../AGENTS.md) | Behavioral guidelines for LLM coding agents working in this repo. |
 | [Agent support docs](agents/) | Issue tracker conventions, triage label vocabulary, and domain-doc consumption rules. |
