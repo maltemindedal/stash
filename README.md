@@ -93,7 +93,7 @@ Per-command deviations from Redis are noted in the [command reference](docs/refe
 
 ## Contributing
 
-See [`docs/contributing.md`](docs/contributing.md) for dev setup and the checks CI runs.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev setup and the checks CI runs.
 
 ## License
 
