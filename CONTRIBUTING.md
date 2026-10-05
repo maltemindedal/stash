@@ -1,5 +1,7 @@
 # Contributing
 
+Everyone taking part in Stash is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Development setup
 
 Install **Go 1.21 or newer**. The minimum is the `go` directive in [`go.mod`](go.mod); CI builds and tests on that minimum and on the two latest Go releases. Stash has no external module dependencies.
