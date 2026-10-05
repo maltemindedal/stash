@@ -65,6 +65,8 @@ go run ./cmd/stash --dump ""
 
 Stash writes a snapshot only during a **graceful** shutdown triggered by `SIGINT` or `SIGTERM`. A second signal during shutdown ends the process at once, so it writes no snapshot either. A `SIGKILL` or crash produces no snapshot. Use `--aof` when writes since the last startup must survive either event.
 
+Loading is stricter than writing. A snapshot write skips the keys it cannot encode and logs how many, because it can still enumerate them. A load cannot skip a value it cannot parse, so startup fails, rather than loading part of the file, when the file selects a database other than `0`, holds a non-string value, or uses an unsupported opcode.
+
 ## Repairing a corrupt append-only file
 
 An unfinished command at the very end of the file is normal after a crash and is cut off automatically. Invalid data with more file behind it is not: replaying only what precedes it would silently drop every later command, and new commands would be appended after the damage. Stash therefore refuses to start and leaves the file untouched:

@@ -1,6 +1,6 @@
 # Setting up replication
 
-Stash supports leader/follower replication over the standard Redis handshake (`REPLCONF`, `PSYNC`). A replica connects to a master, receives an RDB snapshot of current state, then applies a live stream of propagated commands. As in Redis, a full resync *replaces* the replica's dataset: whatever the replica loaded from its own AOF or RDB is discarded in favour of the master's snapshot.
+Stash supports master/replica replication over the standard Redis handshake (`REPLCONF`, `PSYNC`). A replica connects to a master, receives an RDB snapshot of current state, then applies a live stream of propagated commands. As in Redis, a full resync *replaces* the replica's dataset: whatever the replica loaded from its own AOF or RDB is discarded in favour of the master's snapshot.
 
 > Replication supports `REPLCONF`, `PSYNC`, and `WAIT`. It does not support partial resynchronization, replica chaining, or automatic failover.
 

@@ -6,7 +6,7 @@ Stash has two independent eviction mechanisms: **TTL eviction**, which removes k
 
 TTLs are stored internally as absolute Unix millisecond timestamps. Expired keys are removed two ways:
 
-- **Passively**, when a read touches an expired key. The read behaves as though the key is gone.
+- **Passively**, when a command touches an expired key. The command behaves as though the key is gone.
 - **Actively**, by a background loop that samples keys on a fixed interval.
 
 Both are always on; there is no flag to disable them. With `--maxmemory` set there is a third: the first accounted write after a key's TTL deadline has passed re-measures the whole keyspace and drops the expired keys it passes, which reclaims them faster than sampling alone would. Until a deadline passes, accounted writes rely on the running total and do not scan.
@@ -27,7 +27,7 @@ The server publishes removals from the background loop and the accounted-write r
 
 ## Memory-pressure eviction
 
-Set `--maxmemory` to a byte count to enable approximate keyspace accounting and LRU eviction:
+Set `--maxmemory` to a byte count to enable approximate keyspace accounting and memory-pressure eviction:
 
 ```bash
 # 100 MB limit

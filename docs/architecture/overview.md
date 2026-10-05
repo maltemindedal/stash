@@ -2,7 +2,7 @@
 
 This repository implements a Redis-compatible TCP server in Go one phase at a time. It now includes the TCP server, RESP parsing and encoding, sharded in-memory storage, transactions, pub/sub, replication, RDB snapshots, append-only-file durability, memory-pressure eviction, and basic operational metrics. Each package keeps a distinct responsibility so later phases can extend the server without mixing those concerns.
 
-For domain vocabulary, see [`CONTEXT.md`](../../CONTEXT.md) at the repository root.
+For domain vocabulary, see [`GLOSSARY.md`](../../GLOSSARY.md) at the repository root.
 
 ## Request flow
 
@@ -67,10 +67,11 @@ Current responsibilities:
 - route keys to a fixed shard set and protect each shard with its own `sync.RWMutex`
 - support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
 - store TTLs in Unix milliseconds
-- perform passive eviction on reads
+- perform passive eviction when a read or write touches an expired key
 - perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed), reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
 - track approximate keyspace memory when `maxmemory` is enabled
 - evict sampled least-recently-used candidates under memory pressure
+- scan several sorted-set score ranges under one lock acquisition, so `GEORADIUS` reads only the geohash cells that cover its radius, plus two guard ranges for scores outside every cell, instead of the whole set
 
 ### `internal/command`
 
