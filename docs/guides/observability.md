@@ -95,7 +95,7 @@ OK
 redis-cli -p 6379 MONITOR
 ```
 
-The connection switches into monitoring mode and receives every command the server processes. A monitoring client may issue only `PING`. It must reconnect before running other commands.
+The connection switches into monitoring mode and receives every request that clients send to the server, before it runs. A monitoring client may issue only `PING`. It must reconnect before running other commands.
 
 Two operational notes:
 

@@ -22,7 +22,7 @@ A `MULTI` / `EXEC` block of queued commands that runs as one unit, and is aborte
 The record of which clients subscribe to which exact channels, used by `SUBSCRIBE`, `UNSUBSCRIBE`, and `PUBLISH`.
 
 **Monitor**:
-The mode, entered with `MONITOR`, in which a client receives every command the server runs.
+The mode, entered with `MONITOR`, in which a client receives every request that clients send to the server.
 
 **Slowlog**:
 The bounded in-memory log of commands that ran longer than a threshold, read with `SLOWLOG`.
@@ -47,10 +47,20 @@ One of the fixed partitions the **Store** divides keys between, each with its ow
 The Redis data type of a key's value: string, hash, list, set, sorted set, or stream.
 
 **TTL**:
-The deadline after which a key expires. An expired key is removed passively, when a read finds it, or actively, by a sweep of expired keys; only active removals are published to **Replicas**, the **AOF**, and `WATCH`.
+The deadline after which a key expires.
+
+**Eviction**:
+The server removing keys on its own rather than at a client's request: a **TTL eviction** or a **Memory-pressure eviction**. Every eviction except a passive TTL eviction is published to **Replicas**, the **AOF**, and `WATCH`.
+
+**TTL eviction**:
+The removal of a key whose **TTL** has passed: passive when a command touches the key, active when a sweep of expired keys removes it.
 
 **Maxmemory**:
-The approximate limit on keyspace memory past which the **Store** evicts keys, sampling for the least recently used.
+The approximate limit on keyspace memory above which **Memory-pressure eviction** runs.
+
+**Memory-pressure eviction**:
+The removal of live keys, sampled for the least recently used, while keyspace memory is over **Maxmemory**.
+_Avoid_: LRU eviction, memory eviction
 
 **HyperLogLog**:
 A fixed-size approximate cardinality structure stored as a string value, used by `PFADD` and `PFCOUNT`.
@@ -70,12 +80,12 @@ The append-only file: the durable log of writes, stored as replayable RESP comma
 The background compaction that replaces the **AOF** with a file recreating only the current live data.
 
 **RDB snapshot**:
-A Redis database file of the keyspace, loaded at startup, written at graceful shutdown, and sent to a **Replica** on full resync.
+A Redis database file holding the string keys of database `0`. Stash can load one at startup, writes one at graceful shutdown, and sends one to a **Replica** on full resync.
 
 ### Replication
 
 **Master**:
-A server that accepts **Replicas** and forwards the writes it applies to them.
+A server that accepts **Replicas** and forwards to them the commands it propagates: most writes, and `PUBLISH`.
 _Avoid_: leader
 
 **Replica**:
