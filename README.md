@@ -2,7 +2,7 @@
 
 A Redis-compatible key-value store written from scratch in Go, for people who want to read a database implementation rather than depend on one.
 
-Stash speaks RESP over TCP, so `redis-cli` and other RESP clients connect without modification. It implements strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial queries, and streams on a sharded in-memory store. It also supports append-only-file durability, RDB snapshots, leader/follower replication, transactions, and pub/sub. The entire server builds from the Go standard library, with no external dependencies.
+Stash speaks RESP over TCP, so `redis-cli` and other RESP clients connect without modification. It implements strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial queries, and streams on a sharded in-memory store. It also supports append-only-file durability, RDB snapshots, master/replica replication, transactions, and pub/sub. The entire server builds from the Go standard library, with no external dependencies.
 
 ## Quick start
 
