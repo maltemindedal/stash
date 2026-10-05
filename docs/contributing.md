@@ -53,7 +53,7 @@ The integration suite covers AOF replay, RDB loading, replication, event-loop mo
 
 ## Conventions
 
-- **Use the domain glossary.** [`CONTEXT.md`](../CONTEXT.md) defines the project's vocabulary. Name issues, tests, and refactors with those terms rather than synonyms.
+- **Use the domain glossary.** [`GLOSSARY.md`](../GLOSSARY.md) defines the project's vocabulary. Name issues, tests, and refactors with those terms rather than synonyms, and add a term there once a new domain concept is stable.
 - **The code is the source of truth for docs.** When documentation and behavior disagree, fix the documentation.
 - **Unsupported input fails explicitly.** Unrecognized command modifiers return a syntax error rather than being silently ignored. This makes the limits of Redis compatibility clear.
 - **Keep package seams intact.** Protocol, storage, command dispatch, and networking are deliberately separate; see the [architecture overview](architecture/overview.md).
