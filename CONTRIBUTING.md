@@ -72,4 +72,4 @@ Pull requests run the `validate` job (on the minimum Go version) and the `test-l
 
 ## Dependency and vulnerability checks
 
-Stash has no module dependencies, so the moving parts are the Go toolchain and the GitHub Actions in `.github/workflows/`. Actions are pinned to commit SHAs; Dependabot proposes bumps weekly, waiting seven days after a release. A weekly workflow runs `govulncheck` against the latest stable Go. Run it locally with `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`.
+Stash has no module dependencies, so the moving parts are the Go toolchain and the GitHub Actions in `.github/workflows/`. Actions are pinned to commit SHAs; Dependabot proposes bumps weekly, holding back new releases for its default cooldown. A weekly workflow runs `govulncheck` against the latest stable Go. Run it locally with `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`.
