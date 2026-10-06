@@ -1,0 +1,58 @@
+name: Bug report
+description: Stash behaves differently from its documentation or from Redis.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [current boundaries](https://github.com/maltemindedal/stash/blob/main/README.md#current-boundaries) and the [command reference](https://github.com/maltemindedal/stash/blob/main/docs/reference/commands.md) first. A command the reference does not list is unsupported, not a bug.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Stash has no tagged releases. Give the commit, for example from `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: textarea
+    id: command-line
+    attributes:
+      label: How the server was started
+      description: The full command line with every flag, including `--event-loop` if set. Redact passwords.
+      placeholder: go run ./cmd/stash --port 6379 --aof appendonly.aof
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Go version
+      placeholder: Ubuntu 24.04, go1.24.7 linux/amd64
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest input that reproduces the problem, such as a `redis-cli` session.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected, for example the reply Redis gives or what the docs say.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: The reply, error, crash, or hang you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server logs
+      description: Log output around the failure. `--log-level debug` adds detail.
+      render: text

@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a command, flag, or behavior Stash does not have.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What is missing
+      description: The command, modifier, flag, or behavior you need.
+    validations:
+      required: true
+  - type: textarea
+    id: redis
+    attributes:
+      label: Redis behavior
+      description: If Stash should match Redis, link the Redis documentation or show the reply Redis gives.
+  - type: textarea
+    id: why
+    attributes:
+      label: Why you need it
+    validations:
+      required: true
