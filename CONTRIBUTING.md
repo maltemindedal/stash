@@ -62,7 +62,7 @@ The integration suite covers AOF replay, RDB loading, replication, event-loop mo
 
 ## Agent-assisted contributions
 
-[`AGENTS.md`](AGENTS.md) holds behavioral guidelines for LLM coding agents working in this repo, and [`docs/agents/`](docs/agents/) documents the issue tracker and triage label conventions those agents follow.
+[`AGENTS.md`](AGENTS.md) holds the commands, conventions and gotchas for LLM coding agents working in this repo, and [`docs/agents/`](docs/agents/) documents the issue tracker and triage label conventions those agents follow.
 
 ## Issues and pull requests
 
