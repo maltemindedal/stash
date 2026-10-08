@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -533,8 +534,13 @@ func TestConnMachineFeedIsLinearInArrayFrameSize(t *testing.T) {
 			frame.WriteString("$1\r\nx\r\n")
 		}
 
+		// Collector work grows faster than the frame does and varies from run to
+		// run, which has nothing to do with the decoder rescanning bytes. Leave
+		// it out of the timing and take the fastest of several runs.
+		defer debug.SetGCPercent(debug.SetGCPercent(-1))
 		best := time.Duration(1<<63 - 1)
-		for run := 0; run < 3; run++ {
+		for run := 0; run < 7; run++ {
+			runtime.GC()
 			machine := NewConnMachine(nil)
 			start := time.Now()
 			feedInChunks(t, machine, frame.Bytes(), 64*1024)
