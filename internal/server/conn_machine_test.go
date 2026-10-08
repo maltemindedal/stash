@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"testing"
 	"time"
 
@@ -1028,5 +1029,38 @@ func TestConnMachineKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *test
 				t.Fatalf("the write buffer was replaced %d times in %d pipelines (capacities %v), want at most %d", replaced, len(identities), caps, limit)
 			}
 		})
+	}
+}
+
+// liveHeapBytes reports the heap still reachable after a full collection.
+func liveHeapBytes() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats.HeapAlloc
+}
+
+func TestConnMachineReleasesAProcessedRequestWhileTheConnectionIdles(t *testing.T) {
+	// The decoded request is as large as the value it carries. The machine drops
+	// its read buffer after a large request, but it must not hold on to the
+	// request itself either: it sat in the queue's backing array until the next
+	// request arrived, so an idle connection still pinned the whole value.
+	const valueSize = 16 << 20
+	run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+		return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+	}
+	machine := NewConnMachine(nil)
+
+	before := liveHeapBytes()
+	feedInChunks(t, machine, largeSetFrame(valueSize), 64<<10)
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v", err)
+	}
+	after := liveHeapBytes()
+	runtime.KeepAlive(machine)
+
+	if after > before && after-before > valueSize/2 {
+		t.Fatalf("the idle machine keeps %d bytes reachable after a %d byte request has run, want it released", after-before, valueSize)
 	}
 }

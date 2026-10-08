@@ -319,6 +319,10 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	}
 
 	event := m.pending[0]
+	// Clear the slot as well as reslicing past it: the queue's backing array lives
+	// until the next request makes it grow, and a decoded request, which can be as
+	// large as the value it carries, would stay reachable from it.
+	m.pending[0] = connEvent{}
 	m.pending = m.pending[1:]
 
 	if event.protoErr != nil {
