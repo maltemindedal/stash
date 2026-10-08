@@ -90,7 +90,7 @@ Under `everysec` and `no` a command is acknowledged before it reaches the disk, 
 
 ## What TTLs do across a restart
 
-Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT` frame before being written to the AOF. Replay therefore anchors the TTL to the original clock rather than restarting the countdown, and keys that expired while the server was down are dropped instead of being resurrected with a fresh lease.
+Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT` frame before being written to the AOF. Replay therefore anchors the TTL to the original clock rather than restarting the countdown, and keys that expired while the server was down are dropped instead of being resurrected with a fresh lease. This also holds after `BGREWRITEAOF`, which writes each string key with a TTL as `SET key value PXAT <deadline>`.
 
 ## Related
 

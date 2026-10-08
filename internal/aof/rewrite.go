@@ -12,6 +12,9 @@ import (
 )
 
 // GenerateRewrite emits the shortest practical RESP command stream for the supplied snapshot.
+// A TTL is written as the absolute deadline it had, so replay does not restart
+// the countdown from the loader's clock. It returns an error for a collection
+// with a TTL, which no command it emits can recreate.
 func GenerateRewrite(entries []storage.SnapshotEntry, writer io.Writer) (RewriteStats, error) {
 	sorted := make([]storage.SnapshotEntry, len(entries))
 	copy(sorted, entries)
@@ -42,6 +45,12 @@ func GenerateRewrite(entries []storage.SnapshotEntry, writer io.Writer) (Rewrite
 }
 
 func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.Value, error) {
+	// Only SET's PXAT recreates a TTL. No command gives a collection one today,
+	// but refusing it keeps a future TTL from being dropped without a word.
+	if entry.Kind != storage.ValueKindString && entry.ExpiresAt > 0 {
+		return nil, fmt.Errorf("aof: cannot rewrite the TTL of %s key %q", entry.Kind, entry.Key)
+	}
+
 	switch entry.Kind {
 	case storage.ValueKindString:
 		if entry.ExpiresAt > 0 && entry.ExpiresAt <= now {
@@ -49,11 +58,7 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 		}
 		args := []protocol.Value{bulkString(entry.Key), bulkBytes(entry.String)}
 		if entry.ExpiresAt > 0 {
-			ttl := entry.ExpiresAt - now
-			if ttl <= 0 {
-				return nil, nil
-			}
-			args = append(args, bulkString("PX"), bulkString(strconv.FormatInt(ttl, 10)))
+			args = append(args, bulkString("PXAT"), bulkString(strconv.FormatInt(entry.ExpiresAt, 10)))
 		}
 		return []protocol.Value{rewriteCommand("SET", args...)}, nil
 	case storage.ValueKindList:
