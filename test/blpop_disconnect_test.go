@@ -2,6 +2,7 @@ package test
 
 import (
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -155,4 +156,72 @@ func TestBlockedBLPopStillWakesForAClientThatIsThere(t *testing.T) {
 		t.Fatalf("Parse(PING reply) error = %v", err)
 	}
 	assertValuesEqual(t, second, protocol.SimpleString{Value: "PONG"})
+}
+
+func TestABlockedClientThatLeftDoesNotTakeAPushedElement(t *testing.T) {
+	// A blocked BLPOP looked at its client only every 100 ms, never when a push
+	// woke it. A client that had left since the last look popped the element
+	// into a closed connection, the pop was logged as LPOP, and a client still
+	// waiting behind it stayed blocked. Now the woken BLPOP looks first, and a
+	// client that has left passes its turn to the next one.
+	tests := []struct {
+		name         string
+		anotherWaits bool
+		wantList     []string
+		wantLogged   [][]string
+	}{
+		{
+			name:       "no other client waits",
+			wantList:   []string{"job-1"},
+			wantLogged: [][]string{{"RPUSH", "jobs", "job-1"}},
+		},
+		{
+			name:         "another client waits",
+			anotherWaits: true,
+			wantList:     nil,
+			wantLogged:   [][]string{{"RPUSH", "jobs", "job-1"}, {"LPOP", "jobs"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+			addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
+			defer stop()
+			admin, adminParser := dialClient(t, addr)
+
+			departed, _ := blockOn(t, addr, "jobs")
+			var (
+				waiting       net.Conn
+				waitingParser *protocol.Parser
+			)
+			remaining := 1
+			if tt.anotherWaits {
+				waiting, waitingParser = blockOn(t, addr, "jobs")
+				remaining++
+			}
+
+			// The push arrives before the server's next 100 ms look at the client
+			// that left, so only the look on waking can notice it.
+			if err := departed.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			assertCommandResponse(t, admin, adminParser, protocol.Integer{Value: 1}, "RPUSH", "jobs", "job-1")
+
+			if tt.anotherWaits {
+				assertValuesEqual(t, readReplyWithin(t, waiting, waitingParser, 2*time.Second, "BLPOP reply to the client still waiting"), blpopReply("jobs", "job-1"))
+			}
+			waitForClients(t, admin, adminParser, remaining, 3*time.Second, "the server drops the client that left")
+
+			list := make([]protocol.Value, 0, len(tt.wantList))
+			for _, element := range tt.wantList {
+				list = append(list, protocol.BulkString{Data: []byte(element)})
+			}
+			assertValuesEqual(t, roundTrip(t, admin, adminParser, "LRANGE", "jobs", "0", "-1"), protocol.Array{Elements: list})
+
+			stop()
+			waitForServerStop(t, errCh)
+			assertAOFHolds(t, aofPath, tt.wantLogged...)
+		})
+	}
 }

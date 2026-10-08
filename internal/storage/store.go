@@ -687,9 +687,21 @@ func (s *Store) SubscribeListPush(key string) chan struct{} {
 	return s.waiters.subscribe(key)
 }
 
-// UnsubscribeListPush removes a previously registered list push waiter.
+// UnsubscribeListPush removes a waiter registered with SubscribeListPush. A
+// waiter that was signaled but whose wake-up nobody received passes its turn to
+// the next waiter, so a client that stops waiting after its turn came (it has
+// popped already, or has gone) leaves no other client blocked while the list
+// has an element. Call it only once every shard lock is released, as
+// wakeNextListWaiter.
 func (s *Store) UnsubscribeListPush(key string, ch chan struct{}) {
 	s.waiters.unsubscribe(key, ch)
+}
+
+// PassListPushWake passes a turn that a waiter received but will not take, as
+// when its client has gone, to the next waiter for key. Call it only once every
+// shard lock is released, as wakeNextListWaiter.
+func (s *Store) PassListPushWake(key string) {
+	s.wakeNextListWaiter(key)
 }
 
 // wakeNextListWaiter wakes the client that has waited longest for an element of
