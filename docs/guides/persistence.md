@@ -86,7 +86,22 @@ That loses every write from the damaged command onward. If they matter, repair t
 
 ## Watching for write failures
 
-Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. `INFO persistence` reports `aof_last_write_status:err` from the first failed write or fsync until one succeeds again; see [Observability](observability.md).
+Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. A command whose write fails is kept in memory and tried again, ahead of every later command, the next time Stash writes to the file: with the next command under `no`, and within a second under `everysec`. A write that gets only some of the waiting commands onto the disk keeps the ones it wrote in full, so the file catches up with memory as space frees up. If a failed write left part of a command at the end of the file, Stash first cuts the file back to the last complete command. While it cannot, it appends nothing after it, so the file still loads. While the disk stays full, the commands waiting to be written grow with write traffic, because writes are still accepted. They are lost if the process stops before a write succeeds: a graceful shutdown makes one last attempt, and a crash makes none.
+
+Under `always` nothing waits. A command whose write or fsync fails gets `ERR persistence failure`, and Stash cuts back any part of it already in the file. The command stays applied in memory, but it is in neither the append-only file nor the replicas, so the two still agree. If the cut fails too, for example because no file handle is free, the command stays in the file until a later cut succeeds. Stash retries the cut before every later write under `always`, and a crash before then replays the command. The exception is a `BGREWRITEAOF` whose old file failed to close, whose rename failed and whose reopen of the old file failed: no file handle is left, so the cut waits until the file is reopened or `BGREWRITEAOF` replaces it. Because the command is in memory, two things can still copy it later: `BGREWRITEAOF` builds the file from memory, and a replica's full resync loads a snapshot of memory.
+
+A failed fsync cannot be retried the way a failed write is. The kernel may already have dropped the data it could not write, and a later fsync can succeed without it, so no later success shows that the file is whole. Once the disk is healthy again, run `BGREWRITEAOF`: the rewritten file is built from memory.
+
+`INFO persistence` reports `aof_last_write_status:err` in these cases; see also [Observability](observability.md):
+
+| Condition | Status is `err` until |
+| --- | --- |
+| A write fails, or the file cannot be cut back to its last complete command or reopened after a rewrite | A later write succeeds |
+| An fsync fails | `BGREWRITEAOF` replaces the file |
+| During `BGREWRITEAOF`, the old file fails to close and the rename of the rewritten file then fails, so the old file stays | `BGREWRITEAOF` replaces the file |
+| The rewritten file was renamed into place but its directory could not be synced | A later sync of the directory succeeds |
+
+Under `always`, the two conditions that only `BGREWRITEAOF` clears make every write fail with `ERR persistence failure` until then, and an unsynced directory makes every write fail until a sync of the directory succeeds. After a failed close, an old file that turns out shorter than what was written to it takes no further writes under any policy until `BGREWRITEAOF` replaces it.
 
 ## What TTLs do across a restart
 

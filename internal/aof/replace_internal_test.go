@@ -253,13 +253,14 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 			}
 
 			// A working file again: the next successful write or fsync clears it.
+			// Only the file is replaced, so the writer has to recover by itself
+			// from the failure it saw.
 			fresh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 			if err != nil {
 				t.Fatalf("reopen: %v", err)
 			}
 			writer.mu.Lock()
 			writer.file = fresh
-			writer.writer.Reset(fresh)
 			writer.mu.Unlock()
 			t.Cleanup(func() { _ = fresh.Close() })
 
