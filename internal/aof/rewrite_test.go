@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -229,5 +231,99 @@ func TestGenerateRewriteOutputLoadsBackForHugeCollections(t *testing.T) {
 				t.Fatalf("stats = %+v, want 1 key split across several commands", stats)
 			}
 		})
+	}
+}
+
+func TestRewriteKeepsTheAbsoluteDeadlineOfAStringKey(t *testing.T) {
+	// The rewrite used to write a TTL as the time left (PX), which replay counts
+	// from the loader's clock. After BGREWRITEAOF and a restart every TTL was
+	// extended by the downtime, and keys that expired meanwhile came back.
+	inAnHour := time.Now().Add(time.Hour).UnixMilli()
+	tests := []struct {
+		name      string
+		expiresAt int64
+		want      [][]string
+	}{
+		{name: "a TTL an hour out", expiresAt: inAnHour, want: [][]string{{"SET", "k", "v", "PXAT", strconv.FormatInt(inAnHour, 10)}}},
+		{name: "no TTL", expiresAt: 0, want: [][]string{{"SET", "k", "v"}}},
+		{name: "a passed deadline", expiresAt: time.Now().Add(-time.Second).UnixMilli(), want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := storage.SnapshotEntry{Key: "k", Kind: storage.ValueKindString, ExpiresAt: tt.expiresAt, String: []byte("v")}
+			var out bytes.Buffer
+			stats, err := aof.GenerateRewrite([]storage.SnapshotEntry{entry}, &out)
+			if err != nil {
+				t.Fatalf("GenerateRewrite() error = %v", err)
+			}
+			if got := rewriteCommands(t, out.Bytes()); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("rewrite = %q, want %q", got, tt.want)
+			}
+			if stats.Keys != len(tt.want) || stats.Commands != len(tt.want) {
+				t.Fatalf("stats = %+v, want %d key and command", stats, len(tt.want))
+			}
+		})
+	}
+}
+
+func TestRewriteRefusesACollectionWithATTL(t *testing.T) {
+	// No command gives a collection a TTL yet, and the rewrite has no command that
+	// recreates one, so it used to write the collection without its TTL. The
+	// rewrite now fails instead, and the writer keeps the old file.
+	expiresAt := time.Now().Add(time.Hour).UnixMilli()
+	tests := []struct {
+		name  string
+		entry storage.SnapshotEntry
+	}{
+		{name: "list", entry: storage.SnapshotEntry{Key: "letters", Kind: storage.ValueKindList, List: [][]byte{[]byte("a")}}},
+		{name: "hash", entry: storage.SnapshotEntry{Key: "profile", Kind: storage.ValueKindHash, Hash: []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}}}},
+		{name: "set", entry: storage.SnapshotEntry{Key: "tags", Kind: storage.ValueKindSet, Set: [][]byte{[]byte("fast")}}},
+		{name: "sorted set", entry: storage.SnapshotEntry{Key: "leaders", Kind: storage.ValueKindZSet, ZSet: []storage.ZSetRangeEntry{{Member: "alpha", Score: 1}}}},
+		{name: "stream", entry: storage.SnapshotEntry{Key: "events", Kind: storage.ValueKindStream, Stream: []storage.StreamEntry{{ID: "1-0", Values: [][]byte{[]byte("type"), []byte("start")}}}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := tt.entry
+			entry.ExpiresAt = expiresAt
+			_, err := aof.GenerateRewrite([]storage.SnapshotEntry{entry}, io.Discard)
+			if err == nil {
+				t.Fatalf("GenerateRewrite() error = nil, want a refusal to rewrite the TTL of %s key %q", entry.Kind, entry.Key)
+			}
+			if !strings.HasPrefix(err.Error(), "aof: ") || !strings.Contains(err.Error(), strconv.Quote(entry.Key)) {
+				t.Fatalf("GenerateRewrite() error = %q, want an aof: error naming key %q", err, entry.Key)
+			}
+		})
+	}
+}
+
+// rewriteCommands parses a rewrite's output into the arguments of each command.
+func rewriteCommands(t *testing.T, payload []byte) [][]string {
+	t.Helper()
+
+	var commands [][]string
+	parser := protocol.NewParser(bytes.NewReader(payload))
+	for {
+		value, err := parser.Parse()
+		if errors.Is(err, io.EOF) {
+			return commands
+		}
+		if err != nil {
+			t.Fatalf("Parse() error = %v", err)
+		}
+		array, ok := value.(protocol.Array)
+		if !ok {
+			t.Fatalf("rewrite frame = %#v, want a command array", value)
+		}
+		args := make([]string, 0, len(array.Elements))
+		for _, element := range array.Elements {
+			bulk, ok := element.(protocol.BulkString)
+			if !ok {
+				t.Fatalf("rewrite argument = %#v, want a bulk string", element)
+			}
+			args = append(args, string(bulk.Data))
+		}
+		commands = append(commands, args)
 	}
 }
