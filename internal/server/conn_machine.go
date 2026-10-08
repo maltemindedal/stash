@@ -35,6 +35,36 @@ const defaultMaxReadBuffer = 512 * 1024 * 1024
 // Redis's client-output-buffer-limit.
 const defaultMaxWriteBuffer = 512 * 1024 * 1024
 
+// retainedReadBufferCap is the capacity above which the machine releases its
+// read buffer once only a small remainder is left in it. The buffer grows to hold
+// one large request and would otherwise keep that capacity until the connection
+// closes, so many idle connections that each once received a large value would
+// pin all of it. The goroutine-per-connection mode likewise keeps only a bufio
+// buffer of a few kilobytes between requests.
+//
+// The bound sits well above what a connection that keeps sending ordinary
+// requests needs, because releasing that buffer on every read costs an
+// allocation and a copy per read. Between reads such a connection holds part of
+// one request plus the next read, which the event loop makes at most
+// eventLoopReadChunk (64 KiB) at a time. For requests up to a chunk in size that
+// is at most two chunks, and append rounds the capacity up to about 144 KiB for
+// it, so four chunks leaves room above that.
+const retainedReadBufferCap = 256 * 1024
+
+// retainedWriteBufferCap is the capacity above which Flush releases the write
+// buffer once it has written everything. The buffer grows to hold one large reply
+// and would otherwise keep that capacity until the connection closes, which a GET
+// of a large value would leave on every connection that asked for one.
+//
+// The bound sits above what a client that pipelines ordinary requests needs,
+// because releasing that buffer after every pipeline costs an allocation and a
+// copy per pipeline. The event loop stops executing a connection's requests once
+// eventLoopOutputHighWater (1 MiB) of output is pending, so such a client's
+// buffer fills to that mark and a reply past it, and append rounds the capacity
+// up from there (to about 1.2 MiB for 64 KiB replies). Twice the mark leaves
+// room above that.
+const retainedWriteBufferCap = 2 << 20
+
 // ConnCommandRunner executes one parsed request with connection-scoped state
 // and returns the RESP responses to buffer for the client. A non-nil error is
 // fatal for the connection.
@@ -217,10 +247,25 @@ func (m *ConnMachine) decodeBuffered() {
 	}
 
 	if consumed > 0 {
-		m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+		m.discardRead(consumed)
 	}
 
 	m.checkReadBufferLimit()
+}
+
+// discardRead drops the consumed prefix of the read buffer and keeps the bytes
+// behind it. A buffer that grew past retainedReadBufferCap is not kept for them
+// when they are fewer than that: they move to a buffer of their own, or to none when
+// nothing is left, and the large one is garbage. A larger remainder stays where
+// it is, because it is the start of the next large frame.
+func (m *ConnMachine) discardRead(consumed int) {
+	rest := m.readBuf[consumed:]
+	if cap(m.readBuf) > retainedReadBufferCap && len(rest) < retainedReadBufferCap {
+		// append to a nil slice returns nil when there is nothing to copy.
+		m.readBuf = append([]byte(nil), rest...)
+		return
+	}
+	m.readBuf = append(m.readBuf[:0], rest...)
 }
 
 func (m *ConnMachine) checkReadBufferLimit() {
@@ -274,6 +319,10 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	}
 
 	event := m.pending[0]
+	// Clear the slot as well as reslicing past it: the queue's backing array lives
+	// until the next request makes it grow, and a decoded request, which can be as
+	// large as the value it carries, would stay reachable from it.
+	m.pending[0] = connEvent{}
 	m.pending = m.pending[1:]
 
 	if event.protoErr != nil {
@@ -307,9 +356,10 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 // Flush writes pending output to w and consumes whatever w accepts, so partial
 // writes leave the remainder buffered for a later call. The unwritten remainder
 // is tracked by an offset rather than recompacted, so draining a large reply to
-// a slow reader stays linear. Once a closing machine has drained its parsed
-// requests and pending output, Flush completes the transition to the closed
-// state.
+// a slow reader stays linear. When the output has drained completely, a buffer
+// that grew past retainedWriteBufferCap is released rather than kept for the next
+// reply. Once a closing machine has drained its parsed requests and pending
+// output, Flush completes the transition to the closed state.
 func (m *ConnMachine) Flush(w io.Writer) error {
 	if m.state == ConnStateClosed {
 		return ErrConnMachineClosed
@@ -320,6 +370,9 @@ func (m *ConnMachine) Flush(w io.Writer) error {
 		m.writeOff += n
 		if m.writeOff >= len(m.writeBuf) {
 			m.writeBuf = m.writeBuf[:0]
+			if cap(m.writeBuf) > retainedWriteBufferCap {
+				m.writeBuf = nil
+			}
 			m.writeOff = 0
 		}
 		if err != nil {

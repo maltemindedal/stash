@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"testing"
 	"time"
 
@@ -738,5 +739,328 @@ func TestConnMachinePushLimitDoesNotApplyToReplies(t *testing.T) {
 	flushAll(t, machine)
 	if err := machine.BufferEncoded([]byte("+push\r\n")); err != nil {
 		t.Fatalf("BufferEncoded() after draining error = %v", err)
+	}
+}
+
+// idleBufferCapBound is the capacity above which an idle connection must not
+// keep a read or write buffer.
+const idleBufferCapBound = 64 << 10
+
+// largeSetFrame returns a SET of a value of the given size as one RESP frame.
+func largeSetFrame(size int) []byte {
+	frame := make([]byte, 0, size+64)
+	frame = fmt.Appendf(frame, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n", size)
+	frame = append(frame, bytes.Repeat([]byte("x"), size)...)
+	return append(frame, "\r\n"...)
+}
+
+func TestConnMachineReleasesItsReadBufferAfterALargeRequest(t *testing.T) {
+	// A connection that once received a large value must not keep the buffer it
+	// grew to receive it: with many idle connections that adds up to gigabytes.
+	const readChunk = 64 << 10 // what the event loop reads from a socket at a time
+	ping := machineFrame("PING")
+
+	tests := []struct {
+		name string
+		// tail follows the large request in the read that completes it, and rest
+		// arrives afterwards.
+		tail, rest []byte
+	}{
+		{name: "the connection idles and a small request arrives later", rest: ping},
+		{name: "half of the next request arrives with the end of the large one", tail: ping[:7], rest: ping[7:]},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run, executed := echoRunner(t)
+			machine := NewConnMachine(nil)
+
+			feedInChunks(t, machine, append(largeSetFrame(32<<20), tt.tail...), readChunk)
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if len(*executed) != 1 || machine.State() != ConnStateActive {
+				t.Fatalf("executed %d requests, state = %d (err = %v), want the large request executed and the machine active", len(*executed), machine.State(), machine.Err())
+			}
+			if got := cap(machine.readBuf); got > idleBufferCapBound {
+				t.Fatalf("read buffer capacity after the large request = %d bytes, want at most %d", got, idleBufferCapBound)
+			}
+
+			feedInChunks(t, machine, tt.rest, readChunk)
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if got := fmt.Sprint(commandNames(*executed)); got != "[SET PING]" {
+				t.Fatalf("executed = %s, want [SET PING]", got)
+			}
+			if got := cap(machine.readBuf); got > idleBufferCapBound {
+				t.Fatalf("read buffer capacity after the later PING = %d bytes, want at most %d", got, idleBufferCapBound)
+			}
+		})
+	}
+}
+
+func TestConnMachineKeepsALargeRemainderOfTheNextRequest(t *testing.T) {
+	// Bytes of the next request that are still waiting after a large one is
+	// decoded are the start of another large frame, so they stay where they are.
+	// Dropping them would lose the request.
+	run, executed := echoRunner(t)
+	machine := NewConnMachine(nil)
+
+	first, second := largeSetFrame(1<<20), largeSetFrame(1<<20)
+	if err := machine.Feed(append(append([]byte(nil), first...), second[:300<<10]...)); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if got := machine.PendingRequests(); got != 1 {
+		t.Fatalf("PendingRequests() = %d, want only the first request decoded", got)
+	}
+	if err := machine.Feed(second[300<<10:]); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v", err)
+	}
+	if got := fmt.Sprint(commandNames(*executed)); got != "[SET SET]" {
+		t.Fatalf("executed = %s, want [SET SET]", got)
+	}
+	if got := cap(machine.readBuf); got > idleBufferCapBound {
+		t.Fatalf("read buffer capacity once both requests were decoded = %d bytes, want at most %d", got, idleBufferCapBound)
+	}
+}
+
+// bufferIdentity returns the address of the first byte of b's backing array. It
+// changes whenever the machine replaces a buffer with a new one.
+func bufferIdentity(b []byte) *byte {
+	if cap(b) == 0 {
+		return nil
+	}
+	return &b[:1][0]
+}
+
+func TestConnMachineKeepsItsReadBufferWhileOrdinaryRequestsKeepArriving(t *testing.T) {
+	// A client that streams requests leaves part of one behind each 64 KiB read,
+	// and the next read lands behind it. That buffer is working memory, not
+	// something a large request left behind, so it must be reused: replacing it on
+	// every read costs an allocation and a copy per read.
+	const readChunk = 64 << 10
+	tests := []struct {
+		name      string
+		valueSize int
+	}{
+		{name: "values of 100 bytes", valueSize: 100},
+		{name: "values of 4 KiB", valueSize: 4 << 10},
+		{name: "values that nearly fill a read", valueSize: 60 << 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame := machineFrame("SET", "key", string(bytes.Repeat([]byte("v"), tt.valueSize)))
+			stream := bytes.Repeat(frame, (2<<20)/len(frame))
+			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+				return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+			}
+			machine := NewConnMachine(nil)
+
+			var identities []*byte
+			var caps []int
+			for off := 0; off < len(stream); off += readChunk {
+				if err := machine.Feed(stream[off:min(off+readChunk, len(stream))]); err != nil {
+					t.Fatalf("Feed() error = %v", err)
+				}
+				if err := machine.ProcessPending(context.Background(), run); err != nil {
+					t.Fatalf("ProcessPending() error = %v", err)
+				}
+				if err := machine.Flush(io.Discard); err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+				identities = append(identities, bufferIdentity(machine.readBuf))
+				caps = append(caps, cap(machine.readBuf))
+			}
+
+			// The buffer grows a few times while the reads settle on a size, and is
+			// replaced at most that often, not on every read.
+			replaced := 0
+			for i := 1; i < len(identities); i++ {
+				if identities[i] != identities[i-1] {
+					replaced++
+				}
+			}
+			if limit := len(identities) / 4; replaced > limit {
+				t.Fatalf("the read buffer was replaced %d times in %d reads (capacities %v), want at most %d", replaced, len(identities), caps, limit)
+			}
+		})
+	}
+}
+
+// countingDiscard drops what it is written and counts it. It accepts at most
+// limit bytes per Write, like a transport that applies backpressure.
+type countingDiscard struct {
+	limit int
+	total int
+}
+
+func (w *countingDiscard) Write(p []byte) (int, error) {
+	n := min(len(p), w.limit)
+	w.total += n
+	return n, nil
+}
+
+func TestConnMachineReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
+	// A connection that once sent a large value must not keep the buffer it grew
+	// to hold the reply once the reply has drained. A reply the machine would
+	// keep working memory for is kept, so the next one needs no new buffer.
+	tests := []struct {
+		name         string
+		replySize    int
+		writeLimit   int
+		wantReleased bool
+	}{
+		{name: "a large reply the peer accepts in one write", replySize: 32 << 20, writeLimit: 1 << 30, wantReleased: true},
+		{name: "a large reply the peer accepts a megabyte at a time", replySize: 32 << 20, writeLimit: 1 << 20, wantReleased: true},
+		{name: "a reply just over what the machine keeps", replySize: retainedWriteBufferCap + 1, writeLimit: 1 << 30, wantReleased: true},
+		{name: "a reply of a megabyte keeps its buffer for the next one", replySize: 1 << 20, writeLimit: 1 << 30, wantReleased: false},
+		{name: "a small reply keeps its buffer for the next one", replySize: 1 << 10, writeLimit: 1 << 30, wantReleased: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reply := bytes.Repeat([]byte("x"), tt.replySize)
+			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+				return []protocol.Value{protocol.BulkString{Data: reply}}, nil
+			}
+			machine := NewConnMachine(nil)
+			peer := &countingDiscard{limit: tt.writeLimit}
+
+			if err := machine.Feed(machineFrame("GET", "k")); err != nil {
+				t.Fatalf("Feed() error = %v", err)
+			}
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if got := machine.PendingOutputBytes(); got < tt.replySize {
+				t.Fatalf("PendingOutputBytes() = %d, want the %d byte reply buffered", got, tt.replySize)
+			}
+
+			for machine.HasPendingOutput() {
+				if err := machine.Flush(peer); err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+			}
+			wantTotal := len(fmt.Sprintf("$%d\r\n", tt.replySize)) + tt.replySize + len("\r\n")
+			if peer.total != wantTotal {
+				t.Fatalf("peer received %d bytes, want %d", peer.total, wantTotal)
+			}
+
+			got := cap(machine.writeBuf)
+			if tt.wantReleased && got > idleBufferCapBound {
+				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want at most %d", got, idleBufferCapBound)
+			}
+			if !tt.wantReleased && (got == 0 || got > retainedWriteBufferCap) {
+				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want it kept for reuse and at most %d", got, retainedWriteBufferCap)
+			}
+
+			// The released buffer is still good for the next output.
+			if err := machine.BufferEncoded([]byte("+later\r\n")); err != nil {
+				t.Fatalf("BufferEncoded() error = %v", err)
+			}
+			for machine.HasPendingOutput() {
+				if err := machine.Flush(peer); err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+			}
+			if peer.total != wantTotal+len("+later\r\n") {
+				t.Fatalf("peer received %d bytes after the later push, want %d", peer.total, wantTotal+len("+later\r\n"))
+			}
+		})
+	}
+}
+
+func TestConnMachineKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *testing.T) {
+	// A client that sends a pipeline of requests and reads all the replies before
+	// the next pipeline drains the buffer completely each time. That buffer is
+	// working memory, so replacing it after every pipeline would cost an
+	// allocation and a copy per pipeline.
+	tests := []struct {
+		name      string
+		count     int
+		replySize int
+	}{
+		{name: "100 replies of 1 KiB", count: 100, replySize: 1 << 10},
+		{name: "16 replies of 4 KiB", count: 16, replySize: 4 << 10},
+		{name: "16 replies of 64 KiB", count: 16, replySize: 64 << 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reply := bytes.Repeat([]byte("x"), tt.replySize)
+			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+				return []protocol.Value{protocol.BulkString{Data: reply}}, nil
+			}
+			pipeline := bytes.Repeat(machineFrame("GET", "k"), tt.count)
+			machine := NewConnMachine(nil)
+
+			var identities []*byte
+			var caps []int
+			for round := 0; round < 20; round++ {
+				if err := machine.Feed(pipeline); err != nil {
+					t.Fatalf("Feed() error = %v", err)
+				}
+				if err := machine.ProcessPending(context.Background(), run); err != nil {
+					t.Fatalf("ProcessPending() error = %v", err)
+				}
+				// The identity is taken while the replies are buffered, since a buffer
+				// that has drained is empty.
+				identities = append(identities, bufferIdentity(machine.writeBuf))
+				caps = append(caps, cap(machine.writeBuf))
+				for machine.HasPendingOutput() {
+					if err := machine.Flush(io.Discard); err != nil {
+						t.Fatalf("Flush() error = %v", err)
+					}
+				}
+			}
+
+			replaced := 0
+			for i := 1; i < len(identities); i++ {
+				if identities[i] != identities[i-1] {
+					replaced++
+				}
+			}
+			if limit := len(identities) / 4; replaced > limit {
+				t.Fatalf("the write buffer was replaced %d times in %d pipelines (capacities %v), want at most %d", replaced, len(identities), caps, limit)
+			}
+		})
+	}
+}
+
+// liveHeapBytes reports the heap still reachable after a full collection.
+func liveHeapBytes() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats.HeapAlloc
+}
+
+func TestConnMachineReleasesAProcessedRequestWhileTheConnectionIdles(t *testing.T) {
+	// The decoded request is as large as the value it carries. The machine drops
+	// its read buffer after a large request, but it must not hold on to the
+	// request itself either: it sat in the queue's backing array until the next
+	// request arrived, so an idle connection still pinned the whole value.
+	const valueSize = 16 << 20
+	run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+		return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+	}
+	machine := NewConnMachine(nil)
+
+	before := liveHeapBytes()
+	feedInChunks(t, machine, largeSetFrame(valueSize), 64<<10)
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v", err)
+	}
+	after := liveHeapBytes()
+	runtime.KeepAlive(machine)
+
+	if after > before && after-before > valueSize/2 {
+		t.Fatalf("the idle machine keeps %d bytes reachable after a %d byte request has run, want it released", after-before, valueSize)
 	}
 }
