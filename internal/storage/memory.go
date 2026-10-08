@@ -168,11 +168,14 @@ func approximateBaseValueObjectSize(key string, expiresAt int64) int64 {
 	return size
 }
 
-func (s *Store) commitValueWithEvictionLocked(shard *Shard, key string, oldValue *ValueObject, newValue *ValueObject) ([]string, error) {
+// commitValueWithEvictionLocked replaces oldValue, what the write found under
+// key at its clock reading now (nil if absent), with newValue, and reports the
+// keys evicted to make room for it.
+func (s *Store) commitValueWithEvictionLocked(shard *Shard, key string, oldValue *ValueObject, newValue *ValueObject, now int64) ([]string, error) {
 	oldSize := s.approximateValueObjectSize(key, oldValue)
 	newSize := s.approximateValueObjectSize(key, newValue)
 
-	evicted, err := s.ensureMemoryAvailableLocked(newSize-oldSize, protectedKeys(key))
+	evicted, err := s.ensureMemoryAvailableLocked(newSize-oldSize, protectedKeys(key), now)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +197,7 @@ func (s *Store) commitStringWithEvictionLocked(shard *Shard, key string, oldValu
 	oldSize := s.approximateValueObjectSize(key, oldValue)
 	newSize := s.approximateStringValueObjectSize(key, length, expiresAt)
 
-	evicted, err := s.ensureMemoryAvailableLocked(newSize-oldSize, protectedKeys(key))
+	evicted, err := s.ensureMemoryAvailableLocked(newSize-oldSize, protectedKeys(key), now)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +261,16 @@ func (s *Store) mayHaveExpired(now int64) bool {
 	return now > s.nextExpiry.Load()
 }
 
-func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]struct{}) ([]string, error) {
+// ensureMemoryAvailableLocked makes room for a write that grows the keyspace by
+// delta bytes, evicting keys other than the protected ones, and reports the keys
+// it evicted.
+//
+// now is the clock reading of the write being sized. A sweep of expired keys
+// judges expiry by it, not by a fresh reading: the write found its key live at
+// now, and a later reading past the key's TTL deadline would sweep the key being
+// written, report it as an eviction ahead of the write, and leave the caller
+// subtracting its size twice.
+func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]struct{}, now int64) ([]string, error) {
 	if !s.maxMemoryEnabled() || delta <= 0 {
 		return nil, nil
 	}
@@ -266,7 +278,6 @@ func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]st
 	// Sweep expired keys and re-measure the keyspace, but only when a TTL deadline
 	// has passed: until then the maintained counter is exact (see
 	// TestUsedMemoryCounterStaysExact), and the sweep would find nothing.
-	now := time.Now().UnixMilli()
 	current := s.usedMemory.Load()
 	if s.mayHaveExpired(now) {
 		current = s.recalculateUsedMemoryLocked(now)
