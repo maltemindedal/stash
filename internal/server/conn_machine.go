@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,6 +35,13 @@ const defaultMaxReadBuffer = 512 * 1024 * 1024
 // instead of growing server memory without limit. It mirrors the role of
 // Redis's client-output-buffer-limit.
 const defaultMaxWriteBuffer = 512 * 1024 * 1024
+
+// maxIdleBufferCapacity is the capacity a read or write buffer keeps once it
+// holds less than that. A buffer that grew past it to carry one large request or
+// reply is given back when it drains, so a connection that has gone quiet holds
+// kilobytes, not the size of the largest value it ever moved. It is also the
+// size of the reads the event loop takes from a socket.
+const maxIdleBufferCapacity = 64 << 10
 
 // ConnCommandRunner executes one parsed request with connection-scoped state
 // and returns the RESP responses to buffer for the client. A non-nil error is
@@ -217,10 +225,28 @@ func (m *ConnMachine) decodeBuffered() {
 	}
 
 	if consumed > 0 {
-		m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+		m.dropConsumed(consumed)
 	}
 
 	m.checkReadBufferLimit()
+}
+
+// dropConsumed removes the first consumed bytes of the read buffer. A buffer
+// that grew past maxIdleBufferCapacity to hold a large frame is replaced by one
+// sized to what remains once that is under the limit. A larger remainder stays
+// where it is: it is the start of the next large frame.
+func (m *ConnMachine) dropConsumed(consumed int) {
+	remaining := len(m.readBuf) - consumed
+	if cap(m.readBuf) > maxIdleBufferCapacity && remaining < maxIdleBufferCapacity {
+		if remaining == 0 {
+			m.readBuf = nil
+		} else {
+			m.readBuf = bytes.Clone(m.readBuf[consumed:])
+		}
+		return
+	}
+
+	m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
 }
 
 func (m *ConnMachine) checkReadBufferLimit() {
