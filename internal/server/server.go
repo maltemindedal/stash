@@ -191,6 +191,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			return fmt.Errorf("server: enforce maxmemory: %w", err)
 		} else if len(evicted) > 0 {
 			s.logger.Info("applied startup maxmemory eviction", "evicted_keys", len(evicted), "used_memory", s.store.UsedMemory(), "maxmemory", s.cfg.MaxMemory)
+			if err := s.persistStartupEvictions(evicted); err != nil {
+				if closeErr := s.closeAOFWriter(); closeErr != nil {
+					s.logger.Warn("failed to close AOF writer after startup eviction failure", "error", closeErr)
+				}
+				return err
+			}
 		}
 	}
 

@@ -239,6 +239,48 @@ func (s *Server) recordExpiredKeys(keys []string) {
 	s.propagateToReplicas(frames)
 }
 
+// startupEvictionKeysPerDel bounds how many keys one DEL frame names when
+// persistStartupEvictions logs startup evictions. The AOF loader rejects a
+// command array of more than 1,048,576 elements as corruption, and a limit far
+// below the loaded keyspace can evict more keys than that. The number matches
+// the AOF rewrite's items per command.
+const startupEvictionKeysPerDel = 1024
+
+// persistStartupEvictions appends the keys that memory-pressure eviction removed
+// when the server enforced --maxmemory after loading its data, as DEL frames, and
+// fsyncs them before returning. Without them the next start replays the SETs that
+// created the keys and brings them back.
+//
+// Only the AOF needs these deletions. Startup eviction runs before the listener
+// opens, so no client holds a WATCH and no replica is attached: a replica that
+// attaches later gets a full resync of the current keyspace, and the link to a
+// master starts after this. The frames are therefore neither propagated nor
+// reported to the watch registry.
+//
+// The append is synchronous under every appendfsync policy: everysec would only
+// buffer it, and a failure has to be known now, because the server then refuses
+// to serve a keyspace its log does not describe.
+func (s *Server) persistStartupEvictions(keys []string) error {
+	if s == nil || s.aofWriter == nil || len(keys) == 0 {
+		return nil
+	}
+
+	frames := make([]protocol.Value, 0, (len(keys)+startupEvictionKeysPerDel-1)/startupEvictionKeysPerDel)
+	for start := 0; start < len(keys); start += startupEvictionKeysPerDel {
+		end := min(start+startupEvictionKeysPerDel, len(keys))
+		frames = append(frames, DeleteFrame(keys[start:end]))
+	}
+	payload, err := protocol.EncodeValues(frames)
+	if err != nil {
+		return fmt.Errorf("server: encode startup evictions for aof %q: %w", s.cfg.AOFPath, err)
+	}
+	if err := s.aofWriter.AppendSync(payload); err != nil {
+		return fmt.Errorf("server: append startup evictions to aof %q: %w", s.cfg.AOFPath, err)
+	}
+
+	return nil
+}
+
 func persistenceFailureResponse() protocol.ErrorValue {
 	return protocol.ErrorValue{Message: "ERR persistence failure"}
 }

@@ -19,6 +19,8 @@ go run ./cmd/stash --port 6379 --aof appendonly.aof --appendfsync everysec
 
 Every successful mutating command is appended as a RESP frame. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace. If the file ends in a command that was only partly written, as after a crash in the middle of an append, Stash logs a warning, cuts the file back to the last complete command, and carries on, so commands appended afterwards are never mistaken for the rest of the torn one. Invalid data anywhere before the end of the file is different: see [Repairing a corrupt append-only file](#repairing-a-corrupt-append-only-file).
 
+If `--maxmemory` is set, Stash then evicts keys until the loaded keyspace fits, still before opening the listener. It appends the evicted keys to the file as `DEL` commands (at most 1,024 keys each) and fsyncs them under every `--appendfsync` policy, so a later restart does not replay the original writes and bring the keys back. If that append fails, Stash refuses to start with a `server:` error naming the file. See [Memory limits and eviction](memory-and-eviction.md#memory-pressure-eviction).
+
 ## Choose a fsync policy
 
 | `--appendfsync` | Behavior | Trade-off |

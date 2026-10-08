@@ -42,6 +42,8 @@ When a write pushes the keyspace over the limit, the store evicts sampled least-
 level=INFO msg="applied startup maxmemory eviction" evicted_keys=42 used_memory=104857000 maxmemory=104857600
 ```
 
+With `--aof` set, the keys that pass evicts are appended to the AOF as `DEL` commands, at most 1,024 keys each, and fsynced under every `--appendfsync` policy before the server accepts connections. A later restart, with or without `--maxmemory`, therefore does not bring them back. If the append fails, startup stops with an error naming the AOF path instead of serving a keyspace the log does not describe.
+
 ### Accounting is approximate
 
 `used_memory` is the store's own estimate, built from per-entry overhead constants plus key and value byte lengths. It is **not** process RSS and will not match what the OS reports. Go runtime overhead, the RESP buffers, connection state, and the AOF write buffer are all outside this number.
@@ -70,6 +72,8 @@ An eviction is a keyspace mutation, so it is not confined to the server that per
 - it is **propagated** to attached replicas, so a replica does not keep serving a key the master has dropped;
 - it is **appended to the AOF**, so replaying the log does not resurrect the key;
 - it **invalidates `WATCH`** on the evicted keys, so a transaction guarding one aborts.
+
+The eviction pass at startup is the one exception to the first and third points: it runs before the listener opens, so no replica is attached and no client holds a `WATCH`, and its `DEL` frames go to the AOF alone. A replica that attaches later receives the current keyspace in its full resync.
 
 A replica runs its own `--maxmemory` enforcement and active TTL loop, so it can drop keys without an instruction from the master. If an eviction occurs while the replica applies a replicated command, the replica records the eviction in its own AOF but does not send it upstream or to other replicas. An eviction triggered by the replica itself is a local write. Set `--maxmemory` no lower on a replica than on its master, or the replica may drop keys that the master still holds.
 
