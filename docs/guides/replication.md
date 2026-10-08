@@ -66,7 +66,7 @@ The queue for a replica is limited to 256 MiB, and a replica that will not accep
 
 ## When the link to the master drops
 
-A replica that loses its master, or cannot reach it at startup, waits one second and tries again, doubling the wait up to 30 seconds after each failure and starting over once a link has completed its handshake. Every attempt begins with a full resynchronisation, which replaces the replica's dataset with the master's snapshot, so a reconnected replica never keeps data from before the drop. Only an invalid `--replicaof` address stops the retries.
+A replica that loses its master, or cannot reach it at startup, waits one second and tries again, doubling the wait up to 30 seconds after each failure and starting over once a link has completed its handshake. Every attempt begins with a full resynchronisation, which replaces the replica's dataset with the master's snapshot, so a reconnected replica never keeps data from before the drop. Only an invalid `--replicaof` address or the server stopping, including when it can no longer accept connections, stops the retries.
 
 ## Replicate against a protected master
 

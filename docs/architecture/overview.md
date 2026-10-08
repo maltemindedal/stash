@@ -100,6 +100,7 @@ Current responsibilities:
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
 - stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck
+- stop when its accept loop fails with an error that is not temporary: a Replica's link to its Master ends as in any other shutdown, and `ListenAndServe` returns the error after the same teardown
 
 ### `test`
 
