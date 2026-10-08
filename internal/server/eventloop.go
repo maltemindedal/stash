@@ -300,12 +300,9 @@ func (l *eventLoop) applyQueuedWork() {
 		if l.conns[push.conn.fd] != push.conn {
 			continue
 		}
-		push.conn.machine.SetPushLimit(push.conn.pushLimit())
-		if err := push.conn.machine.BufferEncoded(push.data); err != nil {
-			l.closeConn(push.conn, err)
+		if !l.bufferPushes(push.conn, push.data) {
 			continue
 		}
-		push.conn.receivesPushes = true
 		l.finishConnEvent(push.conn)
 		l.enforcePushBudget()
 	}
@@ -323,6 +320,45 @@ func (l *eventLoop) applyQueuedWork() {
 		}
 		l.acceptPaused = false
 	}
+}
+
+// bufferPushes appends push frames to conn's write buffer. It reports false,
+// after closing the connection, when they do not fit within its push limit.
+func (l *eventLoop) bufferPushes(conn *eventConn, data []byte) bool {
+	conn.machine.SetPushLimit(conn.pushLimit())
+	if err := conn.machine.BufferEncoded(data); err != nil {
+		l.closeConn(conn, err)
+		return false
+	}
+	conn.receivesPushes = true
+	return true
+}
+
+// takePushes moves the pushes waiting for conn into its write buffer. The loop
+// calls it before each request, so a message published before the request ran
+// reaches the client ahead of the request's reply, and one published while it
+// runs follows the reply. The connection stays queued with applyQueuedWork,
+// which finds its push buffer empty. It reports whether conn is still being
+// served: false when it was already closed, or when its pushes did not fit or
+// used up the output budget and the loop closed it.
+func (l *eventLoop) takePushes(conn *eventConn) bool {
+	if l.conns[conn.fd] != conn {
+		return false
+	}
+
+	l.mu.Lock()
+	data := conn.pushBuf
+	conn.pushBuf = nil
+	l.mu.Unlock()
+
+	if len(data) > 0 {
+		if !l.bufferPushes(conn, data) {
+			return false
+		}
+		l.accountPushOutput(conn)
+		l.enforcePushBudget()
+	}
+	return l.conns[conn.fd] == conn
 }
 
 // pushLimit is how much output may wait for the connection before it is closed:
@@ -567,6 +603,11 @@ func (l *eventLoop) processConn(conn *eventConn) {
 			if conn.machine.PendingOutputBytes() > eventLoopOutputHighWater {
 				break
 			}
+		}
+
+		// Pushes published before this request ran go out ahead of its reply.
+		if !l.takePushes(conn) {
+			return
 		}
 
 		more, err := conn.machine.ProcessNext(conn.ctx, conn.run)

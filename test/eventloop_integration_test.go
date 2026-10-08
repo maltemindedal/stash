@@ -131,6 +131,84 @@ func TestEventLoopDeliversPubSubMessages(t *testing.T) {
 	waitForServerStop(t, errCh)
 }
 
+// TestEventLoopDeliversAMessagePublishedBeforeUnsubscribeAheadOfTheUnsubscribeReply
+// races a PUBLISH from one connection against the subscriber's own UNSUBSCRIBE.
+// Whichever runs first, nothing may reach the subscriber after the UNSUBSCRIBE
+// reply, since the subscriber reads its next command's reply from there. The
+// loop can serve both requests in one batch of readiness events, so repeating
+// the race is how the test reaches that order; it never waits for a time.
+func TestEventLoopDeliversAMessagePublishedBeforeUnsubscribeAheadOfTheUnsubscribeReply(t *testing.T) {
+	addr, stop, errCh := startTestServer(t, eventLoopTestConfig())
+	defer stop()
+
+	subscriberConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) subscriber error = %v", addr, err)
+	}
+	defer closeTestResource(t, subscriberConn)
+	subscriberParser := protocol.NewParser(subscriberConn)
+
+	publisherConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) publisher error = %v", addr, err)
+	}
+	defer closeTestResource(t, publisherConn)
+	publisherParser := protocol.NewParser(publisherConn)
+
+	const trials = 200
+	for trial := 0; trial < trials; trial++ {
+		assertCommandResponse(t, subscriberConn, subscriberParser, protocol.Array{Elements: []protocol.Value{
+			protocol.TextBulkString{Value: "subscribe"},
+			protocol.BulkString{Data: []byte("news")},
+			protocol.Integer{Value: 1},
+		}}, "SUBSCRIBE", "news")
+
+		if err := protocol.WriteValue(publisherConn, request("PUBLISH", "news", "hello")); err != nil {
+			t.Fatalf("trial %d: WriteValue(PUBLISH) error = %v", trial, err)
+		}
+		if err := protocol.WriteValue(subscriberConn, request("UNSUBSCRIBE", "news")); err != nil {
+			t.Fatalf("trial %d: WriteValue(UNSUBSCRIBE) error = %v", trial, err)
+		}
+
+		// Read up to the UNSUBSCRIBE reply. The message is there only if the
+		// PUBLISH ran first, and then it comes ahead of the reply.
+		for kind := ""; kind != "unsubscribe"; {
+			got, err := subscriberParser.Parse()
+			if err != nil {
+				t.Fatalf("trial %d: Parse() error = %v", trial, err)
+			}
+			if kind = pubSubFrameKind(got); kind != "message" && kind != "unsubscribe" {
+				t.Fatalf("trial %d: subscriber received %#v, want a message or the UNSUBSCRIBE reply", trial, got)
+			}
+		}
+
+		publishReply, err := publisherParser.Parse()
+		if err != nil {
+			t.Fatalf("trial %d: Parse() PUBLISH reply error = %v", trial, err)
+		}
+		if _, ok := publishReply.(protocol.Integer); !ok {
+			t.Fatalf("trial %d: PUBLISH reply = %#v, want an integer", trial, publishReply)
+		}
+
+		// A message still on its way would be read here as PING's reply.
+		assertCommandResponse(t, subscriberConn, subscriberParser, protocol.SimpleString{Value: "PONG"}, "PING")
+	}
+
+	stop()
+	waitForServerStop(t, errCh)
+}
+
+// pubSubFrameKind returns the first element of a pub/sub frame, such as
+// "message" or "unsubscribe", or "" for any other value.
+func pubSubFrameKind(value protocol.Value) string {
+	array, ok := value.(protocol.Array)
+	if !ok || len(array.Elements) == 0 {
+		return ""
+	}
+	kind, _, _ := integrationBulkStringContent(array.Elements[0])
+	return kind
+}
+
 func TestEventLoopClosesConnectionAfterProtocolError(t *testing.T) {
 	addr, stop, errCh := startTestServer(t, eventLoopTestConfig())
 	defer stop()
