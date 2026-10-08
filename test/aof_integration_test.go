@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -697,6 +698,157 @@ func TestAnIncrUnderMaxmemoryIsNotLoggedAfterADelOfTheKeyItFoundLive(t *testing.
 	if len(misordered) > 0 {
 		t.Fatalf("the AOF logs a DEL ahead of %d INCRs that found their key live and replied 10, so a replay leaves them at 1 with no TTL: %v", len(misordered), misordered)
 	}
+}
+
+func TestKeysEvictedAtStartupStayEvictedAfterARestart(t *testing.T) {
+	// A start under --maxmemory evicted keys and only logged them. The AOF still
+	// held their SETs and no DEL, so the next start without the limit replayed
+	// the SETs and brought every evicted key back. Keys an RDB snapshot writes
+	// into an empty AOF came back the same way.
+	const keysPerDEL = 1024
+	tests := []struct {
+		name       string
+		keys       int
+		maxMemory  int64
+		minEvicted int
+		fromRDB    bool
+	}{
+		{name: "50 keys from the AOF", keys: 50, maxMemory: 2000, minEvicted: 30},
+		// About 2,870 evicted keys, more than two DELs may name.
+		{name: "3000 keys from the AOF", keys: 3000, maxMemory: 20000, minEvicted: 2*keysPerDEL + 1},
+		{name: "200 keys an RDB snapshot writes into the AOF", keys: 200, maxMemory: 6000, minEvicted: 140},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, policy := range []string{"always", "everysec", "no"} {
+				t.Run("appendfsync "+policy, func(t *testing.T) {
+					aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+					cfg := testAOFConfig(aofPath)
+					cfg.AppendFsync = policy
+					keys := evictableKeys(tt.keys)
+					if tt.fromRDB {
+						parts := [][]byte{selectTestDB(0)}
+						for _, key := range keys {
+							parts = append(parts, testStringEntry([]byte(key), []byte(evictableValue)))
+						}
+						cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(parts...))
+					} else {
+						writeSetsAOF(t, aofPath, keys)
+					}
+
+					limited := cfg
+					limited.MaxMemory = tt.maxMemory
+					kept := liveKeysAfterStart(t, limited, keys)
+					evicted := len(keys) - len(kept)
+					if evicted < tt.minEvicted || len(kept) == 0 {
+						t.Fatalf("a start with maxmemory %d evicted %d of %d keys, want at least %d evicted and some kept", tt.maxMemory, evicted, len(keys), tt.minEvicted)
+					}
+
+					if got := liveKeysAfterStart(t, cfg, keys); strings.Join(got, " ") != strings.Join(kept, " ") {
+						t.Fatalf("a restart without maxmemory has %d of %d keys live, want the same %d the start with it kept", len(got), len(keys), len(kept))
+					}
+
+					dels, deleted := 0, 0
+					for _, args := range aofCommands(t, aofPath) {
+						if strings.ToUpper(args[0]) != "DEL" {
+							continue
+						}
+						if n := len(args) - 1; n > keysPerDEL {
+							t.Fatalf("a DEL in the append-only file names %d keys, want at most %d", n, keysPerDEL)
+						}
+						dels++
+						deleted += len(args) - 1
+					}
+					if deleted != evicted {
+						t.Fatalf("the append-only file deletes %d keys, want the %d evicted", deleted, evicted)
+					}
+					if want := (evicted + keysPerDEL - 1) / keysPerDEL; dels != want {
+						t.Fatalf("the append-only file holds %d DELs for %d evicted keys, want %d", dels, evicted, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// evictableValue is the value of every key evictableKeys names: 100 bytes, so
+// that a few dozen keys exceed a maxmemory of a few kilobytes.
+var evictableValue = strings.Repeat("v", 100)
+
+// evictableKeys returns n key names, k0000 upwards.
+func evictableKeys(n int) []string {
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%04d", i)
+	}
+	return keys
+}
+
+// writeSetsAOF writes an append-only file at aofPath that sets each of keys to
+// evictableValue, and returns its content.
+func writeSetsAOF(t *testing.T, aofPath string, keys []string) []byte {
+	t.Helper()
+
+	frames := make([]protocol.Value, 0, len(keys))
+	for _, key := range keys {
+		frames = append(frames, request("SET", key, evictableValue))
+	}
+	content, err := protocol.EncodeValues(frames)
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	if err := os.WriteFile(aofPath, content, 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
+	}
+	return content
+}
+
+// aofCommands returns the arguments of each command in the append-only file at
+// path, in order.
+func aofCommands(t *testing.T, path string) [][]string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	frames := protocol.NewParser(bytes.NewReader(data))
+	var commands [][]string
+	for {
+		frame, err := frames.Parse()
+		if errors.Is(err, io.EOF) {
+			return commands
+		}
+		if err != nil {
+			t.Fatalf("Parse(AOF frame) error = %v", err)
+		}
+		commands = append(commands, collectBulkStrings(t, frame))
+	}
+}
+
+// liveKeysAfterStart starts a server with cfg, returns which of keys it holds,
+// in order, and stops it.
+func liveKeysAfterStart(t *testing.T, cfg config.Config, keys []string) []string {
+	t.Helper()
+
+	addr, stop, errCh := startTestServer(t, cfg)
+	conn, parser := dialClient(t, addr)
+	live := make([]string, 0, len(keys))
+	for _, key := range keys {
+		reply := roundTrip(t, conn, parser, "GET", key)
+		_, isNull, ok := integrationBulkStringContent(reply)
+		if !ok {
+			t.Fatalf("GET %s reply = %#v, want a bulk string", key, reply)
+		}
+		if !isNull {
+			live = append(live, key)
+		}
+	}
+	closeTestResource(t, conn)
+	stop()
+	waitForServerStop(t, errCh)
+	return live
 }
 
 func testAOFConfig(aofPath string) config.Config {

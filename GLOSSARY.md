@@ -50,7 +50,7 @@ The Redis data type of a key's value: string, hash, list, set, sorted set, or st
 The deadline after which a key expires.
 
 **Eviction**:
-The server removing keys on its own rather than at a client's request: a **TTL eviction** or a **Memory-pressure eviction**. Every eviction except a passive TTL eviction is published to **Replicas**, the **AOF**, and `WATCH`.
+The server removing keys on its own rather than at a client's request: a **TTL eviction** or a **Memory-pressure eviction**. Every eviction except a passive TTL eviction is published to **Replicas**, the **AOF**, and `WATCH`. The **Memory-pressure eviction** at startup runs before any client or **Replica** connects, so it is published to the **AOF** only.
 
 **TTL eviction**:
 The removal of a key whose **TTL** has passed: passive when a command touches the key, active when a sweep of expired keys removes it.

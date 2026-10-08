@@ -260,6 +260,35 @@ func (s *Server) recordExpiredKeys(keys []string) {
 	s.propagateToReplicas(frames)
 }
 
+// persistStartupEvictions appends a DEL of the keys the startup memory-pressure
+// eviction removed to the AOF and fsyncs it, under every fsync policy, so a
+// failure is known before the server accepts a client. Without it the next
+// start replays their SETs and brings them back. Each DEL names at most
+// aof.ItemsPerCommand keys, because one start can evict more keys than the
+// loader accepts in one command. Startup runs before the listener opens, so no
+// client has a WATCH and no Replica is attached, and a Replica that attaches
+// later gets the keyspace without these keys in its full resync: the AOF is the
+// only place the DEL goes.
+func (s *Server) persistStartupEvictions(keys []string) error {
+	if s == nil || s.aofWriter == nil || len(keys) == 0 {
+		return nil
+	}
+
+	frames := make([]protocol.Value, 0, (len(keys)+aof.ItemsPerCommand-1)/aof.ItemsPerCommand)
+	for start := 0; start < len(keys); start += aof.ItemsPerCommand {
+		end := min(start+aof.ItemsPerCommand, len(keys))
+		frames = append(frames, DeleteFrame(keys[start:end]))
+	}
+	payload, err := protocol.EncodeValues(frames)
+	if err != nil {
+		return fmt.Errorf("server: encode a DEL of the %d keys evicted at startup: %w", len(keys), err)
+	}
+	if err := s.aofWriter.AppendSync(payload); err != nil {
+		return fmt.Errorf("server: append a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)
+	}
+	return nil
+}
+
 func persistenceFailureResponse() protocol.ErrorValue {
 	return protocol.ErrorValue{Message: "ERR persistence failure"}
 }

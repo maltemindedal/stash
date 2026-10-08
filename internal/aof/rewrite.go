@@ -237,21 +237,23 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 	}
 }
 
-// rewriteItemsPerCommand bounds how many values (or field/value pairs) one
-// rewrite command carries. The loader's parser rejects a command array of more
-// than 1,048,576 elements, so one command per key made a collection of about a
-// million values, or half that many pairs, into an append-only file the server
-// could not read back at startup. Several bounded commands replay to the same
-// state; Redis's own rewrite groups items the same way.
-const rewriteItemsPerCommand = 1024
+// ItemsPerCommand bounds how many items one command the server composes for the
+// append-only file carries: the values (or field/value pairs) of a rewrite
+// command, or the keys of a DEL the server writes for its own evictions. The
+// loader's parser rejects a command array of more than 1,048,576 elements, so
+// one command per key made a collection of about a million values, or half that
+// many pairs, into an append-only file the server could not read back at
+// startup. Several bounded commands replay to the same state; Redis's own
+// rewrite groups items the same way.
+const ItemsPerCommand = 1024
 
 // chunkedCommands emits name commands that together carry count items for key,
-// at most rewriteItemsPerCommand items each. appendItem adds the arguments of
+// at most ItemsPerCommand items each. appendItem adds the arguments of
 // item i, and argsPerItem is how many arguments that is.
 func chunkedCommands(name, key string, count, argsPerItem int, appendItem func(args []protocol.Value, i int) []protocol.Value) []protocol.Value {
-	frames := make([]protocol.Value, 0, (count+rewriteItemsPerCommand-1)/rewriteItemsPerCommand)
-	for start := 0; start < count; start += rewriteItemsPerCommand {
-		end := min(start+rewriteItemsPerCommand, count)
+	frames := make([]protocol.Value, 0, (count+ItemsPerCommand-1)/ItemsPerCommand)
+	for start := 0; start < count; start += ItemsPerCommand {
+		end := min(start+ItemsPerCommand, count)
 		args := make([]protocol.Value, 0, (end-start)*argsPerItem+1)
 		args = append(args, bulkString(key))
 		for i := start; i < end; i++ {
