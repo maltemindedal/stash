@@ -11,6 +11,20 @@ The `commandSpecs` table in [`internal/command/types.go`](../../internal/command
 - **Replicated** marks commands forwarded to connected replicas.
 - **Durable** marks commands written to the append-only file when `--aof` is set.
 
+## Protocol errors
+
+A request that cannot be parsed is answered with one error, and the connection is closed, in both networking modes. The error text is Stash's own and differs from Redis's. Redis replies `ERR Protocol error: ` and its wording (`invalid bulk length`, `invalid multibulk length`, `too big mbulk count string`); Stash replies `ERR protocol: ` and a description of its own, such as `bulk string length 536870913 exceeds 536870912 byte limit`. Inside a command, the reply also names the element that failed, so an oversized third argument reads `ERR protocol: parse array element 2: protocol: bulk string length 536870913 exceeds 536870912 byte limit`. Do not match on the text; treat any `ERR protocol:` reply as the end of the connection.
+
+What Stash refuses, as soon as the part of the request that shows it has arrived:
+
+- A bulk string header that declares more than 512 MiB, or an array header of more than 1,048,576 elements.
+- A line (a header, simple string or integer) of more than 65,536 bytes after its type byte, CRLF included, or one that has gone 65,536 bytes without an LF.
+- Arrays nested more than 128 levels deep.
+- On a server with `--requirepass`, before the client authenticates: an array of more than 10 elements or a bulk string of more than 16 KiB. The text ends `for a client that has not authenticated`; see [Securing a server](../guides/securing-a-server.md).
+- An inline command, which Redis accepts and Stash does not: a request that does not start with a RESP type byte gets `ERR protocol: unsupported frame prefix "G"` (here for `GET key`).
+
+`--event-loop` mode also bounds one request at 512 MiB of buffered input, headers and line endings included, and answers a larger one with `ERR protocol: frame exceeds 536870912 byte read-buffer limit`. A request can be within the 512 MiB bulk limit and still over this one: a lone bulk string header declaring 536,870,899 to 536,870,912 bytes is refused in that mode, and waits for its payload in the default mode, which bounds each bulk string and array but not the request as a whole.
+
 ## Connection and authentication
 
 | Command | Replicated | Durable |

@@ -257,6 +257,37 @@ func TestConnMachineFeedRejectsHostileFrames(t *testing.T) {
 			wantState:     ConnStateClosing,
 			reason:        "the decoder's byte hint must reject before the payload is buffered",
 		},
+		// The next four rows pin the one place the event loop and default mode
+		// still disagree: the machine refuses a frame that needs more than its
+		// default 512 MiB read buffer, headers and CRLFs included, where the
+		// Parser has no total bound and waits for the payload. The differential
+		// test in internal/protocol models this check (eventLoopFrameLimit), and
+		// docs/reference/commands.md ("Protocol errors") describes it, so a change
+		// to the machine's limit or its check has to change them too.
+		{
+			name:      "bulk header whose frame just fits the default read buffer",
+			frame:     []byte("$536870898\r\n"),
+			wantState: ConnStateActive,
+			reason:    "the header and CRLFs (14 bytes here) plus the payload come to exactly 512 MiB",
+		},
+		{
+			name:      "bulk header whose frame is one byte over the default read buffer",
+			frame:     []byte("$536870899\r\n"),
+			wantState: ConnStateClosing,
+			reason:    "default mode accepts this header; the machine refuses it once the byte hint passes 512 MiB",
+		},
+		{
+			name:      "bulk header in a command whose frame just fits the default read buffer",
+			frame:     []byte("*2\r\n$3\r\nSET\r\n$536870885\r\n"),
+			wantState: ConnStateActive,
+			reason:    "the 13 bytes of the command before the header count towards the frame",
+		},
+		{
+			name:      "bulk header in a command whose frame is one byte over the default read buffer",
+			frame:     []byte("*2\r\n$3\r\nSET\r\n$536870886\r\n"),
+			wantState: ConnStateClosing,
+			reason:    "the 13 bytes of the command before the header count towards the frame",
+		},
 	}
 
 	for _, tt := range tests {
