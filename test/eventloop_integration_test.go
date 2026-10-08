@@ -131,6 +131,102 @@ func TestEventLoopDeliversPubSubMessages(t *testing.T) {
 	waitForServerStop(t, errCh)
 }
 
+func TestEventLoopDeliversAMessagePublishedBeforeUnsubscribeAheadOfTheUnsubscribeReply(t *testing.T) {
+	addr, stop, errCh := startTestServer(t, eventLoopTestConfig())
+	defer stop()
+
+	subscriberConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) subscriber error = %v", addr, err)
+	}
+	defer closeTestResource(t, subscriberConn)
+	subscriberParser := protocol.NewParser(subscriberConn)
+
+	publisherConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) publisher error = %v", addr, err)
+	}
+	defer closeTestResource(t, publisherConn)
+	publisherParser := protocol.NewParser(publisherConn)
+
+	message := protocol.Array{Elements: []protocol.Value{
+		protocol.TextBulkString{Value: "message"},
+		protocol.BulkString{Data: []byte("news")},
+		protocol.BulkString{Data: []byte("hello")},
+	}}
+	unsubscribeReply := protocol.Array{Elements: []protocol.Value{
+		protocol.TextBulkString{Value: "unsubscribe"},
+		protocol.BulkString{Data: []byte("news")},
+		protocol.Integer{Value: 0},
+	}}
+
+	// The loop runs PUBLISH and UNSUBSCRIBE in either order. Whenever PUBLISH
+	// runs first, its message must reach the subscriber before the UNSUBSCRIBE
+	// reply; arriving after it, the message would be read as PING's reply. The
+	// goroutine-per-connection path can still misorder this, so the test runs
+	// on the event loop only.
+	const trials = 200
+	for trial := 0; trial < trials; trial++ {
+		if err := protocol.WriteValue(subscriberConn, request("SUBSCRIBE", "news")); err != nil {
+			t.Fatalf("trial %d: WriteValue(SUBSCRIBE) error = %v", trial, err)
+		}
+		assertParsedValue(t, subscriberParser, protocol.Array{Elements: []protocol.Value{
+			protocol.TextBulkString{Value: "subscribe"},
+			protocol.BulkString{Data: []byte("news")},
+			protocol.Integer{Value: 1},
+		}})
+
+		if err := protocol.WriteValue(publisherConn, request("PUBLISH", "news", "hello")); err != nil {
+			t.Fatalf("trial %d: WriteValue(PUBLISH) error = %v", trial, err)
+		}
+		if err := protocol.WriteValue(subscriberConn, request("UNSUBSCRIBE", "news")); err != nil {
+			t.Fatalf("trial %d: WriteValue(UNSUBSCRIBE) error = %v", trial, err)
+		}
+
+		messagesBeforeReply := 0
+		for {
+			got, err := subscriberParser.Parse()
+			if err != nil {
+				t.Fatalf("trial %d: Parse() subscriber error = %v", trial, err)
+			}
+			if isPubSubMessage(got) {
+				assertValuesEqual(t, got, message)
+				messagesBeforeReply++
+				continue
+			}
+			assertValuesEqual(t, got, unsubscribeReply)
+			break
+		}
+		assertCommandResponse(t, subscriberConn, subscriberParser, protocol.SimpleString{Value: "PONG"}, "PING")
+
+		published, err := publisherParser.Parse()
+		if err != nil {
+			t.Fatalf("trial %d: Parse() PUBLISH reply error = %v", trial, err)
+		}
+		receivers, ok := published.(protocol.Integer)
+		if !ok {
+			t.Fatalf("trial %d: PUBLISH reply = %#v, want protocol.Integer", trial, published)
+		}
+		if receivers.Value != int64(messagesBeforeReply) {
+			t.Fatalf("trial %d: PUBLISH reached %d subscribers, but the subscriber received %d messages before the UNSUBSCRIBE reply", trial, receivers.Value, messagesBeforeReply)
+		}
+	}
+
+	stop()
+	waitForServerStop(t, errCh)
+}
+
+// isPubSubMessage reports whether value is a pub/sub message frame rather than
+// a reply.
+func isPubSubMessage(value protocol.Value) bool {
+	array, ok := value.(protocol.Array)
+	if !ok || len(array.Elements) == 0 {
+		return false
+	}
+	kind, _, ok := integrationBulkStringContent(array.Elements[0])
+	return ok && kind == "message"
+}
+
 func TestEventLoopClosesConnectionAfterProtocolError(t *testing.T) {
 	addr, stop, errCh := startTestServer(t, eventLoopTestConfig())
 	defer stop()

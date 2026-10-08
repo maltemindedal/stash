@@ -300,12 +300,9 @@ func (l *eventLoop) applyQueuedWork() {
 		if l.conns[push.conn.fd] != push.conn {
 			continue
 		}
-		push.conn.machine.SetPushLimit(push.conn.pushLimit())
-		if err := push.conn.machine.BufferEncoded(push.data); err != nil {
-			l.closeConn(push.conn, err)
+		if !l.bufferPushes(push.conn, push.data) {
 			continue
 		}
-		push.conn.receivesPushes = true
 		l.finishConnEvent(push.conn)
 		l.enforcePushBudget()
 	}
@@ -323,6 +320,37 @@ func (l *eventLoop) applyQueuedWork() {
 		}
 		l.acceptPaused = false
 	}
+}
+
+// takePushes moves the pushes waiting in conn's push queue into its write
+// buffer ahead of the reply to the request about to run, and reports whether
+// conn is still open. A push queued while that request runs stays queued, so it
+// follows the reply. pushQueued stays set because conn stays on the pushed list
+// until applyQueuedWork, which skips an empty pushBuf.
+func (l *eventLoop) takePushes(conn *eventConn) bool {
+	l.mu.Lock()
+	data := conn.pushBuf
+	conn.pushBuf = nil
+	l.mu.Unlock()
+
+	if len(data) > 0 && l.bufferPushes(conn, data) {
+		l.accountPushOutput(conn)
+		l.enforcePushBudget()
+	}
+	return l.conns[conn.fd] == conn
+}
+
+// bufferPushes appends push frames taken from conn's push queue to its write
+// buffer, closing conn if they pass its push limit, and reports whether conn is
+// still open.
+func (l *eventLoop) bufferPushes(conn *eventConn, data []byte) bool {
+	conn.machine.SetPushLimit(conn.pushLimit())
+	if err := conn.machine.BufferEncoded(data); err != nil {
+		l.closeConn(conn, err)
+		return false
+	}
+	conn.receivesPushes = true
+	return true
 }
 
 // pushLimit is how much output may wait for the connection before it is closed:
@@ -569,6 +597,12 @@ func (l *eventLoop) processConn(conn *eventConn) {
 			}
 		}
 
+		// Pushes queued before this request, such as a message another
+		// client published earlier in this iteration, go out ahead of its
+		// reply, as Redis orders them.
+		if !l.takePushes(conn) {
+			return
+		}
 		more, err := conn.machine.ProcessNext(conn.ctx, conn.run)
 		if err != nil {
 			l.closeConn(conn, err)
