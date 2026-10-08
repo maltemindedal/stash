@@ -10,10 +10,14 @@ import (
 // frame. Callers should retry Decode after more bytes arrive.
 var ErrIncomplete = errors.New("protocol: incomplete frame")
 
-// ErrMissingCRLF reports a line or bulk payload that is not terminated by CRLF.
-// It is a typed sentinel so callers can match it with errors.Is rather than the
-// message text. AOF replay relies on this to tell a torn trailing record (a
-// recoverable truncated tail) apart from genuine corruption.
+// ErrMissingCRLF reports a line or bulk payload whose terminator arrived and is
+// not CRLF: a line ended by a bare LF, or other bytes where the CRLF after a
+// payload belongs. A stream that stops before the terminator is not this error;
+// it is ErrIncomplete here and an end-of-stream error from the Parser. It is a
+// typed sentinel so callers can match it with errors.Is rather than the message
+// text. Nothing in Stash does: AOF replay treats io.EOF and io.ErrUnexpectedEOF
+// from the Parser as a torn trailing record and every other error, this one
+// included, as corruption.
 var ErrMissingCRLF = errors.New("protocol: line missing CRLF terminator")
 
 // IncompleteError reports an incomplete frame along with Need, a lower bound on
