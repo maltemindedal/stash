@@ -51,6 +51,20 @@ const defaultMaxWriteBuffer = 512 * 1024 * 1024
 // it, so four chunks leaves room above that.
 const retainedReadBufferCap = 256 * 1024
 
+// retainedWriteBufferCap is the capacity above which Flush releases the write
+// buffer once it has written everything. The buffer grows to hold one large reply
+// and would otherwise keep that capacity until the connection closes, which a GET
+// of a large value would leave on every connection that asked for one.
+//
+// The bound sits above what a client that pipelines ordinary requests needs,
+// because releasing that buffer after every pipeline costs an allocation and a
+// copy per pipeline. The event loop stops executing a connection's requests once
+// eventLoopOutputHighWater (1 MiB) of output is pending, so such a client's
+// buffer fills to that mark and a reply past it, and append rounds the capacity
+// up from there (to about 1.2 MiB for 64 KiB replies). Twice the mark leaves
+// room above that.
+const retainedWriteBufferCap = 2 << 20
+
 // ConnCommandRunner executes one parsed request with connection-scoped state
 // and returns the RESP responses to buffer for the client. A non-nil error is
 // fatal for the connection.
@@ -338,9 +352,10 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 // Flush writes pending output to w and consumes whatever w accepts, so partial
 // writes leave the remainder buffered for a later call. The unwritten remainder
 // is tracked by an offset rather than recompacted, so draining a large reply to
-// a slow reader stays linear. Once a closing machine has drained its parsed
-// requests and pending output, Flush completes the transition to the closed
-// state.
+// a slow reader stays linear. When the output has drained completely, a buffer
+// that grew past retainedWriteBufferCap is released rather than kept for the next
+// reply. Once a closing machine has drained its parsed requests and pending
+// output, Flush completes the transition to the closed state.
 func (m *ConnMachine) Flush(w io.Writer) error {
 	if m.state == ConnStateClosed {
 		return ErrConnMachineClosed
@@ -351,6 +366,9 @@ func (m *ConnMachine) Flush(w io.Writer) error {
 		m.writeOff += n
 		if m.writeOff >= len(m.writeBuf) {
 			m.writeBuf = m.writeBuf[:0]
+			if cap(m.writeBuf) > retainedWriteBufferCap {
+				m.writeBuf = nil
+			}
 			m.writeOff = 0
 		}
 		if err != nil {
