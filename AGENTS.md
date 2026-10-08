@@ -22,6 +22,7 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 - No Go on the machine: run the same commands in Docker, `docker run --rm -v "$PWD":/src -w /src golang:1.21 sh -c 'go vet ./... && go test ./...'`, and lint with `docker run --rm -v "$PWD":/src -w /src golangci/golangci-lint:v2.13.2 golangci-lint run`. When a check could not run, say so in the commit body and the PR.
 - Single test: `go test ./internal/storage -run '^TestStoreActiveEvictionReportsExpiredKeys$' -count=1 -v`. Integration tests are the `./test` package: `go test ./test -run '^TestMasterFullResyncTransfersExistingKeyspace$' -count=1 -v`.
 - A failed race run prints its shuffle seed; replay it with `go test -race -shuffle=<seed> ./...`.
+- Benchmarks: `scripts/bench.sh [-count N] [-threshold PCT] <base-ref> <bench-regex> <package>...` compares HEAD with the base ref (benchstat, `-count` 10 and never below 4, interleaved) and exits non-zero, naming the rows, when a benchmark is more than 5% slower at p<0.05, allocates more per op, or exists on one side only. Each `<package>` resolves from the repo root to exactly one package. Run it on a quiet machine, under a lock if the machine is shared, and paste its header into the commit body. Raise `-count` or `-threshold` only where the issue says so.
 - Run the server with `go run ./cmd/stash --port 6379 --dump ""`. The default `--dump dump.rdb` writes `dump.rdb` into the working directory on graceful shutdown, and `--aof <path>` creates its file wherever it points, so keep AOF paths under a temp dir.
 
 ## Conventions
