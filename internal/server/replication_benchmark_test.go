@@ -29,7 +29,7 @@ func BenchmarkPropagateToReplicas(b *testing.B) {
 			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 			for id := uint64(1); id <= uint64(replicas); id++ {
 				conn := &stubConn{}
-				srv.replicaPeers.Add(id, conn, 6380, newReplicaPeerStateForTest(id, conn))
+				srv.replicaPeers.Add(srv.replication, id, conn, 6380, newReplicaPeerStateForTest(id, conn))
 			}
 			defer srv.replicaPeers.StopFeeds(time.Second)
 

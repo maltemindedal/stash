@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,7 +27,7 @@ func TestReplicaRegistryCountReplicasAtOrAboveWithNotify(t *testing.T) {
 	defer func() { _ = replicaConn.Close() }()
 
 	state := newReplicaPeerStateForTest(1, serverConn)
-	registry.Add(1, serverConn, 6380, state)
+	registry.Add(nil, 1, serverConn, 6380, state)
 
 	count, changed := registry.CountReplicasAtOrAboveWithNotify(10)
 	if count != 0 {
@@ -51,7 +53,7 @@ func TestReplicaRegistryCountReplicasAtOrAboveWithNotify(t *testing.T) {
 func TestReplicaRegistryRemoveAndCloseReturnsCloseError(t *testing.T) {
 	registry := NewReplicaRegistry()
 	conn := &stubConn{closeErr: errors.New("close boom")}
-	registry.Add(1, conn, 6380, newReplicaPeerStateForTest(1, conn))
+	registry.Add(nil, 1, conn, 6380, newReplicaPeerStateForTest(1, conn))
 
 	err := registry.RemoveAndClose(1)
 	if err == nil || err.Error() != "close boom" {
@@ -64,9 +66,9 @@ func TestServerPropagateToReplicasRemovesFailingReplica(t *testing.T) {
 	srv := New(config.Config{}, logger, storage.NewStore(), nil)
 
 	serverConn := &recordingConn{}
-	srv.replicaPeers.Add(1, serverConn, 6380, newReplicaPeerStateForTest(1, serverConn))
+	srv.replicaPeers.Add(srv.replication, 1, serverConn, 6380, newReplicaPeerStateForTest(1, serverConn))
 	failingConn := &stubConn{writeErr: errors.New("write boom")}
-	srv.replicaPeers.Add(2, failingConn, 6381, newReplicaPeerStateForTest(2, failingConn))
+	srv.replicaPeers.Add(srv.replication, 2, failingConn, 6381, newReplicaPeerStateForTest(2, failingConn))
 
 	// Propagating only queues the command for each replica; the replica whose
 	// socket fails is found out, and dropped, by its feed.
@@ -121,7 +123,7 @@ func TestConcurrentWritesReachEveryReplicaInOffsetOrder(t *testing.T) {
 			for i := range conns {
 				id := uint64(i + 1)
 				conns[i] = &recordingConn{}
-				srv.replicaPeers.Add(id, conns[i], 6380+i, newReplicaPeerStateForTest(id, conns[i]))
+				srv.replicaPeers.Add(srv.replication, id, conns[i], 6380+i, newReplicaPeerStateForTest(id, conns[i]))
 			}
 
 			const writers, perWriter = 8, 2000
@@ -224,10 +226,10 @@ func TestAReplicaThatRefusesAFrameIsDroppedOnce(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			registry := NewReplicaRegistry()
 			healthy := &recordingConn{}
-			registry.Add(1, healthy, 6380, newReplicaPeerStateForTest(1, healthy))
+			registry.Add(nil, 1, healthy, 6380, newReplicaPeerStateForTest(1, healthy))
 			// A replica with no writer refuses every frame queued for it.
 			refusing := &stubConn{}
-			registry.Add(2, refusing, 6381, nil)
+			registry.Add(nil, 2, refusing, 6381, nil)
 
 			var handled sync.Mutex
 			var dropped []uint64
@@ -308,7 +310,7 @@ func TestAReplicaThatRefusesAFrameIsDroppedOnce(t *testing.T) {
 func TestAReplicaIsSentNoFrameAfterOneItRefused(t *testing.T) {
 	registry := NewReplicaRegistry()
 	conn := &recordingConn{}
-	registry.Add(1, conn, 6380, newReplicaPeerStateForTest(1, conn))
+	registry.Add(nil, 1, conn, 6380, newReplicaPeerStateForTest(1, conn))
 	// A backlog limit the first frame passes and the second does not.
 	registry.mu.RLock()
 	feed := registry.replicas[1].feed
@@ -338,6 +340,141 @@ func TestAReplicaIsSentNoFrameAfterOneItRefused(t *testing.T) {
 	}
 	if got := conn.Bytes(); len(got) != 0 {
 		t.Fatalf("replica received %q after refusing a frame, want nothing", got)
+	}
+}
+
+// TestAReplicaCountsFromTheOffsetItAttachedAt registers a replica after 100 bytes
+// of writes it is never sent. It acknowledges what it processed counting from
+// zero, so WAIT places it at the master offset it attached at plus what it
+// acknowledged; compared raw, it stayed 100 bytes short of every later write.
+// Before its first acknowledgement it counts only for a target of 0, as in Redis.
+func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
+	tests := []struct {
+		name         string
+		acknowledged int64 // 0 sends no acknowledgement
+		target       int64
+		want         int
+	}{
+		{name: "before acknowledging it counts for a target of 0", target: 0, want: 1},
+		{name: "before acknowledging it does not count for a target of 1", target: 1, want: 0},
+		{name: "it counts at the offset it attached at plus what it acknowledged", acknowledged: 31, target: 131, want: 1},
+		{name: "it does not count past the offset it attached at plus what it acknowledged", acknowledged: 31, target: 132, want: 0},
+		{name: "an acknowledgement past the largest offset does not wrap negative", acknowledged: math.MaxInt64, target: math.MaxInt64, want: 1},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			offsets := &ReplicationState{}
+			offsets.AdvanceMasterOffset(100)
+			registry := NewReplicaRegistry()
+			conn := &stubConn{}
+			registry.Add(offsets, 1, conn, 6380, newReplicaPeerStateForTest(1, conn))
+			defer registry.StopFeeds(time.Second)
+
+			if tt.acknowledged > 0 && !registry.UpdateAck(1, tt.acknowledged) {
+				t.Fatal("UpdateAck() = false, want true")
+			}
+			if got := registry.CountReplicasAtOrAbove(tt.target); got != tt.want {
+				t.Fatalf("CountReplicasAtOrAbove(%d) = %d, want %d", tt.target, got, tt.want)
+			}
+			if got, _ := registry.CountReplicasAtOrAboveWithNotify(tt.target); got != tt.want {
+				t.Fatalf("CountReplicasAtOrAboveWithNotify(%d) = %d, want %d", tt.target, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset registers
+// replicas while writers propagate, as one attaches while clients write, and has
+// each acknowledge everything it was sent. That must count each at the master's
+// offset and not past it: a replica's base is read under the lock Propagate
+// counts and queues under. Read outside that lock, a frame counted in between is
+// neither sent nor below the base, and the replica falls short of every later
+// write; or one is both, and it counts for a write it has not acknowledged. Each
+// replica attaches at a different moment, since one attach does not always land
+// between two frames.
+func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *testing.T) {
+	srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+	frame := []protocol.Value{protocol.Array{Elements: []protocol.Value{
+		protocol.BulkString{Data: []byte("SET")},
+		protocol.BulkString{Data: []byte("key")},
+		protocol.BulkString{Data: []byte("value")},
+	}}}
+
+	const writers = 8
+	var propagated atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				srv.propagateToReplicas(frame)
+				propagated.Add(1)
+			}
+		}()
+	}
+	stopped := false
+	stopWriters := func() {
+		if !stopped {
+			stopped = true
+			close(stop)
+			wg.Wait()
+		}
+	}
+	defer stopWriters()
+	waitForPropagated := func(n int64) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for propagated.Load() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d frames propagated after 10s, want %d", propagated.Load(), n)
+			}
+			runtime.Gosched()
+		}
+	}
+
+	// Each replica attaches after frames were counted without it, and frames are
+	// counted after it, so both sides of its base are exercised.
+	const replicas = 5
+	conns := make([]*recordingConn, replicas)
+	for i := range conns {
+		waitForPropagated(propagated.Load() + 500)
+		id := uint64(i + 1)
+		conns[i] = &recordingConn{}
+		srv.replicaPeers.Add(srv.replication, id, conns[i], 6380+i, newReplicaPeerStateForTest(id, conns[i]))
+	}
+	waitForPropagated(propagated.Load() + 500)
+	stopWriters()
+
+	// Stopping the feeds waits for each to write everything queued for it.
+	if unfinished := srv.replicaPeers.StopFeeds(10 * time.Second); unfinished != 0 {
+		t.Fatalf("%d replica feeds had not finished writing after 10s", unfinished)
+	}
+	for i, conn := range conns {
+		if !srv.replicaPeers.UpdateAck(uint64(i+1), int64(len(conn.Bytes()))) {
+			t.Fatalf("UpdateAck(%d) = false, want true", i+1)
+		}
+	}
+
+	counted := srv.replication.MasterOffset()
+	if got := srv.replicaPeers.CountReplicasAtOrAbove(counted); got != replicas {
+		t.Errorf("CountReplicasAtOrAbove(%d) = %d, want %d", counted, got, replicas)
+	}
+	if got := srv.replicaPeers.CountReplicasAtOrAbove(counted + 1); got != 0 {
+		t.Errorf("CountReplicasAtOrAbove(%d) = %d, want 0", counted+1, got)
+	}
+	if t.Failed() {
+		for _, peer := range srv.replicaPeers.Snapshot() {
+			t.Logf("replica %d attached at %d and acknowledged %d, the master counted %d", peer.ID, peer.baseOffset, peer.AckOffset.Load(), counted)
+		}
 	}
 }
 
@@ -406,7 +543,7 @@ func newReplicaPeerStateForTest(id uint64, conn net.Conn) *ClientState {
 // race detector reports that, so this test is meaningful under -race.
 func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	srv := New(config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
-	srv.replicaPeers.Add(1, &stubConn{}, 6380, nil)
+	srv.replicaPeers.Add(srv.replication, 1, &stubConn{}, 6380, nil)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

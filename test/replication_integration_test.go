@@ -1464,6 +1464,84 @@ func TestWaitReturnsReplicaAcknowledgements(t *testing.T) {
 	}
 }
 
+// TestWaitCountsAReplicaThatAttachedAfterEarlierWrites writes to a master before a
+// replica attaches, then waits on a write made after. The replica counts its
+// offset from zero when it attaches, while the master's includes the earlier
+// writes, so WAIT has to count the replica from the master's offset at attach.
+// It compared the two raw: with three writes before the attach, the replica's
+// acknowledgements stayed 81 bytes short of every later write, more than the
+// GETACK it counts into each acknowledgement makes up. A WAIT that has to wait is
+// an error under --event-loop by design, so this runs in the default mode only.
+func TestWaitCountsAReplicaThatAttachedAfterEarlierWrites(t *testing.T) {
+	tests := []struct {
+		name         string
+		writesBefore int
+	}{
+		{name: "no writes before the replica attached", writesBefore: 0},
+		{name: "three writes before the replica attached", writesBefore: 3},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			logger := stashlogger.New("error")
+			masterStore := storage.NewStore()
+			master := server.New(defaultTestConfig(), logger, masterStore, command.NewExecutor(masterStore, logger))
+			masterCtx, cancelMaster := context.WithCancel(context.Background())
+			defer cancelMaster()
+			masterErrCh := make(chan error, 1)
+			go func() {
+				masterErrCh <- master.ListenAndServe(masterCtx)
+			}()
+			masterAddr := waitForAddr(t, master)
+
+			writerConn, err := net.Dial("tcp", masterAddr)
+			if err != nil {
+				t.Fatalf("Dial(%q) master error = %v", masterAddr, err)
+			}
+			defer closeTestResource(t, writerConn)
+			writerParser := protocol.NewParser(writerConn)
+
+			for i := 0; i < tt.writesBefore; i++ {
+				key, value := string(rune('a'+i)), fmt.Sprint(i+1)
+				assertCommandResponse(t, writerConn, writerParser, protocol.SimpleString{Value: "OK"}, "SET", key, value)
+			}
+
+			replicaCfg := defaultTestConfig()
+			replicaCfg.ReplicaOf = masterAddr
+			replicaAddr, cancelReplica, replicaErrCh := startTestServer(t, replicaCfg)
+			defer cancelReplica()
+
+			// Write only once the master has registered the replica, so that the
+			// write is sent to it rather than lost to the full resync.
+			deadline := time.Now().Add(2 * time.Second)
+			for master.ReplicaCount() != 1 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := master.ReplicaCount(); got != 1 {
+				t.Fatalf("ReplicaCount() = %d, want 1", got)
+			}
+
+			assertCommandResponse(t, writerConn, writerParser, protocol.SimpleString{Value: "OK"}, "SET", "greeting", "hello")
+
+			replicaConn, err := net.Dial("tcp", replicaAddr)
+			if err != nil {
+				t.Fatalf("Dial(%q) replica error = %v", replicaAddr, err)
+			}
+			defer closeTestResource(t, replicaConn)
+			replicaParser := protocol.NewParser(replicaConn)
+			assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("hello")}, 2*time.Second, "GET", "greeting")
+
+			assertCommandResponse(t, writerConn, writerParser, protocol.Integer{Value: 1}, "WAIT", "1", "1000")
+
+			cancelReplica()
+			waitForServerStop(t, replicaErrCh)
+			cancelMaster()
+			waitForServerStop(t, masterErrCh)
+		})
+	}
+}
+
 func TestReplicationStructuredLogs(t *testing.T) {
 	var masterLogs synchronizedBuffer
 	masterLogger := slog.New(slog.NewTextHandler(&masterLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
