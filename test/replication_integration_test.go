@@ -1507,7 +1507,7 @@ func startMasterWithLateReplica(t *testing.T, writesBefore int) (net.Conn, *prot
 	})
 
 	// Write only once the master has registered the replica, so that the write
-	// is sent to it rather than lost to the full resync.
+	// is in its stream, after its base offset, rather than in its snapshot.
 	waitForReplicaCount(t, master, 1)
 	assertCommandResponse(t, writerConn, writerParser, protocol.SimpleString{Value: "OK"}, "SET", "greeting", "hello")
 

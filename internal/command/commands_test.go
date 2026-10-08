@@ -1578,6 +1578,8 @@ func TestExecutorAuth(t *testing.T) {
 		executor := newTestExecutor()
 		executor.SetRequirePass("secret")
 		executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+		registry := server.NewReplicaRegistry()
+		executor.SetReplicaRegistry(registry)
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1608,6 +1610,9 @@ func TestExecutorAuth(t *testing.T) {
 		}
 		if !state.IsReplica() {
 			t.Fatal("IsReplica() = false after PSYNC, want true")
+		}
+		if !result.RegisterReplica || registry.Count() != 1 {
+			t.Fatalf("RegisterReplica = %v with %d replicas registered, want true and 1", result.RegisterReplica, registry.Count())
 		}
 		if !state.IsAuthenticated() {
 			t.Fatal("IsAuthenticated() = false after authenticated PSYNC, want true")

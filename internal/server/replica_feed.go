@@ -32,12 +32,19 @@ var errReplicaBacklog = errors.New("server: replica is too far behind the propag
 // order they were appended and many at a time. Before, each writer wrote to every
 // replica's socket itself and flushed after every command, so one stalled replica
 // stopped every writer and one healthy replica cost a syscall per command.
+//
+// A feed queues from the moment it is created but writes nothing until it is
+// started: a replica's feed holds the writes made while its full resync reply is
+// being sent, which must reach the replica after that reply.
 type replicaFeed struct {
 	mu      sync.Mutex
 	pending []byte
 	spare   []byte
 	limit   int
 	closed  bool
+	// started is set once a goroutine is committed to run the feed. A feed that
+	// is closed before it starts never will be.
+	started bool
 
 	wake chan struct{}
 	stop chan struct{}
@@ -81,6 +88,28 @@ func (f *replicaFeed) backlog() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.pending)
+}
+
+// start runs the feed on a goroutine of its own, which writes the queued stream
+// with write and then calls stopped, when it is set, with the error that stopped
+// it (nil when the feed was closed). It reports whether it started the feed: a
+// feed is started once, and not after it was closed.
+func (f *replicaFeed) start(write func([]byte) error, stopped func(error)) bool {
+	f.mu.Lock()
+	if f.closed || f.started {
+		f.mu.Unlock()
+		return false
+	}
+	f.started = true
+	f.mu.Unlock()
+
+	go func() {
+		err := f.run(write)
+		if stopped != nil {
+			stopped(err)
+		}
+	}()
+	return true
 }
 
 // run writes the queued stream with write until the feed is closed (after one
@@ -133,13 +162,18 @@ func (f *replicaFeed) flush(write func([]byte) error) error {
 
 // close stops the feed. New bytes are refused; the flusher writes what is already
 // queued and exits, and close waits up to grace for that. It reports whether the
-// flusher had exited by then.
+// flusher had exited by then. A feed that was never started has no flusher and
+// will not get one: what it queued is dropped with it, and close returns at once.
 func (f *replicaFeed) close(grace time.Duration) bool {
 	f.once.Do(func() {
 		f.mu.Lock()
 		f.closed = true
+		started := f.started
 		f.mu.Unlock()
 		close(f.stop)
+		if !started {
+			close(f.done)
+		}
 	})
 
 	select {

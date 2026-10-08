@@ -647,7 +647,8 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate: validatePSyncRequest,
 			// As in Redis, which marks PSYNC NO_MULTI. EXEC returns one
 			// reply per queued command, and PSYNC answers with two frames
-			// and turns the connection into a replica.
+			// and turns the connection into a replica. PSYNC's attach cut
+			// would also wait forever for the gate EXEC holds.
 			noTransaction: true,
 		},
 		"WAIT": {

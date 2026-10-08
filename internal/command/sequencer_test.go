@@ -154,6 +154,87 @@ func TestSequencerSkipsWriteOrderingWhenNothingRecordsWrites(t *testing.T) {
 	first()
 }
 
+// TestAttachCutWaitsForAWriteThatSkippedItsStripes starts a write while nothing
+// records writes, so it holds only gate, and then attaches a replica. The cut
+// must wait for that write, which is between being applied and being handed to
+// the replicas, before it copies the snapshot: otherwise the write would be in
+// neither the snapshot nor the new replica's stream. A write that begins once
+// the cut has switched recording on takes its stripes, and the cut holds every
+// stripe until it is released, while reads go on.
+func TestAttachCutWaitsForAWriteThatSkippedItsStripes(t *testing.T) {
+	q := newSequencer()
+	var recording atomic.Bool
+	q.needsOrder = recording.Load
+	key := []byte("k")
+
+	inFlight := q.beginWrite(keysFirstArg, [][]byte{key}) // skips its stripe: nothing records
+	recordingStarted := make(chan struct{})
+	cutTaken := make(chan func(), 1)
+	go func() {
+		cutTaken <- q.attachCut(func() {
+			recording.Store(true)
+			close(recordingStarted)
+		})
+	}()
+
+	t.Run("the cut waits for a write in flight that skipped its stripes", func(t *testing.T) {
+		// Wait until the cut is queued for gate exclusively, which shows as a
+		// new reader being turned away; the write in flight still holds gate
+		// shared, so the cut cannot have been taken after that.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			select {
+			case release := <-cutTaken:
+				release()
+				t.Fatal("the cut was taken while a write that skipped its stripes was in flight")
+			default:
+			}
+			if !q.gate.TryRLock() {
+				break
+			}
+			q.gate.RUnlock()
+			if time.Now().After(deadline) {
+				t.Fatal("the cut never waited for gate exclusively")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case release := <-cutTaken:
+			release()
+			t.Fatal("the cut was taken while a write that skipped its stripes was in flight")
+		default:
+		}
+		inFlight()
+	})
+
+	var release func()
+	select {
+	case release = <-cutTaken:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the cut was not taken after the write in flight finished")
+	}
+	select {
+	case <-recordingStarted:
+	default:
+		t.Fatal("the cut was taken without switching recording on")
+	}
+
+	t.Run("writes wait for the cut and reads do not", func(t *testing.T) {
+		isBlocked, finished := blocked(func() { q.beginWrite(keysFirstArg, [][]byte{key})() })
+		if !isBlocked {
+			t.Fatal("a write ran while the cut held every stripe")
+		}
+		var read atomic.Bool
+		if readBlocked, _ := blocked(func() { q.gate.RLock(); read.Store(true); q.gate.RUnlock() }); readBlocked || !read.Load() {
+			t.Fatal("a read waited for the cut")
+		}
+		release()
+		if !finished() {
+			t.Fatal("the write never proceeded after the cut was released")
+		}
+	})
+}
+
 func TestEveryDurableCommandDeclaresHowToOrderItsWrites(t *testing.T) {
 	// A command added without a key shape is ordered against every write, which
 	// is correct but slow. This lists the shapes the current commands have, so a
@@ -200,6 +281,7 @@ func TestSequenceModeOfRequests(t *testing.T) {
 		{"EXEC", sequenceExclusive},
 		{"BLPOP", sequenceSelf},
 		{"WAIT", sequenceSelf},
+		{"PSYNC", sequenceSelf},
 		{"NOSUCHCOMMAND", sequenceRead},
 	}
 	for _, tt := range tests {

@@ -110,9 +110,10 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 }
 
 // recordsWrites reports whether anything is recording the writes clients make, so
-// that their order matters: an append-only file or a replica.
+// that their order matters: an append-only file or a replica, attached or
+// attaching.
 func (s *Server) recordsWrites() bool {
-	return s.aofWriter != nil || s.replicaPeers.Count() > 0
+	return s.aofWriter != nil || s.replicaPeers.Active()
 }
 
 func (s *Server) beginAOFRewrite(_ context.Context) error {

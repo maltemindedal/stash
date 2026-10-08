@@ -28,6 +28,9 @@ type ExecuteResult struct {
 	UpstreamReplies []protocol.Value
 	Propagation     []protocol.Value
 	Durability      []protocol.Value
+	// RegisterReplica is set by PSYNC, which registered the client as a replica
+	// at its attach cut. The connection then starts the replica's feed
+	// (registerReplicaPeer) once Responses are ahead of anything it writes.
 	RegisterReplica bool
 	// Release, when set, must be called by whoever applies Durability and
 	// Propagation, after it has done so. It ends the exclusion that keeps other
@@ -85,7 +88,11 @@ type ReplicationState struct {
 
 // ReplicaPeer describes a replica connection attached to a master.
 type ReplicaPeer struct {
-	ID            uint64
+	ID uint64
+	// Conn is the replica's connection. It is nil from the attach cut until the
+	// replica's feed starts (ReplicaRegistry.Start), while its full resync reply
+	// is being sent; Start sets it under the registry lock while the peer is
+	// registered, so a peer that Remove returned is read without the lock.
 	Conn          ClientConn
 	ListeningPort int
 	// AckOffset is the latest replication offset the replica acknowledged, in its
@@ -147,11 +154,15 @@ func (p *ReplicaPeer) send(chunk []byte) error {
 // Its lock comes after the command sequencer's gate and write stripes, and before
 // a replica feed's lock: lock order is gate, stripes, mu, feed. While holding mu
 // the registry takes no gate, stripe or shard lock, and calls no handler, since
-// the feed-error handler takes mu itself.
+// the feed-error handler takes mu itself. PSYNC's attach cut takes mu under the
+// gate (BeginAttach) and under every stripe (Reserve), in that order.
 type ReplicaRegistry struct {
 	mu       sync.RWMutex
 	replicas map[uint64]*ReplicaPeer
 	changed  chan struct{}
+	// attaching counts the replicas between BeginAttach and their Reserve or
+	// EndAttach, which Active counts as replicas already.
+	attaching int
 
 	// onFeedError is called, with mu not held, when a replica can no longer be
 	// fed: on the feed's own goroutine when a write to its socket fails, and on
@@ -221,11 +232,62 @@ func NewReplicaRegistry() *ReplicaRegistry {
 	return &ReplicaRegistry{replicas: make(map[uint64]*ReplicaPeer), changed: make(chan struct{})}
 }
 
-// Add stores or updates a replica peer. The replica is sent every frame Propagate
-// counts after it is added, so its base offset is the master offset that offsets
-// holds at that moment.
+// BeginAttach records that a replica is attaching, so Active reports true until
+// the matching Reserve or EndAttach. A replica attaches in three steps, which
+// PSYNC takes:
+//
+//  1. BeginAttach, which PSYNC's attach cut calls while it holds the sequencer's
+//     gate exclusively. From then on Active is true, so every write that begins
+//     after it takes its write stripes, and the cut can wait for it.
+//  2. Reserve, inside the cut, right after the snapshot is copied: the replica is
+//     registered with a feed that queues every write after the snapshot, but does
+//     not write yet. It ends the attach; EndAttach ends one that fails before.
+//  3. Start, once the full resync reply is ahead of anything the feed writes on
+//     the connection: the feed starts writing.
+func (r *ReplicaRegistry) BeginAttach() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.attaching++
+}
+
+// EndAttach ends an attach that BeginAttach began and that will not reach Reserve.
+func (r *ReplicaRegistry) EndAttach() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.attaching--
+}
+
+// Active reports whether a replica is attached or attaching: whether anything
+// will send a write made now to a replica.
+func (r *ReplicaRegistry) Active() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.attaching > 0 || len(r.replicas) > 0
+}
+
+// Reserve registers a replica that BeginAttach began attaching, and ends that
+// attach. Its feed queues every frame Propagate counts from now on, so its base
+// offset is the master offset that offsets holds now, but writes nothing until
+// Start. PSYNC calls it inside its attach cut, right after copying the snapshot,
+// so every write is in exactly one of the snapshot and the replica's stream.
+func (r *ReplicaRegistry) Reserve(offsets *ReplicationState, id uint64, listeningPort int, writer encodedReplicaWriter) {
+	r.register(offsets, id, listeningPort, writer, true)
+}
+
+// Add registers a replica and starts its feed at once, outside any attach cut:
+// Reserve and Start in one step, for a replica that has no snapshot to order its
+// stream against, as in tests. The server attaches replicas through BeginAttach,
+// Reserve and Start.
 func (r *ReplicaRegistry) Add(offsets *ReplicationState, id uint64, conn ClientConn, listeningPort int, writer encodedReplicaWriter) {
-	peer := &ReplicaPeer{ID: id, Conn: conn, ListeningPort: listeningPort, writer: writer, feed: newReplicaFeed(replicaFeedLimit)}
+	r.register(offsets, id, listeningPort, writer, false)
+	r.Start(id, conn)
+}
+
+func (r *ReplicaRegistry) register(offsets *ReplicationState, id uint64, listeningPort int, writer encodedReplicaWriter, endsAttach bool) {
+	peer := &ReplicaPeer{ID: id, ListeningPort: listeningPort, writer: writer, feed: newReplicaFeed(replicaFeedLimit)}
 
 	r.mu.Lock()
 	// Propagate counts and queues each frame under this lock, so the base splits
@@ -238,18 +300,45 @@ func (r *ReplicaRegistry) Add(offsets *ReplicationState, id uint64, conn ClientC
 	peer.baseOffset = offsets.MasterOffset()
 	previous := r.replicas[id]
 	r.replicas[id] = peer
-	onFeedError := r.onFeedError
+	if endsAttach {
+		r.attaching--
+	}
 	r.notifyChangedLocked()
 	r.mu.Unlock()
 
 	if previous != nil {
 		previous.feed.close(0)
 	}
-	go func() {
-		if err := peer.feed.run(peer.send); err != nil && onFeedError != nil {
+}
+
+// Start sets the connection of a replica that Reserve registered and starts its
+// feed, which then writes what it queued since the attach cut and everything
+// after. The caller calls it once the full resync reply is ahead of anything the
+// feed writes on the connection. It reports false when the replica is no longer
+// registered, or its feed was closed, because it was dropped while its reply was
+// sent; the caller then closes conn.
+func (r *ReplicaRegistry) Start(id uint64, conn ClientConn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	peer := r.replicas[id]
+	if peer == nil {
+		return false
+	}
+	onFeedError := r.onFeedError
+	stopped := func(err error) {
+		if err != nil && onFeedError != nil {
 			onFeedError(id, err)
 		}
-	}()
+	}
+	// Set before the feed starts, so that a drop caused by its first write
+	// finds the connection to close.
+	peer.Conn = conn
+	if !peer.feed.start(peer.send, stopped) {
+		peer.Conn = nil
+		return false
+	}
+	return true
 }
 
 // Propagate counts payload into the master's replication offset and queues it
@@ -315,7 +404,9 @@ func (r *ReplicaRegistry) SetFeedErrorHandler(handler func(id uint64, err error)
 // StopFeeds gives every replica's feed up to grace to write what is queued for it
 // and then stops them, returning how many had not finished. The server calls it
 // on shutdown, before it closes the sockets, so that commands already propagated
-// are not lost to a graceful stop.
+// are not lost to a graceful stop. A feed that has not started, because its
+// replica is still being sent its full resync, is stopped without waiting: that
+// replica has to synchronise again from the start anyway.
 func (r *ReplicaRegistry) StopFeeds(grace time.Duration) (unfinished int) {
 	peers := r.Snapshot()
 	deadline := time.Now().Add(grace)
@@ -411,9 +502,11 @@ func (r *ReplicaRegistry) Remove(id uint64) *ReplicaPeer {
 }
 
 // RemoveAndClose deletes a replica peer from the registry and closes its socket.
+// A replica whose feed has not started has no connection here yet; Start then
+// reports that it was dropped, and its caller closes the connection.
 func (r *ReplicaRegistry) RemoveAndClose(id uint64) error {
 	peer := r.Remove(id)
-	if peer != nil {
+	if peer != nil && peer.Conn != nil {
 		if err := peer.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			return err
 		}
@@ -460,18 +553,40 @@ func randomReplicationID() string {
 	return hex.EncodeToString(raw[:])
 }
 
+// replicaMarker is a connection whose limits depend on whether it is a replica:
+// the event loop's, which holds a replica's waiting output to the replica limit.
+type replicaMarker interface {
+	markReplica()
+}
+
+// registerReplicaPeer starts the feed of the replica that PSYNC registered at its
+// attach cut (ReplicaRegistry.Start), once the full resync reply is ahead of
+// anything the feed writes on conn. The feed has queued every write since the
+// snapshot. When the replica was dropped while its reply was sent (its feed
+// refused a frame, past the backlog limit), it closes conn instead.
 func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
-	state := s.getClientState(clientID)
-	if state == nil || !state.IsReplica() {
+	// Before the feed starts, so that the first frame it pushes is held to the
+	// replica's output limit, not a subscriber's.
+	if marker, ok := conn.(replicaMarker); ok {
+		marker.markReplica()
+	}
+	if !s.replicaPeers.Start(clientID, conn) {
+		s.logger.Info("closing a replica dropped while its full resync was sent", "replica_id", clientID)
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.logger.Debug("failed to close dropped replica", "replica_id", clientID, "error", err)
+		}
 		return
 	}
 
-	s.replicaPeers.Add(s.replication, clientID, conn, state.ReplicaListeningPort(), state)
+	listeningPort := 0
+	if state := s.getClientState(clientID); state != nil {
+		listeningPort = state.ReplicaListeningPort()
+	}
 	s.logger.Info(
 		"replica registered",
 		"replica_id", clientID,
 		"remote_addr", conn.RemoteAddr().String(),
-		"listening_port", state.ReplicaListeningPort(),
+		"listening_port", listeningPort,
 		"master_offset", s.replication.MasterOffset(),
 	)
 }
@@ -521,13 +636,19 @@ func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport 
 
 // dropReplica logs why a replica can no longer be fed and closes it. It has to
 // synchronise again from the start. It is the registry's feed-error handler, so
-// it is called with the registry lock not held, and takes it.
+// it is called with the registry lock not held, and takes it. A replica dropped
+// while its full resync reply is being sent has no connection here yet; its feed
+// never starts, and registerReplicaPeer closes the connection once the reply is
+// sent.
 func (s *Server) dropReplica(id uint64, cause error) {
 	peer := s.replicaPeers.Remove(id)
 	if peer == nil {
 		return
 	}
 	s.logger.Warn("dropping a replica: it can no longer be fed the propagated stream", "replica_id", id, "error", cause)
+	if peer.Conn == nil {
+		return
+	}
 	if err := peer.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		s.logger.Debug("failed to close replica after propagation failure", "replica_id", id, "error", err)
 	}

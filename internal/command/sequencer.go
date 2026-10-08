@@ -35,12 +35,27 @@ import (
 // Counting a frame's replication offset and queueing it for every replica happen
 // under that one lock, so writers on different stripes, and WAIT's GETACK, reach
 // every replica in offset order.
+//
+// PSYNC attaches a replica at an attach cut (attachCut): it copies the snapshot
+// it sends the replica and registers the replica while it holds gate shared and
+// every stripe, so no write sits between being applied and being handed to the
+// replicas, and each write is in exactly one of the snapshot and the replica's
+// stream. Writes that skipped their stripes because nothing was recording are
+// waited for first, by taking gate exclusively once, and the cut switches
+// recording on while it holds gate, so every write after that takes its stripes.
+// The store's shard locks (the copy) and then the registry's lock (registering)
+// come after the stripes, and are not held together. Readers keep running during
+// the copy; writers wait for it, as they already waited for the shard locks the
+// copy takes. PSYNC orders itself, like BLPOP and WAIT, but waits only for
+// locks, so it also runs under the event loop. It is refused inside MULTI: EXEC
+// holds gate exclusively, which the cut would wait for forever.
 type sequencer struct {
 	gate    sync.RWMutex
 	stripes [writeStripes]paddedMutex
 
 	// needsOrder reports whether anything is currently recording writes: an
-	// append-only file, or a replica. When it is nil, writes are always ordered.
+	// append-only file, or a replica attached or attaching. When it is nil,
+	// writes are always ordered.
 	needsOrder func() bool
 
 	// The release functions are bound once, so that handing one to a result does
@@ -153,6 +168,33 @@ func (q *sequencer) beginWrite(shape keyShape, args [][]byte) (release func()) {
 	return q.releaseAll
 }
 
+// attachCut takes the locks under which PSYNC copies a replica's snapshot and
+// registers it, and returns the function that gives them up (see sequencer). In
+// order, it:
+//
+//  1. takes gate exclusively, which waits for every write in progress, including
+//     those that skipped their stripes because nothing was recording: they hold
+//     gate shared from before they execute until their frames have been handed
+//     to the replicas. It does so on every attach, since a replica detaching just
+//     before can leave such a write in flight;
+//  2. calls startRecording, after which needsOrder must report true, and releases
+//     gate, so every write that begins after it takes its stripes;
+//  3. takes gate shared and every stripe, as a write whose keys are unknown does,
+//     whatever needsOrder reports: the cut is what makes the copy and the
+//     registration one moment.
+//
+// The caller must hold neither gate nor a stripe, and must not be running inside
+// EXEC, which holds gate exclusively.
+func (q *sequencer) attachCut(startRecording func()) (release func()) {
+	q.gate.Lock()
+	startRecording()
+	q.gate.Unlock()
+
+	q.gate.RLock()
+	q.lockStripes(allStripes)
+	return q.releaseAll
+}
+
 // sequenceMode says how a request is ordered.
 type sequenceMode int
 
@@ -163,7 +205,8 @@ const (
 	sequenceWrite
 	// sequenceExclusive: gate exclusive, until the result is released.
 	sequenceExclusive
-	// sequenceSelf: the command orders itself, because it waits.
+	// sequenceSelf: the command orders itself, because it waits (BLPOP, WAIT)
+	// or because it needs locks no other mode takes (PSYNC's attach cut).
 	sequenceSelf
 )
 
@@ -178,7 +221,7 @@ func (e *Executor) sequenceModeFor(ctx context.Context, request *Request) sequen
 	switch request.Name {
 	case "EXEC":
 		return sequenceExclusive
-	case "BLPOP", "WAIT":
+	case "BLPOP", "WAIT", "PSYNC":
 		return sequenceSelf
 	}
 	if !spec.transactionControl {
