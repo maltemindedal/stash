@@ -307,7 +307,11 @@ func (s *Store) RightPush(key string, values [][]byte) (int64, []string, error) 
 }
 
 // LeftPop removes and returns the left-most value from the list stored at key.
+// When it leaves elements in the list, it wakes the next client waiting for a
+// push to key (see wakeNextListWaiter).
 func (s *Store) LeftPop(key string) ([]byte, bool, error) {
+	var elementsLeft bool
+	defer s.wakeNextListWaiter(key, &elementsLeft) // deferred first, so it runs after the unlock
 	shard := s.shardForKey(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -348,11 +352,16 @@ func (s *Store) LeftPop(key string) ([]byte, bool, error) {
 		s.usedMemory.Add(newSize - oldSize)
 	}
 
+	elementsLeft = true
 	return item, true, nil
 }
 
 // RightPop removes and returns the right-most value from the list stored at key.
+// When it leaves elements in the list, it wakes the next client waiting for a
+// push to key (see wakeNextListWaiter).
 func (s *Store) RightPop(key string) ([]byte, bool, error) {
+	var elementsLeft bool
+	defer s.wakeNextListWaiter(key, &elementsLeft) // deferred first, so it runs after the unlock
 	shard := s.shardForKey(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -394,17 +403,20 @@ func (s *Store) RightPop(key string) ([]byte, bool, error) {
 		s.usedMemory.Add(newSize - oldSize)
 	}
 
+	elementsLeft = true
 	return item, true, nil
 }
 
 // LeftPopN removes and returns up to count left-most values from the list stored at key.
-// Returns (nil, false, nil) when the key is missing or expired.
+// Returns (nil, false, nil) when the key is missing or expired. Like LeftPop, it
+// wakes the next client waiting for a push to key when it leaves elements.
 func (s *Store) LeftPopN(key string, count int64) ([][]byte, bool, error) {
 	return s.popN(key, count, true)
 }
 
 // RightPopN removes and returns up to count right-most values from the list stored at key.
-// Returns (nil, false, nil) when the key is missing or expired.
+// Returns (nil, false, nil) when the key is missing or expired. Like RightPop, it
+// wakes the next client waiting for a push to key when it leaves elements.
 func (s *Store) RightPopN(key string, count int64) ([][]byte, bool, error) {
 	return s.popN(key, count, false)
 }
@@ -414,6 +426,8 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 		return nil, false, ErrSyntax
 	}
 
+	var elementsLeft bool
+	defer s.wakeNextListWaiter(key, &elementsLeft) // deferred first, so it runs after the unlock
 	shard := s.shardForKey(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -473,7 +487,25 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 		s.usedMemory.Add(newSize - oldSize)
 	}
 
+	elementsLeft = true
 	return popped, true, nil
+}
+
+// wakeNextListWaiter wakes the next client waiting for a push to key, when the
+// pop that deferred it left elements in the list (*elementsLeft).
+//
+// A push wakes only the client that has waited longest (pushList). When that
+// client's pop leaves elements, it wakes the next waiter, whose pop does the
+// same, so a push of n elements serves up to n blocked clients one after
+// another, in the order they waited. Waking them all at once would let them race,
+// and a later waiter could take the first element.
+//
+// A pop defers it before it unlocks its shard, so that it runs after the unlock:
+// no shard lock is held while taking waiters.mu (see pushList).
+func (s *Store) wakeNextListWaiter(key string, elementsLeft *bool) {
+	if *elementsLeft {
+		s.waiters.notifyOne(key)
+	}
 }
 
 // ListRange returns an inclusive range of values from the list stored at key.
@@ -1124,6 +1156,10 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 	// Notify only once every shard lock is released. A shard lock must never be
 	// held while taking waiters.mu, so that a future path taking those two locks
 	// in the other order cannot deadlock against this one.
+	//
+	// One waiter is woken however many values were pushed: the one that has
+	// waited longest. Its pop wakes the next while elements remain
+	// (wakeNextListWaiter).
 	s.waiters.notifyOne(key)
 	return length, evicted, nil
 }
