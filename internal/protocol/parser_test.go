@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -188,6 +189,83 @@ func TestParserRejectsUnboundedLine(t *testing.T) {
 	parser := NewParser(strings.NewReader(input))
 	if _, err := parser.Parse(); err == nil {
 		t.Fatal("Parse() error = nil, want unbounded-line rejection")
+	}
+}
+
+// TestParserBoundsALineAsTheDecoderDoes pins the two RESP decoders to one line
+// bound: the LF must be among the first maxLineLength bytes after the type byte,
+// whatever size of bufio.Reader or chunks the Parser reads through. The Parser
+// used to count only the fragments that ended without an LF, so a line of up to
+// 69,632 bytes (17 fragments of 4 KiB) got through, and a caller's larger
+// bufio.Reader raised that bound further.
+func TestParserBoundsALineAsTheDecoderDoes(t *testing.T) {
+	// echoFrame is ECHO x whose bulk length line, CRLF included, is n bytes after
+	// the "$": zeros, then the digit 1.
+	echoFrame := func(n int) []byte {
+		return []byte("*2\r\n$4\r\nECHO\r\n$" + strings.Repeat("0", n-3) + "1\r\nx\r\n")
+	}
+	// simpleString is a "+" line of n bytes after the "+", with or without its CRLF.
+	simpleString := func(terminated bool) func(n int) []byte {
+		return func(n int) []byte {
+			if terminated {
+				return []byte("+" + strings.Repeat("a", n-2) + "\r\n")
+			}
+			return []byte("+" + strings.Repeat("a", n))
+		}
+	}
+
+	inputs := []struct {
+		name  string
+		build func(n int) []byte
+		// over reports whether a line of n bytes is past the bound. A terminated
+		// line may fill the 65,536 bytes; an unterminated one must stop short of
+		// them, because the LF would have to be among them.
+		over func(n int) bool
+	}{
+		{name: "ECHO frame with a padded bulk length", build: echoFrame, over: func(n int) bool { return n > maxLineLength }},
+		{name: "terminated simple string", build: simpleString(true), over: func(n int) bool { return n > maxLineLength }},
+		{name: "unterminated simple string", build: simpleString(false), over: func(n int) bool { return n >= maxLineLength }},
+	}
+	lengths := []int{maxLineLength - 1, maxLineLength, maxLineLength + 1, maxLineLength + 4096, maxLineLength + 4097}
+	readers := []struct {
+		name string
+		wrap func(io.Reader) io.Reader
+	}{
+		{name: "whole input", wrap: func(r io.Reader) io.Reader { return r }},
+		{name: "one byte at a time", wrap: iotest.OneByteReader},
+		{name: "16 byte bufio.Reader", wrap: func(r io.Reader) io.Reader { return bufio.NewReaderSize(r, 16) }},
+		{name: "128 KiB bufio.Reader", wrap: func(r io.Reader) io.Reader { return bufio.NewReaderSize(r, 128<<10) }},
+	}
+
+	for _, in := range inputs {
+		for _, n := range lengths {
+			input := in.build(n)
+			wantValue, _, wantErr := Decode(input)
+			if gotOver := wantErr != nil && !errors.Is(wantErr, ErrIncomplete); gotOver != in.over(n) {
+				t.Fatalf("%s of %d bytes: Decode() error = %v, but the line is over the bound: %v", in.name, n, wantErr, in.over(n))
+			}
+
+			for _, rd := range readers {
+				rd := rd
+				t.Run(fmt.Sprintf("%s, %d bytes, %s", in.name, n, rd.name), func(t *testing.T) {
+					got, err := NewParser(rd.wrap(bytes.NewReader(input))).Parse()
+					switch {
+					case errors.Is(wantErr, ErrIncomplete):
+						if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+							t.Fatalf("Parse() = %v, %v; want the end of the stream, as Decode() reports ErrIncomplete", got, err)
+						}
+					case wantErr != nil:
+						if err == nil || err.Error() != wantErr.Error() {
+							t.Fatalf("Parse() = %v, %v; want error %q", got, err, wantErr)
+						}
+					case err != nil:
+						t.Fatalf("Parse() error = %v, want %v", err, wantValue)
+					case !reflect.DeepEqual(got, wantValue):
+						t.Fatalf("Parse() = %#v, want %#v", got, wantValue)
+					}
+				})
+			}
+		}
 	}
 }
 

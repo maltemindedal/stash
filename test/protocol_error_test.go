@@ -61,3 +61,59 @@ func TestServerClosesTheConnectionAfterAProtocolError(t *testing.T) {
 		})
 	}
 }
+
+// TestALineOverTheLimitGetsTheSameReplyInBothModes sends ECHO x with its bulk
+// length written as a zero-padded line, so the line is exactly as long as the
+// test needs. Both networking modes accept one that fits in 64 KiB, CRLF
+// included, and answer a longer one with one protocol error before they close.
+// Default mode used to accept lines of up to 69,632 bytes: it counted only the
+// 4 KiB fragments that ended without an LF.
+func TestALineOverTheLimitGetsTheSameReplyInBothModes(t *testing.T) {
+	// echo writes raw bytes, because assertCommandResponse writes canonical
+	// lengths. The bulk length line is n bytes after the "$", CRLF included.
+	echo := func(n int) string {
+		return "*2\r\n$4\r\nECHO\r\n$" + strings.Repeat("0", n-3) + "1\r\nx\r\n"
+	}
+	const lineError = "-ERR protocol: parse array element 1: protocol: line exceeds 65536 byte limit\r\n"
+
+	tests := []struct {
+		name      string
+		lineBytes int
+		want      string
+		closes    bool
+	}{
+		{name: "a line of exactly 65,536 bytes is accepted", lineBytes: 65536, want: "$1\r\nx\r\n"},
+		{name: "a line one byte longer is refused", lineBytes: 65537, want: lineError, closes: true},
+		{name: "a line of 69,632 bytes, the most default mode used to accept, is refused", lineBytes: 69632, want: lineError, closes: true},
+	}
+
+	for _, eventLoop := range []bool{false, true} {
+		name := "goroutine per connection"
+		if eventLoop {
+			name = "event loop"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.EventLoop = eventLoop
+			addr, stop, errCh := startTestServer(t, cfg)
+			defer func() {
+				stop()
+				waitForServerStop(t, errCh)
+			}()
+
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					var reply string
+					if tt.closes {
+						reply = readUntilClosed(t, addr, echo(tt.lineBytes))
+					} else {
+						reply = readReplies(t, addr, echo(tt.lineBytes), 2)
+					}
+					if reply != tt.want {
+						t.Fatalf("reply = %q, want %q", reply, tt.want)
+					}
+				})
+			}
+		})
+	}
+}
