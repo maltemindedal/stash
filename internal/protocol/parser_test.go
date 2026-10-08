@@ -14,9 +14,8 @@ import (
 	"time"
 )
 
-// TestParseMissingCRLFReturnsSentinel locks the typed ErrMissingCRLF sentinel
-// that AOF replay relies on (via errors.Is) to tell a torn trailing record apart
-// from corruption, so a reworded parser message can't silently change that.
+// TestParseMissingCRLFReturnsSentinel locks the typed ErrMissingCRLF sentinel,
+// so a reworded parser message can't silently change what errors.Is matches.
 func TestParseMissingCRLFReturnsSentinel(t *testing.T) {
 	// A bulk string whose declared payload is present but not CRLF-terminated.
 	parser := NewParser(strings.NewReader("$4\r\nPINGxx"))

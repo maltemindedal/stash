@@ -60,6 +60,15 @@ For a quick look at the raw numbers of the parser and store, without a compariso
 go test -run ^$ -bench . ./internal/protocol ./internal/storage
 ```
 
+The two RESP decoders in `internal/protocol` (the `Parser` and the `Decoder`) are tested against each other in `differential_test.go`. `go test` runs a fixed corpus of 2,500 mutated inputs, which takes about a second under `-race`; `-short` skips it. To run the first n inputs of the same corpus, or to fuzz for new ones:
+
+```bash
+STASH_DECODER_FUZZ_CASES=1000000 go test ./internal/protocol -run '^TestParserMatchesDecoderOnMutatedFrames$'
+go test ./internal/protocol -run '^$' -fuzz '^FuzzParserMatchesDecoder$' -fuzztime 60s -fuzzminimizetime 0s
+```
+
+Without `-fuzzminimizetime 0s` the fuzzer spends most of the minute minimizing the inputs it finds. A failure prints its whole input; add it to `differentialSeeds` once it is fixed.
+
 ## Lint configuration
 
 [`.golangci.yml`](.golangci.yml) enables `depguard`, `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `errorlint`, `makezero`, `nilnesserr`, `predeclared`, and `wastedassign` with a 2-minute timeout. `govet` runs every analyzer except `fieldalignment` and `shadow`, and `staticcheck` runs all of its checks. `depguard` keeps Stash on the standard library alone: an import outside the standard library and this module fails lint, in code and in tests. It does not look at `go.mod`, so a `require` block there is still caught in review.
