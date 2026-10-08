@@ -247,7 +247,7 @@ func TestParserBoundsALineAsTheDecoderDoes(t *testing.T) {
 
 			for _, rd := range readers {
 				rd := rd
-				t.Run(fmt.Sprintf("%s/%d bytes/%s", in.name, n, rd.name), func(t *testing.T) {
+				t.Run(fmt.Sprintf("%s, %d bytes, %s", in.name, n, rd.name), func(t *testing.T) {
 					got, err := NewParser(rd.wrap(bytes.NewReader(input))).Parse()
 					switch {
 					case errors.Is(wantErr, ErrIncomplete):
