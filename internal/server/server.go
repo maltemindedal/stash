@@ -573,9 +573,9 @@ func (s *Server) ServerStats() Stats {
 	replicas := make([]ReplicaInfo, 0, len(replicaPeers))
 	for _, peer := range replicaPeers {
 		replicas = append(replicas, ReplicaInfo{
-			ID:            peer.ID,
-			ListeningPort: peer.ListeningPort,
-			AckOffset:     peer.acknowledgedMasterOffset(),
+			ID:                peer.ID,
+			ListeningPort:     peer.ListeningPort,
+			AckedMasterOffset: peer.acknowledgedMasterOffset(),
 		})
 	}
 

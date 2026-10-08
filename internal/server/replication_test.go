@@ -566,8 +566,8 @@ func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 		if len(stats.Replicas) != 1 {
 			t.Fatalf("len(Replicas) = %d, want 1", len(stats.Replicas))
 		}
-		if got := stats.Replicas[0].AckOffset; got < last {
-			t.Fatalf("AckOffset went backwards from %d to %d", last, got)
+		if got := stats.Replicas[0].AckedMasterOffset; got < last {
+			t.Fatalf("AckedMasterOffset went backwards from %d to %d", last, got)
 		} else {
 			last = got
 		}

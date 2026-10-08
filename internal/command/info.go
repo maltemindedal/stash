@@ -107,7 +107,7 @@ func (e *Executor) appendInfoReplication(buf *bytes.Buffer) {
 	replicas := append([]server.ReplicaInfo(nil), stats.Replicas...)
 	sort.Slice(replicas, func(i, j int) bool { return replicas[i].ID < replicas[j].ID })
 	for i, replica := range replicas {
-		appendInfoField(buf, fmt.Sprintf("slave%d", i), fmt.Sprintf("id=%d,port=%d,offset=%d", replica.ID, replica.ListeningPort, replica.AckOffset))
+		appendInfoField(buf, fmt.Sprintf("slave%d", i), fmt.Sprintf("id=%d,port=%d,offset=%d", replica.ID, replica.ListeningPort, replica.AckedMasterOffset))
 	}
 }
 
