@@ -45,6 +45,7 @@ Current responsibilities:
 - append successful mutating commands in RESP form
 - apply `appendfsync` policies (`always`, `everysec`, `no`)
 - rewrite the current durable state in the background for `BGREWRITEAOF`
+- write a snapshot of the keyspace into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
 
 ### `internal/protocol`
 
@@ -95,7 +96,7 @@ Current responsibilities:
 - provide a non-blocking connection state machine that buffers reads, parses complete requests, buffers responses, and flushes output incrementally
 - optionally serve all clients from one event-loop goroutine driven by OS readiness notifications (`--event-loop`), dispatching readable and writable sockets through per-connection state machines
 - maintain an active connection registry for shutdown
-- load startup persistence (RDB and/or AOF) before accepting TCP connections
+- load startup persistence (RDB and/or AOF) before accepting TCP connections, and write the keys an RDB snapshot loaded into a missing or empty AOF before opening it, since every later start loads the AOF and skips the RDB snapshot
 - append durable command frames and fan out replication writes after successful execution
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -326,4 +327,216 @@ func rewriteCommands(t *testing.T, payload []byte) [][]string {
 		}
 		commands = append(commands, args)
 	}
+}
+
+func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
+	// Startup seeds a missing or empty append-only file with the keys an RDB
+	// snapshot loaded, and every later start replays that file instead of the
+	// snapshot. So it has to replay to exactly those keys, deadlines included,
+	// and leave no temp file behind.
+	store := storage.NewStore()
+	_, _ = store.Set("name", []byte("Stash"), 0)
+	_, _ = store.Set("session", []byte("alice"), time.Now().Add(time.Hour).UnixMilli())
+	if _, _, err := store.RightPush("letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+		t.Fatalf("RightPush() error = %v", err)
+	}
+	entries, _ := store.SnapshotAll()
+
+	tests := []struct {
+		name string
+		// aofPath prepares dir and returns the path to seed.
+		aofPath func(t *testing.T, dir string) string
+	}{
+		{name: "a missing file", aofPath: func(_ *testing.T, dir string) string {
+			return filepath.Join(dir, "appendonly.aof")
+		}},
+		{name: "an empty file", aofPath: func(t *testing.T, dir string) string {
+			path := filepath.Join(dir, "appendonly.aof")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			return path
+		}},
+		{name: "a file in a missing directory", aofPath: func(_ *testing.T, dir string) string {
+			return filepath.Join(dir, "missing", "appendonly.aof")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := tt.aofPath(t, t.TempDir())
+
+			stats, err := aof.SeedFile(path, entries)
+			if err != nil {
+				t.Fatalf("SeedFile() error = %v", err)
+			}
+			if stats.Keys != 3 || stats.Commands != 3 {
+				t.Fatalf("SeedFile() stats = %+v, want 3 keys in 3 commands", stats)
+			}
+
+			replayedStore := storage.NewStore()
+			executor := command.NewExecutor(replayedStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
+				_, execErr := executor.ExecuteDetailed(ctx, value)
+				return execErr
+			})
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+			if loaded.TornTail || loaded.ReplayedCommands != stats.Commands {
+				t.Fatalf("LoadFile() stats = %+v, want %d complete commands", loaded, stats.Commands)
+			}
+			replayed, _ := replayedStore.SnapshotAll()
+			if got, want := sortedSnapshot(replayed), sortedSnapshot(entries); !reflect.DeepEqual(got, want) {
+				t.Fatalf("replayed keyspace = %+v, want the snapshot %+v", got, want)
+			}
+
+			files, err := os.ReadDir(filepath.Dir(path))
+			if err != nil {
+				t.Fatalf("ReadDir() error = %v", err)
+			}
+			if len(files) != 1 || files[0].Name() != filepath.Base(path) {
+				t.Fatalf("directory holds %v, want only %s", files, filepath.Base(path))
+			}
+		})
+	}
+}
+
+func TestSeedFileWritesThroughASymbolicLinkToTheFileItLeadsTo(t *testing.T) {
+	// OpenWriter appends through a symbolic link to the file it leads to. A seed
+	// renamed over the link itself would replace the link with a regular file and
+	// leave that file empty, moving the AOF off the volume the link chose.
+	entries := []storage.SnapshotEntry{{Key: "k", Kind: storage.ValueKindString, String: []byte("v")}}
+	var want bytes.Buffer
+	if _, err := aof.GenerateRewrite(entries, &want); err != nil {
+		t.Fatalf("GenerateRewrite() error = %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		createTarget bool
+	}{
+		{name: "to an empty file", createTarget: true},
+		{name: "to a file that does not exist yet"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dataDir := filepath.Join(dir, "data")
+			if err := os.Mkdir(dataDir, 0o750); err != nil {
+				t.Fatalf("Mkdir() error = %v", err)
+			}
+			target := filepath.Join(dataDir, "appendonly.aof")
+			if tt.createTarget {
+				if err := os.WriteFile(target, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+			}
+			// A relative link resolves from the link's own directory.
+			link := filepath.Join(dir, "appendonly.aof")
+			linkTo := filepath.Join("data", "appendonly.aof")
+			if err := os.Symlink(linkTo, link); err != nil {
+				t.Skipf("Symlink() error = %v", err)
+			}
+
+			if _, err := aof.SeedFile(link, entries); err != nil {
+				t.Fatalf("SeedFile() error = %v", err)
+			}
+			if got, err := os.Readlink(link); err != nil || got != linkTo {
+				t.Fatalf("Readlink() = (%q, %v), want the link to %q left in place", got, err, linkTo)
+			}
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, want.Bytes()) {
+				t.Fatalf("file the link leads to = (%q, %v), want the seed %q", got, err, want.Bytes())
+			}
+			for _, d := range []struct {
+				dir  string
+				want []string
+			}{{dir, []string{"appendonly.aof", "data"}}, {dataDir, []string{"appendonly.aof"}}} {
+				files, err := os.ReadDir(d.dir)
+				if err != nil {
+					t.Fatalf("ReadDir(%q) error = %v", d.dir, err)
+				}
+				names := make([]string, 0, len(files))
+				for _, file := range files {
+					names = append(names, file.Name())
+				}
+				if !reflect.DeepEqual(names, d.want) {
+					t.Fatalf("%s holds %q, want %q and no temp file", d.dir, names, d.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
+	// The rename that ends seeding replaces whatever the path names. Over
+	// commands it would lose them, and over a device such as /dev/full, which
+	// reports a size of zero, it would put a regular file in the device's place.
+	entries := []storage.SnapshotEntry{{Key: "k", Kind: storage.ValueKindString, String: []byte("v")}}
+	commands := []byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nold\r\n")
+
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, path string)
+		// untouched fails the test unless path is as prepare left it.
+		untouched func(t *testing.T, path string)
+		reason    string
+	}{
+		{
+			name: "a file that holds commands",
+			prepare: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, commands, 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+			},
+			untouched: func(t *testing.T, path string) {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, commands) {
+					t.Fatalf("file after the refusal = (%q, %v), want it untouched", got, err)
+				}
+			},
+			reason: "already holds",
+		},
+		{
+			name: "a directory",
+			prepare: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o750); err != nil {
+					t.Fatalf("Mkdir() error = %v", err)
+				}
+			},
+			untouched: func(t *testing.T, path string) {
+				if info, err := os.Stat(path); err != nil || !info.IsDir() {
+					t.Fatalf("Stat() after the refusal = (%v, %v), want the directory untouched", info, err)
+				}
+			},
+			reason: "not a regular file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "appendonly.aof")
+			tt.prepare(t, path)
+
+			_, err := aof.SeedFile(path, entries)
+			if err == nil {
+				t.Fatal("SeedFile() error = nil, want a refusal")
+			}
+			if msg := err.Error(); !strings.HasPrefix(msg, "aof: ") || !strings.Contains(msg, strconv.Quote(path)) || !strings.Contains(msg, tt.reason) {
+				t.Fatalf("SeedFile() error = %q, want an aof: error naming %q and saying %q", msg, path, tt.reason)
+			}
+			tt.untouched(t, path)
+			if files, err := os.ReadDir(dir); err != nil || len(files) != 1 {
+				t.Fatalf("directory after the refusal = (%v, %v), want only %s", files, err, filepath.Base(path))
+			}
+		})
+	}
+}
+
+// sortedSnapshot orders a snapshot by key, which SnapshotAll does not.
+func sortedSnapshot(entries []storage.SnapshotEntry) []storage.SnapshotEntry {
+	sorted := append([]storage.SnapshotEntry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
+	return sorted
 }

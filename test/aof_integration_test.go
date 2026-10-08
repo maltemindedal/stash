@@ -152,6 +152,126 @@ func TestServerPrefersAOFOverRDB(t *testing.T) {
 	waitForServerStop(t, errCh)
 }
 
+func TestServerKeepsRDBKeysAfterTheAOFTakesOver(t *testing.T) {
+	// The keys an RDB snapshot loaded beside a missing or empty append-only file
+	// used to live in memory only. The first write made the file non-empty, so
+	// the next start loaded the file, skipped the snapshot, and lost every key
+	// that came from it.
+	tests := []struct {
+		name     string
+		emptyAOF bool
+	}{
+		{name: "missing AOF"},
+		{name: "empty AOF", emptyAOF: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+			if tt.emptyAOF {
+				if err := os.WriteFile(aofPath, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
+				}
+			}
+			cfg := testAOFConfig(aofPath)
+			cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
+				selectTestDB(0),
+				testStringEntry([]byte("fromrdb"), []byte("hello")),
+			))
+
+			addr, stop, errCh := startTestServer(t, cfg)
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("Dial(%q) error = %v", addr, err)
+			}
+			parser := protocol.NewParser(conn)
+			assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
+			closeTestResource(t, conn)
+			stop()
+			waitForServerStop(t, errCh)
+
+			restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
+			restartConn, err := net.Dial("tcp", restartAddr)
+			if err != nil {
+				t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+			}
+			defer closeTestResource(t, restartConn)
+			restartParser := protocol.NewParser(restartConn)
+			assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
+			assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
+
+			restartStop()
+			waitForServerStop(t, restartErrCh)
+		})
+	}
+}
+
+func TestServerKeepsTheDeadlineOfAnRDBKeyAfterTheAOFTakesOver(t *testing.T) {
+	// The keys an RDB snapshot loads into an empty append-only file keep the
+	// deadline the snapshot gave them, so a restart neither extends a TTL by the
+	// downtime nor brings back a key that expired meanwhile.
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	// session:43's deadline is an hour out, so the file holds it however slow
+	// the runner is. session:42's passes while the server is down; a runner slow
+	// enough to load the snapshot after it rightly leaves the key out, so no
+	// assertion needs it in the file.
+	lateDeadline := time.Now().Add(time.Hour).UnixMilli()
+	soonDeadline := time.Now().Add(time.Second).UnixMilli()
+	cfg := testAOFConfig(aofPath)
+	cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
+		selectTestDB(0),
+		testExpiringMillisEntry(uint64(lateDeadline), []byte("session:43"), []byte("bob")),
+		testExpiringMillisEntry(uint64(soonDeadline), []byte("session:42"), []byte("alice")),
+	))
+
+	addr, stop, errCh := startTestServer(t, cfg)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) error = %v", addr, err)
+	}
+	parser := protocol.NewParser(conn)
+	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
+	closeTestResource(t, conn)
+	stop()
+	waitForServerStop(t, errCh)
+
+	seeded, err := os.ReadFile(aofPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+	}
+	want, err := protocol.Encode(request("SET", "session:43", "bob", "PXAT", strconv.FormatInt(lateDeadline, 10)))
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	if !bytes.Contains(seeded, want) {
+		t.Fatalf("append-only file = %q, want it to hold %q", seeded, want)
+	}
+	if relative := []byte("$2\r\nPX\r\n"); bytes.Contains(seeded, relative) {
+		t.Fatalf("append-only file = %q, want no TTL relative to the loader's clock", seeded)
+	}
+
+	// session:42 expires while the server is down.
+	for time.Now().UnixMilli() <= soonDeadline {
+		time.Sleep(time.Until(time.UnixMilli(soonDeadline + 1)))
+	}
+
+	restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
+	restartConn, err := net.Dial("tcp", restartAddr)
+	if err != nil {
+		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+	}
+	defer closeTestResource(t, restartConn)
+	restartParser := protocol.NewParser(restartConn)
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
+
+	restartStop()
+	waitForServerStop(t, restartErrCh)
+}
+
 func TestServerDoesNotPersistPublishToAOF(t *testing.T) {
 	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
 	cfg := testAOFConfig(aofPath)
