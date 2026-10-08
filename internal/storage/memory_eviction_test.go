@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +139,106 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	}
 	if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
 		t.Fatalf("UsedMemory() = %d after the sweep, recount = %d", used, want)
+	}
+}
+
+// TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive covers a write that finds
+// its key live, with a TTL deadline that passes before the write commits. The
+// write is anchored to the one clock reading writeKey took, so the sweep it runs
+// to make room must use that reading too: with a second one it removed the very
+// key being written, reported it to the expiration listener (which logs a DEL
+// ahead of the write), and left the memory counter short by the size of the
+// value it then replaced.
+//
+// The write is parked on the last shard lock after it holds the first, which is
+// after its clock reading, so the deadline passes at a point the test chooses.
+func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(store *Store, deadline int64) error
+		want  string
+	}{
+		{
+			name: "INCR that adds a digit",
+			write: func(store *Store, _ int64) error {
+				_, _, err := store.Increment("k")
+				return err
+			},
+			want: "10",
+		},
+		{
+			name: "SETBIT past the end of the string",
+			write: func(store *Store, _ int64) error {
+				_, _, err := store.SetBit("k", 15, 1)
+				return err
+			},
+			want: "9\x01",
+		},
+		{
+			name: "SET to a longer value with a TTL",
+			write: func(store *Store, deadline int64) error {
+				_, err := store.Set("k", []byte("a longer value"), deadline)
+				return err
+			},
+			want: "a longer value",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// A machine stalled for longer than the margin below can run the write's
+			// clock reading after the deadline, which is a different test: start
+			// that attempt over rather than judge it.
+			const attempts = 5
+			for attempt := 0; attempt < attempts; attempt++ {
+				store := NewStore()
+				store.ConfigureMaxMemory(1<<20, 16)
+				var heard []string
+				store.SetExpirationListener(func(keys []string) { heard = append(heard, keys...) })
+
+				deadline := time.Now().UnixMilli() + 100
+				if _, err := store.Set("k", []byte("9"), deadline); err != nil {
+					t.Fatalf("Set(k) error = %v", err)
+				}
+
+				// The write takes the shard locks in ascending order, so once it holds
+				// shard 0 it has read its clock and waits for the last one.
+				last := &store.shards[len(store.shards)-1]
+				last.mu.Lock()
+				done := make(chan error, 1)
+				go func() { done <- tc.write(store, deadline) }()
+				for store.shards[0].mu.TryLock() {
+					store.shards[0].mu.Unlock()
+					runtime.Gosched()
+				}
+				readClockBeforeDeadline := time.Now().UnixMilli() <= deadline
+				for time.Now().UnixMilli() <= deadline {
+					runtime.Gosched()
+				}
+				last.mu.Unlock()
+
+				if err := <-done; err != nil {
+					t.Fatalf("write error = %v", err)
+				}
+				if !readClockBeforeDeadline {
+					continue
+				}
+
+				if len(heard) != 0 {
+					t.Errorf("the expiration listener heard %v, want nothing: the write found %q live", heard, "k")
+				}
+				stored := store.valueObjectForTest("k")
+				if stored == nil || string(stored.String) != tc.want {
+					t.Errorf("stored value = %+v, want %q", stored, tc.want)
+				}
+				if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
+					t.Errorf("UsedMemory() = %d, recount = %d (drift %d)", used, want, used-want)
+				}
+				return
+			}
+			t.Fatalf("the write was not parked before its deadline in %d attempts", attempts)
+		})
 	}
 }
 

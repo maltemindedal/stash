@@ -95,7 +95,7 @@ type keyWrite struct {
 // current itself.
 func (w keyWrite) commit(newValue *ValueObject) ([]string, error) {
 	if w.accounting {
-		return w.store.commitValueWithEvictionLocked(w.shard, w.key, w.current, newValue)
+		return w.store.commitValueWithEvictionLocked(w.shard, w.key, w.current, newValue, w.now)
 	}
 
 	w.store.setKeyLocked(w.shard, w.key, newValue)
