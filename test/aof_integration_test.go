@@ -267,6 +267,89 @@ func TestServerBGRewriteAOFCompactsAndReloads(t *testing.T) {
 	waitForServerStop(t, restartErrCh)
 }
 
+func TestAOFRewriteKeepsTTLDeadlinesAcrossRestart(t *testing.T) {
+	// A rewrite used to write a key's remaining time as `PX <ms left>`. Replay
+	// reads that against the clock at load, so every restart after a rewrite gave
+	// the key a fresh lease and brought back keys that had expired in between.
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) error = %v", addr, err)
+	}
+	parser := protocol.NewParser(conn)
+
+	// Repeated writes to one key give the rewrite something to compact, so the
+	// file shrinking is the signal that it has been swapped in.
+	for i := 0; i < 20; i++ {
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "filler", "v"+strconv.Itoa(i))
+	}
+	deadline := strconv.FormatInt(time.Now().Add(2*time.Second).UnixMilli(), 10)
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "session:42", "alice", "PXAT", deadline)
+	before, err := os.Stat(aofPath)
+	if err != nil {
+		t.Fatalf("Stat(%q) before rewrite error = %v", aofPath, err)
+	}
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "Background append only file rewriting started"}, "BGREWRITEAOF")
+
+	waitUntil := time.Now().Add(3 * time.Second)
+	compacted := false
+	for time.Now().Before(waitUntil) {
+		info, statErr := os.Stat(aofPath)
+		if statErr != nil {
+			t.Fatalf("Stat(%q) during rewrite error = %v", aofPath, statErr)
+		}
+		if info.Size() < before.Size() {
+			compacted = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !compacted {
+		t.Fatalf("BGREWRITEAOF did not compact file within timeout (before=%d)", before.Size())
+	}
+
+	// The live path logged this frame too, but the rewrite replaced the file, so
+	// finding it here means the rewrite kept the absolute deadline.
+	wantFrame, err := protocol.Encode(request("SET", "session:42", "alice", "PXAT", deadline))
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	rewritten, err := os.ReadFile(aofPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+	}
+	if !bytes.Contains(rewritten, wantFrame) {
+		t.Fatalf("rewritten append-only file = %q, want it to hold %q", rewritten, wantFrame)
+	}
+
+	closeTestResource(t, conn)
+	stop()
+	waitForServerStop(t, errCh)
+
+	deadlineMillis, err := strconv.ParseInt(deadline, 10, 64)
+	if err != nil {
+		t.Fatalf("ParseInt(%q) error = %v", deadline, err)
+	}
+	for time.Now().UnixMilli() <= deadlineMillis {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	restartAddr, restartStop, restartErrCh := startTestServer(t, testAOFConfig(aofPath))
+	restartConn, err := net.Dial("tcp", restartAddr)
+	if err != nil {
+		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+	}
+	defer closeTestResource(t, restartConn)
+	restartParser := protocol.NewParser(restartConn)
+
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("v19")}, "GET", "filler")
+
+	restartStop()
+	waitForServerStop(t, restartErrCh)
+}
+
 func TestServerDiscardsTornAOFTailBeforeAppending(t *testing.T) {
 	// A crash mid-append leaves a partial command at the end of the file. Startup
 	// used to replay everything before it and then append new commands straight

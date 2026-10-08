@@ -42,6 +42,13 @@ func GenerateRewrite(entries []storage.SnapshotEntry, writer io.Writer) (Rewrite
 }
 
 func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.Value, error) {
+	// Only a string can carry a deadline through a rewrite (SET ... PXAT). Refuse
+	// any other kind with one rather than write it without, which would bring the
+	// key back for good after a restart. runRewrite keeps the old file on error.
+	if entry.Kind != storage.ValueKindString && entry.ExpiresAt > 0 {
+		return nil, fmt.Errorf("aof: cannot rewrite the TTL of %s key %q", entry.Kind, entry.Key)
+	}
+
 	switch entry.Kind {
 	case storage.ValueKindString:
 		if entry.ExpiresAt > 0 && entry.ExpiresAt <= now {
@@ -49,11 +56,10 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 		}
 		args := []protocol.Value{bulkString(entry.Key), bulkBytes(entry.String)}
 		if entry.ExpiresAt > 0 {
-			ttl := entry.ExpiresAt - now
-			if ttl <= 0 {
-				return nil, nil
-			}
-			args = append(args, bulkString("PX"), bulkString(strconv.FormatInt(ttl, 10)))
+			// The absolute deadline, as the live path logs it (rewriteSetFrame).
+			// A relative PX here would be read against the clock at load, giving
+			// the key a fresh lease on every restart.
+			args = append(args, bulkString("PXAT"), bulkString(strconv.FormatInt(entry.ExpiresAt, 10)))
 		}
 		return []protocol.Value{rewriteCommand("SET", args...)}, nil
 	case storage.ValueKindList:

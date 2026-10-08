@@ -92,6 +92,8 @@ Under `everysec` and `no` a command is acknowledged before it reaches the disk, 
 
 Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT` frame before being written to the AOF. Replay therefore anchors the TTL to the original clock rather than restarting the countdown, and keys that expired while the server was down are dropped instead of being resurrected with a fresh lease.
 
+This also holds after `BGREWRITEAOF`, which writes each key with a TTL as `SET key value PXAT <deadline>`, the same absolute deadline the key had. A rewrite refuses, rather than drops, the TTL of any key that is not a string: it fails, logs the error, and keeps the old file. No command can give such a key a TTL today.
+
 ## Related
 
 - [Configuration reference](../reference/configuration.md) lists flag defaults and validation rules.
