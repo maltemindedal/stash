@@ -259,7 +259,6 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 			}
 			writer.mu.Lock()
 			writer.file = fresh
-			writer.writer.Reset(fresh)
 			writer.mu.Unlock()
 			t.Cleanup(func() { _ = fresh.Close() })
 

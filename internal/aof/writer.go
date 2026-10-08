@@ -1,11 +1,11 @@
 package aof
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -44,15 +44,47 @@ func defaultSyncDir(path string) error {
 	return closeErr
 }
 
+// pendingFlushSize is how many pending bytes make an everysec append write them
+// out instead of waiting for the next tick, as a full bufio.Writer would.
+const pendingFlushSize = 4096
+
+// maxIdlePendingSize is the largest pending buffer kept for reuse once it has
+// been written. A larger one, from a big command or from the commands that piled
+// up while writes failed, is released.
+const maxIdlePendingSize = 64 << 10
+
+// appendFile is the file a Writer appends to: an *os.File opened with O_APPEND,
+// so every write lands at the end of the file, including after a Truncate. Tests
+// put a stand-in in its place that fails on demand.
+type appendFile interface {
+	Write(p []byte) (int, error)
+	Truncate(size int64) error
+	Sync() error
+	Close() error
+}
+
 // Writer appends RESP payloads to an append-only file and can rewrite it in the background.
 type Writer struct {
 	path   string
 	policy Policy
 	logger *slog.Logger
 
-	mu             sync.Mutex
-	file           *os.File
-	writer         *bufio.Writer
+	mu   sync.Mutex
+	file appendFile
+	// pending holds the commands appended since the last write to the file that
+	// succeeded, whole and in order. A failed write leaves them here, so the next
+	// flush writes them again instead of losing commands the server has applied.
+	pending []byte
+	// flushedSize is the length of the file after the last write that succeeded.
+	// Only whole pending buffers are written, so it ends on a command boundary.
+	flushedSize int64
+	// torn reports that a failed write left part of pending in the file after
+	// flushedSize. The next flush truncates the file back to flushedSize before it
+	// writes, and fails without writing while it cannot: a command written after
+	// a torn one would turn it into corruption before the end of the file, and the
+	// next startup refuses to load that.
+	torn bool
+
 	rewriteBuffer  bytes.Buffer
 	rewriteActive  bool
 	rewritePending bool
@@ -94,18 +126,18 @@ func OpenWriter(ctx context.Context, path string, policy Policy, logger *slog.Lo
 		return nil, fmt.Errorf("aof: create directory %q: %w", dir, err)
 	}
 
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	file, size, err := openAppendOnlyFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("aof: open %q: %w", path, err)
 	}
 
 	writer := &Writer{
-		path:    path,
-		policy:  policy,
-		logger:  logger,
-		file:    file,
-		writer:  bufio.NewWriter(file),
-		closeCh: make(chan struct{}),
+		path:        path,
+		policy:      policy,
+		logger:      logger,
+		file:        file,
+		flushedSize: size,
+		closeCh:     make(chan struct{}),
 	}
 	if policy == PolicyEverysec {
 		writer.wg.Add(1)
@@ -158,12 +190,16 @@ func (w *Writer) LastWriteOK() bool {
 	return w == nil || !w.writeFailed.Load()
 }
 
-// Append writes a payload without forcing an immediate fsync.
+// Append writes a payload without forcing an immediate fsync. Under everysec it
+// is written once enough commands are pending or at the next tick, and under no
+// at once. An error means a write failed; the payload is kept all the same, and
+// the next flush writes it again, ahead of anything appended after it.
 func (w *Writer) Append(payload []byte) error {
 	return w.append(payload, false)
 }
 
-// AppendSync writes a payload and fsyncs it before returning.
+// AppendSync writes a payload and fsyncs it before returning. An error means it
+// is not known to be on disk; it is kept and retried as Append's is.
 func (w *Writer) AppendSync(payload []byte) error {
 	return w.append(payload, true)
 }
@@ -243,10 +279,10 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 	if w.closed {
 		return ErrClosed
 	}
-	if _, err := w.writer.Write(payload); err != nil {
-		w.writeFailed.Store(true)
-		return fmt.Errorf("aof: write %q: %w", w.path, err)
-	}
+	// The command is applied in memory already, so both copies are taken before
+	// the file is tried: a failed write must not drop it from this file, nor from
+	// the file a running rewrite is about to put in this one's place.
+	w.pending = append(w.pending, payload...)
 	if w.rewriteActive {
 		if _, err := w.rewriteBuffer.Write(payload); err != nil {
 			return fmt.Errorf("aof: buffer rewrite payload for %q: %w", w.path, err)
@@ -255,12 +291,16 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 	if syncNow {
 		return w.syncLocked()
 	}
-	if w.policy == PolicyNo {
+	switch {
+	case w.policy == PolicyNo:
 		// Handing the bytes to the OS is the whole durability step for this policy.
 		if err := w.flushLocked(); err != nil {
 			return err
 		}
 		w.writeFailed.Store(false)
+	case len(w.pending) >= pendingFlushSize:
+		// everysec: hand a full buffer to the OS now; the next tick fsyncs it.
+		return w.flushLocked()
 	}
 
 	return nil
@@ -309,10 +349,38 @@ func (w *Writer) syncLocked() error {
 	return nil
 }
 
+// flushLocked writes the pending commands to the file. A failed write keeps them
+// pending for the next call, which first truncates away whatever part of them
+// the failed write left in the file, so the file never holds an unfinished
+// command before its end.
 func (w *Writer) flushLocked() error {
-	if err := w.writer.Flush(); err != nil {
+	if w.torn {
+		if err := w.file.Truncate(w.flushedSize); err != nil {
+			w.writeFailed.Store(true)
+			return fmt.Errorf("aof: truncate %q to its last complete command (%d bytes) after a failed write: %w", w.path, w.flushedSize, err)
+		}
+		w.torn = false
+	}
+	if len(w.pending) == 0 {
+		return nil
+	}
+
+	n, err := w.file.Write(w.pending)
+	if err == nil && n < len(w.pending) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		w.writeFailed.Store(true)
-		return fmt.Errorf("aof: flush %q: %w", w.path, err)
+		if n > 0 {
+			w.torn = true
+		}
+		return fmt.Errorf("aof: write %q: %w", w.path, err)
+	}
+	w.flushedSize += int64(n)
+	if cap(w.pending) > maxIdlePendingSize {
+		w.pending = nil
+	} else {
+		w.pending = w.pending[:0]
 	}
 
 	return nil
@@ -466,41 +534,54 @@ func (w *Writer) appendBufferedRewriteLocked(tempFile *os.File) error {
 }
 
 func (w *Writer) swapRewriteFileLocked(tempPath string) error {
-	oldFile := w.file
-	if oldFile != nil {
-		// Commands appended under everysec wait in the writer's buffer. If the swap
-		// fails, the original file is reopened with a fresh buffer and the rewrite
-		// buffer is discarded, so anything not flushed here would be lost.
-		if err := w.flushLocked(); err != nil {
-			return fmt.Errorf("flush append-only file before rewrite swap: %w", err)
-		}
-		if err := oldFile.Close(); err != nil {
+	// The old file is not flushed first, so a write error it is still returning
+	// cannot stop the swap. Nothing pending has to reach it: the commands
+	// appended since the rewrite began are in the rewritten file already, failed
+	// writes included, and the snapshot covers the ones before. If the swap fails,
+	// the original file is reopened, and pending, flushedSize and torn still
+	// describe it, so the next flush carries on there.
+	if w.file != nil {
+		if err := w.file.Close(); err != nil {
 			return fmt.Errorf("close current append-only file before rewrite swap: %w", err)
 		}
 	}
 	if err := replaceFile(tempPath, w.path); err != nil {
-		reopenErr := w.reopenAppendOnlyFileLocked()
+		file, _, reopenErr := openAppendOnlyFile(w.path)
 		if reopenErr != nil {
 			return fmt.Errorf("replace append-only file with rewrite: %w; reopen original file: %w", err, reopenErr)
 		}
+		w.file = file
 		return fmt.Errorf("replace append-only file with rewrite: %w", err)
 	}
-	if err := w.reopenAppendOnlyFileLocked(); err != nil {
+
+	// The rewritten file holds everything that was pending for the old one.
+	w.pending = nil
+	w.torn = false
+	file, size, err := openAppendOnlyFile(w.path)
+	if err != nil {
 		return fmt.Errorf("reopen append-only file after rewrite: %w", err)
 	}
+	w.file = file
+	w.flushedSize = size
 
 	return nil
 }
 
-func (w *Writer) reopenAppendOnlyFileLocked() error {
-	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+// openAppendOnlyFile opens path for appending, creating it if needed, and
+// returns it with its length. The length is read through the path, not the
+// handle, which on Windows is opened without read access.
+func openAppendOnlyFile(path string) (*os.File, int64, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return nil, 0, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		_ = file.Close()
+		return nil, 0, err
 	}
 
-	w.file = file
-	w.writer = bufio.NewWriter(file)
-	return nil
+	return file, info.Size(), nil
 }
 
 func (w *Writer) logInfo(msg string, args ...any) {

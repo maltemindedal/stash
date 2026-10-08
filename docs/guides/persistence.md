@@ -97,7 +97,11 @@ That loses every write from the damaged command onward. If they matter, repair t
 
 ## Watching for write failures
 
-Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. `INFO persistence` reports `aof_last_write_status:err` from the first failed write or fsync until one succeeds again; see [Observability](observability.md).
+Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. Under `always` the client gets `ERR persistence failure`, but the command has already been applied in memory.
+
+Either way the command is kept, not dropped. Stash cuts off any part of it that a failed write left at the end of the file, then writes it again, ahead of the commands after it: on the next append under `always` and `no`, and at the latest on the next once-a-second fsync under `everysec`. Until a write succeeds, the kept commands are held in memory, so they grow with write traffic while the disk stays full. If the unfinished part cannot be cut off, nothing more is written until it can: a command appended after it would leave invalid data before the end of the file, which stops the next startup (see [Repairing a corrupt append-only file](#repairing-a-corrupt-append-only-file)).
+
+`INFO persistence` reports `aof_last_write_status:err` from the first failed write or fsync until one succeeds again; see [Observability](observability.md).
 
 ## What TTLs do across a restart
 
