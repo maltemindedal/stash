@@ -45,6 +45,7 @@ Current responsibilities:
 - append successful mutating commands in RESP form
 - apply `appendfsync` policies (`always`, `everysec`, `no`)
 - rewrite the current durable state in the background for `BGREWRITEAOF`
+- seed a missing or empty file from a loaded RDB snapshot with the same crash-safe swap (temporary file, fsync, rename, directory fsync)
 
 ### `internal/protocol`
 

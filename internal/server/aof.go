@@ -21,15 +21,17 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	loadRDB := func() error {
+	// loadRDB loads the snapshot, if one is configured, and returns how many keys
+	// it put in the store.
+	loadRDB := func() (int, error) {
 		if s.cfg.RDBPath == "" {
-			return nil
+			return 0, nil
 		}
 
 		startedAt := time.Now()
 		stats, err := rdb.LoadFile(s.cfg.RDBPath, s.store)
 		if err != nil {
-			return fmt.Errorf("server: load rdb %q: %w", s.cfg.RDBPath, err)
+			return 0, fmt.Errorf("server: load rdb %q: %w", s.cfg.RDBPath, err)
 		}
 
 		s.logger.Info(
@@ -39,11 +41,12 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			"skipped_expired_keys", stats.SkippedExpiredKeys,
 			"duration", time.Since(startedAt),
 		)
-		return nil
+		return stats.LoadedKeys, nil
 	}
 
 	if s.cfg.AOFPath == "" {
-		return loadRDB()
+		_, err := loadRDB()
+		return err
 	}
 
 	policy, err := aof.ParsePolicy(s.cfg.AppendFsync)
@@ -89,8 +92,19 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 				"kept_bytes", stats.ValidBytes,
 			)
 		}
-	} else if err := loadRDB(); err != nil {
-		return err
+	} else {
+		loadedKeys, err := loadRDB()
+		if err != nil {
+			return err
+		}
+		if loadedKeys > 0 {
+			// The first write makes the file non-empty, and a start that finds a
+			// non-empty file skips the snapshot, so the keys it just loaded would
+			// otherwise exist only until the next restart.
+			if err := s.seedAOFFromStore(); err != nil {
+				return err
+			}
+		}
 	}
 
 	writer, err := aof.OpenWriter(ctx, s.cfg.AOFPath, policy, s.logger)
@@ -106,6 +120,29 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		writer.SetRewriteGuard(sequencer.BeginBackgroundWrite)
 	}
 	s.aofWriter = writer
+	return nil
+}
+
+// seedAOFFromStore writes the keyspace the RDB snapshot just loaded into the AOF
+// file, so that it holds everything the server starts with. It runs before the
+// writer opens the file and before the listener opens, and it either leaves the
+// finished file in place or fails: the caller refuses to start, because serving
+// keys that only memory holds would lose them at the next restart.
+func (s *Server) seedAOFFromStore() error {
+	startedAt := time.Now()
+	entries, _ := s.store.SnapshotAll()
+	stats, err := aof.Seed(s.cfg.AOFPath, entries)
+	if err != nil {
+		return fmt.Errorf("server: seed aof %q from rdb %q: %w", s.cfg.AOFPath, s.cfg.RDBPath, err)
+	}
+
+	s.logger.Info(
+		"seeded append-only file from RDB snapshot",
+		"path", s.cfg.AOFPath,
+		"rdb_path", s.cfg.RDBPath,
+		"seeded_keys", stats.Keys,
+		"duration", time.Since(startedAt),
+	)
 	return nil
 }
 

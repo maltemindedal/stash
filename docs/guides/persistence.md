@@ -50,6 +50,15 @@ level=INFO msg="AOF detected, skipping RDB startup load" aof_path=appendonly.aof
 
 This avoids replaying a stale snapshot over a newer command log.
 
+When the AOF is missing or empty, `--rdb` loads as usual, and if it loads any keys Stash writes them into the AOF before it accepts clients. The AOF is then the only source from the next start on, so the snapshot's keys survive later restarts even though the RDB is skipped from then on. The write is crash-safe: Stash writes a temporary file beside the AOF, fsyncs it, renames it into place and fsyncs the directory, so a crash never leaves a half-written file for the next start to take as the whole log. A key with a TTL keeps its absolute deadline. Stash logs the count:
+
+```
+level=INFO msg="loaded RDB snapshot" path=dump.rdb loaded_keys=1204 skipped_expired_keys=0 duration=3ms
+level=INFO msg="seeded append-only file from RDB snapshot" path=appendonly.aof rdb_path=dump.rdb seeded_keys=1204 duration=4ms
+```
+
+If any step fails, Stash refuses to start with a `server:` error naming the AOF path, rather than serve keys that only memory holds. It also refuses when the AOF path exists but is not a regular file (a device or a FIFO, say), because replacing it would destroy it. A snapshot that loads no keys changes nothing.
+
 ## Configure RDB snapshots
 
 A shutdown snapshot is written by default to `dump.rdb`:
@@ -84,7 +93,7 @@ cp appendonly.aof appendonly.aof.damaged   # keep the original
 truncate -s 88213 appendonly.aof           # drop the damaged command and everything after it
 ```
 
-That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server (or one loaded from `--rdb`).
+That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server, or one loaded from `--rdb`, in which case Stash writes those keys into the new file and treats them as the log from then on, however old the snapshot is.
 
 ## Watching for write failures
 

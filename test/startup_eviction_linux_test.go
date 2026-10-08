@@ -5,7 +5,7 @@ package test
 import (
 	"context"
 	"errors"
-	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -14,7 +14,6 @@ import (
 
 	"github.com/maltemindedal/stash/internal/command"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
-	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -24,37 +23,40 @@ func TestServerRefusesToStartWhenItCannotLogStartupEvictions(t *testing.T) {
 	// first client is served. A server that cannot record them would come back
 	// with them on the next start, so it refuses to start instead of serving a
 	// keyspace the log does not describe.
-	dumpPath := filepath.Join(t.TempDir(), "dump.rdb")
-	seedCfg := defaultTestConfig()
-	seedCfg.DumpPath = dumpPath
-	addr, stop, errCh := startTestServer(t, seedCfg)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
+	//
+	// The append-only file is a FIFO in the test's own directory that nothing
+	// reads. Opening it for writing needs a reader to be there, so one opens it
+	// and closes it at once. A write after that close fails with EPIPE; a write
+	// that wins the race with the close lands in the pipe, and the fsync after it
+	// fails with EINVAL. Either way the eviction's append is the first thing that
+	// cannot be logged, with no keys to seed from a snapshot first and no device
+	// in /dev involved.
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	if err := syscall.Mkfifo(aofPath, 0o600); err != nil {
+		t.Fatalf("Mkfifo(%q) error = %v", aofPath, err)
 	}
-	parser := protocol.NewParser(conn)
-	for i := 0; i < 50; i++ {
-		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", startupEvictionKey(i), strings.Repeat("0", 100))
-	}
-	closeTestResource(t, conn)
-	stop()
-	waitForServerStop(t, errCh)
+	go func() {
+		if reader, err := os.OpenFile(aofPath, os.O_RDONLY, 0); err == nil {
+			_ = reader.Close()
+		}
+	}()
 
-	// /dev/full opens for appending and fails every write with ENOSPC, so the
-	// startup eviction is the first thing that cannot be logged.
-	const aofPath = "/dev/full"
 	cfg := defaultTestConfig()
-	cfg.RDBPath = dumpPath
 	cfg.AOFPath = aofPath
 	cfg.MaxMemory = 2000
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
+	for i := 0; i < 50; i++ {
+		if _, err := store.Set(startupEvictionKey(i), []byte(strings.Repeat("0", 100)), 0); err != nil {
+			t.Fatalf("Set(%s) error = %v", startupEvictionKey(i), err)
+		}
+	}
 	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
 
 	// A server that wrongly starts would serve until the context ends.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err = srv.ListenAndServe(ctx)
+	err := srv.ListenAndServe(ctx)
 	if err == nil {
 		t.Fatal("ListenAndServe() error = nil, want a refusal to start when the evictions cannot be logged")
 	}
@@ -64,7 +66,7 @@ func TestServerRefusesToStartWhenItCannotLogStartupEvictions(t *testing.T) {
 	if want := `append startup evictions to aof "` + aofPath + `"`; !strings.Contains(err.Error(), want) {
 		t.Fatalf("ListenAndServe() error = %q, want it to say %q", err, want)
 	}
-	if !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("ListenAndServe() error = %q, want it to wrap the write failure %v", err, syscall.ENOSPC)
+	if !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("ListenAndServe() error = %q, want it to wrap the failed write (%v) or fsync (%v)", err, syscall.EPIPE, syscall.EINVAL)
 	}
 }
