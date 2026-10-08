@@ -34,9 +34,7 @@ func TestAPopThatLeavesElementsWakesTheNextWaiter(t *testing.T) {
 			first := store.SubscribeListPush("q")
 			second := store.SubscribeListPush("q")
 
-			if _, _, err := store.RightPush("q", [][]byte{[]byte("a"), []byte("b")}); err != nil {
-				t.Fatalf("RightPush() error = %v", err)
-			}
+			rightPush(t, store, "q", "a", "b")
 			assertWoken(t, first, "the push wakes the longest-waiting client")
 			assertNotWoken(t, second, "the push wakes one client")
 
@@ -75,9 +73,7 @@ func TestACountedPopWakesTheNextWaiterOnlyWhenItTakesElementsAndLeavesSome(t *te
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := NewStore()
-			if _, _, err := store.RightPush("q", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
-				t.Fatalf("RightPush() error = %v", err)
-			}
+			rightPush(t, store, "q", "a", "b", "c")
 			waiter := store.SubscribeListPush("q")
 
 			popped, ok, err := tt.pop(store, "q", tt.count)
@@ -93,8 +89,98 @@ func TestACountedPopWakesTheNextWaiterOnlyWhenItTakesElementsAndLeavesSome(t *te
 	}
 }
 
-// assertWoken and assertNotWoken need not wait: a push or pop signals the
-// waiter before it returns.
+func TestAWakeUpNobodyReceivedPassesToTheNextWaiter(t *testing.T) {
+	// A wake-up is a waiting client's turn at an element. A client can stop
+	// waiting after a push or pop has signaled it but before it receives the
+	// wake-up: it has already popped, it has gone, or it took its 100 ms client
+	// check instead. Unsubscribing used to drop that wake-up, and the next client
+	// stayed blocked with an element in the list.
+	tests := []struct {
+		name string
+		// signal leaves first signaled and next waiting, subscribed before or
+		// after the signal. The test then unsubscribes first without receiving
+		// its wake-up.
+		signal func(t *testing.T, s *Store) (first, next chan struct{})
+	}{
+		{name: "signaled by a push", signal: func(t *testing.T, s *Store) (chan struct{}, chan struct{}) {
+			first := s.SubscribeListPush("q")
+			next := s.SubscribeListPush("q")
+			rightPush(t, s, "q", "a")
+			return first, next
+		}},
+		{name: "signaled by a pop that leaves elements", signal: func(t *testing.T, s *Store) (chan struct{}, chan struct{}) {
+			rightPush(t, s, "q", "a", "b")
+			first := s.SubscribeListPush("q")
+			next := s.SubscribeListPush("q")
+			if _, _, err := s.LeftPop("q"); err != nil {
+				t.Fatalf("LeftPop() error = %v", err)
+			}
+			return first, next
+		}},
+		{name: "signaled before the next waiter subscribed", signal: func(t *testing.T, s *Store) (chan struct{}, chan struct{}) {
+			// A BLPOP that has popped keeps its waiter queued until it
+			// unsubscribes. A push in that window signals it, and a client that
+			// started waiting before it unsubscribes needs the turn it never used.
+			first := s.SubscribeListPush("q")
+			rightPush(t, s, "q", "a")
+			return first, s.SubscribeListPush("q")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewStore()
+			first, next := tt.signal(t, store)
+
+			store.UnsubscribeListPush("q", first)
+			assertWoken(t, next, "the wake-up first never received passes to the next waiter")
+			assertNotWoken(t, first, "first's wake-up has been passed on")
+		})
+	}
+}
+
+func TestUnsubscribingAWaiterThatHoldsNoWakeUpWakesNobody(t *testing.T) {
+	// Only a wake-up nobody received is passed on. A waiter still in the queue
+	// was never signaled, and one whose client received its wake-up uses it.
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, s *Store, first chan struct{})
+	}{
+		{name: "still waiting", prepare: func(*testing.T, *Store, chan struct{}) {}},
+		{name: "wake-up received", prepare: func(t *testing.T, s *Store, first chan struct{}) {
+			rightPush(t, s, "q", "a")
+			assertWoken(t, first, "the push wakes the longest-waiting client")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewStore()
+			first := store.SubscribeListPush("q")
+			tt.prepare(t, store, first)
+			second := store.SubscribeListPush("q")
+
+			store.UnsubscribeListPush("q", first)
+			assertNotWoken(t, second, "first held no wake-up to pass on")
+		})
+	}
+}
+
+// rightPush appends values to the list at key.
+func rightPush(t *testing.T, s *Store, key string, values ...string) {
+	t.Helper()
+
+	elements := make([][]byte, 0, len(values))
+	for _, value := range values {
+		elements = append(elements, []byte(value))
+	}
+	if _, _, err := s.RightPush(key, elements); err != nil {
+		t.Fatalf("RightPush() error = %v", err)
+	}
+}
+
+// assertWoken and assertNotWoken need not wait: a push, a pop or an unsubscribe
+// signals the waiter before it returns.
 func assertWoken(t *testing.T, waiter chan struct{}, why string) {
 	t.Helper()
 

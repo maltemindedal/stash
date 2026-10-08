@@ -70,10 +70,14 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 	inTransaction := inTransactionExecution(ctx)
 
 	// While it waits, the command checks now and then that its client is still
-	// there. Otherwise the next push would wake it, it would pop the element, and
-	// the reply would go to a connection nobody is reading.
+	// there, and again when a push wakes it, before it pops. Otherwise it would
+	// pop the element and send the reply to a connection nobody is reading; a
+	// client that has gone passes its turn to the next waiting client instead.
+	// Every way out unsubscribes the waiter, and UnsubscribeListPush hands on a
+	// wake-up that arrived but was not received, so no turn is lost either way.
 	clientCheck := time.NewTicker(blockedClientCheckInterval)
 	defer clientCheck.Stop()
+	woken := false
 	for {
 		waiter := e.store.SubscribeListPush(key)
 
@@ -81,6 +85,20 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		// the caller has logged it (result.Release). Waiting is done with nothing
 		// held, or a transaction could never start.
 		release := e.beginWrite(ctx, keysFirstArg, request.Args)
+
+		// The push that woke this command can still hold the key's stripe: with an
+		// AOF or a Replica, a pusher keeps it until its own frame is logged
+		// (fsynced, under appendfsync always) and replicated, and the client can
+		// leave while beginWrite waits for it. So the client is looked at here,
+		// after that wait and just before the pop. The look never blocks, so it is
+		// safe to make holding the stripe.
+		if woken && server.ClientDisconnected(ctx) {
+			release()
+			e.store.UnsubscribeListPush(key, waiter)
+			e.store.PassListPushWake(key)
+			return server.ExecuteResult{}, server.ErrClientDisconnected
+		}
+
 		value, ok, err := e.store.LeftPop(key)
 		if err != nil {
 			release()
@@ -133,6 +151,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		for waiting := true; waiting; {
 			select {
 			case <-waiter:
+				woken = true
 				waiting = false
 			case <-clientCheck.C:
 				if server.ClientDisconnected(ctx) {

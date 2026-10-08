@@ -112,19 +112,27 @@ func TestAPushThatServesSeveralBlockedClientsIsLoggedWithAPopForEach(t *testing.
 			stop()
 			waitForServerStop(t, errCh)
 
-			data, err := os.ReadFile(aofPath)
-			if err != nil {
-				t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
-			}
-			logged := protocol.NewParser(bytes.NewReader(data))
-			for _, want := range [][]string{tt.push, {"LPOP", "q"}, {"LPOP", "q"}} {
-				if err := assertReplicaRequest(logged, want[0], want[1:]...); err != nil {
-					t.Fatalf("AOF %q: %v (want %v)", data, err, want)
-				}
-			}
-			if _, err := logged.Parse(); !errors.Is(err, io.EOF) {
-				t.Fatalf("AOF %q: Parse() after the two LPOPs error = %v, want io.EOF", data, err)
-			}
+			assertAOFHolds(t, aofPath, tt.push, []string{"LPOP", "q"}, []string{"LPOP", "q"})
 		})
+	}
+}
+
+// assertAOFHolds reads the append-only file at path and checks that it holds the
+// commands in want, in order, and nothing after them.
+func assertAOFHolds(t *testing.T, path string, want ...[]string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	logged := protocol.NewParser(bytes.NewReader(data))
+	for _, command := range want {
+		if err := assertReplicaRequest(logged, command[0], command[1:]...); err != nil {
+			t.Fatalf("AOF %q: %v (want %v)", data, err, command)
+		}
+	}
+	if _, err := logged.Parse(); !errors.Is(err, io.EOF) {
+		t.Fatalf("AOF %q: Parse() after %d commands error = %v, want io.EOF", data, len(want), err)
 	}
 }
