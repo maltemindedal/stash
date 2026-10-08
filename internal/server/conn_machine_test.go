@@ -740,3 +740,153 @@ func TestConnMachinePushLimitDoesNotApplyToReplies(t *testing.T) {
 		t.Fatalf("BufferEncoded() after draining error = %v", err)
 	}
 }
+
+// idleBufferCapBound is the capacity above which an idle connection must not
+// keep a read or write buffer.
+const idleBufferCapBound = 64 << 10
+
+// largeSetFrame returns a SET of a value of the given size as one RESP frame.
+func largeSetFrame(size int) []byte {
+	frame := make([]byte, 0, size+64)
+	frame = fmt.Appendf(frame, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n", size)
+	frame = append(frame, bytes.Repeat([]byte("x"), size)...)
+	return append(frame, "\r\n"...)
+}
+
+func TestConnMachineReleasesItsReadBufferAfterALargeRequest(t *testing.T) {
+	// A connection that once received a large value must not keep the buffer it
+	// grew to receive it: with many idle connections that adds up to gigabytes.
+	const readChunk = 64 << 10 // what the event loop reads from a socket at a time
+	ping := machineFrame("PING")
+
+	tests := []struct {
+		name string
+		// tail follows the large request in the read that completes it, and rest
+		// arrives afterwards.
+		tail, rest []byte
+	}{
+		{name: "the connection idles and a small request arrives later", rest: ping},
+		{name: "half of the next request arrives with the end of the large one", tail: ping[:7], rest: ping[7:]},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run, executed := echoRunner(t)
+			machine := NewConnMachine(nil)
+
+			feedInChunks(t, machine, append(largeSetFrame(32<<20), tt.tail...), readChunk)
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if len(*executed) != 1 || machine.State() != ConnStateActive {
+				t.Fatalf("executed %d requests, state = %d (err = %v), want the large request executed and the machine active", len(*executed), machine.State(), machine.Err())
+			}
+			if got := cap(machine.readBuf); got > idleBufferCapBound {
+				t.Fatalf("read buffer capacity after the large request = %d bytes, want at most %d", got, idleBufferCapBound)
+			}
+
+			feedInChunks(t, machine, tt.rest, readChunk)
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if got := fmt.Sprint(commandNames(*executed)); got != "[SET PING]" {
+				t.Fatalf("executed = %s, want [SET PING]", got)
+			}
+			if got := cap(machine.readBuf); got > idleBufferCapBound {
+				t.Fatalf("read buffer capacity after the later PING = %d bytes, want at most %d", got, idleBufferCapBound)
+			}
+		})
+	}
+}
+
+func TestConnMachineKeepsALargeRemainderOfTheNextRequest(t *testing.T) {
+	// Bytes of the next request that are still waiting after a large one is
+	// decoded are the start of another large frame, so they stay where they are.
+	// Dropping them would lose the request.
+	run, executed := echoRunner(t)
+	machine := NewConnMachine(nil)
+
+	first, second := largeSetFrame(1<<20), largeSetFrame(1<<20)
+	if err := machine.Feed(append(append([]byte(nil), first...), second[:300<<10]...)); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if got := machine.PendingRequests(); got != 1 {
+		t.Fatalf("PendingRequests() = %d, want only the first request decoded", got)
+	}
+	if err := machine.Feed(second[300<<10:]); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v", err)
+	}
+	if got := fmt.Sprint(commandNames(*executed)); got != "[SET SET]" {
+		t.Fatalf("executed = %s, want [SET SET]", got)
+	}
+	if got := cap(machine.readBuf); got > idleBufferCapBound {
+		t.Fatalf("read buffer capacity once both requests were decoded = %d bytes, want at most %d", got, idleBufferCapBound)
+	}
+}
+
+// bufferIdentity returns the address of the first byte of b's backing array. It
+// changes whenever the machine replaces a buffer with a new one.
+func bufferIdentity(b []byte) *byte {
+	if cap(b) == 0 {
+		return nil
+	}
+	return &b[:1][0]
+}
+
+func TestConnMachineKeepsItsReadBufferWhileOrdinaryRequestsKeepArriving(t *testing.T) {
+	// A client that streams requests leaves part of one behind each 64 KiB read,
+	// and the next read lands behind it. That buffer is working memory, not
+	// something a large request left behind, so it must be reused: replacing it on
+	// every read costs an allocation and a copy per read.
+	const readChunk = 64 << 10
+	tests := []struct {
+		name      string
+		valueSize int
+	}{
+		{name: "values of 100 bytes", valueSize: 100},
+		{name: "values of 4 KiB", valueSize: 4 << 10},
+		{name: "values that nearly fill a read", valueSize: 60 << 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame := machineFrame("SET", "key", string(bytes.Repeat([]byte("v"), tt.valueSize)))
+			stream := bytes.Repeat(frame, (2<<20)/len(frame))
+			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+				return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+			}
+			machine := NewConnMachine(nil)
+
+			var identities []*byte
+			var caps []int
+			for off := 0; off < len(stream); off += readChunk {
+				if err := machine.Feed(stream[off:min(off+readChunk, len(stream))]); err != nil {
+					t.Fatalf("Feed() error = %v", err)
+				}
+				if err := machine.ProcessPending(context.Background(), run); err != nil {
+					t.Fatalf("ProcessPending() error = %v", err)
+				}
+				if err := machine.Flush(io.Discard); err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+				identities = append(identities, bufferIdentity(machine.readBuf))
+				caps = append(caps, cap(machine.readBuf))
+			}
+
+			// The buffer grows a few times while the reads settle on a size, and is
+			// replaced at most that often, not on every read.
+			replaced := 0
+			for i := 1; i < len(identities); i++ {
+				if identities[i] != identities[i-1] {
+					replaced++
+				}
+			}
+			if limit := len(identities) / 4; replaced > limit {
+				t.Fatalf("the read buffer was replaced %d times in %d reads (capacities %v), want at most %d", replaced, len(identities), caps, limit)
+			}
+		})
+	}
+}

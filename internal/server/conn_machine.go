@@ -35,6 +35,22 @@ const defaultMaxReadBuffer = 512 * 1024 * 1024
 // Redis's client-output-buffer-limit.
 const defaultMaxWriteBuffer = 512 * 1024 * 1024
 
+// retainedReadBufferCap is the capacity above which the machine releases its
+// read buffer once only a small remainder is left in it. The buffer grows to hold
+// one large request and would otherwise keep that capacity until the connection
+// closes, so many idle connections that each once received a large value would
+// pin all of it. The goroutine-per-connection mode likewise keeps only a bufio
+// buffer of a few kilobytes between requests.
+//
+// The bound sits well above what a connection that keeps sending ordinary
+// requests needs, because releasing that buffer on every read costs an
+// allocation and a copy per read. Between reads such a connection holds part of
+// one request plus the next read, which the event loop makes at most
+// eventLoopReadChunk (64 KiB) at a time. For requests up to a chunk in size that
+// is at most two chunks, and append rounds the capacity up to about 144 KiB for
+// it, so four chunks leaves room above that.
+const retainedReadBufferCap = 256 * 1024
+
 // ConnCommandRunner executes one parsed request with connection-scoped state
 // and returns the RESP responses to buffer for the client. A non-nil error is
 // fatal for the connection.
@@ -217,10 +233,25 @@ func (m *ConnMachine) decodeBuffered() {
 	}
 
 	if consumed > 0 {
-		m.readBuf = append(m.readBuf[:0], m.readBuf[consumed:]...)
+		m.discardRead(consumed)
 	}
 
 	m.checkReadBufferLimit()
+}
+
+// discardRead drops the consumed prefix of the read buffer and keeps the bytes
+// behind it. A buffer that grew past retainedReadBufferCap is not kept for them
+// when they are fewer than that: they move to a buffer of their own, or to none when
+// nothing is left, and the large one is garbage. A larger remainder stays where
+// it is, because it is the start of the next large frame.
+func (m *ConnMachine) discardRead(consumed int) {
+	rest := m.readBuf[consumed:]
+	if cap(m.readBuf) > retainedReadBufferCap && len(rest) < retainedReadBufferCap {
+		// append to a nil slice returns nil when there is nothing to copy.
+		m.readBuf = append([]byte(nil), rest...)
+		return
+	}
+	m.readBuf = append(m.readBuf[:0], rest...)
 }
 
 func (m *ConnMachine) checkReadBufferLimit() {
