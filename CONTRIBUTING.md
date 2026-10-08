@@ -16,23 +16,28 @@ For linting locally you also need [`golangci-lint`](https://golangci-lint.run/) 
 
 ## Verification commands
 
-These are the checks CI runs, in order. Run them before opening a pull request.
+Run [`scripts/gate.sh`](scripts/gate.sh) before opening a pull request. It runs the checks CI runs, from the repository root, on the Go version in `go.mod` (the first run downloads Go 1.21.13 through `GOTOOLCHAIN`). It stops at the first failure, names the failed step and exits non-zero; it exits 0 only when every step passed, and it prints the total duration.
+
+The script also fails when:
+
+- a `stash` binary, a `dump.rdb` or an `*.aof` file is untracked or modified in the working tree. Delete it before committing.
+- the `golangci-lint` it finds (on `PATH`, or the binary in `GOLANGCI_LINT`) is not the version `.github/workflows/ci.yml` pins. It prints the install command.
+
+Check the script's exit status itself. A pipe into `tail` or `grep` replaces it with the status of the pipe's last command, which hides a failure.
+
+The script runs these commands:
 
 ```bash
 gofmt -s -l .          # must print nothing
-go build ./cmd/stash
+go build -o /dev/null ./cmd/stash
 go vet ./...
 go test ./...
 golangci-lint run
+go test -race -shuffle=on ./...
+for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go vet ./...; done
 ```
 
-Race tests run in CI on every pull request and on pushes to `main`. Run them locally when touching concurrency:
-
-```bash
-go test -race ./...
-```
-
-The CI `race` job also runs the tests in random order (`-shuffle=on`) to catch tests that depend on each other. A failing run prints the shuffle seed; repeat it with `go test -race -shuffle=<seed> ./...`.
+The CI `race` job runs the tests under the race detector in random order (`-shuffle=on`) to catch tests that depend on each other. A failing run prints the shuffle seed; repeat it with `go test -race -shuffle=<seed> ./...`.
 
 Benchmarks for the parser and store:
 
