@@ -5,6 +5,7 @@ run:
 
 linters:
   enable:
+    - depguard
     - errcheck
     - govet
     - ineffassign
@@ -16,6 +17,19 @@ linters:
     - predeclared
     - wastedassign
   settings:
+    depguard:
+      rules:
+        stdlib-only:
+          # Stash is built from the standard library alone: an import outside it
+          # and this module fails lint, in code and tests (PR #36 rejected
+          # golang.org/x/sys). A `require` block in go.mod is still a review check.
+          list-mode: strict
+          files:
+            - $all
+          allow:
+            - $gostd
+            # The trailing slash keeps a lookalike such as .../stash-evil out.
+            - github.com/maltemindedal/stash/
     govet:
       enable-all: true
       disable:

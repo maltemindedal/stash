@@ -42,7 +42,7 @@ go test -run ^$ -bench . ./internal/protocol ./internal/storage
 
 ## Lint configuration
 
-[`.golangci.yml`](.golangci.yml) enables `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `errorlint`, `makezero`, `nilnesserr`, `predeclared`, and `wastedassign` with a 2-minute timeout. `govet` runs every analyzer except `fieldalignment` and `shadow`, and `staticcheck` runs all of its checks.
+[`.golangci.yml`](.golangci.yml) enables `depguard`, `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `errorlint`, `makezero`, `nilnesserr`, `predeclared`, and `wastedassign` with a 2-minute timeout. `govet` runs every analyzer except `fieldalignment` and `shadow`, and `staticcheck` runs all of its checks. `depguard` keeps Stash on the standard library alone: an import outside the standard library and this module fails lint, in code and in tests. It does not look at `go.mod`, so a `require` block there is still caught in review.
 
 ## Test layout
 
