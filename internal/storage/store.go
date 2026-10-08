@@ -720,9 +720,18 @@ func (s *Store) SubscribeListPush(key string) chan struct{} {
 	return s.waiters.subscribe(key)
 }
 
-// UnsubscribeListPush removes a previously registered list push waiter.
+// UnsubscribeListPush removes a previously registered list push waiter. If a push
+// has woken it and the wake-up is still in ch, it passes the wake-up on to the next
+// waiter.
 func (s *Store) UnsubscribeListPush(key string, ch chan struct{}) {
 	s.waiters.unsubscribe(key, ch)
+}
+
+// PassListPushWake wakes the next waiter on key in place of one that has received
+// its wake-up but will not pop after all, because its client has gone. The
+// element that woke it then goes to the next waiting client, or stays in the list.
+func (s *Store) PassListPushWake(key string) {
+	s.waiters.notifyOne(key)
 }
 
 // Len returns the current number of stored keys.

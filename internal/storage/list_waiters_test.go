@@ -76,3 +76,26 @@ func TestAPopThatLeavesElementsWakesTheNextWaiter(t *testing.T) {
 		})
 	}
 }
+
+func TestAWakeUpNobodyReceivedPassesToTheNextWaiter(t *testing.T) {
+	// A waiter can leave after a push has woken it and before it has taken the
+	// wake-up: its client went away, or it stopped waiting for another reason.
+	// The wake-up must go to the next waiter, or that waiter stays blocked with
+	// an element in the list.
+	store := NewStore()
+	first := store.SubscribeListPush("queue")
+	second := store.SubscribeListPush("queue")
+
+	if _, _, err := store.RightPush("queue", [][]byte{[]byte("a")}); err != nil {
+		t.Fatalf("RightPush() error = %v", err)
+	}
+	store.UnsubscribeListPush("queue", first)
+
+	if holdsWakeUp(first) {
+		t.Fatal("UnsubscribeListPush() left the wake-up with the waiter that left")
+	}
+	if !holdsWakeUp(second) {
+		t.Fatal("the wake-up the first waiter never received did not pass to the second")
+	}
+	store.UnsubscribeListPush("queue", second)
+}

@@ -70,8 +70,8 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 	inTransaction := inTransactionExecution(ctx)
 
 	// While it waits, the command checks now and then that its client is still
-	// there. Otherwise the next push would wake it, it would pop the element, and
-	// the reply would go to a connection nobody is reading.
+	// there, and again when a push wakes it, before it pops. Otherwise it would pop
+	// the element and send the reply to a connection nobody is reading.
 	clientCheck := time.NewTicker(blockedClientCheckInterval)
 	defer clientCheck.Stop()
 	for {
@@ -133,6 +133,14 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		for waiting := true; waiting; {
 			select {
 			case <-waiter:
+				// The client may have gone since the last check. Popping for it
+				// would lose the element, so look again first, and if it has gone
+				// hand the wake-up on to the next waiting client.
+				if server.ClientDisconnected(ctx) {
+					e.store.UnsubscribeListPush(key, waiter)
+					e.store.PassListPushWake(key)
+					return server.ExecuteResult{}, server.ErrClientDisconnected
+				}
 				waiting = false
 			case <-clientCheck.C:
 				if server.ClientDisconnected(ctx) {

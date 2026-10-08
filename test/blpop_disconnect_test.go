@@ -1,7 +1,10 @@
 package test
 
 import (
+	"bytes"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -155,4 +158,52 @@ func TestBlockedBLPopStillWakesForAClientThatIsThere(t *testing.T) {
 		t.Fatalf("Parse(PING reply) error = %v", err)
 	}
 	assertValuesEqual(t, second, protocol.SimpleString{Value: "PONG"})
+}
+
+func TestABlockedClientThatLeftDoesNotTakeAPushedElement(t *testing.T) {
+	// A blocked BLPOP looked at its client only every 100 ms. A push that came
+	// sooner after the client left woke it anyway: it popped the element for a
+	// closed socket, logged and replicated the pop as LPOP, and a client still
+	// waiting behind it stayed blocked.
+	t.Run("no other client waits", func(t *testing.T) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
+		admin, adminParser := dialClient(t, addr)
+
+		departed, _ := blockOn(t, addr, "jobs")
+		_ = departed.Close()
+		assertCommandResponse(t, admin, adminParser, protocol.Integer{Value: 1}, "RPUSH", "jobs", "job-1")
+		waitForClients(t, admin, adminParser, 1, 5*time.Second, "the server should drop the client that left")
+
+		assertValuesEqual(t, roundTrip(t, admin, adminParser, "LRANGE", "jobs", "0", "-1"), listReply("job-1"))
+		data, err := os.ReadFile(aofPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+		}
+		if bytes.Contains(data, []byte("LPOP")) {
+			t.Fatalf("AOF = %q, want no LPOP: nothing was popped", data)
+		}
+	})
+
+	t.Run("another client waits", func(t *testing.T) {
+		addr, stop, errCh := startTestServer(t, testAOFConfig(filepath.Join(t.TempDir(), "appendonly.aof")))
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
+		admin, adminParser := dialClient(t, addr)
+
+		departed, _ := blockOn(t, addr, "tasks")
+		waiting, waitingParser := blockOn(t, addr, "tasks")
+		_ = departed.Close()
+		assertCommandResponse(t, admin, adminParser, protocol.Integer{Value: 1}, "RPUSH", "tasks", "task-1")
+
+		assertValuesEqual(t, readReplyWithin(t, waiting, waitingParser, 5*time.Second, "BLPOP reply for the client still waiting"), blpopReply("tasks", "task-1"))
+		waitForClients(t, admin, adminParser, 2, 5*time.Second, "the server should drop the client that left")
+		assertValuesEqual(t, roundTrip(t, admin, adminParser, "LRANGE", "tasks", "0", "-1"), listReply())
+	})
 }
