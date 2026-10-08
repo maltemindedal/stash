@@ -1025,19 +1025,14 @@ func (e *Executor) requestReplicaAcknowledgements() error {
 	if err != nil {
 		return fmt.Errorf("encode REPLCONF GETACK: %w", err)
 	}
-	if e.replication != nil {
-		e.replication.AdvanceMasterOffset(int64(len(encoded)))
-	}
 
-	peers := e.replicaPeers.Snapshot()
-	e.logger.Debug("requested replica acknowledgements", "replica_count", len(peers), "payload_size", len(encoded))
-	for _, peer := range peers {
-		if err := peer.WriteEncoded(encoded); err != nil {
-			e.logger.Warn("failed to request replica ACK", "replica_id", peer.ID, "error", err)
-			if closeErr := e.replicaPeers.RemoveAndClose(peer.ID); closeErr != nil {
-				e.logger.Debug("failed to close replica after ACK request failure", "replica_id", peer.ID, "error", closeErr)
-			}
-		}
+	// GETACK is part of the stream and counts toward the offset like a write, so
+	// it is counted and queued in the same step as writes are; a replica that
+	// refuses it is dropped the way propagation drops one.
+	_, queued, refused := e.replicaPeers.Propagate(e.replication, encoded)
+	e.logger.Debug("requested replica acknowledgements", "replica_count", queued+refused, "payload_size", len(encoded))
+	if refused > 0 {
+		e.logger.Warn("failed to request replica ACK", "refused", refused, "requested", queued+refused)
 	}
 
 	return nil

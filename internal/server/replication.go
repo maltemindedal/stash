@@ -134,14 +134,27 @@ func (p *ReplicaPeer) send(chunk []byte) error {
 }
 
 // ReplicaRegistry tracks replica peers connected to a master server.
+//
+// Its lock comes after the command sequencer's gate and write stripes, and before
+// a replica feed's lock: lock order is gate, stripes, mu, feed. While holding mu
+// the registry takes no gate, stripe or shard lock, and calls no handler, since
+// the feed-error handler takes mu itself.
 type ReplicaRegistry struct {
 	mu       sync.RWMutex
 	replicas map[uint64]*ReplicaPeer
 	changed  chan struct{}
 
-	// onFeedError is called, on the feed's own goroutine, when a replica's feed
-	// stops because a write to it failed.
+	// onFeedError is called, with mu not held, when a replica can no longer be
+	// fed: on the feed's own goroutine when a write to its socket fails, and on
+	// the propagating goroutine when its feed refuses a frame (Propagate).
 	onFeedError func(id uint64, err error)
+}
+
+// replicaRefusal is a replica that refused a frame Propagate queued, kept until
+// the registry lock is released so that it can be dropped.
+type replicaRefusal struct {
+	id  uint64
+	err error
 }
 
 func newReplicationState() *ReplicationState {
@@ -218,6 +231,58 @@ func (r *ReplicaRegistry) Add(id uint64, conn ClientConn, listeningPort int, wri
 			onFeedError(id, err)
 		}
 	}()
+}
+
+// Propagate counts payload into the master's replication offset and queues it
+// for every replica, as one step under the registry lock. Two calls therefore
+// reach every replica in the order their offsets were counted, so a replica that
+// acknowledges offset N has every frame that ends at or before N, which WAIT
+// relies on. It returns the offset at which payload ends, how many replicas it
+// was queued for, and how many refused it.
+//
+// The lock is taken even when no replica is attached: a frame counted without
+// it could miss a replica registering at the same moment.
+//
+// Queueing only appends to each replica's feed, so the lock is held for copies,
+// never for a socket write. A replica whose feed refuses payload (it is closed,
+// or too far behind) is sent nothing after it, and is dropped once the lock is
+// released, through the feed-error handler, or by RemoveAndClose when none is
+// set.
+func (r *ReplicaRegistry) Propagate(offsets *ReplicationState, payload []byte) (end int64, queued, refused int) {
+	// Refusals are rare, so the slice is only allocated when one happens.
+	var refusals []replicaRefusal
+
+	r.mu.Lock()
+	end = offsets.AdvanceMasterOffset(int64(len(payload)))
+	for id, peer := range r.replicas {
+		if err := peer.WriteEncoded(payload); err != nil {
+			// Close the feed so that it refuses every later frame as well. A
+			// smaller frame could otherwise still fit under the backlog limit
+			// before the replica is dropped, and reach the replica at a position
+			// other than the offset counted for it.
+			if peer.feed != nil {
+				peer.feed.close(0)
+			}
+			refusals = append(refusals, replicaRefusal{id: id, err: err})
+			continue
+		}
+		queued++
+	}
+	onFeedError := r.onFeedError
+	r.mu.Unlock()
+
+	// Both drop paths take the registry lock, so they run after it is released.
+	for _, refusal := range refusals {
+		if onFeedError != nil {
+			onFeedError(refusal.id, refusal.err)
+			continue
+		}
+		// With no handler there is nowhere to report a failed close; the server
+		// always sets one (dropReplica), which logs it.
+		_ = r.RemoveAndClose(refusal.id)
+	}
+
+	return end, queued, len(refusals)
 }
 
 // SetFeedErrorHandler registers what happens when writing a replica's stream
@@ -381,11 +446,9 @@ func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport 
 		return propagationReport{}
 	}
 
-	peers := s.replicaPeers.Snapshot()
-	report := propagationReport{attempted: len(peers), payloadSize: len(payload)}
-	report.endOffset = s.replication.AdvanceMasterOffset(int64(len(payload)))
-
-	report.succeeded, report.failed = s.writePropagationPayload(payload, peers)
+	report := propagationReport{payloadSize: len(payload)}
+	report.endOffset, report.succeeded, report.failed = s.replicaPeers.Propagate(s.replication, payload)
+	report.attempted = report.succeeded + report.failed
 	if report.attempted > 0 {
 		s.logger.Debug(
 			"propagated command to replicas",
@@ -415,37 +478,9 @@ func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport 
 	return report
 }
 
-// writePropagationPayload queues payload for every replica. Queueing is a copy
-// into each replica's feed and never waits on a socket, so there is nothing to
-// gain from doing it concurrently.
-func (s *Server) writePropagationPayload(payload []byte, peers []*ReplicaPeer) (int, int) {
-	succeeded := 0
-	failed := 0
-	for _, peer := range peers {
-		if s.writePropagationPayloadToReplica(peer, payload) {
-			succeeded++
-		} else {
-			failed++
-		}
-	}
-
-	return succeeded, failed
-}
-
-func (s *Server) writePropagationPayloadToReplica(peer *ReplicaPeer, payload []byte) bool {
-	if peer == nil {
-		return false
-	}
-	if err := peer.WriteEncoded(payload); err != nil {
-		s.dropReplica(peer.ID, err)
-		return false
-	}
-
-	return true
-}
-
 // dropReplica logs why a replica can no longer be fed and closes it. It has to
-// synchronise again from the start.
+// synchronise again from the start. It is the registry's feed-error handler, so
+// it is called with the registry lock not held, and takes it.
 func (s *Server) dropReplica(id uint64, cause error) {
 	peer := s.replicaPeers.Remove(id)
 	if peer == nil {
