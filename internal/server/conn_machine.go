@@ -333,7 +333,8 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 // Flush writes pending output to w and consumes whatever w accepts, so partial
 // writes leave the remainder buffered for a later call. The unwritten remainder
 // is tracked by an offset rather than recompacted, so draining a large reply to
-// a slow reader stays linear. Once a closing machine has drained its parsed
+// a slow reader stays linear. A buffer that grew past maxIdleBufferCapacity is
+// released once it drains. Once a closing machine has drained its parsed
 // requests and pending output, Flush completes the transition to the closed
 // state.
 func (m *ConnMachine) Flush(w io.Writer) error {
@@ -345,7 +346,13 @@ func (m *ConnMachine) Flush(w io.Writer) error {
 		n, err := w.Write(m.writeBuf[m.writeOff:])
 		m.writeOff += n
 		if m.writeOff >= len(m.writeBuf) {
-			m.writeBuf = m.writeBuf[:0]
+			if cap(m.writeBuf) > maxIdleBufferCapacity {
+				// Drained: nothing is left to move, so the buffer a large reply
+				// grew is dropped rather than kept for the life of the connection.
+				m.writeBuf = nil
+			} else {
+				m.writeBuf = m.writeBuf[:0]
+			}
 			m.writeOff = 0
 		}
 		if err != nil {

@@ -144,3 +144,74 @@ func TestConnMachineReleasesItsReadBufferAfterALargeRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestConnMachineReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
+	value := bytes.Repeat([]byte("x"), largeRequestSize)
+	wantReply := append(append([]byte(fmt.Sprintf("$%d\r\n", len(value))), value...), "\r\n"...)
+
+	tests := []struct {
+		name string
+		// writeLimit is how many bytes the socket takes per write.
+		writeLimit int
+		wantWrites int
+	}{
+		{name: "the socket takes the whole reply at once", writeLimit: len(wantReply), wantWrites: 1},
+		{name: "the socket takes the reply a mebibyte at a time", writeLimit: 1 << 20, wantWrites: len(wantReply)>>20 + 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			replies := 0
+			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
+				replies++
+				if replies == 1 {
+					return []protocol.Value{protocol.BulkString{Data: value}}, nil
+				}
+				return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
+			}
+			machine := NewConnMachine(nil)
+
+			if err := machine.Feed(machineFrame("GET", "k")); err != nil {
+				t.Fatalf("Feed() error = %v", err)
+			}
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if got := machine.PendingOutputBytes(); got != len(wantReply) {
+				t.Fatalf("PendingOutputBytes() = %d, want the %d byte reply", got, len(wantReply))
+			}
+
+			socket := &shortWriter{limit: tt.writeLimit}
+			writes := 0
+			for machine.HasPendingOutput() {
+				if err := machine.Flush(socket); err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+				writes++
+			}
+
+			if writes != tt.wantWrites {
+				t.Fatalf("Flush() wrote the reply in %d writes, want %d", writes, tt.wantWrites)
+			}
+			if !bytes.Equal(socket.buf.Bytes(), wantReply) {
+				t.Fatalf("flushed %d bytes that differ from the %d byte reply", socket.buf.Len(), len(wantReply))
+			}
+			if cap(machine.writeBuf) > releasedBufferCapacity {
+				t.Fatalf("cap(writeBuf) = %d after the reply drained, want at most %d", cap(machine.writeBuf), releasedBufferCapacity)
+			}
+
+			if err := machine.Feed([]byte(pingFrame)); err != nil {
+				t.Fatalf("Feed() error = %v", err)
+			}
+			if err := machine.ProcessPending(context.Background(), run); err != nil {
+				t.Fatalf("ProcessPending() error = %v", err)
+			}
+			if got, want := flushAll(t, machine), "+OK\r\n"; string(got) != want {
+				t.Fatalf("flushed output = %q, want %q", got, want)
+			}
+			if cap(machine.writeBuf) > releasedBufferCapacity {
+				t.Fatalf("cap(writeBuf) = %d after a small reply drained, want at most %d", cap(machine.writeBuf), releasedBufferCapacity)
+			}
+		})
+	}
+}
