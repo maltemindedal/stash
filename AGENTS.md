@@ -26,7 +26,7 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 
 ## Conventions
 
-- Standard library only, in code and tests: `go.mod` has no `require` block and there is no `go.sum`. CI does not check this; review does. Reach for `syscall` and the standard library instead, as the epoll/kqueue pollers do (PR #36 rejected `golang.org/x/sys`).
+- Standard library only, in code and tests: lint (`depguard` in `.golangci.yml`) fails any import outside the standard library and this module. `go.mod` has no `require` block and there is no `go.sum`; lint does not check that, review does. Reach for `syscall` and the standard library instead, as the epoll/kqueue pollers do (PR #36 rejected `golang.org/x/sys`).
 - Write Go 1.21. Loop variables are shared across iterations even on new toolchains, so copy one before a closure or goroutine captures it, as `newSequencer` in `internal/command/sequencer.go` does. Raising the floor is its own change, decided by the owner, with no `toolchain` line.
 - Skills are installed globally: keep `.agents/skills/` and `skills-lock.json` out of the repo (removed twice, last in f6e2ace). The per-repo settings skills read are `## Agent skills` below and `docs/agents/`.
 - Unsupported input fails explicitly: an unrecognized modifier returns `ERR syntax error`. Wire errors use Redis's exact text through the `Err*` sentinels and `newRESPError` in `internal/command/executor.go`. Go errors start with their package (`"aof: ..."`, `"server: ..."`).
