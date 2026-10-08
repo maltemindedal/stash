@@ -4,7 +4,9 @@ Stash is a Redis-compatible TCP key/value server built from the Go standard libr
 
 ## Commands
 
-The pre-PR gate mirrors `.github/workflows/ci.yml`. Run all of it from the repo root:
+Run `scripts/gate.sh` before every PR. It runs the commands below on the floor toolchain, stops at the first failure and names the step, and fails on a stray `stash`, `dump.rdb` or `*.aof`. A pass is exit status 0: read `$?` or redirect the output to a file, because a pipe into `tail` or `grep` reports the pipe's last command (two PR #36 commits went in on a failed gate that way). It needs `golangci-lint` at the version `ci.yml` pins, on `PATH` or in `GOLANGCI_LINT`, and prints the install command for any other.
+
+What it runs, from the repo root, mirroring `.github/workflows/ci.yml`:
 
 ```bash
 gofmt -s -l .                        # must print nothing; fix with gofmt -s -w .
@@ -16,7 +18,7 @@ go test -race -shuffle=on ./...
 for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go vet ./...; done
 ```
 
-- CI builds, tests and races on the floor in `go.mod` (Go 1.21). `go build` on a newer toolchain accepts calls to post-1.21 standard-library APIs; `go vet` reports them and CI's floor build rejects them. Run the gate on the floor by prefixing the `go` commands with `GOTOOLCHAIN=go1.21.13` (it downloads that toolchain).
+- CI builds, tests and races on the floor in `go.mod` (Go 1.21). `go build` on a newer toolchain accepts calls to post-1.21 standard-library APIs; `go vet` reports them and CI's floor build rejects them. The script sets `GOTOOLCHAIN=go1.21.13` (it downloads that toolchain); prefix the `go` commands you run by hand the same way.
 - No Go on the machine: run the same commands in Docker, `docker run --rm -v "$PWD":/src -w /src golang:1.21 sh -c 'go vet ./... && go test ./...'`, and lint with `docker run --rm -v "$PWD":/src -w /src golangci/golangci-lint:v2.13.2 golangci-lint run`. When a check could not run, say so in the commit body and the PR.
 - Single test: `go test ./internal/storage -run '^TestStoreActiveEvictionReportsExpiredKeys$' -count=1 -v`. Integration tests are the `./test` package: `go test ./test -run '^TestMasterFullResyncTransfersExistingKeyspace$' -count=1 -v`.
 - A failed race run prints its shuffle seed; replay it with `go test -race -shuffle=<seed> ./...`.
