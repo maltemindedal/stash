@@ -1,6 +1,7 @@
 package test
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -90,6 +91,53 @@ func TestABulkLengthOverTheLimitGetsTheSameReplyInBothModes(t *testing.T) {
 					want := "-ERR protocol: parse array element 2: protocol: bulk string length " + length + " exceeds 536870912 byte limit\r\n"
 					if reply != want {
 						t.Fatalf("reply = %q, want %q", reply, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestALineOverTheLimitGetsTheSameReplyInBothModes sends an ECHO whose bulk
+// length is a zero-padded line of a given size after the '$', CRLF included.
+// Both networking modes accept a line of 65,536 bytes and reject a longer one
+// with the same error before closing. Default mode used to accept lines of up to
+// 69,632 bytes. The request is written raw because assertCommandResponse sends
+// canonical lengths.
+func TestALineOverTheLimitGetsTheSameReplyInBothModes(t *testing.T) {
+	const wantTooLong = "-ERR protocol: parse array element 1: protocol: line exceeds 65536 byte limit\r\n"
+
+	echo := func(lineLength int) string {
+		return "*2\r\n$4\r\nECHO\r\n$" + strings.Repeat("0", lineLength-3) + "1\r\nx\r\n"
+	}
+
+	for _, eventLoop := range []bool{false, true} {
+		name := "goroutine per connection"
+		if eventLoop {
+			name = "event loop"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.EventLoop = eventLoop
+			addr, stop, errCh := startTestServer(t, cfg)
+			defer func() {
+				stop()
+				waitForServerStop(t, errCh)
+			}()
+
+			t.Run("a line of 65536 bytes is accepted", func(t *testing.T) {
+				reply := readReplies(t, addr, echo(65536), 2)
+				if reply != "$1\r\nx\r\n" {
+					t.Fatalf("reply = %q, want the echoed value", reply)
+				}
+			})
+
+			for _, lineLength := range []int{65537, 69632} {
+				lineLength := lineLength
+				t.Run(fmt.Sprintf("a line of %d bytes is rejected", lineLength), func(t *testing.T) {
+					reply := readUntilClosed(t, addr, echo(lineLength))
+					if reply != wantTooLong {
+						t.Fatalf("reply = %q, want %q", reply, wantTooLong)
 					}
 				})
 			}

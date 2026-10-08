@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -188,6 +189,102 @@ func TestParserRejectsUnboundedLine(t *testing.T) {
 	parser := NewParser(strings.NewReader(input))
 	if _, err := parser.Parse(); err == nil {
 		t.Fatal("Parse() error = nil, want unbounded-line rejection")
+	}
+}
+
+// TestParserBoundsALineAsTheDecoderDoes pins the streaming Parser to the
+// Decoder's line bound: the LF must be among the first maxLineLength bytes after
+// the type byte, however the bytes arrive and however large the bufio.Reader is.
+// The Parser used to check the bound only after a 4,096-byte fragment without
+// the LF, and not at all on the first fragment, so it accepted lines of up to
+// 69,632 bytes by default and more behind a larger reader.
+func TestParserBoundsALineAsTheDecoderDoes(t *testing.T) {
+	type outcome int
+	const (
+		accepted outcome = iota
+		incomplete
+		rejected
+	)
+
+	// echo is an ECHO frame whose bulk length is a zero-padded line of the given
+	// size after the '$', CRLF included.
+	echo := func(lineLength int) string {
+		return "*2\r\n$4\r\nECHO\r\n$" + strings.Repeat("0", lineLength-3) + "1\r\nx\r\n"
+	}
+	// unterminated is a simple string of the given size after the '+' that never
+	// sends its LF.
+	unterminated := func(lineLength int) string {
+		return "+" + strings.Repeat("a", lineLength)
+	}
+
+	lines := []struct {
+		size             int
+		echo, unfinished outcome
+	}{
+		{size: 65535, echo: accepted, unfinished: incomplete},
+		{size: 65536, echo: accepted, unfinished: rejected},
+		{size: 65537, echo: rejected, unfinished: rejected},
+		{size: 69632, echo: rejected, unfinished: rejected}, // the largest the Parser used to accept
+		{size: 69633, echo: rejected, unfinished: rejected},
+	}
+	readers := []struct {
+		name string
+		wrap func(io.Reader) io.Reader
+	}{
+		{name: "whole input", wrap: func(r io.Reader) io.Reader { return r }},
+		{name: "one byte at a time", wrap: iotest.OneByteReader},
+		{name: "16-byte bufio reader", wrap: func(r io.Reader) io.Reader { return bufio.NewReaderSize(r, 16) }},
+		// 1,000 does not divide the limit, so a fragment that ends the stream can
+		// carry the line past it.
+		{name: "1000-byte bufio reader", wrap: func(r io.Reader) io.Reader { return bufio.NewReaderSize(r, 1000) }},
+		{name: "128 KiB bufio reader", wrap: func(r io.Reader) io.Reader { return bufio.NewReaderSize(r, 128<<10) }},
+	}
+
+	for _, line := range lines {
+		inputs := []struct {
+			name  string
+			input string
+			want  outcome
+		}{
+			{name: "ECHO frame", input: echo(line.size), want: line.echo},
+			{name: "unterminated line", input: unterminated(line.size), want: line.unfinished},
+		}
+		for _, in := range inputs {
+			for _, rd := range readers {
+				name := fmt.Sprintf("%s of %d bytes read by %s", in.name, line.size, rd.name)
+				t.Run(name, func(t *testing.T) {
+					wantValue, _, wantErr := Decode([]byte(in.input))
+					var got outcome
+					switch {
+					case wantErr == nil:
+						got = accepted
+					case errors.Is(wantErr, ErrIncomplete):
+						got = incomplete
+					default:
+						got = rejected
+					}
+					if got != in.want {
+						t.Fatalf("Decode() = (%#v, %v), want outcome %d, got %d", wantValue, wantErr, in.want, got)
+					}
+
+					value, err := NewParser(rd.wrap(strings.NewReader(in.input))).Parse()
+					switch in.want {
+					case accepted:
+						if err != nil || !reflect.DeepEqual(value, wantValue) {
+							t.Fatalf("Parse() = (%#v, %v), want (%#v, nil)", value, err, wantValue)
+						}
+					case incomplete:
+						if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+							t.Fatalf("Parse() error = %v, want io.EOF or io.ErrUnexpectedEOF", err)
+						}
+					case rejected:
+						if err == nil || err.Error() != wantErr.Error() {
+							t.Fatalf("Parse() error = %v, want %v", err, wantErr)
+						}
+					}
+				})
+			}
+		}
 	}
 }
 
