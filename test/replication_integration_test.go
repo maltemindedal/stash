@@ -1542,6 +1542,118 @@ func TestWaitCountsAReplicaThatAttachedAfterEarlierWrites(t *testing.T) {
 	}
 }
 
+// TestInfoReportsAReplicasOffsetInTheMastersOffsets has a replica attach after
+// earlier writes and acknowledge a later one, then reads INFO replication on the
+// master. As in Redis, a slaveN line's offset is how far the replica has
+// acknowledged the stream in the master's offsets, so a replica that holds
+// everything sent to it shows master_repl_offset. It used to show the replica's
+// own count, which leaves out the writes made before it attached.
+func TestInfoReportsAReplicasOffsetInTheMastersOffsets(t *testing.T) {
+	tests := []struct {
+		name         string
+		writesBefore int
+	}{
+		{name: "no writes before the replica attached", writesBefore: 0},
+		{name: "three writes before the replica attached", writesBefore: 3},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			logger := stashlogger.New("error")
+			masterStore := storage.NewStore()
+			master := server.New(defaultTestConfig(), logger, masterStore, command.NewExecutor(masterStore, logger))
+			masterCtx, cancelMaster := context.WithCancel(context.Background())
+			defer cancelMaster()
+			masterErrCh := make(chan error, 1)
+			go func() {
+				masterErrCh <- master.ListenAndServe(masterCtx)
+			}()
+			masterAddr := waitForAddr(t, master)
+
+			masterConn, err := net.Dial("tcp", masterAddr)
+			if err != nil {
+				t.Fatalf("Dial(%q) master error = %v", masterAddr, err)
+			}
+			defer closeTestResource(t, masterConn)
+			masterParser := protocol.NewParser(masterConn)
+
+			for i := 0; i < tt.writesBefore; i++ {
+				key, value := string(rune('a'+i)), fmt.Sprint(i+1)
+				assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", key, value)
+			}
+
+			replicaCfg := defaultTestConfig()
+			replicaCfg.ReplicaOf = masterAddr
+			replicaAddr, cancelReplica, replicaErrCh := startTestServer(t, replicaCfg)
+			defer cancelReplica()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for master.ReplicaCount() != 1 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := master.ReplicaCount(); got != 1 {
+				t.Fatalf("ReplicaCount() = %d, want 1", got)
+			}
+
+			assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "greeting", "hello")
+			replicaConn, err := net.Dial("tcp", replicaAddr)
+			if err != nil {
+				t.Fatalf("Dial(%q) replica error = %v", replicaAddr, err)
+			}
+			defer closeTestResource(t, replicaConn)
+			replicaParser := protocol.NewParser(replicaConn)
+			assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("hello")}, 2*time.Second, "GET", "greeting")
+			// WAIT has the replica acknowledge everything it was sent, including
+			// the GETACK, after which the master sends nothing more.
+			assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "WAIT", "1", "1000")
+
+			fields := infoFields(t, masterConn, masterParser, "replication")
+			slave, ok := fields["slave0"]
+			if !ok {
+				t.Fatalf("INFO replication = %v, missing slave0", fields)
+			}
+			_, slaveOffset, found := strings.Cut(slave, ",offset=")
+			if !found {
+				t.Fatalf("slave0 = %q, missing an offset", slave)
+			}
+			if masterOffset := fields["master_repl_offset"]; slaveOffset != masterOffset {
+				t.Fatalf("slave0 offset = %s, want master_repl_offset %s (slave0:%s)", slaveOffset, masterOffset, slave)
+			}
+
+			cancelReplica()
+			waitForServerStop(t, replicaErrCh)
+			cancelMaster()
+			waitForServerStop(t, masterErrCh)
+		})
+	}
+}
+
+// infoFields sends INFO section on conn and returns its name:value fields.
+func infoFields(t *testing.T, conn net.Conn, parser *protocol.Parser, section string) map[string]string {
+	t.Helper()
+
+	if err := protocol.WriteValue(conn, request("INFO", section)); err != nil {
+		t.Fatalf("WriteValue(INFO %s) error = %v", section, err)
+	}
+	reply, err := parser.Parse()
+	if err != nil {
+		t.Fatalf("Parse(INFO %s) error = %v", section, err)
+	}
+	text, _, ok := integrationBulkStringContent(reply)
+	if !ok {
+		t.Fatalf("INFO %s reply type = %T, want a bulk string", section, reply)
+	}
+
+	fields := make(map[string]string)
+	for _, line := range strings.Split(text, "\r\n") {
+		if name, value, found := strings.Cut(line, ":"); found && !strings.HasPrefix(line, "#") {
+			fields[name] = value
+		}
+	}
+	return fields
+}
+
 func TestReplicationStructuredLogs(t *testing.T) {
 	var masterLogs synchronizedBuffer
 	masterLogger := slog.New(slog.NewTextHandler(&masterLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))

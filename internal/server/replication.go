@@ -375,8 +375,9 @@ func (r *ReplicaRegistry) countReplicasAtOrAboveLocked(targetOffset int64) int {
 }
 
 // acknowledgedMasterOffset is how far the replica has acknowledged the stream, in
-// the master's count: its base plus what it acknowledged. Until it acknowledges
-// something it is 0, as Redis's repl_ack_off starts, so it counts only for a
+// the master's count: its base plus what it acknowledged. WAIT counts replicas by
+// it and INFO reports it, as Redis does with repl_ack_off. Until the replica
+// acknowledges something it is 0, as repl_ack_off starts, so it counts only for a
 // target of 0; the base alone would count a replica that may not have loaded the
 // snapshot yet.
 func (p *ReplicaPeer) acknowledgedMasterOffset() int64 {
