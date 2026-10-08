@@ -1,8 +1,12 @@
 package test
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,4 +85,46 @@ func TestBLPopIsLoggedAndReplicatedAsAPop(t *testing.T) {
 	}()
 	restarted, restartedParser := dialClient(t, restartAddr)
 	assertValuesEqual(t, roundTrip(t, restarted, restartedParser, "LRANGE", "jobs", "0", "-1"), protocol.Array{Elements: []protocol.Value{}})
+}
+
+func TestAPushThatServesSeveralBlockedClientsIsLoggedWithAPopForEach(t *testing.T) {
+	// Each blocked client the push serves pops an element, and each pop is logged
+	// as LPOP, so the log replays to the list the clients left behind.
+	tests := []struct {
+		name string
+		push []string
+	}{
+		{name: "two elements for two clients", push: []string{"RPUSH", "q", "a", "b"}},
+		{name: "three elements for two clients", push: []string{"RPUSH", "q", "a", "b", "c"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+			addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
+			admin, adminParser := dialClient(t, addr)
+
+			first, firstParser := blockOn(t, addr, "q")
+			second, secondParser := blockOn(t, addr, "q")
+			assertCommandResponse(t, admin, adminParser, protocol.Integer{Value: int64(len(tt.push) - 2)}, tt.push...)
+			readReplyWithin(t, first, firstParser, 2*time.Second, "BLPOP reply to the first client")
+			readReplyWithin(t, second, secondParser, 2*time.Second, "BLPOP reply to the second client")
+			stop()
+			waitForServerStop(t, errCh)
+
+			data, err := os.ReadFile(aofPath)
+			if err != nil {
+				t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+			}
+			logged := protocol.NewParser(bytes.NewReader(data))
+			for _, want := range [][]string{tt.push, {"LPOP", "q"}, {"LPOP", "q"}} {
+				if err := assertReplicaRequest(logged, want[0], want[1:]...); err != nil {
+					t.Fatalf("AOF %q: %v (want %v)", data, err, want)
+				}
+			}
+			if _, err := logged.Parse(); !errors.Is(err, io.EOF) {
+				t.Fatalf("AOF %q: Parse() after the two LPOPs error = %v, want io.EOF", data, err)
+			}
+		})
+	}
 }
