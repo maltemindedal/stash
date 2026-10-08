@@ -1,6 +1,7 @@
 package aof
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -271,6 +273,98 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 				t.Fatal("LastWriteOK() = false after the file worked again")
 			}
 		})
+	}
+}
+
+// TestSeedFileLeavesTheFileAsItWasWhenAStepBeforeTheRenameFails covers a seed
+// that fails before its rename. The path must still be missing or empty, so the
+// next start loads the RDB snapshot again, and the temp file must be gone.
+func TestSeedFileLeavesTheFileAsItWasWhenAStepBeforeTheRenameFails(t *testing.T) {
+	keys := []storage.SnapshotEntry{{Key: "k", Kind: storage.ValueKindString, String: []byte("v")}}
+	// No command recreates the TTL of a collection, so the rewrite refuses this.
+	unwritable := []storage.SnapshotEntry{{Key: "letters", Kind: storage.ValueKindList, List: [][]byte{[]byte("a")}, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}}
+	renameErr := errors.New("rename failed")
+
+	tests := []struct {
+		name       string
+		existing   bool
+		entries    []storage.SnapshotEntry
+		failRename bool
+	}{
+		{name: "the rename fails over a missing file", entries: keys, failRename: true},
+		{name: "the rename fails over an empty file", existing: true, entries: keys, failRename: true},
+		{name: "the commands cannot be generated", existing: true, entries: unwritable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "appendonly.aof")
+			if tt.existing {
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+			}
+			if tt.failRename {
+				original := renameFile
+				renameFile = func(string, string) error { return renameErr }
+				defer func() { renameFile = original }()
+			}
+
+			_, err := SeedFile(path, tt.entries)
+			if err == nil || (tt.failRename && !errors.Is(err, renameErr)) {
+				t.Fatalf("SeedFile() error = %v, want the failure", err)
+			}
+			files, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir() error = %v", err)
+			}
+			switch {
+			case !tt.existing && len(files) != 0:
+				t.Fatalf("directory holds %v, want nothing: no file, as before", files)
+			case tt.existing && (len(files) != 1 || files[0].Name() != "appendonly.aof"):
+				t.Fatalf("directory holds %v, want only the empty appendonly.aof", files)
+			}
+			if tt.existing {
+				if info, err := os.Stat(path); err != nil || info.Size() != 0 {
+					t.Fatalf("Stat() = (%v, %v), want the empty file untouched", info, err)
+				}
+			}
+		})
+	}
+}
+
+// TestSeedFileReportsARenameWhoseDirectoryCouldNotBeSynced covers the one step
+// after the rename. The path already names the complete file and must keep it,
+// and the error must still reach the caller, which refuses to start rather than
+// append to a file whose name may not survive a crash.
+func TestSeedFileReportsARenameWhoseDirectoryCouldNotBeSynced(t *testing.T) {
+	entries := []storage.SnapshotEntry{
+		{Key: "a", Kind: storage.ValueKindString, String: []byte("1")},
+		{Key: "b", Kind: storage.ValueKindString, String: []byte("2")},
+	}
+	var want bytes.Buffer
+	if _, err := GenerateRewrite(entries, &want); err != nil {
+		t.Fatalf("GenerateRewrite() error = %v", err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "appendonly.aof")
+
+	sentinel := errors.New("directory sync failed")
+	original := syncDir
+	syncDir = func(string) error { return sentinel }
+	defer func() { syncDir = original }()
+
+	_, err := SeedFile(path, entries)
+	var unsynced *unsyncedReplaceError
+	if !errors.As(err, &unsynced) || !errors.Is(err, sentinel) {
+		t.Fatalf("SeedFile() error = %v, want the directory sync failure", err)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want.Bytes()) {
+		t.Fatalf("file after the failed directory sync = (%q, %v), want the complete seed %q", got, err, want.Bytes())
+	}
+	if files, err := os.ReadDir(dir); err != nil || len(files) != 1 {
+		t.Fatalf("directory = (%v, %v), want only appendonly.aof", files, err)
 	}
 }
 
