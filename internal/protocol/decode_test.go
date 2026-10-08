@@ -174,18 +174,50 @@ func TestDecodeArrayIncompleteCarriesByteHint(t *testing.T) {
 	}
 }
 
-func TestDecodeHugeBulkLengthReportsIncomplete(t *testing.T) {
-	// A near-MaxInt declared length must not overflow the payload-availability
-	// check into a false "complete" read that then indexes out of range.
-	for _, length := range []string{"9223372036854775807", "9223372036854775806"} {
-		input := []byte("$" + length + "\r\n")
-		value, consumed, err := Decode(input)
-		if !errors.Is(err, ErrIncomplete) {
-			t.Fatalf("Decode($%s) error = %v, want ErrIncomplete", length, err)
-		}
-		if value != nil || consumed != 0 {
-			t.Fatalf("Decode($%s) = (%#v, %d), want (nil, 0)", length, value, consumed)
-		}
+func TestDecodeRejectsABulkLengthOverTheLimitAsTheParserDoes(t *testing.T) {
+	// The Decoder serves --event-loop mode and the Parser serves the default
+	// mode, so a header both can see must get the same permanent error from each.
+	// A near-MaxInt length is the case an overflowing size hint once hid: it
+	// reported the frame incomplete, and nothing answered the client.
+	tests := []struct {
+		name  string
+		input string
+		// incomplete marks a header the limit allows. The Decoder waits for its
+		// payload, and the Parser would block reading it, so there is no error
+		// text to compare.
+		incomplete bool
+	}{
+		{name: "the limit itself is allowed", input: "$536870912\r\n", incomplete: true},
+		{name: "one byte over the limit", input: "$536870913\r\n"},
+		{name: "one below MaxInt", input: "$9223372036854775806\r\n"},
+		{name: "MaxInt", input: "$9223372036854775807\r\n"},
+		{name: "MaxInt as a command argument", input: "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$9223372036854775807\r\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, consumed, err := Decode([]byte(tt.input))
+			if value != nil || consumed != 0 {
+				t.Fatalf("Decode(%q) = (%#v, %d), want (nil, 0)", tt.input, value, consumed)
+			}
+			if tt.incomplete {
+				if !errors.Is(err, ErrIncomplete) {
+					t.Fatalf("Decode(%q) error = %v, want ErrIncomplete", tt.input, err)
+				}
+				return
+			}
+			if err == nil || errors.Is(err, ErrIncomplete) {
+				t.Fatalf("Decode(%q) error = %v, want a permanent protocol error", tt.input, err)
+			}
+
+			_, parseErr := NewParser(bytes.NewReader([]byte(tt.input))).Parse()
+			if parseErr == nil {
+				t.Fatalf("Parse(%q) error = nil, want a protocol error", tt.input)
+			}
+			if err.Error() != parseErr.Error() {
+				t.Fatalf("Decode(%q) error = %q, want the Parser's %q", tt.input, err, parseErr)
+			}
+		})
 	}
 }
 

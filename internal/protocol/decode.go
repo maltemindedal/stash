@@ -223,12 +223,11 @@ func (d *Decoder) decodeBulkString(buf []byte) (Value, int, error) {
 	if length < -1 {
 		return nil, 0, fmt.Errorf("protocol: invalid bulk string length %d", length)
 	}
-	// Only a tightened limit is checked here. The default is left to the caller's
-	// buffer limit, which also bounds a length too large to add up as a hint.
-	if d.limits.bulkLength() < maxBulkStringLength {
-		if err := d.limits.checkBulkLength(length); err != nil {
-			return nil, 0, err
-		}
+	// Check the length under every limit, the default included, as the Parser
+	// does. That also keeps the size hint below from overflowing: length is at
+	// most maxBulkStringLength here.
+	if err := d.limits.checkBulkLength(length); err != nil {
+		return nil, 0, err
 	}
 
 	remaining := buf[consumed:]
