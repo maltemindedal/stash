@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -174,19 +175,59 @@ func TestDecodeArrayIncompleteCarriesByteHint(t *testing.T) {
 	}
 }
 
-func TestDecodeHugeBulkLengthReportsIncomplete(t *testing.T) {
-	// A near-MaxInt declared length must not overflow the payload-availability
-	// check into a false "complete" read that then indexes out of range.
-	for _, length := range []string{"9223372036854775807", "9223372036854775806"} {
-		input := []byte("$" + length + "\r\n")
-		value, consumed, err := Decode(input)
+// TestDecodeRejectsABulkLengthOverTheLimitAsTheParserDoes pins that both RESP
+// decoders refuse a bulk string length over the limit when its header arrives,
+// with the same text, so the Event loop and default mode answer a hostile header
+// alike. A near-MaxInt length must also not overflow the payload-availability
+// check into a false "complete" read.
+func TestDecodeRejectsABulkLengthOverTheLimitAsTheParserDoes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "one byte over the limit", input: "$536870913\r\n"},
+		{name: "one below MaxInt", input: "$9223372036854775806\r\n"},
+		{name: "MaxInt", input: "$9223372036854775807\r\n"},
+		{name: "MaxInt inside a command", input: "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$9223372036854775807\r\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, consumed, err := Decode([]byte(tt.input))
+			if err == nil || errors.Is(err, ErrIncomplete) {
+				t.Fatalf("Decode(%q) error = %v, want a permanent protocol error", tt.input, err)
+			}
+			if value != nil || consumed != 0 {
+				t.Fatalf("Decode(%q) = (%#v, %d), want (nil, 0)", tt.input, value, consumed)
+			}
+
+			_, parseErr := NewParser(strings.NewReader(tt.input)).Parse()
+			if parseErr == nil {
+				t.Fatalf("Parse(%q) error = nil, want a protocol error", tt.input)
+			}
+			if err.Error() != parseErr.Error() {
+				t.Fatalf("Decode(%q) error = %q, Parse error = %q, want the same text", tt.input, err, parseErr)
+			}
+		})
+	}
+
+	t.Run("the limit itself is allowed", func(t *testing.T) {
+		input := "$536870912\r\n"
+		value, consumed, err := Decode([]byte(input))
 		if !errors.Is(err, ErrIncomplete) {
-			t.Fatalf("Decode($%s) error = %v, want ErrIncomplete", length, err)
+			t.Fatalf("Decode(%q) error = %v, want ErrIncomplete", input, err)
 		}
 		if value != nil || consumed != 0 {
-			t.Fatalf("Decode($%s) = (%#v, %d), want (nil, 0)", length, value, consumed)
+			t.Fatalf("Decode(%q) = (%#v, %d), want (nil, 0)", input, value, consumed)
 		}
-	}
+		var incomplete *IncompleteError
+		if !errors.As(err, &incomplete) {
+			t.Fatalf("Decode(%q) error = %v, want *IncompleteError", input, err)
+		}
+		if want := len(input) + maxBulkStringLength + len("\r\n"); incomplete.Need != want {
+			t.Fatalf("IncompleteError.Need = %d, want %d", incomplete.Need, want)
+		}
+	})
 }
 
 func TestDecodeDeeplyNestedArrayIsBounded(t *testing.T) {

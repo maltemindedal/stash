@@ -61,3 +61,38 @@ func TestServerClosesTheConnectionAfterAProtocolError(t *testing.T) {
 		})
 	}
 }
+
+// TestABulkLengthOverTheLimitGetsTheSameReplyInBothModes sends only the header of
+// a SET whose value declares more than the 512 MiB bulk string limit. Both
+// networking modes must answer as soon as the header arrives, with the same
+// error, and close. The Event loop used to answer a length just over the limit
+// with its read-buffer text, and one near MaxInt not at all.
+func TestABulkLengthOverTheLimitGetsTheSameReplyInBothModes(t *testing.T) {
+	for _, eventLoop := range []bool{false, true} {
+		name := "goroutine per connection"
+		if eventLoop {
+			name = "event loop"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.EventLoop = eventLoop
+			addr, stop, errCh := startTestServer(t, cfg)
+			defer func() {
+				stop()
+				waitForServerStop(t, errCh)
+			}()
+
+			for _, length := range []string{"536870913", "9223372036854775807"} {
+				length := length
+				t.Run("length "+length, func(t *testing.T) {
+					// Only the header is sent. Nothing waits for a value that never comes.
+					reply := readUntilClosed(t, addr, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$"+length+"\r\n")
+					want := "-ERR protocol: parse array element 2: protocol: bulk string length " + length + " exceeds 536870912 byte limit\r\n"
+					if reply != want {
+						t.Fatalf("reply = %q, want %q", reply, want)
+					}
+				})
+			}
+		})
+	}
+}

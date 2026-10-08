@@ -230,10 +230,10 @@ func TestConnMachineFeedRejectsHostileFrames(t *testing.T) {
 		reason        string
 	}{
 		{
-			name:      "near-MaxInt bulk length buffers as incomplete",
+			name:      "near-MaxInt bulk length is rejected",
 			frame:     []byte("$9223372036854775807\r\n"),
-			wantState: ConnStateActive,
-			reason:    "a huge declared length must not index out of range in the decoder",
+			wantState: ConnStateClosing,
+			reason:    "a declared length over the limit must be refused when its header arrives",
 		},
 		{
 			name:      "deeply nested array",
