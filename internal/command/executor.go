@@ -18,6 +18,9 @@ var (
 	ErrWatchInsideMulti = errors.New("WATCH inside MULTI is not allowed")
 	// ErrExecAbort reports that EXEC aborted because queue-time validation failed.
 	ErrExecAbort = errors.New("transaction discarded because of previous errors")
+	// ErrNotAllowedInTransaction reports that a command that cannot run inside a
+	// transaction was sent after MULTI.
+	ErrNotAllowedInTransaction = errors.New("command not allowed inside a transaction")
 	// ErrInvalidExpireTime reports an invalid EX/PX duration.
 	ErrInvalidExpireTime = errors.New("invalid expire time in 'SET' command")
 	// ErrInvalidStreamID reports that a stream ID could not be parsed.
@@ -128,6 +131,12 @@ func ErrWatchInsideMultiError() error {
 // ErrExecAbortError reports that EXEC refused to run after queue-time validation errors.
 func ErrExecAbortError() error {
 	return newRESPError("EXECABORT", "Transaction discarded because of previous errors.", ErrExecAbort)
+}
+
+// ErrNotAllowedInTransactionError reports that a command cannot be queued after
+// MULTI. The transaction is marked dirty, so EXEC answers EXECABORT, as in Redis.
+func ErrNotAllowedInTransactionError() error {
+	return newRESPError("ERR", "Command not allowed inside a transaction", ErrNotAllowedInTransaction)
 }
 
 // ErrInvalidExpireTimeError reports an invalid SET expiry argument.

@@ -2157,6 +2157,41 @@ func TestExecutorTransactions(t *testing.T) {
 		}
 	})
 
+	t.Run("PSYNC is refused inside a transaction, which then aborts", func(t *testing.T) {
+		tests := []struct {
+			name string
+			args []string
+		}{
+			{name: "the arguments a replica sends", args: []string{"?", "-1"}},
+			// Redis checks only the arity of a NO_MULTI command inside MULTI.
+			{name: "arguments PSYNC would reject outside MULTI", args: []string{"a", "b"}},
+		}
+
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				executor := newTestExecutor()
+				executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+				ctx := withClientStateForExecutor(context.Background(), executor, 1)
+				state, _ := server.ClientStateFromContext(ctx)
+
+				if _, err := executor.Execute(ctx, requestValue("MULTI")); err != nil {
+					t.Fatalf("MULTI error = %v", err)
+				}
+				_, err := executor.ExecuteDetailed(ctx, requestValue(append([]string{"PSYNC"}, tt.args...)...))
+				if !errors.Is(err, ErrNotAllowedInTransaction) || err.Error() != "Command not allowed inside a transaction" {
+					t.Fatalf("queued PSYNC %v error = %v, want ErrNotAllowedInTransaction", tt.args, err)
+				}
+				if _, err := executor.Execute(ctx, requestValue("EXEC")); !errors.Is(err, ErrExecAbort) {
+					t.Fatalf("EXEC error = %v, want ErrExecAbort", err)
+				}
+				if state.IsReplica() {
+					t.Fatal("IsReplica() = true after a refused PSYNC, want false")
+				}
+			})
+		}
+	})
+
 	t.Run("queue-time malformed stream IDs abort EXEC", func(t *testing.T) {
 		tests := []struct {
 			name    string
