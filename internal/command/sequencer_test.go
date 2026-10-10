@@ -239,7 +239,7 @@ func TestEveryDurableCommandDeclaresHowToOrderItsWrites(t *testing.T) {
 	// A command added without a key shape is ordered against every write, which
 	// is correct but slow. This lists the shapes the current commands have, so a
 	// change to one is a decision rather than an accident.
-	executor := NewExecutor(nil, nil)
+	executor := newTestExecutor()
 	want := map[string]keyShape{
 		"SET": keysFirstArg, "SETBIT": keysFirstArg, "PFADD": keysFirstArg, "INCR": keysFirstArg,
 		"LPUSH": keysFirstArg, "RPUSH": keysFirstArg, "LPOP": keysFirstArg, "RPOP": keysFirstArg,
@@ -269,7 +269,7 @@ func TestEveryDurableCommandDeclaresHowToOrderItsWrites(t *testing.T) {
 }
 
 func TestSequenceModeOfRequests(t *testing.T) {
-	executor := NewExecutor(nil, nil)
+	executor := newTestExecutor()
 	tests := []struct {
 		name string
 		want sequenceMode

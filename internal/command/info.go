@@ -141,10 +141,6 @@ func boolToInt(value bool) int {
 }
 
 func (e *Executor) serverStats() server.Stats {
-	if e.serverStatsProvider == nil {
-		return server.Stats{Role: "master", AOFLastWriteOK: true}
-	}
-
 	return e.serverStatsProvider()
 }
 

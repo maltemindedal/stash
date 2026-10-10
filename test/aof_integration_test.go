@@ -14,11 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
 	"github.com/maltemindedal/stash/internal/config"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -321,8 +319,7 @@ func TestServerRejectsInvalidReplicaConfigBeforeOpeningAOF(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	err := srv.ListenAndServe(context.Background())
 	if err == nil {
@@ -542,7 +539,7 @@ func TestServerRefusesToStartOnACorruptAOF(t *testing.T) {
 	cfg := testAOFConfig(aofPath)
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 
 	// A server that wrongly starts would serve until the context ends.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

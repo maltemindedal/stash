@@ -196,9 +196,6 @@ func (e *Executor) handleBGRewriteAOF(ctx context.Context, request *Request) (pr
 	if len(request.Args) != 0 {
 		return nil, wrongNumberOfArgumentsError("BGREWRITEAOF")
 	}
-	if e.aofRewrite == nil {
-		return nil, fmt.Errorf("append only file persistence is not enabled")
-	}
 	if err := e.aofRewrite(ctx); err != nil {
 		return nil, err
 	}
@@ -232,11 +229,7 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 			return server.ExecuteResult{}, ErrSyntaxError()
 		}
 
-		ackOffset := int64(0)
-		if e.replication != nil {
-			ackOffset = e.replication.ReplicaOffset()
-		}
-
+		ackOffset := e.replication.ReplicaOffset()
 		result := server.ExecuteResult{}
 		result.UpstreamReplies = []protocol.Value{propagationFrame(&Request{
 			Name: "REPLCONF",
@@ -249,7 +242,7 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 			return server.ExecuteResult{}, ErrSyntaxError()
 		}
 
-		if state, ok := server.ClientStateFromContext(ctx); ok && state != nil && state.IsReplica() && e.replicaPeers != nil {
+		if state, ok := server.ClientStateFromContext(ctx); ok && state != nil && state.IsReplica() {
 			if updated := e.replicaPeers.UpdateAck(state.ID, ackOffset); updated {
 				// The replica's own count, from zero when it attached. INFO and
 				// WAIT add the master offset it attached at.
@@ -270,7 +263,7 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	if string(request.Args[0]) != "?" || string(request.Args[1]) != "-1" {
 		return server.ExecuteResult{}, ErrSyntaxError()
 	}
-	if e.replication == nil || e.replication.MasterReplicationID == "" || e.replicaPeers == nil {
+	if e.replication.MasterReplicationID == "" {
 		return server.ExecuteResult{}, fmt.Errorf("replication state unavailable")
 	}
 	state, err := clientStateFromContext(ctx)
@@ -401,11 +394,8 @@ func (e *Executor) waitTargetOffset(ctx context.Context) int64 {
 	if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
 		return state.LastWriteReplicationOffset()
 	}
-	if e.replication != nil {
-		return e.replication.MasterOffset()
-	}
 
-	return 0
+	return e.replication.MasterOffset()
 }
 
 func (e *Executor) waitForReplicaAcknowledgements(ctx context.Context, replicas int64, timeoutMillis int64, targetOffset int64, startedAt time.Time) (server.ExecuteResult, error) {
@@ -508,10 +498,6 @@ func (e *Executor) handleEcho(_ context.Context, request *Request) (protocol.Val
 }
 
 func (e *Executor) handlePublish(_ context.Context, request *Request) (protocol.Value, error) {
-	if e.pubSubRegistry == nil {
-		return protocol.Integer{Value: 0}, nil
-	}
-
 	channel := string(request.Args[0])
 	pooledSubscribers := getPooledPubSubSubscribers()
 	subscribers := e.pubSubRegistry.AppendSubscribers(channel, (*pooledSubscribers)[:0])
@@ -1022,7 +1008,7 @@ func clientStateFromContext(ctx context.Context) (*server.ClientState, error) {
 }
 
 func (e *Executor) touchWatchKeys(keys ...string) {
-	if e.watchRegistry == nil || len(keys) == 0 {
+	if len(keys) == 0 {
 		return
 	}
 
@@ -1030,26 +1016,14 @@ func (e *Executor) touchWatchKeys(keys ...string) {
 }
 
 func (e *Executor) countReplicasAtOrAbove(targetOffset int64) int {
-	if e.replicaPeers == nil {
-		return 0
-	}
-
 	return e.replicaPeers.CountReplicasAtOrAbove(targetOffset)
 }
 
 func (e *Executor) countReplicasAtOrAboveWithNotify(targetOffset int64) (int, <-chan struct{}) {
-	if e.replicaPeers == nil {
-		return 0, nil
-	}
-
 	return e.replicaPeers.CountReplicasAtOrAboveWithNotify(targetOffset)
 }
 
 func (e *Executor) requestReplicaAcknowledgements() error {
-	if e.replicaPeers == nil {
-		return nil
-	}
-
 	encoded, err := cachedReplConfGetAckPayload()
 	if err != nil {
 		return fmt.Errorf("encode REPLCONF GETACK: %w", err)

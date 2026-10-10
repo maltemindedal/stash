@@ -24,7 +24,7 @@ flowchart LR
 Contains the `main` package and the production binary entrypoint. It is responsible for:
 
 - parsing runtime flags
-- creating the logger, store, command executor, and TCP server
+- creating the logger, store, and TCP server, and giving the server `command.New` to build the command executor with
 - starting the server with signal-aware shutdown
 
 ### `internal/config`
@@ -78,6 +78,8 @@ Current responsibilities:
 
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
+`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, and the server's INFO snapshot, AOF rewrite and write-recording check. It refuses a `Services` with a collaborator missing, naming the field.
+
 Implemented commands cover strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial data, streams, transactions, pub/sub, replication handshakes, `WAIT`, `BGREWRITEAOF`, `INFO`, `SLOWLOG`, and `MONITOR`. The `commandSpecs` table registers each command with its handler, argument validator, and replication and durability flags. The [command reference](../reference/commands.md) documents that table for users.
 
 ### `internal/server`
@@ -86,6 +88,7 @@ Owns the TCP lifecycle.
 
 Current responsibilities:
 
+- create the registries it shares with the command executor, and build the executor once from `Services` with the constructor `cmd/stash` gives it; the executor is a required interface (`CommandExecutor`), so a method renamed on either side is a compile error, and only `BeginBackgroundWrite`, which guards the expiry sweep and an AOF rewrite's snapshot, is still found by optional type assertion
 - create the listener with `net.Listen`
 - accept client connections in a loop
 - spawn one goroutine per client (default networking mode), which queues each reply and sends the queue just before it would wait for more input, so a client that pipelines requests gets its replies in as few writes as the requests arrived in

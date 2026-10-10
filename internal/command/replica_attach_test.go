@@ -58,10 +58,16 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				store.ConfigureMaxMemory(1<<40, 5)
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			executor := NewExecutor(store, logger)
 			// Wires the executor and store to the server's replica registry,
 			// offsets, write ordering and expiry publishing, as in production.
-			server.New(config.Config{}, logger, store, executor)
+			var executor *Executor
+			if _, err := server.New(config.Config{}, logger, store, func(services server.Services) (server.CommandExecutor, error) {
+				built, err := New(services)
+				executor = built
+				return built, err
+			}); err != nil {
+				t.Fatalf("server.New() error = %v", err)
+			}
 			registry, offsets := executor.replicaPeers, executor.replication
 
 			// A client write's value -> the end offset counted for its frame, for

@@ -17,30 +17,30 @@ import (
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
+// stubExecutor is a command executor that answers every request with +OK.
 type stubExecutor struct{}
 
-func (stubExecutor) Execute() (protocol.Value, error) {
-	return protocol.SimpleString{Value: "OK"}, nil
+func (stubExecutor) ExecuteSequenced(context.Context, protocol.Value) (ExecuteResult, error) {
+	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 }
 
 func (stubExecutor) ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error) {
 	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 }
 
-type stubWatchExecutor struct {
-	registry *WatchRegistry
-}
+// newTestServer builds a server around executor, or around stubExecutor when
+// executor is nil.
+func newTestServer(t testing.TB, cfg config.Config, logger *slog.Logger, store *storage.Store, executor CommandExecutor) *Server {
+	t.Helper()
 
-func (s stubWatchExecutor) Execute() (protocol.Value, error) {
-	return protocol.SimpleString{Value: "OK"}, nil
-}
-
-func (s stubWatchExecutor) ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error) {
-	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
-}
-
-func (s stubWatchExecutor) WatchRegistry() *WatchRegistry {
-	return s.registry
+	if executor == nil {
+		executor = stubExecutor{}
+	}
+	srv, err := New(cfg, logger, store, func(Services) (CommandExecutor, error) { return executor, nil })
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return srv
 }
 
 func TestClientStateTransactionLifecycle(t *testing.T) {
@@ -246,7 +246,7 @@ func TestClientStateLifecycle(t *testing.T) {
 	cfg.RequirePass = "secret"
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(cfg, logger, storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, cfg, logger, storage.NewStore(), stubExecutor{})
 
 	first := srv.createClientState(1)
 	second := srv.createClientState(2)
@@ -297,8 +297,8 @@ func TestClientStateLifecycle(t *testing.T) {
 
 func TestServerClientStateCleanupUnwatchesKeys(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	registry := NewWatchRegistry()
-	srv := New(config.Default(), logger, storage.NewStore(), stubWatchExecutor{registry: registry})
+	srv := newTestServer(t, config.Default(), logger, storage.NewStore(), nil)
+	registry := srv.watchRegistry
 
 	state := srv.createClientState(1)
 	state.WatchKeys("alpha")
@@ -348,8 +348,8 @@ func TestServerClientStateCleanupUnwatchesKeys(t *testing.T) {
 
 func TestHandleConnectionDisconnectCleansTransactionState(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	registry := NewWatchRegistry()
-	srv := New(config.Default(), logger, storage.NewStore(), stubWatchExecutor{registry: registry})
+	srv := newTestServer(t, config.Default(), logger, storage.NewStore(), nil)
+	registry := srv.watchRegistry
 
 	serverConn, clientConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()
@@ -405,7 +405,7 @@ func TestHandleConnectionDisconnectCleansTransactionState(t *testing.T) {
 
 func TestHandleConnectionClosesConnectionBeforeDisconnect(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(config.Default(), logger, storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, config.Default(), logger, storage.NewStore(), stubExecutor{})
 
 	conn := newBlockingConn()
 	clientID := srv.registry.Add(conn)
@@ -460,7 +460,7 @@ func TestShutdownClosesConnectionsBeforeDisconnectingClientStates(t *testing.T) 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := config.Default()
 	cfg.DumpPath = ""
-	srv := New(cfg, logger, storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, cfg, logger, storage.NewStore(), stubExecutor{})
 
 	conn := newBlockingConn()
 	clientID := srv.registry.Add(conn)

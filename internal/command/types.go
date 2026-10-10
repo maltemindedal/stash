@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -92,59 +93,49 @@ type Executor struct {
 	seq                 *sequencer
 }
 
-// NewExecutor constructs a command executor with the currently supported command set.
-func NewExecutor(store *storage.Store, logger *slog.Logger) *Executor {
-	executor := &Executor{
-		store:          store,
-		logger:         logger,
-		watchRegistry:  server.NewWatchRegistry(),
-		pubSubRegistry: server.NewPubSubRegistry(),
-		seq:            newSequencer(),
+// New builds the command executor from the server's Services. Every
+// collaborator is required: a Services with a nil pointer or function field is
+// refused with an error that names it. RequirePass only verifies AUTH; it does
+// not decide who may run commands, the Client state does (see
+// validateAuthContext).
+func New(services server.Services) (*Executor, error) {
+	if err := checkServices(services); err != nil {
+		return nil, err
 	}
+
+	executor := &Executor{
+		store:               services.Store,
+		logger:              services.Logger,
+		watchRegistry:       services.Watches,
+		pubSubRegistry:      services.PubSub,
+		requirePass:         services.RequirePass,
+		replication:         services.Replication,
+		replicaPeers:        services.Replicas,
+		slowlogRegistry:     services.Slowlog,
+		slowlogThreshold:    services.SlowlogThreshold,
+		serverStatsProvider: services.Stats,
+		aofRewrite:          services.RewriteAOF,
+		seq:                 newSequencer(),
+	}
+	// Writes are ordered only while something records them (see sequencer).
+	executor.seq.needsOrder = services.RecordsWrites
 	executor.commands = executor.commandSpecs()
-	return executor
+	return executor, nil
 }
 
-// WatchRegistry exposes the shared optimistic-locking registry to the server.
-func (e *Executor) WatchRegistry() *server.WatchRegistry {
-	return e.watchRegistry
-}
-
-// PubSubRegistry exposes the shared exact-channel pub/sub registry to the server.
-func (e *Executor) PubSubRegistry() *server.PubSubRegistry {
-	return e.pubSubRegistry
-}
-
-// SetReplicationState injects shared replication metadata from the server.
-func (e *Executor) SetReplicationState(state *server.ReplicationState) {
-	e.replication = state
-}
-
-// SetReplicaRegistry injects the server's live replica registry.
-func (e *Executor) SetReplicaRegistry(registry *server.ReplicaRegistry) {
-	e.replicaPeers = registry
-}
-
-// SetRequirePass gives AUTH the configured password to verify. It does not
-// decide who may run commands; the Client state does (see validateAuthContext).
-func (e *Executor) SetRequirePass(password string) {
-	e.requirePass = password
-}
-
-// SetAOFRewriteTrigger injects the background AOF rewrite hook.
-func (e *Executor) SetAOFRewriteTrigger(trigger func(context.Context) error) {
-	e.aofRewrite = trigger
-}
-
-// SetSlowlogConfig injects the shared slowlog registry and execution threshold.
-func (e *Executor) SetSlowlogConfig(registry *server.SlowlogRegistry, threshold time.Duration) {
-	e.slowlogRegistry = registry
-	e.slowlogThreshold = threshold
-}
-
-// SetServerStatsProvider injects a snapshot provider used by INFO.
-func (e *Executor) SetServerStatsProvider(provider func() server.Stats) {
-	e.serverStatsProvider = provider
+// checkServices refuses a Services with a collaborator missing. It looks at
+// every field that can be nil, so a field added to Services is checked too.
+func checkServices(services server.Services) error {
+	value := reflect.ValueOf(services)
+	for i := 0; i < value.NumField(); i++ {
+		switch field := value.Field(i); field.Kind() {
+		case reflect.Pointer, reflect.Func, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan:
+			if field.IsNil() {
+				return fmt.Errorf("command: missing Services.%s", value.Type().Field(i).Name)
+			}
+		}
+	}
+	return nil
 }
 
 // Execute dispatches a parsed RESP frame to its command handler.
@@ -680,7 +671,7 @@ func (e *Executor) validateSubscriptionContext(ctx context.Context, request *Req
 }
 
 func (e *Executor) recordSlowCommand(ctx context.Context, request *Request, timestamp time.Time, duration time.Duration) {
-	if e.slowlogRegistry == nil || request == nil || e.slowlogThreshold < 0 || duration < e.slowlogThreshold || server.IsReplicationOrigin(ctx) {
+	if request == nil || e.slowlogThreshold < 0 || duration < e.slowlogThreshold || server.IsReplicationOrigin(ctx) {
 		return
 	}
 

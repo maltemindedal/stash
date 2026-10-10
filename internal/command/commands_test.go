@@ -1025,9 +1025,11 @@ func TestExecutorInfo(t *testing.T) {
 
 func TestExecutorSlowlog(t *testing.T) {
 	t.Run("records commands at zero threshold", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
@@ -1049,9 +1051,11 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("negative threshold disables recording", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, -time.Microsecond)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = -time.Microsecond
+		})
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
@@ -1062,9 +1066,11 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("reset clears entries", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
@@ -1079,10 +1085,12 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("does not record commands rejected before dispatch", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 77)
 
 		if _, err := executor.Execute(ctx, requestValue("SET", "name", "Stash")); !errors.Is(err, ErrNoAuth) {
@@ -1094,10 +1102,12 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("redacts sensitive command arguments", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 78)
 
 		if _, err := executor.Execute(ctx, requestValue("AUTH", "secret")); err != nil {
@@ -1133,9 +1143,10 @@ func TestInfoPersistence(t *testing.T) {
 	})
 
 	t.Run("a failed AOF write is reported as err", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetServerStatsProvider(func() server.Stats {
-			return server.Stats{Role: "master", AOFEnabled: true, AOFLastWriteOK: false}
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Stats = func() server.Stats {
+				return server.Stats{Role: "master", AOFEnabled: true, AOFLastWriteOK: false}
+			}
 		})
 
 		text := info(t, executor, "persistence")
@@ -1160,9 +1171,11 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 	record := func(t *testing.T, args ...string) []string {
 		t.Helper()
 
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 		if _, err := executor.Execute(clientContext(executor), requestValue(args...)); err != nil {
 			t.Fatalf("%s error = %v", args[0], err)
 		}
@@ -1239,10 +1252,9 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 
 func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	t.Run("replica-origin GETACK emits upstream ACK reply", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceReplicaOffset(123)
-		executor.SetReplicationState(replication)
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 
 		result, err := handle(server.WithReplicationOrigin(context.Background()), executor, requestValue("REPLCONF", "GETACK", "*"), false)
 		if err != nil {
@@ -1259,15 +1271,14 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	})
 
 	t.Run("ACK updates tracked replica offset", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewReplicaRegistry()
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replicas = registry })
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		state := newReplicaPeerStateForExecutor(executor, 7, serverConn)
 		registry.Add(nil, 7, serverConn, 6380, state)
-		executor.SetReplicaRegistry(registry)
 
 		ctx := server.WithClientState(context.Background(), state)
 
@@ -1289,17 +1300,18 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 
 func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT requests ACKs and returns once enough replicas catch up", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
-		executor.SetReplicationState(replication)
-
 		registry := server.NewReplicaRegistry()
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Replication = replication
+			s.Replicas = registry
+		})
+
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		registry.Add(replication, 11, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 11, serverConn))
-		executor.SetReplicaRegistry(registry)
 		// The client wrote 50 bytes after the replica attached, which the replica
 		// acknowledges below.
 		replication.AdvanceMasterOffset(50)
@@ -1341,10 +1353,9 @@ func TestExecutorWait(t *testing.T) {
 	})
 
 	t.Run("WAIT times out when replicas do not acknowledge", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(5)
-		executor.SetReplicationState(replication)
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(5)
 		ctx := server.WithClientState(context.Background(), writer)
@@ -1366,10 +1377,9 @@ func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT with a timeout past what a duration can hold keeps waiting", func(t *testing.T) {
 		// 9223372036855 ms overflows time.Duration; it used to wrap negative, so the
 		// timer fired at once and WAIT answered without waiting at all.
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(5)
-		executor.SetReplicationState(replication)
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(5)
@@ -1399,18 +1409,19 @@ func TestExecutorWait(t *testing.T) {
 	})
 
 	t.Run("WAIT uses the calling client's last write offset", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(50)
-		executor.SetReplicationState(replication)
-
 		registry := server.NewReplicaRegistry()
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Replication = replication
+			s.Replicas = registry
+		})
+
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		registry.Add(replication, 12, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 12, serverConn))
-		executor.SetReplicaRegistry(registry)
 
 		state := &server.ClientState{ID: 99, Authenticated: true}
 		state.SetLastWriteReplicationOffset(0)
@@ -1433,8 +1444,7 @@ func TestExecutorWait(t *testing.T) {
 
 func TestExecutorAuth(t *testing.T) {
 	t.Run("unauthenticated clients may only use AUTH and PING", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 1)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1476,8 +1486,7 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("AUTH success unlocks subsequent commands on the same connection", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 2)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1507,8 +1516,7 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("AUTH failure keeps the client blocked", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 3)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1528,8 +1536,7 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("AUTH failure after successful AUTH keeps the client authenticated", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 33)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1563,9 +1570,10 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("unauthenticated clients cannot start replica handshake when password protection is enabled", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
-		executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1584,11 +1592,12 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("authenticated clients may perform replica handshake on protected masters", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
-		executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
 		registry := server.NewReplicaRegistry()
-		executor.SetReplicaRegistry(registry)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+			s.Replicas = registry
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
 		state, ok := server.ClientStateFromContext(ctx)
 		if !ok || state == nil {
@@ -1629,8 +1638,7 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("replication-origin traffic bypasses the auth gate", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := server.WithReplicationOrigin(withUnauthenticatedClientStateForExecutor(context.Background(), executor, 6))
 
 		value, err := executor.Execute(ctx, requestValue("SET", "replicated", "1"))
@@ -1699,8 +1707,7 @@ func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor := newTestExecutor()
-			executor.SetRequirePass(tt.requirePass)
+			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = tt.requirePass })
 
 			value, err := executor.Execute(tt.ctx, requestValue("SET", "name", "Stash"))
 			_, stored, _ := executor.store.Get("name")
@@ -2267,8 +2274,9 @@ func TestExecutorTransactions(t *testing.T) {
 		for _, tt := range tests {
 			tt := tt
 			t.Run(tt.name, func(t *testing.T) {
-				executor := newTestExecutor()
-				executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+				executor := newTestExecutorWith(func(s *server.Services) {
+					s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+				})
 				ctx := withClientStateForExecutor(context.Background(), executor, 1)
 				state, _ := server.ClientStateFromContext(ctx)
 
@@ -2463,7 +2471,7 @@ func TestExecutorPubSub(t *testing.T) {
 			t.Fatalf("PUBLISH error = %v", err)
 		}
 		assertValueEqual(t, published, protocol.Integer{Value: 0})
-		if got := len(executor.PubSubRegistry().Subscribers("news")); got != 0 {
+		if got := len(executor.pubSubRegistry.Subscribers("news")); got != 0 {
 			t.Fatalf("len(Subscribers(news)) = %d after disconnected publish, want 0", got)
 		}
 		if state.IsSubscribed() {
@@ -2846,10 +2854,11 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	// Queueing refuses PSYNC, so EXEC never runs one. Should it, the attach cut
 	// would wait forever for the gate EXEC holds, so PSYNC refuses itself too.
-	executor := newTestExecutor()
-	executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
 	registry := server.NewReplicaRegistry()
-	executor.SetReplicaRegistry(registry)
+	executor := newTestExecutorWith(func(s *server.Services) {
+		s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+		s.Replicas = registry
+	})
 	ctx := withClientStateForExecutor(context.Background(), executor, 1)
 	state, _ := server.ClientStateFromContext(ctx)
 
@@ -2866,9 +2875,45 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	}
 }
 
+// testServices is a Services whose every collaborator is a working stand-in:
+// a new store and registries, a logger that discards, INFO's view of a lone
+// master, no AOF, a Slowlog that records nothing, and writes always ordered.
+func testServices() server.Services {
+	return server.Services{
+		Store:            storage.NewStore(),
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Watches:          server.NewWatchRegistry(),
+		PubSub:           server.NewPubSubRegistry(),
+		Slowlog:          server.NewSlowlogRegistry(),
+		SlowlogThreshold: -1,
+		Replication:      &server.ReplicationState{},
+		Replicas:         server.NewReplicaRegistry(),
+		Stats: func() server.Stats {
+			return server.Stats{Role: "master", AOFLastWriteOK: true}
+		},
+		RewriteAOF: func(context.Context) error {
+			return errors.New("append only file persistence is not enabled")
+		},
+		RecordsWrites: func() bool { return true },
+	}
+}
+
 func newTestExecutor() *Executor {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewExecutor(storage.NewStore(), logger)
+	return newTestExecutorWith(nil)
+}
+
+// newTestExecutorWith builds an executor from testServices, after configure has
+// changed what a test needs.
+func newTestExecutorWith(configure func(*server.Services)) *Executor {
+	services := testServices()
+	if configure != nil {
+		configure(&services)
+	}
+	executor, err := New(services)
+	if err != nil {
+		panic(err)
+	}
+	return executor
 }
 
 // clientContext is the context of a request from a client that has
@@ -2899,8 +2944,8 @@ func withUnauthenticatedClientStateForExecutor(ctx context.Context, executor *Ex
 
 func newTestClientState(executor *Executor, id uint64) *server.ClientState {
 	state := &server.ClientState{ID: id, Authenticated: true}
-	state.SetWatchRegistry(executor.WatchRegistry())
-	state.SetPubSubRegistry(executor.PubSubRegistry())
+	state.SetWatchRegistry(executor.watchRegistry)
+	state.SetPubSubRegistry(executor.pubSubRegistry)
 	return state
 }
 
@@ -3042,7 +3087,7 @@ func assertPropagationFrames(t *testing.T, got []protocol.Value, want ...protoco
 // arguments without repeating the arity check. A new command registered with a
 // handler but no validate would reach that handler unvalidated.
 func TestCommandSpecsAlwaysValidate(t *testing.T) {
-	executor := NewExecutor(storage.NewStore(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	executor := newTestExecutor()
 
 	for name, spec := range executor.commands {
 		t.Run(name, func(t *testing.T) {

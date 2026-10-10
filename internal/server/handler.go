@@ -208,12 +208,9 @@ func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn
 }
 
 // executeRequest runs one request through the executor, ordered against other
-// requests when the executor supports it.
+// requests.
 func (s *Server) executeRequest(ctx context.Context, request protocol.Value) (ExecuteResult, error) {
-	if sequenced, ok := s.executor.(sequencedExecutor); ok {
-		return sequenced.ExecuteSequenced(ctx, request)
-	}
-	return s.executor.ExecuteDetailed(ctx, request)
+	return s.executor.ExecuteSequenced(ctx, request)
 }
 
 func (s *Server) writeClientResponses(ctx context.Context, writer *bufio.Writer, values []protocol.Value) error {

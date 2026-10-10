@@ -304,11 +304,3 @@ func (e *Executor) beginWrite(shape keyShape, request *Request) (release func())
 	}
 	return e.seq.beginWrite(shape, request.Args)
 }
-
-// SetWriteOrdering tells the executor how to find out whether anything is
-// recording writes at the moment (an append-only file, a replica). While nothing
-// is, writes are not ordered against one another, which keeps concurrent writers
-// to different keys parallel. The default is to always order them.
-func (e *Executor) SetWriteOrdering(needed func() bool) {
-	e.seq.needsOrder = needed
-}
