@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -87,10 +88,18 @@ type ReplicaPeer struct {
 	ID            uint64
 	Conn          ClientConn
 	ListeningPort int
-	// AckOffset is the latest replication offset the replica acknowledged. It is
-	// written under the registry lock but read through the peers Snapshot returns,
-	// so it is atomic.
+	// AckOffset is the latest replication offset the replica acknowledged, in its
+	// own count: the bytes of the stream it has processed since it was registered.
+	// It is written under the registry lock but read through the peers Snapshot
+	// returns, so it is atomic.
 	AckOffset atomic.Int64
+
+	// baseOffset is the master's replication offset when the replica was
+	// registered. The replica is sent every frame counted after that and counts
+	// from zero, so its acknowledged offset in the master's count is
+	// baseOffset+AckOffset. It is set before the peer enters the registry and
+	// never changes.
+	baseOffset int64
 
 	writer encodedReplicaWriter
 	feed   *replicaFeed
@@ -212,11 +221,21 @@ func NewReplicaRegistry() *ReplicaRegistry {
 	return &ReplicaRegistry{replicas: make(map[uint64]*ReplicaPeer), changed: make(chan struct{})}
 }
 
-// Add stores or updates a replica peer.
-func (r *ReplicaRegistry) Add(id uint64, conn ClientConn, listeningPort int, writer encodedReplicaWriter) {
+// Add stores or updates a replica peer. The replica is sent every frame Propagate
+// counts after it is added, so its base offset is the master offset that offsets
+// holds at that moment.
+func (r *ReplicaRegistry) Add(offsets *ReplicationState, id uint64, conn ClientConn, listeningPort int, writer encodedReplicaWriter) {
 	peer := &ReplicaPeer{ID: id, Conn: conn, ListeningPort: listeningPort, writer: writer, feed: newReplicaFeed(replicaFeedLimit)}
 
 	r.mu.Lock()
+	// Propagate counts and queues each frame under this lock, so the base splits
+	// the stream exactly: no frame counted before it is sent to the replica, and
+	// every frame counted after it is. Read before the lock, a frame counted in
+	// between would lie above the base without being sent, and the replica would
+	// fall that many bytes short of every later write; read after it, a frame
+	// could be sent and still lie below the base, and WAIT would count the
+	// replica for a write it has not acknowledged.
+	peer.baseOffset = offsets.MasterOffset()
 	previous := r.replicas[id]
 	r.replicas[id] = peer
 	onFeedError := r.onFeedError
@@ -308,7 +327,8 @@ func (r *ReplicaRegistry) StopFeeds(grace time.Duration) (unfinished int) {
 	return unfinished
 }
 
-// UpdateAck records the latest processed replication offset for a replica peer.
+// UpdateAck records the latest replication offset a replica peer acknowledged,
+// in the replica's own count from when it was registered.
 func (r *ReplicaRegistry) UpdateAck(id uint64, offset int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -325,7 +345,8 @@ func (r *ReplicaRegistry) UpdateAck(id uint64, offset int64) bool {
 	return true
 }
 
-// CountReplicasAtOrAbove reports how many replicas have acknowledged at least targetOffset.
+// CountReplicasAtOrAbove reports how many replicas have acknowledged at least
+// targetOffset, an offset in the master's count.
 func (r *ReplicaRegistry) CountReplicasAtOrAbove(targetOffset int64) int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -345,12 +366,32 @@ func (r *ReplicaRegistry) CountReplicasAtOrAboveWithNotify(targetOffset int64) (
 func (r *ReplicaRegistry) countReplicasAtOrAboveLocked(targetOffset int64) int {
 	count := 0
 	for _, peer := range r.replicas {
-		if peer.AckOffset.Load() >= targetOffset {
+		if peer.acknowledgedMasterOffset() >= targetOffset {
 			count++
 		}
 	}
 
 	return count
+}
+
+// acknowledgedMasterOffset is how far the replica has acknowledged the stream, in
+// the master's count: its base plus what it acknowledged. WAIT counts replicas by
+// it and INFO reports it, as Redis does with repl_ack_off. Until the replica
+// acknowledges something it is 0, as repl_ack_off starts, so it counts only for a
+// target of 0; the base alone would count a replica that may not have loaded the
+// snapshot yet.
+func (p *ReplicaPeer) acknowledgedMasterOffset() int64 {
+	acknowledged := p.AckOffset.Load()
+	if acknowledged <= 0 {
+		return 0
+	}
+	// A replica that claims more than the master could have sent it is placed at
+	// the largest offset instead of wrapping negative.
+	if acknowledged > math.MaxInt64-p.baseOffset {
+		return math.MaxInt64
+	}
+
+	return p.baseOffset + acknowledged
 }
 
 // Remove deletes a replica peer from the registry.
@@ -425,7 +466,7 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 		return
 	}
 
-	s.replicaPeers.Add(clientID, conn, state.ReplicaListeningPort(), state)
+	s.replicaPeers.Add(s.replication, clientID, conn, state.ReplicaListeningPort(), state)
 	s.logger.Info(
 		"replica registered",
 		"replica_id", clientID,

@@ -89,19 +89,6 @@ func startAcceptFailureMaster(t *testing.T) (*server.Server, string) {
 	return master, waitForAddr(t, master)
 }
 
-// waitForReplicaCount waits until master has want Replicas attached.
-func waitForReplicaCount(t *testing.T, master *server.Server, want int, when string) {
-	t.Helper()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for master.ReplicaCount() != want {
-		if time.Now().After(deadline) {
-			t.Fatalf("ReplicaCount() = %d, want %d %s", master.ReplicaCount(), want, when)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 // TestAReplicaWhoseAcceptLoopFailsStopsAndReturnsTheError checks that a server
 // whose accept loop fails with something other than a closed listener returns
 // that error from ListenAndServe after its teardown, as a Master does, and that

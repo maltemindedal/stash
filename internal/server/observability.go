@@ -31,7 +31,11 @@ type Stats struct {
 type ReplicaInfo struct {
 	ID            uint64
 	ListeningPort int
-	AckOffset     int64
+	// AckedMasterOffset is how far the replica has acknowledged the stream, in
+	// the master's offsets as Redis reports it: 0 until it first acknowledges.
+	// The replica's own acknowledged offset, which counts from zero when it
+	// attached, is ReplicaPeer.AckOffset.
+	AckedMasterOffset int64
 }
 
 type observedCommand struct {

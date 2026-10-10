@@ -58,6 +58,22 @@ Two caveats:
 
 Use `go_heap_alloc` and `go_heap_sys` for actual Go runtime memory.
 
+### Reading the replication section
+
+A master with one replica, which attached after three writes and has since acknowledged a fourth:
+
+```
+# Replication
+role:master
+master_replid:462892e6adeee77ec04f2de048fdd4cff2cfffe9
+master_repl_offset:156
+slave_repl_offset:0
+connected_slaves:1
+slave0:id=4,port=6380,offset=156
+```
+
+`master_repl_offset` counts the bytes of the replication stream the master has produced since it started, including writes made before any replica attached. On each `slaveN` line, `offset` is how far that replica has acknowledged the stream, in the same count, as in Redis: a replica that has acknowledged everything sent to it shows `master_repl_offset`, even if it attached after earlier writes. It is `0` until the replica first acknowledges. A replica acknowledges only when the master asks, which it does when a client runs `WAIT`, so between `WAIT`s the offset can trail `master_repl_offset`; Redis replicas also acknowledge once a second, and Stash replicas do not. `slave_repl_offset` is, on a replica, how many bytes of its master's stream it has processed since its last full resynchronisation, and `0` on a master.
+
 ## Find slow commands with SLOWLOG
 
 Commands slower than `--slowlog-log-slower-than` are recorded in an in-memory ring buffer that holds 128 entries, matching Redis' default length.

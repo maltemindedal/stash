@@ -252,7 +252,9 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 
 		if state, ok := server.ClientStateFromContext(ctx); ok && state != nil && state.IsReplica() && e.replicaPeers != nil {
 			if updated := e.replicaPeers.UpdateAck(state.ID, ackOffset); updated {
-				e.logger.Debug("replica acknowledged offset", "replica_id", state.ID, "ack_offset", ackOffset)
+				// The replica's own count, from zero when it attached. INFO and
+				// WAIT add the master offset it attached at.
+				e.logger.Debug("replica acknowledged offset", "replica_id", state.ID, "replica_offset", ackOffset)
 			}
 		}
 

@@ -1266,7 +1266,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		defer func() { _ = replicaConn.Close() }()
 
 		state := newReplicaPeerStateForExecutor(executor, 7, serverConn)
-		registry.Add(7, serverConn, 6380, state)
+		registry.Add(nil, 7, serverConn, 6380, state)
 		executor.SetReplicaRegistry(registry)
 
 		ctx := server.WithClientState(context.Background(), state)
@@ -1291,7 +1291,6 @@ func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT requests ACKs and returns once enough replicas catch up", func(t *testing.T) {
 		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
-		replication.AdvanceMasterOffset(50)
 		executor.SetReplicationState(replication)
 
 		registry := server.NewReplicaRegistry()
@@ -1299,8 +1298,10 @@ func TestExecutorWait(t *testing.T) {
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		registry.Add(11, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 11, serverConn))
+		registry.Add(replication, 11, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 11, serverConn))
 		executor.SetReplicaRegistry(registry)
+		// 50 bytes written after the replica attached, which it acknowledges below.
+		replication.AdvanceMasterOffset(50)
 
 		requestSeen := make(chan struct{})
 		go func() {
@@ -1399,7 +1400,7 @@ func TestExecutorWait(t *testing.T) {
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		registry.Add(12, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 12, serverConn))
+		registry.Add(replication, 12, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 12, serverConn))
 		executor.SetReplicaRegistry(registry)
 
 		state := &server.ClientState{ID: 99, Authenticated: true}

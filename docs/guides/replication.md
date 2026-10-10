@@ -93,7 +93,7 @@ OK
 (integer) 1
 ```
 
-The reply is the number of replicas that acknowledged, which may be lower than requested if the timeout fires first. A timeout of `0` returns the current count immediately without waiting.
+The reply is the number of replicas that acknowledged, which may be lower than requested if the timeout fires first. A timeout of `0` returns the current count immediately without waiting. A replica that attached after earlier writes counts once it has acknowledged everything the master sent it since.
 
 In `--event-loop` mode, `WAIT` returns an error if it would have to block. Commands execute inline on the loop goroutine, so waiting would stall every connection. The command still succeeds when enough replicas have already acknowledged the write or when the timeout is `0`.
 
