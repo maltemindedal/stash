@@ -35,6 +35,8 @@ For a replica, use `--masterauth-file` the same way. Startup fails if the file i
 
 Unauthenticated clients may still issue `PING`. Every other command, including the replication handshake, requires authentication first.
 
+Authentication fails closed. Whether a client may run a command is decided by its own connection alone: on a server started with `--requirepass` every connection starts unauthenticated, and only a successful `AUTH` on that connection changes that. Should the password not reach the code that checks `AUTH`, clients are locked out (`AUTH` answers that no password is configured) rather than let in, and a request that arrives without its connection's state is refused. The writes a replica receives from its master and the commands replayed from the append-only file at startup come from no client, so they need no `AUTH`.
+
 Until a client authenticates it is also held to small frames, the same limits Redis applies: an array of at most 10 elements and a bulk string of at most 16 KiB. Anything larger is answered with one protocol error and the connection is closed, before the server has read the rest of the frame, so someone who can reach the port cannot make it buffer large requests. `AUTH` and `PING` fit easily. The limits end once the client authenticates, and apply only when `--requirepass` is set; the frame that follows an `AUTH` in the same pipeline is judged after the `AUTH` has run.
 
 A client also has a limited time to authenticate. With `--requirepass` set, a connection that has not sent a successful `AUTH` within `--auth-timeout` (30 seconds by default) is closed, including one that is half way through sending its `AUTH`; `--auth-timeout 0` turns this off. Once a client has authenticated, an idle connection is left alone.

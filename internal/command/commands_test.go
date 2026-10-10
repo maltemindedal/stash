@@ -1641,6 +1641,89 @@ func TestExecutorAuth(t *testing.T) {
 	})
 }
 
+func TestAuthIsRequiredEvenWhenTheExecutorHasNoPassword(t *testing.T) {
+	// A server that requires a password creates each client unauthenticated and
+	// hands the password to the executor separately. When that hand-off is lost
+	// the client is still held to AUTH and PING, and AUTH cannot succeed.
+	tests := []struct {
+		name    string
+		request []string
+		want    protocol.Value
+		wantErr error
+	}{
+		{name: "PING is answered", request: []string{"PING"}, want: protocol.SimpleString{Value: "PONG"}},
+		{name: "GET is refused", request: []string{"GET", "name"}, wantErr: ErrNoAuth},
+		{name: "SET is refused", request: []string{"SET", "name", "Stash"}, wantErr: ErrNoAuth},
+		{name: "MULTI is refused", request: []string{"MULTI"}, wantErr: ErrNoAuth},
+		{name: "AUTH does not authenticate", request: []string{"AUTH", "secret"}, wantErr: ErrAuthNotConfigured},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := newTestExecutor()
+			ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 1)
+			state, _ := server.ClientStateFromContext(ctx)
+
+			value, err := executor.Execute(ctx, requestValue(tt.request...))
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("%s error = %v (reply %#v), want %v", tt.request[0], err, value, tt.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("%s error = %v", tt.request[0], err)
+				}
+				assertValueEqual(t, value, tt.want)
+			}
+			if state.IsAuthenticated() {
+				t.Fatalf("IsAuthenticated() = true after %s, want false", tt.request[0])
+			}
+			if _, ok, _ := executor.store.Get("name"); ok {
+				t.Fatalf("%s stored a key, want nothing to run", tt.request[0])
+			}
+		})
+	}
+}
+
+func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		requirePass string
+		wantRefused bool
+	}{
+		{name: "a client request on a server without a password", ctx: context.Background(), wantRefused: true},
+		{name: "a client request on a server with a password", ctx: context.Background(), requirePass: "secret", wantRefused: true},
+		{name: "the Master's replication stream and AOF replay run without one", ctx: server.WithReplicationOrigin(context.Background()), requirePass: "secret"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := newTestExecutor()
+			executor.SetRequirePass(tt.requirePass)
+
+			value, err := executor.Execute(tt.ctx, requestValue("SET", "name", "Stash"))
+			_, stored, _ := executor.store.Get("name")
+			if tt.wantRefused {
+				if !errors.Is(err, errNoClientState) {
+					t.Fatalf("SET error = %v (reply %#v), want errNoClientState", err, value)
+				}
+				if stored {
+					t.Fatal("refused SET stored its key")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SET error = %v", err)
+			}
+			assertValueEqual(t, value, protocol.SimpleString{Value: "OK"})
+			if !stored {
+				t.Fatal("SET did not store its key")
+			}
+		})
+	}
+}
+
 func TestExecutorXAddAutoGeneratesIDs(t *testing.T) {
 	executor := newTestExecutor()
 
