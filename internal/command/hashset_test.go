@@ -1,7 +1,6 @@
 package command
 
 import (
-	"context"
 	"errors"
 	"sort"
 	"testing"
@@ -12,7 +11,7 @@ import (
 func TestExecutorLPopRPop(t *testing.T) {
 	t.Run("LPOP without count returns bulk string", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("RPUSH", "k", "a", "b")); err != nil {
 			t.Fatalf("RPUSH error = %v", err)
 		}
@@ -32,7 +31,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("LPOP with count returns array", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("RPUSH", "k", "a", "b", "c")); err != nil {
 			t.Fatalf("RPUSH error = %v", err)
 		}
@@ -49,7 +48,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("LPOP missing key with count returns null array", func(t *testing.T) {
 		executor := newTestExecutor()
-		value, err := executor.Execute(context.Background(), requestValue("LPOP", "missing", "3"))
+		value, err := executor.Execute(clientContext(executor), requestValue("LPOP", "missing", "3"))
 		if err != nil {
 			t.Fatalf("LPOP missing 3 error = %v", err)
 		}
@@ -61,7 +60,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("RPOP without count returns tail", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("RPUSH", "k", "a", "b")); err != nil {
 			t.Fatalf("RPUSH error = %v", err)
 		}
@@ -75,7 +74,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("RPOP with count returns array in tail-first order", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("RPUSH", "k", "a", "b", "c")); err != nil {
 			t.Fatalf("RPUSH error = %v", err)
 		}
@@ -92,7 +91,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("RPOP missing key with count returns null array", func(t *testing.T) {
 		executor := newTestExecutor()
-		value, err := executor.Execute(context.Background(), requestValue("RPOP", "missing", "3"))
+		value, err := executor.Execute(clientContext(executor), requestValue("RPOP", "missing", "3"))
 		if err != nil {
 			t.Fatalf("RPOP missing 3 error = %v", err)
 		}
@@ -104,7 +103,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("LPOP rejects negative count", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("RPUSH", "k", "a")); err != nil {
 			t.Fatalf("RPUSH error = %v", err)
 		}
@@ -115,7 +114,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 
 	t.Run("LPOP on wrong type returns WRONGTYPE", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("SET", "k", "v")); err != nil {
 			t.Fatalf("SET error = %v", err)
 		}
@@ -130,7 +129,7 @@ func TestExecutorLPopRPop(t *testing.T) {
 func TestExecutorHashCommands(t *testing.T) {
 	t.Run("HSET returns newly added count", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 
 		value, err := executor.Execute(ctx, requestValue("HSET", "h", "f1", "v1", "f2", "v2"))
 		if err != nil {
@@ -147,7 +146,7 @@ func TestExecutorHashCommands(t *testing.T) {
 
 	t.Run("HGET returns value or null", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("HSET", "h", "f", "v")); err != nil {
 			t.Fatalf("HSET error = %v", err)
 		}
@@ -167,7 +166,7 @@ func TestExecutorHashCommands(t *testing.T) {
 
 	t.Run("HDEL returns removed count", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("HSET", "h", "a", "1", "b", "2")); err != nil {
 			t.Fatalf("HSET error = %v", err)
 		}
@@ -181,7 +180,7 @@ func TestExecutorHashCommands(t *testing.T) {
 
 	t.Run("HGETALL returns all field/value pairs", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("HSET", "h", "a", "1", "b", "2")); err != nil {
 			t.Fatalf("HSET error = %v", err)
 		}
@@ -206,14 +205,14 @@ func TestExecutorHashCommands(t *testing.T) {
 
 	t.Run("HSET rejects odd arg count", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("HSET", "h", "f")); err == nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("HSET", "h", "f")); err == nil {
 			t.Fatalf("HSET h f expected error")
 		}
 	})
 
 	t.Run("Hash commands on wrong type return WRONGTYPE", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("SET", "k", "v")); err != nil {
 			t.Fatalf("SET error = %v", err)
 		}
@@ -236,7 +235,7 @@ func TestExecutorHashCommands(t *testing.T) {
 func TestExecutorSetCommands(t *testing.T) {
 	t.Run("SADD returns added count", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		value, err := executor.Execute(ctx, requestValue("SADD", "s", "a", "b", "a"))
 		if err != nil {
 			t.Fatalf("SADD error = %v", err)
@@ -252,7 +251,7 @@ func TestExecutorSetCommands(t *testing.T) {
 
 	t.Run("SISMEMBER returns 0/1", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("SADD", "s", "x")); err != nil {
 			t.Fatalf("SADD error = %v", err)
 		}
@@ -272,7 +271,7 @@ func TestExecutorSetCommands(t *testing.T) {
 
 	t.Run("SREM returns removed count", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("SADD", "s", "a", "b", "c")); err != nil {
 			t.Fatalf("SADD error = %v", err)
 		}
@@ -286,7 +285,7 @@ func TestExecutorSetCommands(t *testing.T) {
 
 	t.Run("SMEMBERS returns all members", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("SADD", "s", "a", "b", "c")); err != nil {
 			t.Fatalf("SADD error = %v", err)
 		}
@@ -303,7 +302,7 @@ func TestExecutorSetCommands(t *testing.T) {
 
 	t.Run("Set commands on wrong type return WRONGTYPE", func(t *testing.T) {
 		executor := newTestExecutor()
-		ctx := context.Background()
+		ctx := clientContext(executor)
 		if _, err := executor.Execute(ctx, requestValue("SET", "k", "v")); err != nil {
 			t.Fatalf("SET error = %v", err)
 		}

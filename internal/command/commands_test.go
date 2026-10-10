@@ -65,7 +65,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "GET returns stored value",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("SET", "name", "Stash")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SET", "name", "Stash")); err != nil {
 					t.Fatalf("SET error = %v", err)
 				}
 			},
@@ -82,7 +82,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "GET returns null after PX expiration",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("SET", "temp", "1", "PX", "10")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SET", "temp", "1", "PX", "10")); err != nil {
 					t.Fatalf("SET error = %v", err)
 				}
 			},
@@ -100,7 +100,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "GET rejects list values with wrong type",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("RPUSH", "queue", "job-1")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("RPUSH", "queue", "job-1")); err != nil {
 					t.Fatalf("RPUSH error = %v", err)
 				}
 			},
@@ -127,7 +127,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "SETBIT sets sparse bits and returns previous bit",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				value, err := executor.Execute(context.Background(), requestValue("SETBIT", "bitmap", "16", "1"))
+				value, err := executor.Execute(clientContext(executor), requestValue("SETBIT", "bitmap", "16", "1"))
 				if err != nil {
 					t.Fatalf("SETBIT error = %v", err)
 				}
@@ -146,7 +146,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "SETBIT returns overwritten bit",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("SETBIT", "bitmap", "7", "1")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SETBIT", "bitmap", "7", "1")); err != nil {
 					t.Fatalf("SETBIT setup error = %v", err)
 				}
 			},
@@ -163,7 +163,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "GETBIT reads existing and unset bits",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("SETBIT", "bitmap", "0", "1")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SETBIT", "bitmap", "0", "1")); err != nil {
 					t.Fatalf("SETBIT setup error = %v", err)
 				}
 			},
@@ -236,7 +236,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "Bitmap commands reject wrong value type",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("RPUSH", "queue", "job-1")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("RPUSH", "queue", "job-1")); err != nil {
 					t.Fatalf("RPUSH error = %v", err)
 				}
 			},
@@ -252,7 +252,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "PFADD reports changed estimate and PFCOUNT counts unique elements",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				value, err := executor.Execute(context.Background(), requestValue("PFADD", "visitors", "alice", "bob", "alice"))
+				value, err := executor.Execute(clientContext(executor), requestValue("PFADD", "visitors", "alice", "bob", "alice"))
 				if err != nil {
 					t.Fatalf("PFADD error = %v", err)
 				}
@@ -271,7 +271,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "PFADD returns zero for repeated elements",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("PFADD", "visitors", "alice")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("PFADD", "visitors", "alice")); err != nil {
 					t.Fatalf("PFADD setup error = %v", err)
 				}
 			},
@@ -299,10 +299,10 @@ func TestExecutorExecute(t *testing.T) {
 			name: "PFCOUNT unions multiple HyperLogLog keys",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("PFADD", "morning", "alice", "bob")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("PFADD", "morning", "alice", "bob")); err != nil {
 					t.Fatalf("PFADD morning error = %v", err)
 				}
-				if _, err := executor.Execute(context.Background(), requestValue("PFADD", "evening", "bob", "carol")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("PFADD", "evening", "bob", "carol")); err != nil {
 					t.Fatalf("PFADD evening error = %v", err)
 				}
 			},
@@ -329,7 +329,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "HyperLogLog commands reject wrong value type",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("RPUSH", "queue", "job-1")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("RPUSH", "queue", "job-1")); err != nil {
 					t.Fatalf("RPUSH error = %v", err)
 				}
 			},
@@ -345,7 +345,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "HyperLogLog commands reject plain string values",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("SET", "greeting", "hello")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SET", "greeting", "hello")); err != nil {
 					t.Fatalf("SET error = %v", err)
 				}
 			},
@@ -361,10 +361,10 @@ func TestExecutorExecute(t *testing.T) {
 			name: "DEL removes existing keys and returns count",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("SET", "one", "1")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SET", "one", "1")); err != nil {
 					t.Fatalf("SET one error = %v", err)
 				}
-				if _, err := executor.Execute(context.Background(), requestValue("SET", "two", "2")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("SET", "two", "2")); err != nil {
 					t.Fatalf("SET two error = %v", err)
 				}
 			},
@@ -396,10 +396,10 @@ func TestExecutorExecute(t *testing.T) {
 			name: "LPUSH and LRANGE return list contents",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("LPUSH", "letters", "a", "b")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("LPUSH", "letters", "a", "b")); err != nil {
 					t.Fatalf("LPUSH error = %v", err)
 				}
-				if _, err := executor.Execute(context.Background(), requestValue("RPUSH", "letters", "c")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("RPUSH", "letters", "c")); err != nil {
 					t.Fatalf("RPUSH error = %v", err)
 				}
 			},
@@ -420,7 +420,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "ZADD and ZRANGE WITHSCORES return sorted contents",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("ZADD", "leaders", "2", "beta", "1", "alpha", "2", "aardvark")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("ZADD", "leaders", "2", "beta", "1", "alpha", "2", "aardvark")); err != nil {
 					t.Fatalf("ZADD error = %v", err)
 				}
 			},
@@ -444,7 +444,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "ZADD returns count of newly added members only",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("ZADD", "leaders", "1", "alpha")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("ZADD", "leaders", "1", "alpha")); err != nil {
 					t.Fatalf("initial ZADD error = %v", err)
 				}
 			},
@@ -471,10 +471,10 @@ func TestExecutorExecute(t *testing.T) {
 			name: "XADD and XREAD return stream entries",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("XADD", "events", "1-0", "type", "start")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("XADD", "events", "1-0", "type", "start")); err != nil {
 					t.Fatalf("first XADD error = %v", err)
 				}
-				if _, err := executor.Execute(context.Background(), requestValue("XADD", "events", "2-0", "type", "finish", "user", "42")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("XADD", "events", "2-0", "type", "finish", "user", "42")); err != nil {
 					t.Fatalf("second XADD error = %v", err)
 				}
 			},
@@ -534,7 +534,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "XADD rejects non monotonic explicit IDs",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				if _, err := executor.Execute(context.Background(), requestValue("XADD", "events", "1-0", "field", "value")); err != nil {
+				if _, err := executor.Execute(clientContext(executor), requestValue("XADD", "events", "1-0", "field", "value")); err != nil {
 					t.Fatalf("initial XADD error = %v", err)
 				}
 			},
@@ -713,7 +713,7 @@ func TestExecutorExecute(t *testing.T) {
 				time.Sleep(tt.wait)
 			}
 
-			value, err := executor.Execute(context.Background(), tt.request)
+			value, err := executor.Execute(clientContext(executor), tt.request)
 			tt.assert(t, value, err)
 		})
 	}
@@ -723,7 +723,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("SET returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("SET", "name", "Stash"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "name", "Stash"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -738,7 +738,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("INCR returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("INCR", "counter"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("INCR", "counter"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -753,7 +753,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("SETBIT returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("SETBIT", "bitmap", "0", "1"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SETBIT", "bitmap", "0", "1"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -769,7 +769,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("PFADD returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("PFADD", "visitors", "alice"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("PFADD", "visitors", "alice"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -785,7 +785,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("PUBLISH returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("PUBLISH", "news", "hello"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("PUBLISH", "news", "hello"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -800,7 +800,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("DEL propagates even when it removes no keys", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("DEL", "missing"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("DEL", "missing"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -929,7 +929,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 func TestExecutorMaxMemory(t *testing.T) {
 	t.Run("SET returns OOM when an oversized protected update cannot fit", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("SET", "item", strings.Repeat("a", 64))); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "item", strings.Repeat("a", 64))); err != nil {
 			t.Fatalf("initial SET error = %v", err)
 		}
 
@@ -937,11 +937,11 @@ func TestExecutorMaxMemory(t *testing.T) {
 		baseline := executor.store.UsedMemory()
 		executor.store.ConfigureMaxMemory(baseline, 16)
 
-		if _, err := executor.Execute(context.Background(), requestValue("SET", "item", strings.Repeat("b", 4096))); !errors.Is(err, ErrOutOfMemory) {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "item", strings.Repeat("b", 4096))); !errors.Is(err, ErrOutOfMemory) {
 			t.Fatalf("oversized SET error = %v, want ErrOutOfMemory", err)
 		}
 
-		value, err := executor.Execute(context.Background(), requestValue("GET", "item"))
+		value, err := executor.Execute(clientContext(executor), requestValue("GET", "item"))
 		if err != nil {
 			t.Fatalf("GET after OOM error = %v", err)
 		}
@@ -951,7 +951,7 @@ func TestExecutorMaxMemory(t *testing.T) {
 	t.Run("SET evicts stale keys and emits DEL side effects", func(t *testing.T) {
 		executor := newTestExecutor()
 		payload := strings.Repeat("x", 96)
-		if _, err := executor.Execute(context.Background(), requestValue("SET", "cold", payload)); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "cold", payload)); err != nil {
 			t.Fatalf("initial SET error = %v", err)
 		}
 
@@ -960,7 +960,7 @@ func TestExecutorMaxMemory(t *testing.T) {
 		executor.store.ConfigureMaxMemory(baseline+baseline/2, 16)
 		time.Sleep(2 * time.Millisecond)
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("SET", "hot!", payload))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "hot!", payload))
 		if err != nil {
 			t.Fatalf("evicting SET error = %v", err)
 		}
@@ -977,13 +977,13 @@ func TestExecutorMaxMemory(t *testing.T) {
 			requestValue("DEL", "cold"),
 		)
 
-		cold, err := executor.Execute(context.Background(), requestValue("GET", "cold"))
+		cold, err := executor.Execute(clientContext(executor), requestValue("GET", "cold"))
 		if err != nil {
 			t.Fatalf("GET cold error = %v", err)
 		}
 		assertValueEqual(t, cold, protocol.BulkString{Null: true})
 
-		hot, err := executor.Execute(context.Background(), requestValue("GET", "hot!"))
+		hot, err := executor.Execute(clientContext(executor), requestValue("GET", "hot!"))
 		if err != nil {
 			t.Fatalf("GET hot error = %v", err)
 		}
@@ -993,14 +993,14 @@ func TestExecutorMaxMemory(t *testing.T) {
 
 func TestExecutorInfo(t *testing.T) {
 	executor := newTestExecutor()
-	if _, err := executor.Execute(context.Background(), requestValue("SET", "name", "Stash")); err != nil {
+	if _, err := executor.Execute(clientContext(executor), requestValue("SET", "name", "Stash")); err != nil {
 		t.Fatalf("SET error = %v", err)
 	}
-	if _, err := executor.Execute(context.Background(), requestValue("LPUSH", "letters", "a")); err != nil {
+	if _, err := executor.Execute(clientContext(executor), requestValue("LPUSH", "letters", "a")); err != nil {
 		t.Fatalf("LPUSH error = %v", err)
 	}
 
-	value, err := executor.Execute(context.Background(), requestValue("INFO", "memory"))
+	value, err := executor.Execute(clientContext(executor), requestValue("INFO", "memory"))
 	if err != nil {
 		t.Fatalf("INFO memory error = %v", err)
 	}
@@ -1011,7 +1011,7 @@ func TestExecutorInfo(t *testing.T) {
 		}
 	}
 
-	value, err = executor.Execute(context.Background(), requestValue("INFO"))
+	value, err = executor.Execute(clientContext(executor), requestValue("INFO"))
 	if err != nil {
 		t.Fatalf("INFO error = %v", err)
 	}
@@ -1029,16 +1029,16 @@ func TestExecutorSlowlog(t *testing.T) {
 		registry := server.NewSlowlogRegistry()
 		executor.SetSlowlogConfig(registry, 0)
 
-		if _, err := executor.Execute(context.Background(), requestValue("PING")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
 		}
-		value, err := executor.Execute(context.Background(), requestValue("SLOWLOG", "LEN"))
+		value, err := executor.Execute(clientContext(executor), requestValue("SLOWLOG", "LEN"))
 		if err != nil {
 			t.Fatalf("SLOWLOG LEN error = %v", err)
 		}
 		assertValueEqual(t, value, protocol.Integer{Value: 1})
 
-		value, err = executor.Execute(context.Background(), requestValue("SLOWLOG", "GET", "1"))
+		value, err = executor.Execute(clientContext(executor), requestValue("SLOWLOG", "GET", "1"))
 		if err != nil {
 			t.Fatalf("SLOWLOG GET error = %v", err)
 		}
@@ -1053,7 +1053,7 @@ func TestExecutorSlowlog(t *testing.T) {
 		registry := server.NewSlowlogRegistry()
 		executor.SetSlowlogConfig(registry, -time.Microsecond)
 
-		if _, err := executor.Execute(context.Background(), requestValue("PING")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
 		}
 		if got := registry.Len(); got != 0 {
@@ -1066,10 +1066,10 @@ func TestExecutorSlowlog(t *testing.T) {
 		registry := server.NewSlowlogRegistry()
 		executor.SetSlowlogConfig(registry, 0)
 
-		if _, err := executor.Execute(context.Background(), requestValue("PING")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
 		}
-		if _, err := executor.Execute(context.Background(), requestValue("SLOWLOG", "RESET")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SLOWLOG", "RESET")); err != nil {
 			t.Fatalf("SLOWLOG RESET error = %v", err)
 		}
 		// RESET itself is recorded at a zero threshold after clearing older entries.
@@ -1118,7 +1118,7 @@ func TestInfoPersistence(t *testing.T) {
 	info := func(t *testing.T, executor *Executor, args ...string) string {
 		t.Helper()
 
-		value, err := executor.Execute(context.Background(), requestValue(append([]string{"INFO"}, args...)...))
+		value, err := executor.Execute(clientContext(executor), requestValue(append([]string{"INFO"}, args...)...))
 		if err != nil {
 			t.Fatalf("INFO %v error = %v", args, err)
 		}
@@ -1163,7 +1163,7 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
 		executor.SetSlowlogConfig(registry, 0)
-		if _, err := executor.Execute(context.Background(), requestValue(args...)); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue(args...)); err != nil {
 			t.Fatalf("%s error = %v", args[0], err)
 		}
 		entries := registry.Entries(1)
@@ -1300,8 +1300,12 @@ func TestExecutorWait(t *testing.T) {
 
 		registry.Add(replication, 11, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 11, serverConn))
 		executor.SetReplicaRegistry(registry)
-		// 50 bytes written after the replica attached, which it acknowledges below.
+		// The client wrote 50 bytes after the replica attached, which the replica
+		// acknowledges below.
 		replication.AdvanceMasterOffset(50)
+		writer := newTestClientState(executor, 1)
+		writer.SetLastWriteReplicationOffset(50)
+		ctx := server.WithClientState(context.Background(), writer)
 
 		requestSeen := make(chan struct{})
 		go func() {
@@ -1324,7 +1328,7 @@ func TestExecutorWait(t *testing.T) {
 			registry.UpdateAck(11, 50)
 		}()
 
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("WAIT", "1", "200"))
+		result, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "200"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1341,9 +1345,12 @@ func TestExecutorWait(t *testing.T) {
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(5)
 		executor.SetReplicationState(replication)
+		writer := newTestClientState(executor, 1)
+		writer.SetLastWriteReplicationOffset(5)
+		ctx := server.WithClientState(context.Background(), writer)
 
 		startedAt := time.Now()
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("WAIT", "1", "25"))
+		result, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "25"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1364,7 +1371,9 @@ func TestExecutorWait(t *testing.T) {
 		replication.AdvanceMasterOffset(5)
 		executor.SetReplicationState(replication)
 
-		ctx, cancel := context.WithCancel(context.Background())
+		writer := newTestClientState(executor, 1)
+		writer.SetLastWriteReplicationOffset(5)
+		ctx, cancel := context.WithCancel(server.WithClientState(context.Background(), writer))
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
@@ -1635,11 +1644,11 @@ func TestExecutorAuth(t *testing.T) {
 func TestExecutorXAddAutoGeneratesIDs(t *testing.T) {
 	executor := newTestExecutor()
 
-	first, err := executor.Execute(context.Background(), requestValue("XADD", "events", "*", "field", "one"))
+	first, err := executor.Execute(clientContext(executor), requestValue("XADD", "events", "*", "field", "one"))
 	if err != nil {
 		t.Fatalf("first XADD error = %v", err)
 	}
-	second, err := executor.Execute(context.Background(), requestValue("XADD", "events", "*", "field", "two"))
+	second, err := executor.Execute(clientContext(executor), requestValue("XADD", "events", "*", "field", "two"))
 	if err != nil {
 		t.Fatalf("second XADD error = %v", err)
 	}
@@ -1700,11 +1709,11 @@ func TestExecutorBLPop(t *testing.T) {
 			pushErrCh := make(chan error, 1)
 			go func() {
 				time.Sleep(20 * time.Millisecond)
-				_, err := executor.Execute(context.Background(), requestValue("RPUSH", "jobs", "build"))
+				_, err := executor.Execute(clientContext(executor), requestValue("RPUSH", "jobs", "build"))
 				pushErrCh <- err
 			}()
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(clientContext(executor), time.Second)
 			defer cancel()
 
 			value, err := executor.Execute(ctx, requestValue("BLPOP", "jobs"))
@@ -2253,7 +2262,7 @@ func TestExecutorPubSub(t *testing.T) {
 			protocol.Integer{Value: 1},
 		}})
 
-		published, err := executor.Execute(context.Background(), requestValue("PUBLISH", "news", "hello"))
+		published, err := executor.Execute(clientContext(executor), requestValue("PUBLISH", "news", "hello"))
 		if err != nil {
 			t.Fatalf("PUBLISH error = %v", err)
 		}
@@ -2366,7 +2375,7 @@ func TestExecutorPubSub(t *testing.T) {
 
 		state.Disconnect()
 
-		published, err := executor.Execute(context.Background(), requestValue("PUBLISH", "news", "hello"))
+		published, err := executor.Execute(clientContext(executor), requestValue("PUBLISH", "news", "hello"))
 		if err != nil {
 			t.Fatalf("PUBLISH error = %v", err)
 		}
@@ -2408,7 +2417,7 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("PUBLISH rejects empty channel names", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		_, err := executor.Execute(context.Background(), requestValue("PUBLISH", "", "hello"))
+		_, err := executor.Execute(clientContext(executor), requestValue("PUBLISH", "", "hello"))
 		if !errors.Is(err, ErrSyntax) {
 			t.Fatalf("PUBLISH empty channel error = %v, want ErrSyntax", err)
 		}
@@ -2447,11 +2456,12 @@ func BenchmarkExecutorPublish(b *testing.B) {
 			}
 
 			publishRequest := requestValue("PUBLISH", "news", "hello")
+			publisher := clientContext(executor)
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				value, err := executor.Execute(context.Background(), publishRequest)
+				value, err := executor.Execute(publisher, publishRequest)
 				if err != nil {
 					b.Fatalf("PUBLISH error = %v", err)
 				}
@@ -2466,12 +2476,13 @@ func BenchmarkExecutorPublish(b *testing.B) {
 func BenchmarkExecutorDetailedPropagation(b *testing.B) {
 	executor := newTestExecutor()
 	request := requestValue("SET", "name", "Stash")
+	ctx := clientContext(executor)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		result, err := executor.ExecuteDetailed(context.Background(), request)
+		result, err := executor.ExecuteDetailed(ctx, request)
 		if err != nil {
 			b.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -2582,7 +2593,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		executor := newTestExecutor()
 
 		before := time.Now().UnixMilli()
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("SET", "name", "Stash", "EX", "100"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "name", "Stash", "EX", "100"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -2624,7 +2635,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 
 	t.Run("SET without expiry keeps its verbatim frame", func(t *testing.T) {
 		executor := newTestExecutor()
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("SET", "name", "Stash"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "name", "Stash"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -2635,13 +2646,13 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 	t.Run("rewritten PXAT frame is accepted on replay and preserves the value", func(t *testing.T) {
 		executor := newTestExecutor()
 		future := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("SET", "k", "v", "PXAT", future))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "k", "v", "PXAT", future))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(SET PXAT) error = %v", err)
 		}
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
 
-		got, err := executor.ExecuteDetailed(context.Background(), requestValue("GET", "k"))
+		got, err := executor.ExecuteDetailed(clientContext(executor), requestValue("GET", "k"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(GET) error = %v", err)
 		}
@@ -2655,7 +2666,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 	// auto-ID entry came back under a different ID after a restart.
 	t.Run("auto ID is replaced by the ID that was generated", func(t *testing.T) {
 		executor := newTestExecutor()
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("XADD", "events", "*", "type", "start"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("XADD", "events", "*", "type", "start"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(XADD *) error = %v", err)
 		}
@@ -2671,7 +2682,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok {
 			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
 		}
-		if _, err := replayed.ExecuteDetailed(context.Background(), frame); err != nil {
+		if _, err := replayed.ExecuteDetailed(server.WithReplicationOrigin(context.Background()), frame); err != nil {
 			t.Fatalf("replaying the logged frame: %v", err)
 		}
 		entries, err := replayed.store.XRead("events", "0-0")
@@ -2708,7 +2719,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 
 	t.Run("an explicit ID keeps its verbatim frame", func(t *testing.T) {
 		executor := newTestExecutor()
-		result, err := executor.ExecuteDetailed(context.Background(), requestValue("XADD", "events", "5-1", "type", "start"))
+		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("XADD", "events", "5-1", "type", "start"))
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(XADD 5-1) error = %v", err)
 		}
@@ -2719,6 +2730,14 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 func newTestExecutor() *Executor {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewExecutor(storage.NewStore(), logger)
+}
+
+// clientContext is the context of a request from a client that has
+// authenticated, or that needs no AUTH: it carries the Client state the server
+// gives every connection, as every client request does. Each call is a new
+// client, numbered 0 so that it shares no ID with the clients a test makes.
+func clientContext(executor *Executor) context.Context {
+	return withClientStateForExecutor(context.Background(), executor, 0)
 }
 
 func withClientStateForExecutor(ctx context.Context, executor *Executor, id uint64) context.Context {
