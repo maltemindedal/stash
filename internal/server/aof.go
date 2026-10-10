@@ -21,15 +21,15 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	loadRDB := func() error {
+	loadRDB := func() (int, error) {
 		if s.cfg.RDBPath == "" {
-			return nil
+			return 0, nil
 		}
 
 		startedAt := time.Now()
 		stats, err := rdb.LoadFile(s.cfg.RDBPath, s.store)
 		if err != nil {
-			return fmt.Errorf("server: load rdb %q: %w", s.cfg.RDBPath, err)
+			return 0, fmt.Errorf("server: load rdb %q: %w", s.cfg.RDBPath, err)
 		}
 
 		s.logger.Info(
@@ -39,11 +39,12 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			"skipped_expired_keys", stats.SkippedExpiredKeys,
 			"duration", time.Since(startedAt),
 		)
-		return nil
+		return stats.LoadedKeys, nil
 	}
 
 	if s.cfg.AOFPath == "" {
-		return loadRDB()
+		_, err := loadRDB()
+		return err
 	}
 
 	policy, err := aof.ParsePolicy(s.cfg.AppendFsync)
@@ -89,8 +90,28 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 				"kept_bytes", stats.ValidBytes,
 			)
 		}
-	} else if err := loadRDB(); err != nil {
-		return err
+	} else {
+		loadedKeys, err := loadRDB()
+		if err != nil {
+			return err
+		}
+		if loadedKeys > 0 {
+			// The first command appended makes the file non-empty, and from then on
+			// startup loads it and skips the RDB snapshot, so the keys the snapshot
+			// loaded go into the file first.
+			startedAt := time.Now()
+			entries, _ := s.store.SnapshotAll()
+			stats, err := aof.SeedFile(s.cfg.AOFPath, entries)
+			if err != nil {
+				return fmt.Errorf("server: write the keys loaded from rdb %q into aof %q: %w", s.cfg.RDBPath, s.cfg.AOFPath, err)
+			}
+			s.logger.Info(
+				"seeded append-only file from RDB snapshot",
+				"path", s.cfg.AOFPath,
+				"written_keys", stats.Keys,
+				"duration", time.Since(startedAt),
+			)
+		}
 	}
 
 	writer, err := aof.OpenWriter(ctx, s.cfg.AOFPath, policy, s.logger)

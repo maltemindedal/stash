@@ -17,7 +17,7 @@ The AOF preserves all supported data types. RDB provides a fast string-only snap
 go run ./cmd/stash --port 6379 --aof appendonly.aof --appendfsync everysec
 ```
 
-Every successful mutating command is appended as a RESP frame. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace. If the file ends in a command that was only partly written, as after a crash in the middle of an append, Stash logs a warning, cuts the file back to the last complete command, and carries on, so commands appended afterwards are never mistaken for the rest of the torn one. Invalid data anywhere before the end of the file is different: see [Repairing a corrupt append-only file](#repairing-a-corrupt-append-only-file).
+Every successful mutating command is appended as a RESP frame. A `BLPOP` that pops an element is appended as `LPOP`, so a push that serves several blocked clients is followed by one `LPOP` for each. On the next startup, Stash replays the file before opening the listener, so no client can observe a partially restored keyspace. If the file ends in a command that was only partly written, as after a crash in the middle of an append, Stash logs a warning, cuts the file back to the last complete command, and carries on, so commands appended afterwards are never mistaken for the rest of the torn one. Invalid data anywhere before the end of the file is different: see [Repairing a corrupt append-only file](#repairing-a-corrupt-append-only-file).
 
 ## Choose a fsync policy
 
@@ -47,6 +47,25 @@ level=INFO msg="AOF detected, skipping RDB startup load" aof_path=appendonly.aof
 ```
 
 This avoids replaying a stale snapshot over a newer command log.
+
+When the AOF file is missing or empty, Stash loads the RDB snapshot instead. If the snapshot loads any keys, Stash writes them into the AOF before it accepts clients, so they survive later restarts even though every later start skips the RDB snapshot. Each string key with a TTL is written as `SET key value PXAT <deadline>`, keeping the deadline the snapshot gave it. The server logs the step:
+
+```
+level=INFO msg="seeded append-only file from RDB snapshot" path=appendonly.aof written_keys=1204 duration=3.1ms
+```
+
+The keys are written the way `BGREWRITEAOF` writes its file: to a temporary file `appendonly.aof.seed-*` beside the AOF, which is fsynced and then renamed over the AOF, after which the directory is fsynced. A crash at any point leaves the AOF either as it was, so the next start loads the RDB snapshot again, or complete. A crash before the rename can leave the temporary file behind, which is safe to delete.
+
+If any of these steps fails, Stash refuses to start with an error naming the AOF path, rather than serve keys that only memory holds. None of them modifies the RDB snapshot. If only the final directory fsync fails, the AOF path already names the complete file, but the rename may not survive a crash: the next start loads that file if it is there, and the RDB snapshot if it is not.
+
+The rename replaces whatever it is renamed over, so Stash writes the keys only into a missing file or an empty regular file:
+
+- If the AOF path is a symbolic link, the keys go to the file the link leads to, which is the file Stash appends to afterwards, and the link stays in place. A link to a file that does not exist yet first gets that file created empty, as opening the AOF would create it. `BGREWRITEAOF` does not follow links yet: its rename replaces the link itself with a regular file in the link's directory.
+- A path that is not a regular file, such as `/dev/null` or `/dev/full`, looks empty, but the rename would put a regular file in its place. With an RDB snapshot that loads keys, Stash refuses to start before it opens the AOF. With no keys to write, it opens such a path as before.
+
+```
+server: write the keys loaded from rdb "dump.rdb" into aof "/dev/null": aof: "/dev/null" is not a regular file, and seeding it would put one in its place
+```
 
 ## Configure RDB snapshots
 
@@ -82,15 +101,30 @@ cp appendonly.aof appendonly.aof.damaged   # keep the original
 truncate -s 88213 appendonly.aof           # drop the damaged command and everything after it
 ```
 
-That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server (or one loaded from `--rdb`).
+That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server, or one holding only the keys `--rdb` loads, which then become the whole append-only file (see [Understand the AOF/RDB precedence](#understand-the-aofrdb-precedence)).
 
 ## Watching for write failures
 
-Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. `INFO persistence` reports `aof_last_write_status:err` from the first failed write or fsync until one succeeds again; see [Observability](observability.md).
+Under `everysec` and `no` a command is acknowledged before it reaches the disk, so a full or failing disk does not make the command fail. A command whose write fails is kept in memory and tried again, ahead of every later command, the next time Stash writes to the file: with the next command under `no`, and within a second under `everysec`. A write that gets only some of the waiting commands onto the disk keeps the ones it wrote in full, so the file catches up with memory as space frees up. If a failed write left part of a command at the end of the file, Stash first cuts the file back to the last complete command. While it cannot, it appends nothing after it, so the file still loads. While the disk stays full, the commands waiting to be written grow with write traffic, because writes are still accepted. They are lost if the process stops before a write succeeds: a graceful shutdown makes one last attempt, and a crash makes none.
+
+Under `always` nothing waits. A command whose write or fsync fails gets `ERR persistence failure`, and Stash cuts back any part of it already in the file. The command stays applied in memory, but it is in neither the append-only file nor the replicas, so the two still agree. If the cut fails too, for example because no file handle is free, the command stays in the file until a later cut succeeds. Stash retries the cut before every later write under `always`, and a crash before then replays the command. The exception is a `BGREWRITEAOF` whose old file failed to close, whose rename failed and whose reopen of the old file failed: no file handle is left, so the cut waits until the file is reopened or `BGREWRITEAOF` replaces it. Because the command is in memory, two things can still copy it later: `BGREWRITEAOF` builds the file from memory, and a replica's full resync loads a snapshot of memory.
+
+A failed fsync cannot be retried the way a failed write is. The kernel may already have dropped the data it could not write, and a later fsync can succeed without it, so no later success shows that the file is whole. Once the disk is healthy again, run `BGREWRITEAOF`: the rewritten file is built from memory.
+
+`INFO persistence` reports `aof_last_write_status:err` in these cases; see also [Observability](observability.md):
+
+| Condition | Status is `err` until |
+| --- | --- |
+| A write fails, or the file cannot be cut back to its last complete command or reopened after a rewrite | A later write succeeds |
+| An fsync fails | `BGREWRITEAOF` replaces the file |
+| During `BGREWRITEAOF`, the old file fails to close and the rename of the rewritten file then fails, so the old file stays | `BGREWRITEAOF` replaces the file |
+| The rewritten file was renamed into place but its directory could not be synced | A later sync of the directory succeeds |
+
+Under `always`, the two conditions that only `BGREWRITEAOF` clears make every write fail with `ERR persistence failure` until then, and an unsynced directory makes every write fail until a sync of the directory succeeds. After a failed close, an old file that turns out shorter than what was written to it takes no further writes under any policy until `BGREWRITEAOF` replaces it.
 
 ## What TTLs do across a restart
 
-Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT` frame before being written to the AOF. Replay therefore anchors the TTL to the original clock rather than restarting the countdown, and keys that expired while the server was down are dropped instead of being resurrected with a fresh lease. This also holds after `BGREWRITEAOF`, which writes each string key with a TTL as `SET key value PXAT <deadline>`.
+Relative expirations (`SET key value EX 60`) are rewritten to an absolute `PXAT` frame before being written to the AOF. Replay therefore anchors the TTL to the original clock rather than restarting the countdown, and keys that expired while the server was down are dropped instead of being resurrected with a fresh lease. This also holds after `BGREWRITEAOF`, which writes each string key with a TTL as `SET key value PXAT <deadline>`, and for the keys an RDB snapshot loads into a missing or empty AOF, which are written the same way (see [Understand the AOF/RDB precedence](#understand-the-aofrdb-precedence)).
 
 ## Related
 

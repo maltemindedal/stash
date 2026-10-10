@@ -1,0 +1,40 @@
+goos: linux
+goarch: amd64
+pkg: github.com/maltemindedal/stash/internal/protocol
+cpu: Intel(R) Xeon(R) Processor @ 2.80GHz
+,base,,head,,,
+,sec/op,CI,sec/op,CI,vs base,P
+Encode/PING-4,8.92e-08,∞,1.076e-07,∞,+20.63%,p=0.008 n=5
+Encode/SET_with_PX-4,2.309e-07,∞,2.272e-07,∞,~,p=0.238 n=5
+Encode/RESP3_nested_array-4,1.597e-07,∞,1.596e-07,∞,~,p=0.794 n=5
+geomean,1.487183532289791e-07,,1.574289123991673e-07,,+5.86%,
+
+,base,,head,,,
+,B/op,CI,B/op,CI,vs base,P
+Encode/PING-4,16,∞,16,∞,~,p=1.000 n=5
+Encode/SET_with_PX-4,64,∞,64,∞,~,p=1.000 n=5
+Encode/RESP3_nested_array-4,24,∞,24,∞,~,p=1.000 n=5
+geomean,29.073929485314228,,29.073929485314228,,+0.00%,
+
+,base,,head,,,
+,allocs/op,CI,allocs/op,CI,vs base,P
+Encode/PING-4,1,∞,1,∞,~,p=1.000 n=5
+Encode/SET_with_PX-4,1,∞,1,∞,~,p=1.000 n=5
+Encode/RESP3_nested_array-4,1,∞,1,∞,~,p=1.000 n=5
+geomean,1,,1,,+0.00%,
+
+pkg: github.com/maltemindedal/stash/internal/storage
+,base,,head,,,
+,sec/op,CI,sec/op,CI,vs base,P
+Store/set-4,1.0067e-06,∞,1.0212e-06,∞,+1.44%,p=0.008 n=5
+geomean,1.0066999999999998e-06,,1.0212000000000005e-06,,+1.44%,
+
+,base,,head,,,
+,B/op,CI,B/op,CI,vs base,P
+Store/set-4,120,∞,120,∞,~,p=1.000 n=5
+geomean,119.99999999999999,,119.99999999999999,,+0.00%,
+
+,base,,head,,,
+,allocs/op,CI,allocs/op,CI,vs base,P
+Store/set-4,3,∞,3,∞,~,p=1.000 n=5
+geomean,2.9999999999999996,,2.9999999999999996,,+0.00%,

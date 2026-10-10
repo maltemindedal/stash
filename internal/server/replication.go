@@ -697,7 +697,9 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 	for {
 		value, err := parser.Parse()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			// A Master that goes away inside a frame is still a lost link: the Parser
+			// reports a bulk payload cut short as io.ErrUnexpectedEOF, not io.EOF.
+			if ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
 				return
 			}
 

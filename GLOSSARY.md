@@ -79,6 +79,9 @@ The append-only file: the durable log of writes, stored as replayable RESP comma
 **AOF rewrite**:
 The background compaction that replaces the **AOF** with a file recreating only the current live data.
 
+**AOF seed**:
+The startup step that writes the keys an **RDB snapshot** loaded into a missing or empty **AOF**, the way an **AOF rewrite** writes its file, because every later start loads the **AOF** and skips the snapshot.
+
 **RDB snapshot**:
 A Redis database file holding the string keys of database `0`. Stash can load one at startup, writes one at graceful shutdown, and sends one to a **Replica** on full resync.
 

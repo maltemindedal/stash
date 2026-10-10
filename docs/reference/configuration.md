@@ -14,9 +14,9 @@ Stash is configured entirely through command-line flags. There is no configurati
 | `--log-level` | string | `info` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `--eviction-interval` | duration | `100ms` | Interval between active TTL eviction passes. |
 | `--eviction-sample-size` | int | `20` | Number of keys in each eviction sample. A pass samples again while over a quarter of the last sample had expired, for up to a quarter of `--eviction-interval`. |
-| `--rdb` | string | *(empty)* | Path to an RDB file to load before the listener opens. Empty disables startup RDB loading. |
+| `--rdb` | string | *(empty)* | Path to an RDB file to load before the listener opens. Empty disables startup RDB loading. With `--aof`, it is loaded only while the AOF is missing or empty, and the keys it loads are then written into the AOF; see [AOF/RDB precedence](../guides/persistence.md#understand-the-aofrdb-precedence). |
 | `--dump` | string | `dump.rdb` | Path to write an RDB snapshot to during graceful shutdown. |
-| `--aof` | string | *(empty)* | Path to an append-only file for durable command logging. Empty disables AOF. |
+| `--aof` | string | *(empty)* | Path to an append-only file for durable command logging. Empty disables AOF. When `--rdb` loads keys into a missing or empty AOF, the path must be a regular file or a symbolic link to one: `/dev/null`, or any other path that is not a regular file, then stops startup. See [AOF/RDB precedence](../guides/persistence.md#understand-the-aofrdb-precedence). |
 | `--appendfsync` | string | `everysec` | Fsync policy: `always`, `everysec`, or `no`. Rejected at startup if the value is anything else. |
 | `--maxmemory` | int64 | `0` | Approximate keyspace memory limit in bytes. `0` disables memory-pressure eviction. Negative values are rejected. |
 | `--maxclients` | int | `10000` | Maximum concurrent client connections. `0` disables the limit. Negative values are rejected. |

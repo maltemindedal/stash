@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
 )
@@ -142,6 +143,56 @@ func BenchmarkParserParseReuseBufferedReader(b *testing.B) {
 		if _, err := parser.Parse(); err != nil {
 			b.Fatalf("Parse() error = %v", err)
 		}
+	}
+}
+
+// BenchmarkParserParsePipelined reads 1000 SET commands that arrive in 4 KiB
+// reads: a client that pipelines, or an AOF being replayed. One iteration is all
+// 1000 Frames, so the allocations reported are for the lot.
+func BenchmarkParserParsePipelined(b *testing.B) {
+	const frames = 1000
+	raw := bytes.Repeat(commandFrame("SET", "k", "v"), frames)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for i := 0; i < b.N; i++ {
+		parser := NewParser(&splitReader{data: raw, sizes: []int{4096}})
+		for n := 0; n < frames; n++ {
+			if _, err := parser.Parse(); err != nil {
+				b.Fatalf("Parse() frame %d error = %v", n, err)
+			}
+		}
+	}
+}
+
+// BenchmarkParserParseLargeBulk reads one bulk string that arrives in 64 KiB
+// reads, which is where a Parser that copies a payload more than once shows.
+func BenchmarkParserParseLargeBulk(b *testing.B) {
+	for _, size := range []int{1 << 20, 64 << 20} {
+		size := size
+		// Built the first time this size runs, so a -bench filter that skips it
+		// does not pay for the 64 MiB.
+		var raw []byte
+
+		b.Run(fmt.Sprintf("%d MiB", size>>20), func(b *testing.B) {
+			if raw == nil {
+				raw = append([]byte(fmt.Sprintf("$%d\r\n", size)), bytes.Repeat([]byte{'v'}, size)...)
+				raw = append(raw, "\r\n"...)
+			}
+			b.ResetTimer()
+			b.ReportAllocs()
+			b.SetBytes(int64(len(raw)))
+			for i := 0; i < b.N; i++ {
+				parser := NewParser(&splitReader{data: raw, sizes: []int{64 << 10}})
+				value, err := parser.Parse()
+				if err != nil {
+					b.Fatalf("Parse() error = %v", err)
+				}
+				if bulk, ok := value.(BulkString); !ok || len(bulk.Data) != size {
+					b.Fatalf("Parse() = %T, want a BulkString of %d bytes", value, size)
+				}
+			}
+		})
 	}
 }
 

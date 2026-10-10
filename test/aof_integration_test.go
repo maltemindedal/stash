@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -149,6 +150,126 @@ func TestServerPrefersAOFOverRDB(t *testing.T) {
 
 	stop()
 	waitForServerStop(t, errCh)
+}
+
+func TestServerKeepsRDBKeysAfterTheAOFTakesOver(t *testing.T) {
+	// The keys an RDB snapshot loaded beside a missing or empty append-only file
+	// used to live in memory only. The first write made the file non-empty, so
+	// the next start loaded the file, skipped the snapshot, and lost every key
+	// that came from it.
+	tests := []struct {
+		name     string
+		emptyAOF bool
+	}{
+		{name: "missing AOF"},
+		{name: "empty AOF", emptyAOF: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+			if tt.emptyAOF {
+				if err := os.WriteFile(aofPath, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
+				}
+			}
+			cfg := testAOFConfig(aofPath)
+			cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
+				selectTestDB(0),
+				testStringEntry([]byte("fromrdb"), []byte("hello")),
+			))
+
+			addr, stop, errCh := startTestServer(t, cfg)
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("Dial(%q) error = %v", addr, err)
+			}
+			parser := protocol.NewParser(conn)
+			assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
+			closeTestResource(t, conn)
+			stop()
+			waitForServerStop(t, errCh)
+
+			restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
+			restartConn, err := net.Dial("tcp", restartAddr)
+			if err != nil {
+				t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+			}
+			defer closeTestResource(t, restartConn)
+			restartParser := protocol.NewParser(restartConn)
+			assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
+			assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
+
+			restartStop()
+			waitForServerStop(t, restartErrCh)
+		})
+	}
+}
+
+func TestServerKeepsTheDeadlineOfAnRDBKeyAfterTheAOFTakesOver(t *testing.T) {
+	// The keys an RDB snapshot loads into an empty append-only file keep the
+	// deadline the snapshot gave them, so a restart neither extends a TTL by the
+	// downtime nor brings back a key that expired meanwhile.
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	// session:43's deadline is an hour out, so the file holds it however slow
+	// the runner is. session:42's passes while the server is down; a runner slow
+	// enough to load the snapshot after it rightly leaves the key out, so no
+	// assertion needs it in the file.
+	lateDeadline := time.Now().Add(time.Hour).UnixMilli()
+	soonDeadline := time.Now().Add(time.Second).UnixMilli()
+	cfg := testAOFConfig(aofPath)
+	cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
+		selectTestDB(0),
+		testExpiringMillisEntry(uint64(lateDeadline), []byte("session:43"), []byte("bob")),
+		testExpiringMillisEntry(uint64(soonDeadline), []byte("session:42"), []byte("alice")),
+	))
+
+	addr, stop, errCh := startTestServer(t, cfg)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) error = %v", addr, err)
+	}
+	parser := protocol.NewParser(conn)
+	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
+	closeTestResource(t, conn)
+	stop()
+	waitForServerStop(t, errCh)
+
+	seeded, err := os.ReadFile(aofPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+	}
+	want, err := protocol.Encode(request("SET", "session:43", "bob", "PXAT", strconv.FormatInt(lateDeadline, 10)))
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	if !bytes.Contains(seeded, want) {
+		t.Fatalf("append-only file = %q, want it to hold %q", seeded, want)
+	}
+	if relative := []byte("$2\r\nPX\r\n"); bytes.Contains(seeded, relative) {
+		t.Fatalf("append-only file = %q, want no TTL relative to the loader's clock", seeded)
+	}
+
+	// session:42 expires while the server is down.
+	for time.Now().UnixMilli() <= soonDeadline {
+		time.Sleep(time.Until(time.UnixMilli(soonDeadline + 1)))
+	}
+
+	restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
+	restartConn, err := net.Dial("tcp", restartAddr)
+	if err != nil {
+		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+	}
+	defer closeTestResource(t, restartConn)
+	restartParser := protocol.NewParser(restartConn)
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
+
+	restartStop()
+	waitForServerStop(t, restartErrCh)
 }
 
 func TestServerDoesNotPersistPublishToAOF(t *testing.T) {
@@ -493,6 +614,89 @@ func TestServerKeepsAutoGeneratedStreamIDsAcrossRestart(t *testing.T) {
 
 	restartStop()
 	waitForServerStop(t, restartErrCh)
+}
+
+// TestAnIncrUnderMaxmemoryIsNotLoggedAfterADelOfTheKeyItFoundLive sends each
+// INCR in the last microseconds before its key's TTL deadline, so that it finds
+// the key live and then, under maxmemory, sweeps expired keys to make room as
+// the deadline passes. The AOF must not log a DEL of the key ahead of an INCR
+// that found it live: replaying it would leave the key at 1 with no TTL. A
+// round can miss the window it aims at, so the test asserts no timing and logs
+// how many rounds straddled their deadline.
+func TestAnIncrUnderMaxmemoryIsNotLoggedAfterADelOfTheKeyItFoundLive(t *testing.T) {
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	cfg := testAOFConfig(aofPath)
+	cfg.AppendFsync = "everysec"
+	cfg.MaxMemory = 1 << 30
+	// Leave the sweeping to accounted writes. An active pass may remove a key
+	// before its INCR arrives, a correct order this test must not have to tell
+	// apart.
+	cfg.EvictionInterval = time.Hour
+
+	addr, stop, errCh := startTestServer(t, cfg)
+	conn, parser := dialClient(t, addr)
+
+	const rounds = 400
+	foundLive := make(map[string]bool)
+	straddled := 0
+	for round := 0; round < rounds; round++ {
+		key := "k" + strconv.Itoa(round)
+		deadline := time.Now().UnixMilli() + 2
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", key, "9", "PXAT", strconv.FormatInt(deadline, 10))
+
+		// The key expires when the deadline's millisecond ends. Aim the INCR 5 to
+		// 100 µs before that, so it reads the clock just before and makes room
+		// just after.
+		lead := time.Duration(5+round%96) * time.Microsecond
+		sendAt := time.UnixMilli(deadline + 1).Add(-lead)
+		for time.Now().Before(sendAt) {
+		}
+		reply := roundTrip(t, conn, parser, "INCR", key)
+		n, ok := reply.(protocol.Integer)
+		if !ok {
+			t.Fatalf("INCR %s reply = %#v, want an integer", key, reply)
+		}
+		// 10 means the INCR found the key live, 1 that it had already expired.
+		foundLive[key] = n.Value == 10
+		if foundLive[key] && time.Now().UnixMilli() > deadline {
+			straddled++
+		}
+	}
+	t.Logf("%d of %d INCRs found their key live and replied after its deadline had passed", straddled, rounds)
+	closeTestResource(t, conn)
+	stop()
+	waitForServerStop(t, errCh)
+
+	data, err := os.ReadFile(aofPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+	}
+	frames := protocol.NewParser(bytes.NewReader(data))
+	deleted := make(map[string]bool)
+	var misordered []string
+	for {
+		frame, err := frames.Parse()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Parse(AOF frame) error = %v", err)
+		}
+		args := collectBulkStrings(t, frame)
+		switch strings.ToUpper(args[0]) {
+		case "DEL":
+			for _, key := range args[1:] {
+				deleted[key] = true
+			}
+		case "INCR":
+			if foundLive[args[1]] && deleted[args[1]] {
+				misordered = append(misordered, args[1])
+			}
+		}
+	}
+	if len(misordered) > 0 {
+		t.Fatalf("the AOF logs a DEL ahead of %d INCRs that found their key live and replied 10, so a replay leaves them at 1 with no TTL: %v", len(misordered), misordered)
+	}
 }
 
 func testAOFConfig(aofPath string) config.Config {
