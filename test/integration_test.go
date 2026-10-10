@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -29,7 +30,13 @@ func defaultTestConfig() config.Config {
 
 func startTestServer(t *testing.T, cfg config.Config) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
-	logger := stashlogger.New(cfg.LogLevel)
+	return startTestServerWithLogger(t, cfg, stashlogger.New(cfg.LogLevel))
+}
+
+// startTestServerWithLogger is startTestServer for a test that reads the server's
+// log output.
+func startTestServerWithLogger(t *testing.T, cfg config.Config, logger *slog.Logger) (string, context.CancelFunc, <-chan error) {
+	t.Helper()
 	store := storage.NewStore()
 	executor := command.NewExecutor(store, logger)
 	srv := server.New(cfg, logger, store, executor)

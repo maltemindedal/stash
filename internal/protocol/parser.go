@@ -207,8 +207,15 @@ func (p *Parser) readLine() (string, error) {
 	return string(line), nil
 }
 
+// readLineBytes reads the line after a type byte, with the bound decodeLine
+// applies: the LF must be among the first maxLineLength bytes. Every ReadSlice
+// result is checked, so the bound does not depend on the size of the bufio.Reader
+// or on how the bytes arrive.
 func (p *Parser) readLineBytes() ([]byte, error) {
 	line, err := p.reader.ReadSlice('\n')
+	if lineTooLong(len(line), err == nil) {
+		return nil, errLineTooLong()
+	}
 	if err == nil {
 		return trimCRLF(line)
 	}
@@ -220,6 +227,10 @@ func (p *Parser) readLineBytes() ([]byte, error) {
 	for {
 		fragment, readErr := p.reader.ReadSlice('\n')
 		combined = append(combined, fragment...)
+		if lineTooLong(len(combined), readErr == nil) {
+			p.lineBuf = combined[:0]
+			return nil, errLineTooLong()
+		}
 		if readErr == nil {
 			p.lineBuf = combined[:0]
 			return trimCRLF(combined)
@@ -228,11 +239,21 @@ func (p *Parser) readLineBytes() ([]byte, error) {
 			p.lineBuf = combined[:0]
 			return nil, readErr
 		}
-		if len(combined) > maxLineLength {
-			p.lineBuf = combined[:0]
-			return nil, fmt.Errorf("protocol: line exceeds %d byte limit", maxLineLength)
-		}
 	}
+}
+
+// lineTooLong reports whether n bytes read after a type byte put the line past
+// maxLineLength. A terminated line, CRLF included, may fill maxLineLength bytes.
+// An unterminated one may not: the LF would have to be among them.
+func lineTooLong(n int, terminated bool) bool {
+	if terminated {
+		return n > maxLineLength
+	}
+	return n >= maxLineLength
+}
+
+func errLineTooLong() error {
+	return fmt.Errorf("protocol: line exceeds %d byte limit", maxLineLength)
 }
 
 func (p *Parser) expectCRLF() error {

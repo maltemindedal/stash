@@ -10,10 +10,14 @@ import (
 // frame. Callers should retry Decode after more bytes arrive.
 var ErrIncomplete = errors.New("protocol: incomplete frame")
 
-// ErrMissingCRLF reports a line or bulk payload that is not terminated by CRLF.
-// It is a typed sentinel so callers can match it with errors.Is rather than the
-// message text. AOF replay relies on this to tell a torn trailing record (a
-// recoverable truncated tail) apart from genuine corruption.
+// ErrMissingCRLF reports a line or bulk payload whose terminator arrived and is
+// not CRLF: a line ended by a bare LF, or other bytes where the CRLF after a
+// payload belongs. A stream that stops before the terminator is not this error;
+// it is ErrIncomplete here and an end-of-stream error from the Parser. It is a
+// typed sentinel so callers can match it with errors.Is rather than the message
+// text. Nothing in Stash does: AOF replay treats io.EOF and io.ErrUnexpectedEOF
+// from the Parser as a torn trailing record and every other error, this one
+// included, as corruption.
 var ErrMissingCRLF = errors.New("protocol: line missing CRLF terminator")
 
 // IncompleteError reports an incomplete frame along with Need, a lower bound on
@@ -223,12 +227,11 @@ func (d *Decoder) decodeBulkString(buf []byte) (Value, int, error) {
 	if length < -1 {
 		return nil, 0, fmt.Errorf("protocol: invalid bulk string length %d", length)
 	}
-	// Only a tightened limit is checked here. The default is left to the caller's
-	// buffer limit, which also bounds a length too large to add up as a hint.
-	if d.limits.bulkLength() < maxBulkStringLength {
-		if err := d.limits.checkBulkLength(length); err != nil {
-			return nil, 0, err
-		}
+	// Check the length under every limit, the default included, as the Parser
+	// does. That also keeps the size hint below from overflowing: length is at
+	// most maxBulkStringLength here.
+	if err := d.limits.checkBulkLength(length); err != nil {
+		return nil, 0, err
 	}
 
 	remaining := buf[consumed:]

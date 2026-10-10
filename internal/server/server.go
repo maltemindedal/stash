@@ -104,6 +104,11 @@ type Server struct {
 	upstreamConn   net.Conn
 	upstreamConnMu sync.Mutex
 
+	// stopLink ends a Replica's link to its Master. ListenAndServe sets it before
+	// the link or anything that can call shutdown starts, and shutdown calls it,
+	// so every way the server stops ends the link. It stays nil on a Master.
+	stopLink context.CancelFunc
+
 	listener     net.Listener
 	listenerMu   sync.RWMutex
 	shutdownOnce sync.Once
@@ -215,8 +220,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	defer stopEviction()
 	evictionDone := s.store.StartEviction(evictionCtx, s.cfg.EvictionInterval, s.cfg.EvictionSampleSize)
 	if s.cfg.IsReplica() {
+		// The link runs on its own context because serve can fail while ctx is
+		// still live, and the link would redial for as long as ctx lasts.
+		linkCtx, stopLink := context.WithCancel(ctx)
+		s.stopLink = stopLink
 		s.handlerWG.Add(1)
-		go s.startReplicaLink(ctx, listener.Addr().String())
+		go s.startReplicaLink(linkCtx, listener.Addr().String())
 	}
 
 	stopShutdown := context.AfterFunc(ctx, s.shutdown)
@@ -441,6 +450,11 @@ const replicaShutdownGrace = time.Second
 
 func (s *Server) shutdown() {
 	s.shutdownOnce.Do(func() {
+		// Ending the link first keeps it from dialling the Master again after the
+		// upstream connection below is closed.
+		if s.stopLink != nil {
+			s.stopLink()
+		}
 		s.closeUpstreamConn()
 		// Commands already propagated are written to the replicas before their
 		// sockets are closed, as they were when propagation wrote them directly.

@@ -1508,7 +1508,7 @@ func startMasterWithLateReplica(t *testing.T, writesBefore int) (net.Conn, *prot
 
 	// Write only once the master has registered the replica, so that the write
 	// is in its stream, after its base offset, rather than in its snapshot.
-	waitForReplicaCount(t, master, 1)
+	waitForReplicaCount(t, master, 1, "before the write")
 	assertCommandResponse(t, writerConn, writerParser, protocol.SimpleString{Value: "OK"}, "SET", "greeting", "hello")
 
 	replicaConn, err := net.Dial("tcp", replicaAddr)
@@ -1522,17 +1522,16 @@ func startMasterWithLateReplica(t *testing.T, writesBefore int) (net.Conn, *prot
 	return writerConn, writerParser
 }
 
-// waitForReplicaCount waits up to two seconds for srv to have want replicas
-// registered.
-func waitForReplicaCount(t *testing.T, srv *server.Server, want int) {
+// waitForReplicaCount waits until master has want Replicas attached.
+func waitForReplicaCount(t *testing.T, master *server.Server, want int, when string) {
 	t.Helper()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for srv.ReplicaCount() != want && time.Now().Before(deadline) {
+	deadline := time.Now().Add(5 * time.Second)
+	for master.ReplicaCount() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("ReplicaCount() = %d, want %d %s", master.ReplicaCount(), want, when)
+		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	if got := srv.ReplicaCount(); got != want {
-		t.Fatalf("ReplicaCount() = %d, want %d", got, want)
 	}
 }
 

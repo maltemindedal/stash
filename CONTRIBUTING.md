@@ -39,11 +39,35 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 
 The CI `race` job runs the tests under the race detector in random order (`-shuffle=on`) to catch tests that depend on each other. A failing run prints the shuffle seed; repeat it with `go test -race -shuffle=<seed> ./...`.
 
-Benchmarks for the parser and store:
+## Benchmarks
+
+A performance change is judged against the commit it replaces, not by absolute numbers. Run [`scripts/bench.sh`](scripts/bench.sh) on a quiet machine, with nothing else competing for the CPUs (on a shared machine hold a lock around the run, for example with `flock`; the script takes none):
+
+```bash
+scripts/bench.sh [-count N] [-threshold PCT] <base-ref> <bench-regex> <package>...
+scripts/bench.sh origin/main '^BenchmarkStore$' ./internal/storage
+```
+
+Each `<package>` is a path or import path that `go list` resolves from the repository root, whatever your current directory, to exactly one package; `./...` is refused. The package needs tests at `<base-ref>` and at `HEAD`.
+
+For each package the script builds one test binary at `<base-ref>` and one at `HEAD` (uncommitted changes are not measured) on the floor toolchain, then runs `-count` rounds of the base binary followed by the head binary, so drift in the machine reaches both. `-count` defaults to 10 and must be at least 4: with fewer samples a side benchstat cannot reach p<0.05, so no slowdown could fail the bar. [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) compares the results; its version is pinned in the script and nothing is added to `go.mod`. The first run downloads Go 1.21.13 and the Go 1.26 that benchstat needs.
+
+The script prints a header to paste into the commit body (nproc, Go version, CPU model, count, base and head commits). It exits 1 and names the rows when a benchmark is more than `-threshold` percent (default 5) slower in sec/op at p<0.05, when allocs/op rises, or when a benchmark was measured on one side only (renamed or removed at `HEAD`, or new), because nothing can be compared. It exits 2 when the results cannot be judged, for example a row without a p-value. Use `-count 20` or a larger threshold only where the issue allows it. The pass or fail logic is [`scripts/benchcheck`](scripts/benchcheck), a standard-library Go program with its own tests.
+
+For a quick look at the raw numbers of the parser and store, without a comparison:
 
 ```bash
 go test -run ^$ -bench . ./internal/protocol ./internal/storage
 ```
+
+The two RESP decoders in `internal/protocol` (the `Parser` and the `Decoder`) are tested against each other in `differential_test.go`. `go test` runs a fixed corpus of 2,500 mutated inputs, which takes about a second under `-race`; `-short` skips it. To run the first n inputs of the same corpus, or to fuzz for new ones:
+
+```bash
+STASH_DECODER_FUZZ_CASES=1000000 go test ./internal/protocol -run '^TestParserMatchesDecoderOnMutatedFrames$'
+go test ./internal/protocol -run '^$' -fuzz '^FuzzParserMatchesDecoder$' -fuzztime 60s -fuzzminimizetime 0s
+```
+
+Without `-fuzzminimizetime 0s` the fuzzer spends most of the minute minimizing the inputs it finds. A failure prints its whole input; add it to `differentialSeeds` once it is fixed.
 
 ## Lint configuration
 
@@ -78,3 +102,5 @@ Pull requests run the `validate` job (on the minimum Go version) and the `test-l
 ## Dependency and vulnerability checks
 
 Stash has no module dependencies, so the moving parts are the Go toolchain and the GitHub Actions in `.github/workflows/`. Actions are pinned to commit SHAs; Dependabot proposes bumps weekly, holding back new releases for its default cooldown. A weekly workflow runs `govulncheck` against the latest stable Go. Run it locally with `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`.
+
+Two more tools are pinned outside `go.mod`, both to versions at least a week old when chosen (the rule in PR #36's dependency table): `golangci-lint` at the version `.github/workflows/ci.yml` names, and `benchstat`, which `scripts/bench.sh` runs as `golang.org/x/perf/cmd/benchstat@v0.0.0-20260929162123-406019bb8b68` (golang.org/x/perf has no tags, so this is a pseudo-version; the script's `benchstat_version` is the one place to bump it, together with this line).

@@ -1,8 +1,12 @@
 package aof
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"time"
@@ -42,6 +46,123 @@ func GenerateRewrite(entries []storage.SnapshotEntry, writer io.Writer) (Rewrite
 	}
 
 	return stats, nil
+}
+
+// SeedFile writes entries as the append-only file at path, which must be
+// missing or an empty regular file. Startup uses it when an RDB snapshot loaded
+// keys beside such a file: from the next start on the file is not empty, so it
+// is loaded instead of the RDB snapshot, and it has to hold those keys. If path
+// is a symbolic link, the file it leads to is the one written, as OpenWriter
+// would append to it.
+//
+// It builds the file the way a rewrite does, so that a crash at any point
+// leaves either the file as it was or all of the new one: the commands go to a
+// temp file in the same directory, which is fsynced and closed, then renamed
+// over the file, and then the directory is fsynced. If a step before the rename
+// fails, the temp file is removed and the file is left as it was. If only the
+// directory sync fails, the file already holds the complete seed, but the
+// rename may not survive a crash. SeedFile returns an error then too, so that
+// the caller appends nothing to a file that may not keep its name.
+func SeedFile(path string, entries []storage.SnapshotEntry) (stats RewriteStats, err error) {
+	if path == "" {
+		return RewriteStats{}, errors.New("aof: empty file path")
+	}
+	if path, err = resolveSeedPath(path); err != nil {
+		return RewriteStats{}, err
+	}
+	// The rename replaces whatever path names: that must not be commands, or a
+	// device such as /dev/full that reports a size of zero.
+	info, err := os.Stat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return RewriteStats{}, fmt.Errorf("aof: inspect %q: %w", path, err)
+	case !info.Mode().IsRegular():
+		return RewriteStats{}, fmt.Errorf("aof: %q is not a regular file, and seeding it would put one in its place", path)
+	case info.Size() > 0:
+		return RewriteStats{}, fmt.Errorf("aof: %q already holds %d bytes, and seeding it would replace them", path, info.Size())
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return RewriteStats{}, fmt.Errorf("aof: create directory %q: %w", dir, err)
+	}
+	tempFile, err := os.CreateTemp(dir, filepath.Base(path)+".seed-*")
+	if err != nil {
+		return RewriteStats{}, fmt.Errorf("aof: create a temp file beside %q: %w", path, err)
+	}
+	tempPath := tempFile.Name()
+	closed, renamed := false, false
+	defer func() {
+		if !closed {
+			_ = tempFile.Close()
+		}
+		if renamed {
+			return
+		}
+		if removeErr := removeFile(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("aof: remove temp file %q: %w", tempPath, removeErr))
+		}
+	}()
+
+	buffered := bufio.NewWriter(tempFile)
+	if stats, err = GenerateRewrite(entries, buffered); err != nil {
+		return stats, err
+	}
+	if err := buffered.Flush(); err != nil {
+		return stats, fmt.Errorf("aof: write %q: %w", tempPath, err)
+	}
+	// The commands must be on disk before the rename lets path name them.
+	if err := tempFile.Sync(); err != nil {
+		return stats, fmt.Errorf("aof: sync %q: %w", tempPath, err)
+	}
+	closed = true
+	if err := tempFile.Close(); err != nil {
+		return stats, fmt.Errorf("aof: close %q: %w", tempPath, err)
+	}
+	if err := replaceFile(tempPath, path); err != nil {
+		var unsynced *unsyncedReplaceError
+		renamed = errors.As(err, &unsynced)
+		return stats, err
+	}
+	renamed = true
+
+	return stats, nil
+}
+
+// resolveSeedPath returns the file a seed of path replaces: path itself, unless
+// it is a symbolic link. OpenWriter's open of path follows a link, but a rename
+// over the link would replace the link with a regular file in its directory and
+// leave the file it points to empty, moving the AOF off the volume the link
+// chose. So a link resolves to the file it leads to. If that file does not
+// exist yet, it is first created empty through the link, as OpenWriter would
+// create it; an empty file there is also all a failed seed leaves behind.
+func resolveSeedPath(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("aof: inspect %q: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return path, nil
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return "", fmt.Errorf("aof: create the file symbolic link %q leads to: %w", path, err)
+		}
+		if err := file.Close(); err != nil {
+			return "", fmt.Errorf("aof: create the file symbolic link %q leads to: %w", path, err)
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("aof: resolve symbolic link %q: %w", path, err)
+	}
+
+	return resolved, nil
 }
 
 func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.Value, error) {

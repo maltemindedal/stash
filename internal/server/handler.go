@@ -82,7 +82,10 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		parser.SetLimits(s.requestLimits(state))
 		value, err := parser.Parse()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			// A client that leaves inside a frame is still a client that left: the
+			// Parser reports a bulk payload cut short as io.ErrUnexpectedEOF, not
+			// io.EOF. There is no one to answer and nothing to warn about.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			if authDeadlineSet && errors.Is(err, os.ErrDeadlineExceeded) {

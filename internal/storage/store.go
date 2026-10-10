@@ -308,51 +308,27 @@ func (s *Store) RightPush(key string, values [][]byte) (int64, []string, error) 
 
 // LeftPop removes and returns the left-most value from the list stored at key.
 func (s *Store) LeftPop(key string) ([]byte, bool, error) {
-	shard := s.shardForKey(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	value, ok := shard.data[key]
-	if ok && isExpired(value, time.Now().UnixMilli()) {
-		s.deleteKeyLocked(shard, key)
-		ok = false
-	}
-	if !ok {
-		return nil, false, nil
-	}
-	list, err := value.ListValue()
-	if err != nil {
-		return nil, false, err
-	}
-	if len(list) == 0 {
-		s.deleteKeyLocked(shard, key)
-		return nil, false, nil
-	}
-	accounting := s.maxMemoryEnabled()
-	var oldSize int64
-	if accounting {
-		oldSize = s.approximateValueObjectSize(key, value)
-	}
-
-	item := list[0]
-	list[0] = nil
-	list = list[1:]
-	value.dropListFront(1)
-	value.touch(time.Now().UnixMilli())
-	if len(list) == 0 {
-		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return item, true, nil
-	}
-	if accounting {
-		newSize := s.approximateValueObjectSize(key, value)
-		s.usedMemory.Add(newSize - oldSize)
-	}
-
-	return item, true, nil
+	return s.popOne(key, true)
 }
 
 // RightPop removes and returns the right-most value from the list stored at key.
 func (s *Store) RightPop(key string) ([]byte, bool, error) {
+	return s.popOne(key, false)
+}
+
+// popOne removes one value from the left or right end of the list stored at key.
+// A pop that leaves elements behind wakes the next waiting client.
+func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
+	item, remaining, ok, err := s.popOneFromShard(key, left)
+	if remaining > 0 {
+		s.wakeNextListWaiter(key)
+	}
+	return item, ok, err
+}
+
+// popOneFromShard does popOne's work under the key's shard lock, and also reports
+// how many elements the list has left.
+func (s *Store) popOneFromShard(key string, left bool) ([]byte, int, bool, error) {
 	shard := s.shardForKey(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -363,15 +339,15 @@ func (s *Store) RightPop(key string) ([]byte, bool, error) {
 		ok = false
 	}
 	if !ok {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	list, err := value.ListValue()
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	if len(list) == 0 {
 		s.deleteKeyLocked(shard, key)
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	accounting := s.maxMemoryEnabled()
 	var oldSize int64
@@ -379,22 +355,30 @@ func (s *Store) RightPop(key string) ([]byte, bool, error) {
 		oldSize = s.approximateValueObjectSize(key, value)
 	}
 
-	last := len(list) - 1
-	item := list[last]
-	list[last] = nil
-	list = list[:last]
-	value.dropListEnd(1)
+	var item []byte
+	if left {
+		item = list[0]
+		list[0] = nil
+		list = list[1:]
+		value.dropListFront(1)
+	} else {
+		last := len(list) - 1
+		item = list[last]
+		list[last] = nil
+		list = list[:last]
+		value.dropListEnd(1)
+	}
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return item, true, nil
+		return item, 0, true, nil
 	}
 	if accounting {
 		newSize := s.approximateValueObjectSize(key, value)
 		s.usedMemory.Add(newSize - oldSize)
 	}
 
-	return item, true, nil
+	return item, len(list), true, nil
 }
 
 // LeftPopN removes and returns up to count left-most values from the list stored at key.
@@ -409,11 +393,24 @@ func (s *Store) RightPopN(key string, count int64) ([][]byte, bool, error) {
 	return s.popN(key, count, false)
 }
 
+// popN removes up to count values from the left or right end of the list stored
+// at key. A pop that removes values and leaves elements behind wakes the next
+// waiting client.
 func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error) {
 	if count < 0 {
 		return nil, false, ErrSyntax
 	}
 
+	popped, remaining, ok, err := s.popNFromShard(key, count, left)
+	if len(popped) > 0 && remaining > 0 {
+		s.wakeNextListWaiter(key)
+	}
+	return popped, ok, err
+}
+
+// popNFromShard does popN's work under the key's shard lock, and also reports
+// how many elements the list has left.
+func (s *Store) popNFromShard(key string, count int64, left bool) ([][]byte, int, bool, error) {
 	shard := s.shardForKey(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -424,15 +421,15 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 		ok = false
 	}
 	if !ok {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	list, err := value.ListValue()
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	if len(list) == 0 {
 		s.deleteKeyLocked(shard, key)
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	accounting := s.maxMemoryEnabled()
 	var oldSize int64
@@ -466,14 +463,14 @@ func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error)
 	value.touch(time.Now().UnixMilli())
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return popped, true, nil
+		return popped, 0, true, nil
 	}
 	if accounting {
 		newSize := s.approximateValueObjectSize(key, value)
 		s.usedMemory.Add(newSize - oldSize)
 	}
 
-	return popped, true, nil
+	return popped, len(list), true, nil
 }
 
 // ListRange returns an inclusive range of values from the list stored at key.
@@ -683,14 +680,42 @@ func (s *Store) XRead(key, rawID string) ([]StreamEntry, error) {
 	return entries, nil
 }
 
-// SubscribeListPush registers a waiter that is notified when a push occurs for key.
+// SubscribeListPush registers a waiter for an element of the list at key. It is
+// signaled when its turn comes: by a push, or by a pop that leaves elements
+// behind (wakeNextListWaiter).
 func (s *Store) SubscribeListPush(key string) chan struct{} {
 	return s.waiters.subscribe(key)
 }
 
-// UnsubscribeListPush removes a previously registered list push waiter.
+// UnsubscribeListPush removes a waiter registered with SubscribeListPush. A
+// waiter that was signaled but whose wake-up nobody received passes its turn to
+// the next waiter, so a client that stops waiting after its turn came (it has
+// popped already, or has gone) leaves no other client blocked while the list
+// has an element. Call it only once every shard lock is released, as
+// wakeNextListWaiter.
 func (s *Store) UnsubscribeListPush(key string, ch chan struct{}) {
 	s.waiters.unsubscribe(key, ch)
+}
+
+// PassListPushWake passes a turn that a waiter received but will not take, as
+// when its client has gone, to the next waiter for key. Call it only once every
+// shard lock is released, as wakeNextListWaiter.
+func (s *Store) PassListPushWake(key string) {
+	s.wakeNextListWaiter(key)
+}
+
+// wakeNextListWaiter wakes the client that has waited longest for an element of
+// the list at key, if any client is waiting. A push calls it, and so does a pop
+// that leaves elements behind. The woken client's own pop then wakes the next,
+// so a push of n elements serves up to n waiting clients, longest-waiting first,
+// one after the other rather than all at once: woken together, they would race,
+// and a later waiter could take the first element.
+//
+// Call it only once every shard lock is released. A shard lock must never be
+// held while taking waiters.mu, so that a future path taking those two locks in
+// the other order cannot deadlock against this one.
+func (s *Store) wakeNextListWaiter(key string) {
+	s.waiters.notifyOne(key)
 }
 
 // Len returns the current number of stored keys.
@@ -1121,10 +1146,7 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 		return 0, nil, err
 	}
 
-	// Notify only once every shard lock is released. A shard lock must never be
-	// held while taking waiters.mu, so that a future path taking those two locks
-	// in the other order cannot deadlock against this one.
-	s.waiters.notifyOne(key)
+	s.wakeNextListWaiter(key)
 	return length, evicted, nil
 }
 

@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +140,107 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
 		t.Fatalf("UsedMemory() = %d after the sweep, recount = %d", used, want)
 	}
+}
+
+// TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive covers a growing write
+// to a key whose TTL deadline passes while the write runs. Under maxmemory the
+// write sweeps expired keys to make room, and that sweep judges expiry by the
+// clock reading at which the write found its key live: the key is neither
+// reported to the expiration listener nor counted out of used memory.
+func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(store *Store, key string) error
+	}{
+		{
+			name: "INCR that adds a digit",
+			write: func(store *Store, key string) error {
+				_, _, err := store.Increment(key)
+				return err
+			},
+		},
+		{
+			name: "SETBIT past the end",
+			write: func(store *Store, key string) error {
+				_, _, err := store.SetBit(key, 15, 1)
+				return err
+			},
+		},
+		{
+			name: "SET to a longer value with a TTL",
+			write: func(store *Store, key string) error {
+				_, err := store.Set(key, []byte("longer"), time.Now().Add(time.Hour).UnixMilli())
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			store, key, heard := writeAcrossItsKeysDeadline(t, tt.write)
+
+			if len(heard) != 0 {
+				t.Errorf("the expiration listener heard %v, want nothing: the write found %s live", heard, key)
+			}
+			if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
+				t.Errorf("UsedMemory() = %d after the write, recount = %d", used, want)
+			}
+		})
+	}
+}
+
+// writeAcrossItsKeysDeadline stores "9" under a key on the last shard, with a
+// TTL deadline an hour out, under maxmemory. It runs write on that key so that
+// the write takes its clock reading at or before the key's deadline and makes
+// room after it, and returns the store, the key, and the keys the expiration
+// listener heard.
+//
+// An accounted write reads the clock and then takes every shard lock in
+// ascending order, so while the test holds the last shard's lock the write
+// parks there, holding shard 0 and past its clock reading. The test then moves
+// the key's deadline to a clock reading of its own, which cannot precede the
+// write's, under that same lock, and lets the write go on once the clock has
+// passed it.
+func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key string) error) (*Store, string, []string) {
+	t.Helper()
+
+	store := NewStore()
+	store.ConfigureMaxMemory(1<<20, 16)
+	var heard []string
+	store.SetExpirationListener(func(keys []string) { heard = append(heard, keys...) })
+
+	lastIndex := len(store.shards) - 1
+	key := ""
+	for i := 0; key == ""; i++ {
+		if candidate := fmt.Sprintf("k%d", i); store.shardIndex(candidate) == lastIndex {
+			key = candidate
+		}
+	}
+	if _, err := store.Set(key, []byte("9"), time.Now().Add(time.Hour).UnixMilli()); err != nil {
+		t.Fatalf("Set(%s) error = %v", key, err)
+	}
+
+	last := &store.shards[lastIndex]
+	last.mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- write(store, key) }()
+	for store.shards[0].mu.TryLock() {
+		store.shards[0].mu.Unlock()
+		runtime.Gosched()
+	}
+	deadline := time.Now().UnixMilli()
+	last.data[key].ExpiresAt = deadline
+	store.noteExpiry(deadline)
+	for time.Now().UnixMilli() <= deadline {
+		runtime.Gosched()
+	}
+	last.mu.Unlock()
+
+	if err := <-done; err != nil {
+		t.Fatalf("the write failed: %v", err)
+	}
+	return store, key, heard
 }
 
 // TestStoreExpiryLowerBound pins how the earliest-deadline bound is kept: unknown

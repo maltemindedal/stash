@@ -95,7 +95,7 @@ type keyWrite struct {
 // current itself.
 func (w keyWrite) commit(newValue *ValueObject) ([]string, error) {
 	if w.accounting {
-		return w.store.commitValueWithEvictionLocked(w.shard, w.key, w.current, newValue)
+		return w.store.commitValueWithEvictionLocked(w.shard, w.key, w.current, newValue, w.now)
 	}
 
 	w.store.setKeyLocked(w.shard, w.key, newValue)
@@ -131,7 +131,9 @@ func (w keyWrite) commitString(length int, expiresAt int64, fill func(payload []
 // shard for writing. It may lock every shard because eviction can cross shard
 // boundaries. It also reclaims the key when its TTL has passed and releases all
 // locks on every path. fn therefore sees either a live value of unknown kind or
-// nil when the key is absent.
+// nil when the key is absent. The one clock reading decides every expiry the
+// write sees: its own key's and, under maxmemory, those in the sweep that makes
+// room for it, so the sweep cannot remove a key fn was handed as live.
 //
 // fn runs under the write locks and stores its result through the keyWrite it is
 // handed; it must not retain that keyWrite, or memory borrowed from the value,
