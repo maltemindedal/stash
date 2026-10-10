@@ -1,7 +1,6 @@
 package command
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -82,7 +81,7 @@ func TestGeohashEncodeDecode(t *testing.T) {
 func TestExecutorGeoAdd(t *testing.T) {
 	t.Run("adds new members and returns added count", func(t *testing.T) {
 		executor := newTestExecutor()
-		value, err := executor.Execute(context.Background(), geoAddSicilyRequest())
+		value, err := executor.Execute(clientContext(executor), geoAddSicilyRequest())
 		if err != nil {
 			t.Fatalf("GEOADD error = %v", err)
 		}
@@ -91,11 +90,11 @@ func TestExecutorGeoAdd(t *testing.T) {
 
 	t.Run("updating an existing member returns zero", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), geoAddSicilyRequest()); err != nil {
+		if _, err := executor.Execute(clientContext(executor), geoAddSicilyRequest()); err != nil {
 			t.Fatalf("GEOADD error = %v", err)
 		}
 
-		value, err := executor.Execute(context.Background(), requestValue("GEOADD", "Sicily", "13.5", "38.2", "Palermo"))
+		value, err := executor.Execute(clientContext(executor), requestValue("GEOADD", "Sicily", "13.5", "38.2", "Palermo"))
 		if err != nil {
 			t.Fatalf("GEOADD update error = %v", err)
 		}
@@ -104,11 +103,11 @@ func TestExecutorGeoAdd(t *testing.T) {
 
 	t.Run("stores members as sorted-set data", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), geoAddSicilyRequest()); err != nil {
+		if _, err := executor.Execute(clientContext(executor), geoAddSicilyRequest()); err != nil {
 			t.Fatalf("GEOADD error = %v", err)
 		}
 
-		value, err := executor.Execute(context.Background(), requestValue("ZRANGE", "Sicily", "0", "-1"))
+		value, err := executor.Execute(clientContext(executor), requestValue("ZRANGE", "Sicily", "0", "-1"))
 		if err != nil {
 			t.Fatalf("ZRANGE error = %v", err)
 		}
@@ -120,7 +119,7 @@ func TestExecutorGeoAdd(t *testing.T) {
 
 	t.Run("rejects out-of-range coordinates", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEOADD", "Sicily", "200", "40", "nowhere"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEOADD", "Sicily", "200", "40", "nowhere"))
 		if err == nil {
 			t.Fatal("GEOADD error = nil, want invalid coordinates error")
 		}
@@ -131,7 +130,7 @@ func TestExecutorGeoAdd(t *testing.T) {
 
 	t.Run("rejects non-numeric coordinates", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEOADD", "Sicily", "east", "38", "Palermo"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEOADD", "Sicily", "east", "38", "Palermo"))
 		if err == nil {
 			t.Fatal("GEOADD error = nil, want float parse error")
 		}
@@ -140,7 +139,7 @@ func TestExecutorGeoAdd(t *testing.T) {
 
 	t.Run("rejects incomplete coordinate triples", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEOADD", "Sicily", "13.361389", "38.115556"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEOADD", "Sicily", "13.361389", "38.115556"))
 		if err == nil {
 			t.Fatal("GEOADD error = nil, want wrong number of arguments error")
 		}
@@ -149,11 +148,11 @@ func TestExecutorGeoAdd(t *testing.T) {
 
 	t.Run("fails against a non-zset key", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("SET", "Sicily", "island")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "Sicily", "island")); err != nil {
 			t.Fatalf("SET error = %v", err)
 		}
 
-		_, err := executor.Execute(context.Background(), requestValue("GEOADD", "Sicily", "13.361389", "38.115556", "Palermo"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEOADD", "Sicily", "13.361389", "38.115556", "Palermo"))
 		if err == nil {
 			t.Fatal("GEOADD error = nil, want WRONGTYPE error")
 		}
@@ -178,11 +177,11 @@ func TestExecutorGeoDist(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				executor := newTestExecutor()
-				if _, err := executor.Execute(context.Background(), geoAddSicilyRequest()); err != nil {
+				if _, err := executor.Execute(clientContext(executor), geoAddSicilyRequest()); err != nil {
 					t.Fatalf("GEOADD error = %v", err)
 				}
 
-				value, err := executor.Execute(context.Background(), requestValue(tt.args...))
+				value, err := executor.Execute(clientContext(executor), requestValue(tt.args...))
 				if err != nil {
 					t.Fatalf("GEODIST error = %v", err)
 				}
@@ -193,11 +192,11 @@ func TestExecutorGeoDist(t *testing.T) {
 
 	t.Run("returns null bulk string when a member is missing", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), geoAddSicilyRequest()); err != nil {
+		if _, err := executor.Execute(clientContext(executor), geoAddSicilyRequest()); err != nil {
 			t.Fatalf("GEOADD error = %v", err)
 		}
 
-		value, err := executor.Execute(context.Background(), requestValue("GEODIST", "Sicily", "Palermo", "Messina"))
+		value, err := executor.Execute(clientContext(executor), requestValue("GEODIST", "Sicily", "Palermo", "Messina"))
 		if err != nil {
 			t.Fatalf("GEODIST error = %v", err)
 		}
@@ -206,7 +205,7 @@ func TestExecutorGeoDist(t *testing.T) {
 
 	t.Run("returns null bulk string for a missing key", func(t *testing.T) {
 		executor := newTestExecutor()
-		value, err := executor.Execute(context.Background(), requestValue("GEODIST", "missing", "Palermo", "Catania"))
+		value, err := executor.Execute(clientContext(executor), requestValue("GEODIST", "missing", "Palermo", "Catania"))
 		if err != nil {
 			t.Fatalf("GEODIST error = %v", err)
 		}
@@ -215,11 +214,11 @@ func TestExecutorGeoDist(t *testing.T) {
 
 	t.Run("rejects unsupported units", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), geoAddSicilyRequest()); err != nil {
+		if _, err := executor.Execute(clientContext(executor), geoAddSicilyRequest()); err != nil {
 			t.Fatalf("GEOADD error = %v", err)
 		}
 
-		_, err := executor.Execute(context.Background(), requestValue("GEODIST", "Sicily", "Palermo", "Catania", "yd"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEODIST", "Sicily", "Palermo", "Catania", "yd"))
 		if err == nil {
 			t.Fatal("GEODIST error = nil, want unsupported unit error")
 		}
@@ -230,11 +229,11 @@ func TestExecutorGeoDist(t *testing.T) {
 
 	t.Run("fails against a non-zset key", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("SET", "Sicily", "island")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "Sicily", "island")); err != nil {
 			t.Fatalf("SET error = %v", err)
 		}
 
-		_, err := executor.Execute(context.Background(), requestValue("GEODIST", "Sicily", "Palermo", "Catania"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEODIST", "Sicily", "Palermo", "Catania"))
 		if err == nil {
 			t.Fatal("GEODIST error = nil, want WRONGTYPE error")
 		}
@@ -243,11 +242,11 @@ func TestExecutorGeoDist(t *testing.T) {
 
 	t.Run("treats non-geo scores deterministically", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("ZADD", "mixed", "-1", "a", "-2", "b")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("ZADD", "mixed", "-1", "a", "-2", "b")); err != nil {
 			t.Fatalf("ZADD error = %v", err)
 		}
 
-		value, err := executor.Execute(context.Background(), requestValue("GEODIST", "mixed", "a", "b"))
+		value, err := executor.Execute(clientContext(executor), requestValue("GEODIST", "mixed", "a", "b"))
 		if err != nil {
 			t.Fatalf("GEODIST error = %v", err)
 		}
@@ -270,11 +269,11 @@ func TestExecutorGeoRadius(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				executor := newTestExecutor()
-				if _, err := executor.Execute(context.Background(), geoAddSicilyRequest()); err != nil {
+				if _, err := executor.Execute(clientContext(executor), geoAddSicilyRequest()); err != nil {
 					t.Fatalf("GEOADD error = %v", err)
 				}
 
-				value, err := executor.Execute(context.Background(), requestValue(tt.args...))
+				value, err := executor.Execute(clientContext(executor), requestValue(tt.args...))
 				if err != nil {
 					t.Fatalf("GEORADIUS error = %v", err)
 				}
@@ -290,7 +289,7 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("returns empty array for a missing key", func(t *testing.T) {
 		executor := newTestExecutor()
-		value, err := executor.Execute(context.Background(), requestValue("GEORADIUS", "missing", "15", "37", "200", "km"))
+		value, err := executor.Execute(clientContext(executor), requestValue("GEORADIUS", "missing", "15", "37", "200", "km"))
 		if err != nil {
 			t.Fatalf("GEORADIUS error = %v", err)
 		}
@@ -299,7 +298,7 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("rejects negative radius", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEORADIUS", "Sicily", "15", "37", "-1", "km"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEORADIUS", "Sicily", "15", "37", "-1", "km"))
 		if err == nil {
 			t.Fatal("GEORADIUS error = nil, want negative radius error")
 		}
@@ -310,7 +309,7 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("rejects out-of-range center coordinates", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEORADIUS", "Sicily", "200", "37", "1", "km"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEORADIUS", "Sicily", "200", "37", "1", "km"))
 		if err == nil {
 			t.Fatal("GEORADIUS error = nil, want invalid coordinates error")
 		}
@@ -319,7 +318,7 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("rejects unsupported units", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEORADIUS", "Sicily", "15", "37", "200", "yd"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEORADIUS", "Sicily", "15", "37", "200", "yd"))
 		if err == nil {
 			t.Fatal("GEORADIUS error = nil, want unsupported unit error")
 		}
@@ -328,7 +327,7 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("rejects unsupported modifiers", func(t *testing.T) {
 		executor := newTestExecutor()
-		_, err := executor.Execute(context.Background(), requestValue("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHCOORD"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHCOORD"))
 		if err == nil {
 			t.Fatal("GEORADIUS error = nil, want syntax error")
 		}
@@ -337,11 +336,11 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("fails against a non-zset key", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("SET", "Sicily", "island")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "Sicily", "island")); err != nil {
 			t.Fatalf("SET error = %v", err)
 		}
 
-		_, err := executor.Execute(context.Background(), requestValue("GEORADIUS", "Sicily", "15", "37", "200", "km"))
+		_, err := executor.Execute(clientContext(executor), requestValue("GEORADIUS", "Sicily", "15", "37", "200", "km"))
 		if err == nil {
 			t.Fatal("GEORADIUS error = nil, want WRONGTYPE error")
 		}
@@ -350,17 +349,17 @@ func TestExecutorGeoRadius(t *testing.T) {
 
 	t.Run("treats non-geo scores deterministically", func(t *testing.T) {
 		executor := newTestExecutor()
-		if _, err := executor.Execute(context.Background(), requestValue("ZADD", "mixed", "-1", "negative", "1e300", "huge")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("ZADD", "mixed", "-1", "negative", "1e300", "huge")); err != nil {
 			t.Fatalf("ZADD error = %v", err)
 		}
-		if _, err := executor.Execute(context.Background(), requestValue("GEOADD", "mixed", "13.361389", "38.115556", "Palermo")); err != nil {
+		if _, err := executor.Execute(clientContext(executor), requestValue("GEOADD", "mixed", "13.361389", "38.115556", "Palermo")); err != nil {
 			t.Fatalf("GEOADD error = %v", err)
 		}
 
 		// Out-of-range scores map to zero geohash bits, which decode to the
 		// south-west corner cell of the coordinate space.
 		cornerLongitude, cornerLatitude := geohashDecode(0)
-		value, err := executor.Execute(context.Background(), requestValue(
+		value, err := executor.Execute(clientContext(executor), requestValue(
 			"GEORADIUS", "mixed",
 			strconv.FormatFloat(cornerLongitude, 'f', -1, 64),
 			strconv.FormatFloat(cornerLatitude, 'f', -1, 64),
@@ -374,7 +373,7 @@ func TestExecutorGeoRadius(t *testing.T) {
 			protocol.TextBulkString{Value: "huge"},
 		}})
 
-		value, err = executor.Execute(context.Background(), requestValue("GEORADIUS", "mixed", "13.361389", "38.115556", "1", "km"))
+		value, err = executor.Execute(clientContext(executor), requestValue("GEORADIUS", "mixed", "13.361389", "38.115556", "1", "km"))
 		if err != nil {
 			t.Fatalf("GEORADIUS Palermo error = %v", err)
 		}
@@ -400,7 +399,7 @@ func TestExecutorGeoRadiusMatchesFullScan(t *testing.T) {
 			point.member,
 		)
 	}
-	if _, err := executor.Execute(context.Background(), requestValue(args...)); err != nil {
+	if _, err := executor.Execute(clientContext(executor), requestValue(args...)); err != nil {
 		t.Fatalf("GEOADD error = %v", err)
 	}
 
@@ -424,7 +423,7 @@ func TestExecutorGeoRadiusMatchesFullScan(t *testing.T) {
 	}
 	for _, query := range queries {
 		t.Run(query.name, func(t *testing.T) {
-			value, err := executor.Execute(context.Background(), requestValue(
+			value, err := executor.Execute(clientContext(executor), requestValue(
 				"GEORADIUS", "world",
 				strconv.FormatFloat(query.longitude, 'f', -1, 64),
 				strconv.FormatFloat(query.latitude, 'f', -1, 64),

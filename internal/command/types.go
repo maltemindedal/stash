@@ -119,7 +119,8 @@ func (e *Executor) SetReplicaRegistry(registry *server.ReplicaRegistry) {
 	e.replicaPeers = registry
 }
 
-// SetRequirePass injects the configured connection password requirement.
+// SetRequirePass gives AUTH the configured password to verify. It does not
+// decide who may run commands; the Client state does (see validateAuthContext).
 func (e *Executor) SetRequirePass(password string) {
 	e.requirePass = password
 }
@@ -707,31 +708,37 @@ func (e *Executor) recordSlowCommand(ctx context.Context, request *Request, time
 	e.slowlogRegistry.Record(entry)
 }
 
-func (e *Executor) validateAuthContext(ctx context.Context, request *Request) error {
-	if e.requirePass == "" {
-		return nil
-	}
+// errNoClientState refuses a client request that reached the executor without
+// the Client state the server gives every connection.
+var errNoClientState = errors.New("command: client request without a client state")
 
-	state, ok := server.ClientStateFromContext(ctx)
-	if !ok || state == nil {
+// validateAuthContext is the auth gate. It decides from the Client state alone,
+// which the server creates unauthenticated whenever a password is required. The
+// executor's own copy of the password only verifies AUTH, so a password that
+// never reached the executor leaves every command but AUTH and PING refused
+// rather than open. A client request that arrives without a Client state is
+// refused too, instead of running as if it had authenticated. Only the Master's
+// replication stream and AOF replay, which come from no client, run without one.
+func (e *Executor) validateAuthContext(ctx context.Context, request *Request) error {
+	state, _ := server.ClientStateFromContext(ctx)
+	if state != nil && state.IsAuthenticated() {
 		return nil
 	}
-	if state.IsAuthenticated() {
+	if server.IsReplicationOrigin(ctx) {
 		return nil
 	}
-	if isAllowedUnauthenticatedCommand(ctx, request) {
+	if state == nil {
+		return errNoClientState
+	}
+	if isAllowedUnauthenticatedCommand(request.Name) {
 		return nil
 	}
 
 	return ErrNoAuthError()
 }
 
-func isAllowedUnauthenticatedCommand(ctx context.Context, request *Request) bool {
-	if server.IsReplicationOrigin(ctx) {
-		return true
-	}
-
-	switch request.Name {
+func isAllowedUnauthenticatedCommand(name string) bool {
+	switch name {
 	case "AUTH", "PING":
 		return true
 	default:
