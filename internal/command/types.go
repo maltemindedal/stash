@@ -24,10 +24,17 @@ type Request struct {
 	// and propagated frames depend on: the keys it evicted, SET's absolute
 	// expiry, XADD's generated ID. Each execution starts it from zero.
 	effects executionEffects
+	// client, origin and inline are the request's Call (see server.Call):
+	// the Client state of the connection it came from, where it came from, and
+	// whether it runs inline on the Event loop. They sit beside inTransaction
+	// so that the flags share one word.
+	client *server.ClientState
 	// inTransaction marks a command EXEC runs from its queue. EXEC holds the
 	// sequencer exclusively while it does, so such a command must not wait for
 	// anything another request would have to provide.
 	inTransaction bool
+	origin        server.Origin
+	inline        bool
 }
 
 // Handler executes a command against the current server state.
@@ -96,8 +103,7 @@ type Executor struct {
 // New builds the command executor from the server's Services. Every
 // collaborator is required: a Services with a nil pointer or function field is
 // refused with an error that names it. RequirePass only verifies AUTH; it does
-// not decide who may run commands, the Client state does (see
-// validateAuthContext).
+// not decide who may run commands, the Client state does (see validateAuth).
 func New(services server.Services) (*Executor, error) {
 	if err := checkServices(services); err != nil {
 		return nil, err
@@ -138,42 +144,65 @@ func checkServices(services server.Services) error {
 	return nil
 }
 
-// Execute dispatches a parsed RESP frame to its command handler.
-func (e *Executor) Execute(ctx context.Context, value protocol.Value) (protocol.Value, error) {
-	result, err := e.ExecuteDetailed(ctx, value)
+// decodeCall decodes a RESP frame into a request that carries its Call.
+func decodeCall(call server.Call, value protocol.Value) (*Request, error) {
+	request, err := DecodeRequest(value)
 	if err != nil {
 		return nil, err
 	}
-	if len(result.Responses) == 1 {
-		return result.Responses[0], nil
-	}
-
-	return nil, fmt.Errorf("command: expected single response, got %d", len(result.Responses))
+	request.client = call.Client
+	request.origin = call.Origin
+	request.inline = call.Inline
+	return request, nil
 }
 
-// ExecuteDetailed dispatches a parsed RESP frame to a handler that may emit multiple responses.
-func (e *Executor) ExecuteDetailed(ctx context.Context, value protocol.Value) (server.ExecuteResult, error) {
-	request, err := DecodeRequest(value)
-	if err != nil {
-		return server.ExecuteResult{}, err
-	}
+var (
+	// errNoOrigin refuses a request whose Call does not say where it came from.
+	errNoOrigin = errors.New("command: request without an origin")
+	// errNoClientState refuses a client request that reached the executor
+	// without the Client state the server gives every connection.
+	errNoClientState = errors.New("command: client request without a client state")
+	// errClientStateWithoutClientOrigin refuses a request from the Master's
+	// stream or AOF replay that carries a Client state: only a client has one,
+	// and it must not lend its connection to an Origin that needs no AUTH.
+	errClientStateWithoutClientOrigin = errors.New("command: a request that is not a client's carries a client state")
+)
 
-	return e.executeRequestDetailed(ctx, request, true)
+// validateCall refuses a request whose Call is not one the server makes: an
+// Origin is required, a client request carries its Client state, and nothing
+// else does.
+func validateCall(request *Request) error {
+	switch request.origin {
+	case server.OriginClient:
+		if request.client == nil {
+			return errNoClientState
+		}
+	case server.OriginMaster, server.OriginReplay:
+		if request.client != nil {
+			return errClientStateWithoutClientOrigin
+		}
+	default:
+		return errNoOrigin
+	}
+	return nil
 }
 
 func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request, allowQueue bool) (server.ExecuteResult, error) {
 	request.effects = executionEffects{}
 	effects := &request.effects
 
-	if err := e.validateSubscriptionContext(ctx, request); err != nil {
+	if err := validateCall(request); err != nil {
 		return server.ExecuteResult{}, err
 	}
-	if err := e.validateAuthContext(ctx, request); err != nil {
+	if err := e.validateSubscriptionContext(request); err != nil {
+		return server.ExecuteResult{}, err
+	}
+	if err := e.validateAuth(request); err != nil {
 		return server.ExecuteResult{}, err
 	}
 
 	if allowQueue {
-		if queued, response, err := e.maybeQueueRequest(ctx, request); queued || err != nil {
+		if queued, response, err := e.maybeQueueRequest(request); queued || err != nil {
 			if response == nil {
 				return server.ExecuteResult{}, err
 			}
@@ -197,7 +226,7 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 		if err != nil {
 			return server.ExecuteResult{}, err
 		}
-		e.recordSlowCommand(ctx, request, startedAt, time.Since(startedAt))
+		e.recordSlowCommand(request, startedAt, time.Since(startedAt))
 		result.Propagation = append(result.Propagation, effects.propagation...)
 		result.Durability = append(result.Durability, effects.durability...)
 		return result, nil
@@ -210,9 +239,9 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
-	e.recordSlowCommand(ctx, request, startedAt, time.Since(startedAt))
+	e.recordSlowCommand(request, startedAt, time.Since(startedAt))
 
-	propagation, durability := executionFrames(ctx, request, spec)
+	propagation, durability := executionFrames(request, spec)
 	result := server.SingleResponse(response)
 	result.Propagation = append(propagation, effects.propagation...)
 	result.Durability = append(durability, effects.durability...)
@@ -237,9 +266,9 @@ func (e *Executor) validateQueueableRequest(request *Request) error {
 	return nil
 }
 
-func (e *Executor) maybeQueueRequest(ctx context.Context, request *Request) (bool, protocol.Value, error) {
-	state, ok := server.ClientStateFromContext(ctx)
-	if !ok || !state.InTransactionActive() || e.isTransactionControlCommand(request.Name) {
+func (e *Executor) maybeQueueRequest(request *Request) (bool, protocol.Value, error) {
+	state := request.client
+	if state == nil || !state.InTransactionActive() || e.isTransactionControlCommand(request.Name) {
 		return false, nil, nil
 	}
 	if err := e.validateQueueableRequest(request); err != nil {
@@ -262,7 +291,7 @@ func responseErrorValue(err error) protocol.ErrorValue {
 	return protocol.ErrorValue{Message: prefix + " " + err.Error()}
 }
 
-func executionFrames(ctx context.Context, request *Request, spec commandSpec) ([]protocol.Value, []protocol.Value) {
+func executionFrames(request *Request, spec commandSpec) ([]protocol.Value, []protocol.Value) {
 	var (
 		frame     protocol.Array
 		haveFrame bool
@@ -284,7 +313,7 @@ func executionFrames(ctx context.Context, request *Request, spec commandSpec) ([
 	}
 
 	var propagation []protocol.Value
-	if spec.propagates && !server.IsReplicationOrigin(ctx) {
+	if spec.propagates && request.origin.Propagates() {
 		propagation = []protocol.Value{ensureFrame()}
 	}
 
@@ -345,14 +374,14 @@ func rewriteXAddFrame(request *Request) (protocol.Array, bool) {
 	return frame, true
 }
 
-func (e *Executor) recordEvictedKeys(ctx context.Context, request *Request, keys []string) {
+func (e *Executor) recordEvictedKeys(request *Request, keys []string) {
 	if len(keys) == 0 {
 		return
 	}
 
 	e.touchWatchKeys(keys...)
 	frame := server.DeleteFrame(keys)
-	if !server.IsReplicationOrigin(ctx) {
+	if request.origin.Propagates() {
 		request.effects.propagation = append(request.effects.propagation, frame)
 	}
 	request.effects.durability = append(request.effects.durability, frame)
@@ -654,9 +683,9 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 	}
 }
 
-func (e *Executor) validateSubscriptionContext(ctx context.Context, request *Request) error {
-	state, ok := server.ClientStateFromContext(ctx)
-	if !ok || state == nil {
+func (e *Executor) validateSubscriptionContext(request *Request) error {
+	state := request.client
+	if state == nil {
 		return nil
 	}
 
@@ -670,8 +699,8 @@ func (e *Executor) validateSubscriptionContext(ctx context.Context, request *Req
 	return nil
 }
 
-func (e *Executor) recordSlowCommand(ctx context.Context, request *Request, timestamp time.Time, duration time.Duration) {
-	if request == nil || e.slowlogThreshold < 0 || duration < e.slowlogThreshold || server.IsReplicationOrigin(ctx) {
+func (e *Executor) recordSlowCommand(request *Request, timestamp time.Time, duration time.Duration) {
+	if request == nil || e.slowlogThreshold < 0 || duration < e.slowlogThreshold || !request.origin.RecordsSlowlog() {
 		return
 	}
 
@@ -680,35 +709,25 @@ func (e *Executor) recordSlowCommand(ctx context.Context, request *Request, time
 		Duration:  duration,
 		Command:   requestTokens(request),
 	}
-	if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
-		entry.ClientAddr = state.RemoteAddress()
+	if request.client != nil {
+		entry.ClientAddr = request.client.RemoteAddress()
 	}
 	e.slowlogRegistry.Record(entry)
 }
 
-// errNoClientState refuses a client request that reached the executor without
-// the Client state the server gives every connection.
-var errNoClientState = errors.New("command: client request without a client state")
-
-// validateAuthContext is the auth gate. It decides from the Client state alone,
-// which the server creates unauthenticated whenever a password is required. The
-// executor's own copy of the password only verifies AUTH, so a password that
-// never reached the executor leaves every command but AUTH and PING refused
-// rather than open. A client request that arrives without a Client state is
-// refused too, instead of running as if it had authenticated. Only the Master's
-// replication stream and AOF replay, which come from no client, run without one.
-func (e *Executor) validateAuthContext(ctx context.Context, request *Request) error {
-	state, _ := server.ClientStateFromContext(ctx)
-	if state != nil && state.IsAuthenticated() {
+// validateAuth is the auth gate, for a request validateCall has accepted. Only
+// a client request needs AUTH, and whether it has authenticated is decided by
+// its Client state alone, which the server creates unauthenticated whenever a
+// password is required. The executor's own copy of the password only verifies
+// AUTH, so a password that never reached the executor leaves every command but
+// AUTH and PING refused rather than open. The Master's replication stream and
+// AOF replay come from no client and need no AUTH; a Call from either that
+// carries a Client state has already been refused.
+func (e *Executor) validateAuth(request *Request) error {
+	if !request.origin.NeedsAuth() {
 		return nil
 	}
-	if server.IsReplicationOrigin(ctx) {
-		return nil
-	}
-	if state == nil {
-		return errNoClientState
-	}
-	if isAllowedUnauthenticatedCommand(request.Name) {
+	if request.client.IsAuthenticated() || isAllowedUnauthenticatedCommand(request.Name) {
 		return nil
 	}
 

@@ -1,7 +1,6 @@
 package command
 
 import (
-	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -285,7 +284,7 @@ func TestSequenceModeOfRequests(t *testing.T) {
 		{"NOSUCHCOMMAND", sequenceRead},
 	}
 	for _, tt := range tests {
-		if got := executor.sequenceModeFor(context.Background(), &Request{Name: tt.name}); got != tt.want {
+		if got := executor.sequenceModeFor(&Request{Name: tt.name}); got != tt.want {
 			t.Errorf("sequenceModeFor(%s) = %d, want %d", tt.name, got, tt.want)
 		}
 	}

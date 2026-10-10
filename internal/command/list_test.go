@@ -25,7 +25,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	state := newTestClientState(executor, 1)
 	state.BindResponseWriter(bufio.NewWriter(conn))
 	state.BindResponseConn(conn)
-	ctx, cancel := context.WithCancel(server.WithClientState(context.Background(), state))
+	ctx, cancel := context.WithCancel(withClient(context.Background(), state))
 	defer cancel()
 
 	// BLPOP flushes the replies queued ahead of it only once it is waiting.
@@ -77,7 +77,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	if err := client.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	waitFor(t, "the server side to see the client leave", func() bool { return server.ClientDisconnected(ctx) })
+	waitFor(t, "the server side to see the client leave", func() bool { return state.Disconnected() })
 	stripe.Unlock()
 	stripeHeld = false
 

@@ -150,9 +150,9 @@ func (s *Server) serveEventLoop(ctx context.Context, listener net.Listener) erro
 // the feed writes through the connection's push queue, which the loop moves
 // into the write buffer only after the request that queued it, so the stream
 // follows the responses.
-func (s *Server) connCommandRunner(clientID uint64, conn ClientConn, logger *slog.Logger) ConnCommandRunner {
+func (s *Server) connCommandRunner(call Call, clientID uint64, conn ClientConn, logger *slog.Logger) ConnCommandRunner {
 	return func(ctx context.Context, request protocol.Value) ([]protocol.Value, error) {
-		responses, registerReplica, err := s.executeClientRequest(ctx, clientID, conn, logger, request)
+		responses, registerReplica, err := s.executeClientRequest(ctx, call, clientID, conn, logger, request)
 		if err != nil {
 			return nil, err
 		}
@@ -499,9 +499,11 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	conn.machine = NewConnMachine(state)
 	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
 	conn.machine.SetPushLimit(eventLoopPushLimit)
-	conn.ctx = WithInlineExecution(WithClientState(l.ctx, state))
+	conn.ctx = l.ctx
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
-	conn.run = l.srv.connCommandRunner(clientID, handle, conn.logger)
+	// Requests run inline on the loop goroutine, where whatever would block
+	// returns an error instead.
+	conn.run = l.srv.connCommandRunner(Call{Client: state, Origin: OriginClient, Inline: true}, clientID, handle, conn.logger)
 
 	if err := l.poller.Add(fd); err != nil {
 		conn.logger.Warn("failed to register accepted connection with poller", "error", err)

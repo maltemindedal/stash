@@ -10,7 +10,15 @@ Stash is a Redis-compatible TCP key/value server written in Go. It is implementa
 The Redis Serialization Protocol. It carries client requests and replies, and the command streams written to the **AOF** and sent to **Replicas**.
 
 **Command executor**:
-The component that validates each request against the **Client state**, runs it, and returns its RESP reply.
+The component that validates each request against its **Call**, runs it, and returns its RESP reply.
+
+**Origin**:
+Where a request came from: a client connection, the **Master**'s replication stream, or **AOF** replay at startup. It decides whether the request needs `AUTH`, is propagated to **Replicas**, is recorded in the **Slowlog**, and may answer `REPLCONF GETACK`.
+_Avoid_: replication origin (for all of them), source
+
+**Call**:
+What the **Command executor** is told about one request besides its arguments: its **Origin**, its **Client state** when it came from a client, and whether it runs inline on the **Event loop**.
+_Avoid_: request context, execution context
 
 **Client state**:
 What the server knows about one connection: whether it has authenticated, and whether it is in a **Transaction**, pub/sub mode, **Monitor** mode, or a replication role.

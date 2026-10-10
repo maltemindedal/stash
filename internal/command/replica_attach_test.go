@@ -161,7 +161,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				stream := &replicaStream{}
 				state := newTestClientState(executor, id)
 				state.BindResponseWriter(bufio.NewWriter(stream))
-				result, err := handle(server.WithClientState(context.Background(), state), executor, requestValue("PSYNC", "?", "-1"), true)
+				result, err := handle(withClient(context.Background(), state), executor, requestValue("PSYNC", "?", "-1"), true)
 				if err != nil || !result.RegisterReplica {
 					t.Fatalf("PSYNC: RegisterReplica = %v, error = %v", result.RegisterReplica, err)
 				}

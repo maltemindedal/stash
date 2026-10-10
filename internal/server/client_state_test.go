@@ -20,11 +20,7 @@ import (
 // stubExecutor is a command executor that answers every request with +OK.
 type stubExecutor struct{}
 
-func (stubExecutor) ExecuteSequenced(context.Context, protocol.Value) (ExecuteResult, error) {
-	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
-}
-
-func (stubExecutor) ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error) {
+func (stubExecutor) Handle(context.Context, Call, protocol.Value) (ExecuteResult, error) {
 	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 }
 
@@ -270,15 +266,6 @@ func TestClientStateLifecycle(t *testing.T) {
 
 	if got := srv.getClientState(1); got != first {
 		t.Fatalf("getClientState(1) = %p, want %p", got, first)
-	}
-
-	ctx := WithClientState(context.Background(), first)
-	restored, ok := ClientStateFromContext(ctx)
-	if !ok {
-		t.Fatal("ClientStateFromContext() ok = false, want true")
-	}
-	if restored != first {
-		t.Fatalf("ClientStateFromContext() = %p, want %p", restored, first)
 	}
 
 	srv.removeClientState(1)
@@ -697,19 +684,16 @@ func TestTryFlushResponsesDoesNotWaitForAStuckWriter(t *testing.T) {
 	// peer's own requests, which for a replica are its acknowledgements.
 	state, _ := startBlockedReply(t)
 
-	done := make(chan error, 2)
+	done := make(chan error, 1)
 	go func() { done <- state.TryFlushResponses() }()
-	go func() { done <- FlushClientResponses(WithClientState(context.Background(), state)) }()
 
-	for i := 0; i < 2; i++ {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("flush behind a stuck writer error = %v, want it to be skipped", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("a flush waited behind a writer stuck holding the response lock")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("flush behind a stuck writer error = %v, want it to be skipped", err)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a flush waited behind a writer stuck holding the response lock")
 	}
 }
 

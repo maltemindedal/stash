@@ -218,21 +218,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // multiplexing backend (epoll on Linux, kqueue on macOS).
 var errEventLoopUnsupported = errors.New("server: event loop networking is not supported on this platform")
 
-type inlineExecutionContextKey struct{}
-
-// WithInlineExecution marks ctx as executing commands inline on a shared
-// event-loop goroutine, where a blocked command stalls every connection.
-func WithInlineExecution(ctx context.Context) context.Context {
-	return context.WithValue(ctx, inlineExecutionContextKey{}, true)
-}
-
-// IsInlineExecution reports whether commands on ctx run inline on a shared
-// event-loop goroutine and therefore must fail instead of blocking.
-func IsInlineExecution(ctx context.Context) bool {
-	inline, _ := ctx.Value(inlineExecutionContextKey{}).(bool)
-	return inline
-}
-
 // serve accepts and serves client connections until shutdown. With event-loop
 // mode enabled it dispatches sockets through OS readiness notifications where
 // supported (epoll on Linux, kqueue on macOS) and falls back to one goroutine

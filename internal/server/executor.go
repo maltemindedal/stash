@@ -14,14 +14,49 @@ import (
 // Services, with the NewExecutorFunc it is given. A method renamed on either
 // side is a compile error rather than a feature that silently switches off.
 type CommandExecutor interface {
-	// ExecuteSequenced runs a request ordered against the other requests (see
-	// the command package's sequencer). When the result has a Release
-	// function, the caller calls it once it has applied the result's
+	// Handle runs one request, ordered against the others (see the command
+	// package's sequencer), as call describes it. When the result has a
+	// Release function, the caller calls it once it has applied the result's
 	// durability and propagation frames, and not before.
-	ExecuteSequenced(context.Context, protocol.Value) (ExecuteResult, error)
-	// ExecuteDetailed runs a request without ordering it. AOF replay uses it,
-	// before anything else runs.
-	ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error)
+	Handle(ctx context.Context, call Call, request protocol.Value) (ExecuteResult, error)
+}
+
+// Origin is where a request came from, which decides what it may do. The zero
+// Origin is none of them, so the executor refuses a Call that does not set one.
+type Origin uint8
+
+const (
+	// OriginClient is a client connection.
+	OriginClient Origin = iota + 1
+	// OriginMaster is the Master's replication stream, applied on a Replica.
+	OriginMaster
+	// OriginReplay is AOF replay at startup.
+	OriginReplay
+)
+
+// Propagates reports whether the request's writes are forwarded to Replicas.
+func (o Origin) Propagates() bool { return o == OriginClient }
+
+// RecordsSlowlog reports whether the request can be recorded in the Slowlog.
+func (o Origin) RecordsSlowlog() bool { return o == OriginClient }
+
+// NeedsAuth reports whether the request runs only for a client that has
+// authenticated, on a server that requires a password.
+func (o Origin) NeedsAuth() bool { return o == OriginClient }
+
+// AnswersGetAck reports whether the request may answer REPLCONF GETACK.
+func (o Origin) AnswersGetAck() bool { return o == OriginMaster }
+
+// Call is what the command executor is told about one request besides its
+// arguments.
+type Call struct {
+	// Client is the Client state of the connection the request came from. It
+	// is required for OriginClient and must be nil for every other Origin.
+	Client *ClientState
+	Origin Origin
+	// Inline marks a request run on the Event loop's goroutine, where whatever
+	// would block returns an error instead.
+	Inline bool
 }
 
 // backgroundWriteSequencer orders work the server does on its own (the expiry
