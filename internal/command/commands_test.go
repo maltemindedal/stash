@@ -723,7 +723,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("SET returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "name", "Stash"))
+		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -738,7 +738,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("INCR returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("INCR", "counter"))
+		result, err := handle(clientContext(executor), executor, requestValue("INCR", "counter"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -753,7 +753,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("SETBIT returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SETBIT", "bitmap", "0", "1"))
+		result, err := handle(clientContext(executor), executor, requestValue("SETBIT", "bitmap", "0", "1"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -769,7 +769,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("PFADD returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("PFADD", "visitors", "alice"))
+		result, err := handle(clientContext(executor), executor, requestValue("PFADD", "visitors", "alice"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -785,7 +785,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("PUBLISH returns propagation frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("PUBLISH", "news", "hello"))
+		result, err := handle(clientContext(executor), executor, requestValue("PUBLISH", "news", "hello"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -800,7 +800,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("DEL propagates even when it removes no keys", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("DEL", "missing"))
+		result, err := handle(clientContext(executor), executor, requestValue("DEL", "missing"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -815,7 +815,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("replication-origin commands do not re-propagate", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := executor.ExecuteDetailed(server.WithReplicationOrigin(context.Background()), requestValue("PUBLISH", "news", "replica"))
+		result, err := handle(server.WithReplicationOrigin(context.Background()), executor, requestValue("PUBLISH", "news", "replica"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -838,7 +838,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			t.Fatalf("queued DEL error = %v", err)
 		}
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("EXEC"))
+		result, err := handle(ctx, executor, requestValue("EXEC"), false)
 		if err != nil {
 			t.Fatalf("EXEC error = %v", err)
 		}
@@ -868,7 +868,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			t.Fatalf("MULTI error = %v", err)
 		}
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("EXEC"))
+		result, err := handle(ctx, executor, requestValue("EXEC"), false)
 		if err != nil {
 			t.Fatalf("EXEC error = %v", err)
 		}
@@ -902,7 +902,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			t.Fatalf("queued SET good error = %v", err)
 		}
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("EXEC"))
+		result, err := handle(ctx, executor, requestValue("EXEC"), false)
 		if err != nil {
 			t.Fatalf("EXEC error = %v", err)
 		}
@@ -960,7 +960,7 @@ func TestExecutorMaxMemory(t *testing.T) {
 		executor.store.ConfigureMaxMemory(baseline+baseline/2, 16)
 		time.Sleep(2 * time.Millisecond)
 
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "hot!", payload))
+		result, err := handle(clientContext(executor), executor, requestValue("SET", "hot!", payload), false)
 		if err != nil {
 			t.Fatalf("evicting SET error = %v", err)
 		}
@@ -1244,7 +1244,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		replication.AdvanceReplicaOffset(123)
 		executor.SetReplicationState(replication)
 
-		result, err := executor.ExecuteDetailed(server.WithReplicationOrigin(context.Background()), requestValue("REPLCONF", "GETACK", "*"))
+		result, err := handle(server.WithReplicationOrigin(context.Background()), executor, requestValue("REPLCONF", "GETACK", "*"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1271,7 +1271,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 
 		ctx := server.WithClientState(context.Background(), state)
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("REPLCONF", "ACK", "42"))
+		result, err := handle(ctx, executor, requestValue("REPLCONF", "ACK", "42"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1328,7 +1328,7 @@ func TestExecutorWait(t *testing.T) {
 			registry.UpdateAck(11, 50)
 		}()
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "200"))
+		result, err := handle(ctx, executor, requestValue("WAIT", "1", "200"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1350,7 +1350,7 @@ func TestExecutorWait(t *testing.T) {
 		ctx := server.WithClientState(context.Background(), writer)
 
 		startedAt := time.Now()
-		result, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "25"))
+		result, err := handle(ctx, executor, requestValue("WAIT", "1", "25"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1377,7 +1377,7 @@ func TestExecutorWait(t *testing.T) {
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
-			_, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "9223372036855"))
+			_, err := handle(ctx, executor, requestValue("WAIT", "1", "9223372036855"), false)
 			done <- err
 		}()
 
@@ -1417,7 +1417,7 @@ func TestExecutorWait(t *testing.T) {
 		ctx := server.WithClientState(context.Background(), state)
 
 		startedAt := time.Now()
-		result, err := executor.ExecuteDetailed(ctx, requestValue("WAIT", "1", "50"))
+		result, err := handle(ctx, executor, requestValue("WAIT", "1", "50"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -1467,7 +1467,7 @@ func TestExecutorAuth(t *testing.T) {
 			t.Fatal("InTransactionActive() = true after rejected MULTI, want false")
 		}
 
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news")); !errors.Is(err, ErrNoAuth) {
+		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); !errors.Is(err, ErrNoAuth) {
 			t.Fatalf("SUBSCRIBE error = %v, want ErrNoAuth", err)
 		}
 		if state.IsSubscribed() {
@@ -1572,10 +1572,10 @@ func TestExecutorAuth(t *testing.T) {
 			t.Fatal("ClientStateFromContext() returned no state")
 		}
 
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("REPLCONF", "listening-port", "6380")); !errors.Is(err, ErrNoAuth) {
+		if _, err := handle(ctx, executor, requestValue("REPLCONF", "listening-port", "6380"), false); !errors.Is(err, ErrNoAuth) {
 			t.Fatalf("REPLCONF listening-port error = %v, want ErrNoAuth", err)
 		}
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("PSYNC", "?", "-1")); !errors.Is(err, ErrNoAuth) {
+		if _, err := handle(ctx, executor, requestValue("PSYNC", "?", "-1"), false); !errors.Is(err, ErrNoAuth) {
 			t.Fatalf("PSYNC error = %v, want ErrNoAuth", err)
 		}
 		if state.IsReplica() {
@@ -1601,7 +1601,7 @@ func TestExecutorAuth(t *testing.T) {
 		}
 		assertValueEqual(t, value, protocol.SimpleString{Value: "OK"})
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("REPLCONF", "listening-port", "6380"))
+		result, err := handle(ctx, executor, requestValue("REPLCONF", "listening-port", "6380"), false)
 		if err != nil {
 			t.Fatalf("REPLCONF listening-port error = %v", err)
 		}
@@ -1610,7 +1610,7 @@ func TestExecutorAuth(t *testing.T) {
 		}
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
 
-		result, err = executor.ExecuteDetailed(ctx, requestValue("PSYNC", "?", "-1"))
+		result, err = handle(ctx, executor, requestValue("PSYNC", "?", "-1"), false)
 		if err != nil {
 			t.Fatalf("PSYNC error = %v", err)
 		}
@@ -2275,7 +2275,7 @@ func TestExecutorTransactions(t *testing.T) {
 				if _, err := executor.Execute(ctx, requestValue("MULTI")); err != nil {
 					t.Fatalf("MULTI error = %v", err)
 				}
-				_, err := executor.ExecuteDetailed(ctx, requestValue(append([]string{"PSYNC"}, tt.args...)...))
+				_, err := handle(ctx, executor, requestValue(append([]string{"PSYNC"}, tt.args...)...), false)
 				if !errors.Is(err, ErrNotAllowedInTransaction) || err.Error() != "Command not allowed inside a transaction" {
 					t.Fatalf("queued PSYNC %v error = %v, want ErrNotAllowedInTransaction", tt.args, err)
 				}
@@ -2332,7 +2332,7 @@ func TestExecutorPubSub(t *testing.T) {
 		state.BindResponseWriter(bufio.NewWriter(&outbound))
 		ctx := server.WithClientState(context.Background(), state)
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news"))
+		result, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false)
 		if err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
 		}
@@ -2367,11 +2367,11 @@ func TestExecutorPubSub(t *testing.T) {
 		executor := newTestExecutor()
 		ctx := withClientStateForExecutor(context.Background(), executor, 1)
 
-		first, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news"))
+		first, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false)
 		if err != nil {
 			t.Fatalf("first SUBSCRIBE error = %v", err)
 		}
-		second, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news"))
+		second, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false)
 		if err != nil {
 			t.Fatalf("second SUBSCRIBE error = %v", err)
 		}
@@ -2392,11 +2392,11 @@ func TestExecutorPubSub(t *testing.T) {
 		executor := newTestExecutor()
 		ctx := withClientStateForExecutor(context.Background(), executor, 1)
 
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "zulu", "alpha")); err != nil {
+		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "zulu", "alpha"), false); err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
 		}
 
-		result, err := executor.ExecuteDetailed(ctx, requestValue("UNSUBSCRIBE"))
+		result, err := handle(ctx, executor, requestValue("UNSUBSCRIBE"), false)
 		if err != nil {
 			t.Fatalf("UNSUBSCRIBE error = %v", err)
 		}
@@ -2419,7 +2419,7 @@ func TestExecutorPubSub(t *testing.T) {
 		executor := newTestExecutor()
 		ctx := withClientStateForExecutor(context.Background(), executor, 1)
 
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news")); err != nil {
+		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
 		}
 
@@ -2452,7 +2452,7 @@ func TestExecutorPubSub(t *testing.T) {
 		state.BindResponseWriter(bufio.NewWriter(io.Discard))
 		ctx := server.WithClientState(context.Background(), state)
 
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news")); err != nil {
+		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
 		}
 
@@ -2478,7 +2478,7 @@ func TestExecutorPubSub(t *testing.T) {
 		if _, err := executor.Execute(ctx, requestValue("MULTI")); err != nil {
 			t.Fatalf("MULTI error = %v", err)
 		}
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news")); !errors.Is(err, ErrSubscribeInsideMulti) {
+		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); !errors.Is(err, ErrSubscribeInsideMulti) {
 			t.Fatalf("SUBSCRIBE error = %v, want ErrSubscribeInsideMulti", err)
 		}
 	})
@@ -2488,7 +2488,7 @@ func TestExecutorPubSub(t *testing.T) {
 		state := newTestClientState(executor, 1)
 		ctx := server.WithClientState(context.Background(), state)
 
-		_, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", ""))
+		_, err := handle(ctx, executor, requestValue("SUBSCRIBE", ""), false)
 		if !errors.Is(err, ErrSyntax) {
 			t.Fatalf("SUBSCRIBE empty channel error = %v, want ErrSyntax", err)
 		}
@@ -2511,11 +2511,11 @@ func TestExecutorPubSub(t *testing.T) {
 		state := newTestClientState(executor, 1)
 		ctx := server.WithClientState(context.Background(), state)
 
-		if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news")); err != nil {
+		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE news error = %v", err)
 		}
 
-		_, err := executor.ExecuteDetailed(ctx, requestValue("UNSUBSCRIBE", ""))
+		_, err := handle(ctx, executor, requestValue("UNSUBSCRIBE", ""), false)
 		if !errors.Is(err, ErrSyntax) {
 			t.Fatalf("UNSUBSCRIBE empty channel error = %v, want ErrSyntax", err)
 		}
@@ -2533,7 +2533,7 @@ func BenchmarkExecutorPublish(b *testing.B) {
 				state := newTestClientState(executor, uint64(i+1))
 				state.BindResponseWriter(bufio.NewWriter(io.Discard))
 				ctx := server.WithClientState(context.Background(), state)
-				if _, err := executor.ExecuteDetailed(ctx, requestValue("SUBSCRIBE", "news")); err != nil {
+				if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 					b.Fatalf("SUBSCRIBE error = %v", err)
 				}
 			}
@@ -2676,7 +2676,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		executor := newTestExecutor()
 
 		before := time.Now().UnixMilli()
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "name", "Stash", "EX", "100"))
+		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash", "EX", "100"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -2718,7 +2718,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 
 	t.Run("SET without expiry keeps its verbatim frame", func(t *testing.T) {
 		executor := newTestExecutor()
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "name", "Stash"))
+		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed() error = %v", err)
 		}
@@ -2729,13 +2729,13 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 	t.Run("rewritten PXAT frame is accepted on replay and preserves the value", func(t *testing.T) {
 		executor := newTestExecutor()
 		future := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("SET", "k", "v", "PXAT", future))
+		result, err := handle(clientContext(executor), executor, requestValue("SET", "k", "v", "PXAT", future), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(SET PXAT) error = %v", err)
 		}
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
 
-		got, err := executor.ExecuteDetailed(clientContext(executor), requestValue("GET", "k"))
+		got, err := handle(clientContext(executor), executor, requestValue("GET", "k"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(GET) error = %v", err)
 		}
@@ -2749,7 +2749,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 	// auto-ID entry came back under a different ID after a restart.
 	t.Run("auto ID is replaced by the ID that was generated", func(t *testing.T) {
 		executor := newTestExecutor()
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("XADD", "events", "*", "type", "start"))
+		result, err := handle(clientContext(executor), executor, requestValue("XADD", "events", "*", "type", "start"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(XADD *) error = %v", err)
 		}
@@ -2765,7 +2765,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok {
 			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
 		}
-		if _, err := replayed.ExecuteDetailed(server.WithReplicationOrigin(context.Background()), frame); err != nil {
+		if _, err := handle(server.WithReplicationOrigin(context.Background()), replayed, frame, false); err != nil {
 			t.Fatalf("replaying the logged frame: %v", err)
 		}
 		entries, err := replayed.store.XRead("events", "0-0")
@@ -2781,11 +2781,11 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 			requestValue("MULTI"),
 			requestValue("XADD", "events", "*", "type", "start"),
 		} {
-			if _, err := executor.ExecuteDetailed(ctx, step); err != nil {
+			if _, err := handle(ctx, executor, step, false); err != nil {
 				t.Fatalf("ExecuteDetailed(%v) error = %v", step, err)
 			}
 		}
-		result, err := executor.ExecuteDetailed(ctx, requestValue("EXEC"))
+		result, err := handle(ctx, executor, requestValue("EXEC"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(EXEC) error = %v", err)
 		}
@@ -2802,7 +2802,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 
 	t.Run("an explicit ID keeps its verbatim frame", func(t *testing.T) {
 		executor := newTestExecutor()
-		result, err := executor.ExecuteDetailed(clientContext(executor), requestValue("XADD", "events", "5-1", "type", "start"))
+		result, err := handle(clientContext(executor), executor, requestValue("XADD", "events", "5-1", "type", "start"), false)
 		if err != nil {
 			t.Fatalf("ExecuteDetailed(XADD 5-1) error = %v", err)
 		}
@@ -2877,6 +2877,14 @@ func newTestExecutor() *Executor {
 // client, numbered 0 so that it shares no ID with the clients a test makes.
 func clientContext(executor *Executor) context.Context {
 	return withClientStateForExecutor(context.Background(), executor, 0)
+}
+
+// handle is the tests' only way into ExecuteDetailed (sequenced false) and ExecuteSequenced (true); step 3 of #43 swaps its body for a Call and Handle.
+func handle(ctx context.Context, executor *Executor, request protocol.Value, sequenced bool) (server.ExecuteResult, error) {
+	if sequenced {
+		return executor.ExecuteSequenced(ctx, request)
+	}
+	return executor.ExecuteDetailed(ctx, request)
 }
 
 func withClientStateForExecutor(ctx context.Context, executor *Executor, id uint64) context.Context {
