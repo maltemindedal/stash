@@ -2810,6 +2810,62 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 	})
 }
 
+func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
+	// A request's effects belong to one execution. A request executed a second
+	// time, as a pooled or retried one would be, must not log the evictions of
+	// the first a second time.
+	executor := newTestExecutor()
+	ctx := clientContext(executor)
+	payload := strings.Repeat("x", 96)
+	if _, err := executor.Execute(ctx, requestValue("SET", "cold", payload)); err != nil {
+		t.Fatalf("initial SET error = %v", err)
+	}
+	executor.store.ConfigureMaxMemory(1<<30, 16)
+	baseline := executor.store.UsedMemory()
+	executor.store.ConfigureMaxMemory(baseline+baseline/2, 16)
+	time.Sleep(2 * time.Millisecond)
+
+	request, err := DecodeRequest(requestValue("SET", "hot!", payload))
+	if err != nil {
+		t.Fatalf("DecodeRequest() error = %v", err)
+	}
+	first, err := executor.executeRequestDetailed(ctx, request, true)
+	if err != nil {
+		t.Fatalf("first SET error = %v", err)
+	}
+	assertPropagationFrames(t, first.Durability, requestValue("SET", "hot!", payload), requestValue("DEL", "cold"))
+
+	second, err := executor.executeRequestDetailed(ctx, request, true)
+	if err != nil {
+		t.Fatalf("second SET error = %v", err)
+	}
+	assertPropagationFrames(t, second.Propagation, requestValue("SET", "hot!", payload))
+	assertPropagationFrames(t, second.Durability, requestValue("SET", "hot!", payload))
+}
+
+func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
+	// Queueing refuses PSYNC, so EXEC never runs one. Should it, the attach cut
+	// would wait forever for the gate EXEC holds, so PSYNC refuses itself too.
+	executor := newTestExecutor()
+	executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+	registry := server.NewReplicaRegistry()
+	executor.SetReplicaRegistry(registry)
+	ctx := withClientStateForExecutor(context.Background(), executor, 1)
+	state, _ := server.ClientStateFromContext(ctx)
+
+	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, inTransaction: true}
+	result, err := executor.executeRequestDetailed(ctx, request, false)
+	if result.Release != nil {
+		result.Release()
+	}
+	if !errors.Is(err, ErrNotAllowedInTransaction) {
+		t.Fatalf("PSYNC run by EXEC error = %v, want ErrNotAllowedInTransaction", err)
+	}
+	if state.IsReplica() || registry.Count() != 0 {
+		t.Fatalf("after a refused PSYNC IsReplica() = %v with %d replicas registered, want false and 0", state.IsReplica(), registry.Count())
+	}
+}
+
 func newTestExecutor() *Executor {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewExecutor(storage.NewStore(), logger)

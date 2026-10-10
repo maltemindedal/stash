@@ -23,7 +23,7 @@ func (e *Executor) handleHSet(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 
@@ -108,7 +108,7 @@ func (e *Executor) handleSAdd(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 

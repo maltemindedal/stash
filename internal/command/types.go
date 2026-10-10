@@ -18,6 +18,15 @@ import (
 type Request struct {
 	Name string
 	Args [][]byte
+
+	// effects records what one execution of the request did that its logged
+	// and propagated frames depend on: the keys it evicted, SET's absolute
+	// expiry, XADD's generated ID. Each execution starts it from zero.
+	effects executionEffects
+	// inTransaction marks a command EXEC runs from its queue. EXEC holds the
+	// sequencer exclusively while it does, so such a command must not wait for
+	// anything another request would have to provide.
+	inTransaction bool
 }
 
 // Handler executes a command against the current server state.
@@ -49,7 +58,7 @@ type commandSpec struct {
 	// form. Used by SET to rewrite relative EX/PX expirations to an absolute
 	// PXAT so replicas and AOF reloads do not re-anchor the TTL to their own
 	// clock.
-	rewriteFrame func(context.Context, *Request) (protocol.Array, bool)
+	rewriteFrame func(*Request) (protocol.Array, bool)
 }
 
 type executionEffects struct {
@@ -66,8 +75,6 @@ type executionEffects struct {
 	streamID string
 }
 
-type executionEffectsContextKey struct{}
-
 // Executor routes protocol frames to concrete command handlers.
 type Executor struct {
 	store               *storage.Store
@@ -78,7 +85,6 @@ type Executor struct {
 	commands            map[string]commandSpec
 	replication         *server.ReplicationState
 	replicaPeers        *server.ReplicaRegistry
-	monitorRegistry     *server.MonitorRegistry
 	slowlogRegistry     *server.SlowlogRegistry
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
@@ -136,11 +142,6 @@ func (e *Executor) SetSlowlogConfig(registry *server.SlowlogRegistry, threshold 
 	e.slowlogThreshold = threshold
 }
 
-// SetMonitorRegistry injects the shared MONITOR fan-out registry.
-func (e *Executor) SetMonitorRegistry(registry *server.MonitorRegistry) {
-	e.monitorRegistry = registry
-}
-
 // SetServerStatsProvider injects a snapshot provider used by INFO.
 func (e *Executor) SetServerStatsProvider(provider func() server.Stats) {
 	e.serverStatsProvider = provider
@@ -170,7 +171,8 @@ func (e *Executor) ExecuteDetailed(ctx context.Context, value protocol.Value) (s
 }
 
 func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request, allowQueue bool) (server.ExecuteResult, error) {
-	ctx, effects := withExecutionEffects(ctx)
+	request.effects = executionEffects{}
+	effects := &request.effects
 
 	if err := e.validateSubscriptionContext(ctx, request); err != nil {
 		return server.ExecuteResult{}, err
@@ -277,7 +279,7 @@ func executionFrames(ctx context.Context, request *Request, spec commandSpec) ([
 	ensureFrame := func() protocol.Array {
 		if !haveFrame {
 			if spec.rewriteFrame != nil {
-				if rewritten, ok := spec.rewriteFrame(ctx, request); ok {
+				if rewritten, ok := spec.rewriteFrame(request); ok {
 					frame = rewritten
 					haveFrame = true
 					return frame
@@ -317,12 +319,12 @@ func propagationFrame(request *Request) protocol.Array {
 // `SET key value PXAT <absolute-ms>` so replicas and AOF replay anchor the
 // expiry to the master's clock at execution time rather than re-evaluating the
 // relative window against their own, later, clock. The absolute deadline is the
-// one the handler already computed and stored (carried on the execution
+// one the handler already computed and stored (carried on the request's
 // effects), so the propagated frame matches the master's stored expiry exactly.
 // SET without an expiration keeps its verbatim frame.
-func rewriteSetFrame(ctx context.Context, request *Request) (protocol.Array, bool) {
-	effects := executionEffectsFromContext(ctx)
-	if effects == nil || effects.setExpiryMillis <= 0 {
+func rewriteSetFrame(request *Request) (protocol.Array, bool) {
+	effects := &request.effects
+	if effects.setExpiryMillis <= 0 {
 		return protocol.Array{}, false
 	}
 
@@ -341,9 +343,9 @@ func rewriteSetFrame(ctx context.Context, request *Request) (protocol.Array, boo
 // frame would generate a new ID from the clock at replay time, so entries came
 // back from the AOF under different IDs than the ones clients had been given.
 // An XADD with an explicit ID keeps its verbatim frame.
-func rewriteXAddFrame(ctx context.Context, request *Request) (protocol.Array, bool) {
-	effects := executionEffectsFromContext(ctx)
-	if effects == nil || effects.streamID == "" || effects.streamID == string(request.Args[1]) {
+func rewriteXAddFrame(request *Request) (protocol.Array, bool) {
+	effects := &request.effects
+	if effects.streamID == "" || effects.streamID == string(request.Args[1]) {
 		return protocol.Array{}, false
 	}
 
@@ -352,32 +354,17 @@ func rewriteXAddFrame(ctx context.Context, request *Request) (protocol.Array, bo
 	return frame, true
 }
 
-func withExecutionEffects(ctx context.Context) (context.Context, *executionEffects) {
-	effects := &executionEffects{}
-	return context.WithValue(ctx, executionEffectsContextKey{}, effects), effects
-}
-
-func executionEffectsFromContext(ctx context.Context) *executionEffects {
-	effects, _ := ctx.Value(executionEffectsContextKey{}).(*executionEffects)
-	return effects
-}
-
-func (e *Executor) recordEvictedKeys(ctx context.Context, keys []string) {
+func (e *Executor) recordEvictedKeys(ctx context.Context, request *Request, keys []string) {
 	if len(keys) == 0 {
 		return
 	}
 
 	e.touchWatchKeys(keys...)
-	effects := executionEffectsFromContext(ctx)
-	if effects == nil {
-		return
-	}
-
 	frame := server.DeleteFrame(keys)
 	if !server.IsReplicationOrigin(ctx) {
-		effects.propagation = append(effects.propagation, frame)
+		request.effects.propagation = append(request.effects.propagation, frame)
 	}
-	effects.durability = append(effects.durability, frame)
+	request.effects.durability = append(request.effects.durability, frame)
 }
 
 // DecodeRequest converts a RESP array into a command request.
