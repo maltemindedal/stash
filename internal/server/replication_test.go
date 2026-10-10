@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,9 +98,253 @@ func TestServerPropagateToReplicasRemovesFailingReplica(t *testing.T) {
 	}
 }
 
+// TestConcurrentWritesReachEveryReplicaInOffsetOrder has writers propagate at the
+// same time, as writers on different stripes do, and checks that every replica
+// receives each frame at the stream position the master counted for it. A replica
+// that acknowledges offset N must hold every frame that ends at or before N, which
+// WAIT relies on. Counting the offset and queueing the frame used to be separate
+// steps, and thousands of the 16,000 frames arrived out of place.
+func TestConcurrentWritesReachEveryReplicaInOffsetOrder(t *testing.T) {
+	tests := []struct {
+		name     string
+		replicas int
+	}{
+		{name: "one replica", replicas: 1},
+		{name: "three replicas", replicas: 3},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			conns := make([]*recordingConn, tt.replicas)
+			for i := range conns {
+				id := uint64(i + 1)
+				conns[i] = &recordingConn{}
+				srv.replicaPeers.Add(id, conns[i], 6380+i, newReplicaPeerStateForTest(id, conns[i]))
+			}
+
+			const writers, perWriter = 8, 2000
+			var mu sync.Mutex
+			ends := make(map[string]int64, writers*perWriter) // frame tag -> end offset counted for it
+			var wg sync.WaitGroup
+			for w := 0; w < writers; w++ {
+				w := w
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; i < perWriter; i++ {
+						tag := fmt.Sprintf("w%d-%d", w, i)
+						frame := protocol.Array{Elements: []protocol.Value{
+							protocol.BulkString{Data: []byte("SET")},
+							protocol.BulkString{Data: []byte(tag)},
+							// Sizes differ, so two frames queued out of order end at
+							// positions other than their offsets.
+							protocol.BulkString{Data: bytes.Repeat([]byte("x"), (w*37+i)%200)},
+						}}
+						report := srv.propagateToReplicas([]protocol.Value{frame})
+						mu.Lock()
+						ends[tag] = report.endOffset
+						mu.Unlock()
+					}
+				}()
+			}
+			wg.Wait()
+
+			// Stopping the feeds waits for each to write everything queued for it.
+			if unfinished := srv.replicaPeers.StopFeeds(10 * time.Second); unfinished != 0 {
+				t.Fatalf("%d replica feeds had not finished writing after 10s", unfinished)
+			}
+
+			counted := srv.replication.MasterOffset()
+			for i, conn := range conns {
+				stream := conn.Bytes()
+				if int64(len(stream)) != counted {
+					t.Fatalf("replica %d received %d bytes, want the %d the master counted", i+1, len(stream), counted)
+				}
+				frames, misplaced, first := framesAwayFromTheirOffsets(t, stream, ends)
+				if frames != writers*perWriter {
+					t.Fatalf("replica %d received %d frames, want %d", i+1, frames, writers*perWriter)
+				}
+				if misplaced > 0 {
+					t.Errorf("replica %d: %d of %d frames end at a stream position other than the offset counted for them; first: %s", i+1, misplaced, frames, first)
+				}
+			}
+		})
+	}
+}
+
+// framesAwayFromTheirOffsets parses the stream a replica received and counts the
+// frames that do not end at the offset ends records for their tag (the key of a
+// SET frame).
+func framesAwayFromTheirOffsets(t *testing.T, stream []byte, ends map[string]int64) (frames, misplaced int, first string) {
+	t.Helper()
+
+	parser := protocol.NewParser(bytes.NewReader(stream))
+	var position int64
+	for position < int64(len(stream)) {
+		value, err := parser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() at stream position %d: %v", position, err)
+		}
+		n, err := protocol.EncodedLen(value)
+		if err != nil {
+			t.Fatalf("EncodedLen() at stream position %d: %v", position, err)
+		}
+		position += int64(n)
+		frames++
+
+		tag := string(value.(protocol.Array).Elements[1].(protocol.BulkString).Data)
+		if want := ends[tag]; want != position {
+			if misplaced == 0 {
+				first = fmt.Sprintf("%s ends at %d, counted to end at %d", tag, position, want)
+			}
+			misplaced++
+		}
+	}
+	return frames, misplaced, first
+}
+
+// TestAReplicaThatRefusesAFrameIsDroppedOnce checks that a replica whose feed
+// refuses a frame is dropped by one path, once: the feed-error handler, called
+// after the registry lock is released so that it can take the lock as
+// dropReplica does, or the registry's RemoveAndClose when no handler is set. The
+// other replicas still receive the frame, and its offset is counted once.
+func TestAReplicaThatRefusesAFrameIsDroppedOnce(t *testing.T) {
+	tests := []struct {
+		name        string
+		withHandler bool
+	}{
+		{name: "through the feed-error handler", withHandler: true},
+		{name: "by the registry when no handler is set", withHandler: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			registry := NewReplicaRegistry()
+			healthy := &recordingConn{}
+			registry.Add(1, healthy, 6380, newReplicaPeerStateForTest(1, healthy))
+			// A replica with no writer refuses every frame queued for it.
+			refusing := &stubConn{}
+			registry.Add(2, refusing, 6381, nil)
+
+			var handled sync.Mutex
+			var dropped []uint64
+			if tt.withHandler {
+				registry.SetFeedErrorHandler(func(id uint64, _ error) {
+					handled.Lock()
+					dropped = append(dropped, id)
+					handled.Unlock()
+					// Takes the registry lock, as the server's handler does.
+					registry.Remove(id)
+				})
+			}
+
+			offsets := &ReplicationState{}
+			payload := []byte("*1\r\n$4\r\nPING\r\n")
+			for round := 1; round <= 2; round++ {
+				type outcome struct {
+					end             int64
+					queued, refused int
+				}
+				done := make(chan outcome, 1)
+				go func() {
+					end, queued, refused := registry.Propagate(offsets, payload)
+					done <- outcome{end, queued, refused}
+				}()
+
+				var got outcome
+				select {
+				case got = <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("round %d: Propagate did not return; dropping the replica waited for the registry lock", round)
+				}
+
+				want := outcome{end: int64(round * len(payload)), queued: 1}
+				if round == 1 {
+					want.refused = 1
+				}
+				if got != want {
+					t.Fatalf("round %d: Propagate() = %+v, want %+v", round, got, want)
+				}
+			}
+
+			if got := registry.Count(); got != 1 {
+				t.Fatalf("Count() = %d, want 1: the refusing replica is still registered", got)
+			}
+			handled.Lock()
+			gotDropped := append([]uint64(nil), dropped...)
+			handled.Unlock()
+			wantDropped, wantCloses := []uint64{2}, int32(1)
+			if tt.withHandler {
+				// Closing the socket is the handler's job; the registry must not
+				// drop the replica a second way.
+				wantCloses = 0
+			} else {
+				wantDropped = nil
+			}
+			if fmt.Sprint(gotDropped) != fmt.Sprint(wantDropped) {
+				t.Fatalf("handler dropped %v, want %v", gotDropped, wantDropped)
+			}
+			if got := refusing.closes.Load(); got != wantCloses {
+				t.Fatalf("refusing replica's connection closed %d times, want %d", got, wantCloses)
+			}
+
+			if unfinished := registry.StopFeeds(5 * time.Second); unfinished != 0 {
+				t.Fatalf("%d replica feeds had not finished writing after 5s", unfinished)
+			}
+			if got, want := healthy.Bytes(), bytes.Repeat(payload, 2); !bytes.Equal(got, want) {
+				t.Fatalf("healthy replica received %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestAReplicaIsSentNoFrameAfterOneItRefused has a replica's backlog refuse a
+// frame, and then propagates a smaller frame that would still fit before the
+// replica is dropped. Queueing it would put it at the stream position of the
+// refused frame instead of at the offset counted for it, so it must be refused too.
+func TestAReplicaIsSentNoFrameAfterOneItRefused(t *testing.T) {
+	registry := NewReplicaRegistry()
+	conn := &recordingConn{}
+	registry.Add(1, conn, 6380, newReplicaPeerStateForTest(1, conn))
+	// A backlog limit the first frame passes and the second does not.
+	registry.mu.RLock()
+	feed := registry.replicas[1].feed
+	registry.mu.RUnlock()
+	feed.mu.Lock()
+	feed.limit = 16
+	feed.mu.Unlock()
+
+	// The handler keeps the replica registered, as it is between a refusal and
+	// the drop that follows it.
+	registry.SetFeedErrorHandler(func(uint64, error) {})
+
+	offsets := &ReplicationState{}
+	large := []byte("*1\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n")
+	small := []byte("*1\r\n$4\r\nPING\r\n")
+	for _, payload := range [][]byte{large, small} {
+		if _, queued, refused := registry.Propagate(offsets, payload); queued != 0 || refused != 1 {
+			t.Fatalf("Propagate(%q) queued %d and refused %d, want 0 and 1", payload, queued, refused)
+		}
+	}
+
+	if got, want := offsets.MasterOffset(), int64(len(large)+len(small)); got != want {
+		t.Fatalf("MasterOffset() = %d, want %d", got, want)
+	}
+	if unfinished := registry.StopFeeds(5 * time.Second); unfinished != 0 {
+		t.Fatalf("%d replica feeds had not finished writing after 5s", unfinished)
+	}
+	if got := conn.Bytes(); len(got) != 0 {
+		t.Fatalf("replica received %q after refusing a frame, want nothing", got)
+	}
+}
+
 type stubConn struct {
 	writeErr error
 	closeErr error
+	closes   atomic.Int32
 }
 
 type recordingConn struct {
@@ -113,7 +359,10 @@ func (c *stubConn) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-func (c *stubConn) Close() error                       { return c.closeErr }
+func (c *stubConn) Close() error {
+	c.closes.Add(1)
+	return c.closeErr
+}
 func (c *stubConn) LocalAddr() net.Addr                { return stubAddr("local") }
 func (c *stubConn) RemoteAddr() net.Addr               { return stubAddr("remote") }
 func (c *stubConn) SetDeadline(_ time.Time) error      { return nil }

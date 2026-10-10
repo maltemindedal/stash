@@ -60,7 +60,7 @@ slave0:id=1,port=6380,offset=31
 
 ## How the stream reaches a replica, and when a replica is dropped
 
-Writes on the master are queued for each replica and sent by a goroutine of that replica's own, in order and several at a time. A slow or stalled replica therefore never holds up clients writing to the master, and one healthy replica costs the master little (with one replica attached, a benchmark of pipelined `SET` went from about 127,000 to about 220,000 operations per second on the same machine).
+Writes on the master are queued for each replica and sent by a goroutine of that replica's own, in the order of their replication offsets, which `WAIT` relies on, and several at a time. A slow or stalled replica therefore never holds up clients writing to the master, and one healthy replica costs the master little (with one replica attached, a benchmark of pipelined `SET` went from about 127,000 to about 220,000 operations per second on the same machine).
 
 The queue for a replica is limited to 256 MiB, and a replica that will not accept 1 MiB of the stream within 30 seconds is considered stalled. In either case the master logs `dropping a replica` and closes the connection. On a graceful shutdown the master gives the replicas up to a second to take what is queued before it closes their sockets.
 

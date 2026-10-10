@@ -29,7 +29,12 @@ import (
 //
 // Lock order is gate, then stripes by ascending index. Nothing takes gate shared
 // while it already holds it, and nothing waits for another request while holding
-// either (a blocking command waits with neither held).
+// either (a blocking command waits with neither held). Handing a write's frames
+// to the replicas then takes the replica registry's lock and a replica feed's
+// (server.ReplicaRegistry.Propagate), which take neither gate nor stripe.
+// Counting a frame's replication offset and queueing it for every replica happen
+// under that one lock, so writers on different stripes, and WAIT's GETACK, reach
+// every replica in offset order.
 type sequencer struct {
 	gate    sync.RWMutex
 	stripes [writeStripes]paddedMutex
