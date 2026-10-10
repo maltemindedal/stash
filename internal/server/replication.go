@@ -156,10 +156,17 @@ func (p *ReplicaPeer) send(chunk []byte) error {
 // the registry takes no gate, stripe or shard lock, and calls no handler, since
 // the feed-error handler takes mu itself. PSYNC's attach cut takes mu under the
 // gate (BeginAttach) and under every stripe (Reserve), in that order.
+//
+// A client write's frames skip mu while no replica is registered
+// (PropagateOrdered): the attach cut orders them against Reserve instead. Every
+// other frame takes it (Propagate).
 type ReplicaRegistry struct {
 	mu       sync.RWMutex
 	replicas map[uint64]*ReplicaPeer
-	changed  chan struct{}
+	// registered is len(replicas), stored under mu whenever it changes, so that
+	// PropagateOrdered can find out without mu that no replica is registered.
+	registered atomic.Int64
+	changed    chan struct{}
 	// attaching counts the replicas between BeginAttach and their Reserve or
 	// EndAttach, which Active counts as replicas already.
 	attaching int
@@ -280,7 +287,9 @@ func (r *ReplicaRegistry) Reserve(offsets *ReplicationState, id uint64, listenin
 // Add registers a replica and starts its feed at once, outside any attach cut:
 // Reserve and Start in one step, for a replica that has no snapshot to order its
 // stream against, as in tests. The server attaches replicas through BeginAttach,
-// Reserve and Start.
+// Reserve and Start. Outside the cut nothing orders Add against PropagateOrdered,
+// which may count a frame without the lock while no replica is registered, so Add
+// must not run while frames are propagated that way.
 func (r *ReplicaRegistry) Add(offsets *ReplicationState, id uint64, conn ClientConn, listeningPort int, writer encodedReplicaWriter) {
 	r.register(offsets, id, listeningPort, writer, false)
 	r.Start(id, conn)
@@ -300,6 +309,7 @@ func (r *ReplicaRegistry) register(offsets *ReplicationState, id uint64, listeni
 	peer.baseOffset = offsets.MasterOffset()
 	previous := r.replicas[id]
 	r.replicas[id] = peer
+	r.registered.Store(int64(len(r.replicas)))
 	if endsAttach {
 		r.attaching--
 	}
@@ -348,8 +358,11 @@ func (r *ReplicaRegistry) Start(id uint64, conn ClientConn) bool {
 // relies on. It returns the offset at which payload ends, how many replicas it
 // was queued for, and how many refused it.
 //
-// The lock is taken even when no replica is attached: a frame counted without
-// it could miss a replica registering at the same moment.
+// The lock is taken even when no replica is registered, so Propagate is safe
+// from any goroutine: a frame counted without it could lie above the base of a
+// replica registering at that moment and never be queued for it. A caller that
+// the command sequencer orders against PSYNC's attach cut uses PropagateOrdered,
+// which skips the lock then.
 //
 // Queueing only appends to each replica's feed, so the lock is held for copies,
 // never for a socket write. A replica whose feed refuses payload (it is closed,
@@ -391,6 +404,28 @@ func (r *ReplicaRegistry) Propagate(offsets *ReplicationState, payload []byte) (
 	}
 
 	return end, queued, len(refusals)
+}
+
+// PropagateOrdered is Propagate for a client write's frames, whose caller the
+// command sequencer orders against PSYNC's attach cut: it holds the sequencer's
+// gate, and the stripes of the write whenever anything records writes, from
+// before the write is applied until this returns (ExecuteResult.Release). While
+// no replica is registered it only counts payload into the master offset, without
+// the registry lock, and returns 0 for queued and refused.
+//
+// That is safe because a replica is registered (Reserve) only inside the attach
+// cut, which first waits, holding gate exclusively, for every write that skipped
+// its stripes, so that every later write takes them, and then holds every stripe.
+// Such a call therefore either returned before the cut, so its frame lies at or
+// below the replica's base and its write is in the snapshot, or begins after the
+// cut and finds the replica registered, taking the lock. A frame the sequencer
+// does not order that way, such as WAIT's REPLCONF GETACK or an expiry DEL that a
+// replica's full resync publishes, goes through Propagate.
+func (r *ReplicaRegistry) PropagateOrdered(offsets *ReplicationState, payload []byte) (end int64, queued, refused int) {
+	if r.registered.Load() == 0 {
+		return offsets.AdvanceMasterOffset(int64(len(payload))), 0, 0
+	}
+	return r.Propagate(offsets, payload)
 }
 
 // SetFeedErrorHandler registers what happens when writing a replica's stream
@@ -492,6 +527,7 @@ func (r *ReplicaRegistry) Remove(id uint64) *ReplicaPeer {
 
 	peer := r.replicas[id]
 	delete(r.replicas, id)
+	r.registered.Store(int64(len(r.replicas)))
 	if peer != nil {
 		r.notifyChangedLocked()
 		if peer.feed != nil {
@@ -591,7 +627,23 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 	)
 }
 
+// propagateToReplicas hands a client write's frames to the replicas. Its caller
+// holds the write's sequencer locks until it returns (finalizeMutationEffects runs
+// before ExecuteResult.Release), so it skips the registry lock while no replica is
+// registered (ReplicaRegistry.PropagateOrdered).
 func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport {
+	return s.propagate(values, true)
+}
+
+// propagateUnorderedToReplicas hands the replicas frames that the sequencer may
+// not order against PSYNC's attach cut, and so always takes the registry lock
+// (ReplicaRegistry.Propagate): the expiry DELs, which the replica link's full
+// resync publishes while holding no sequencer lock (consumeFullResync).
+func (s *Server) propagateUnorderedToReplicas(values []protocol.Value) propagationReport {
+	return s.propagate(values, false)
+}
+
+func (s *Server) propagate(values []protocol.Value, ordered bool) propagationReport {
 	if len(values) == 0 {
 		return propagationReport{}
 	}
@@ -603,7 +655,11 @@ func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport 
 	}
 
 	report := propagationReport{payloadSize: len(payload)}
-	report.endOffset, report.succeeded, report.failed = s.replicaPeers.Propagate(s.replication, payload)
+	if ordered {
+		report.endOffset, report.succeeded, report.failed = s.replicaPeers.PropagateOrdered(s.replication, payload)
+	} else {
+		report.endOffset, report.succeeded, report.failed = s.replicaPeers.Propagate(s.replication, payload)
+	}
 	report.attempted = report.succeeded + report.failed
 	if report.attempted > 0 {
 		s.logger.Debug(

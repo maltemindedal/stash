@@ -258,7 +258,11 @@ func (s *Server) recordExpiredKeys(keys []string) {
 			return
 		}
 	}
-	s.propagateToReplicas(frames)
+	// The sweep and an accounted write publish expiries while the sequencer
+	// orders them, but a replica's full resync publishes the ones its new dataset
+	// holds with no sequencer lock (consumeFullResync), and the store hands every
+	// expiry to whichever of them publishes next.
+	s.propagateUnorderedToReplicas(frames)
 }
 
 // persistStartupEvictions appends a DEL of the keys the startup memory-pressure

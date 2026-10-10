@@ -386,21 +386,24 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 }
 
 // TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset registers
-// replicas while writers propagate, as one attaches while clients write, and has
-// each acknowledge everything it was sent. That must count each at the master's
-// offset and not past it: a replica's base is read under the lock Propagate
-// counts and queues under. Read outside that lock, a frame counted in between is
-// neither sent nor below the base, and the replica falls short of every later
-// write; or one is both, and it counts for a write it has not acknowledged. Each
-// replica attaches at a different moment, since one attach does not always land
-// between two frames.
+// replicas while writers propagate frames that the sequencer does not order, as
+// the expiry DELs are, and has each replica acknowledge everything it was sent.
+// That must count each at the master's offset and not past it: a replica's base
+// is read under the lock Propagate counts and queues under. Read outside that
+// lock, a frame counted in between is neither sent nor below the base, and the
+// replica falls short of every later write; or one is both, and it counts for a
+// write it has not acknowledged. Each replica attaches at a different moment,
+// since one attach does not always land between two frames.
+//
+// The replicas register as PSYNC registers them, through BeginAttach, Reserve and
+// Start, but outside an attach cut, which is the command sequencer's. A client
+// write skips the registry lock while no replica is registered and relies on the
+// cut instead, so it is covered where the cut is, by
+// TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt in the
+// command package.
 func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *testing.T) {
 	srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
-	frame := []protocol.Value{protocol.Array{Elements: []protocol.Value{
-		protocol.BulkString{Data: []byte("SET")},
-		protocol.BulkString{Data: []byte("key")},
-		protocol.BulkString{Data: []byte("value")},
-	}}}
+	frame := []protocol.Value{DeleteFrame([]string{"key"})}
 
 	const writers = 8
 	var propagated atomic.Int64
@@ -416,7 +419,7 @@ func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *test
 					return
 				default:
 				}
-				srv.propagateToReplicas(frame)
+				srv.propagateUnorderedToReplicas(frame)
 				propagated.Add(1)
 			}
 		}()
@@ -449,7 +452,11 @@ func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *test
 		waitForPropagated(propagated.Load() + 500)
 		id := uint64(i + 1)
 		conns[i] = &recordingConn{}
-		srv.replicaPeers.Add(srv.replication, id, conns[i], 6380+i, newReplicaPeerStateForTest(id, conns[i]))
+		srv.replicaPeers.BeginAttach()
+		srv.replicaPeers.Reserve(srv.replication, id, 6380+i, newReplicaPeerStateForTest(id, conns[i]))
+		if !srv.replicaPeers.Start(id, conns[i]) {
+			t.Fatalf("Start(%d) = false, want true", id)
+		}
 	}
 	waitForPropagated(propagated.Load() + 500)
 	stopWriters()
@@ -475,6 +482,72 @@ func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *test
 		for _, peer := range srv.replicaPeers.Snapshot() {
 			t.Logf("replica %d attached at %d and acknowledged %d, the master counted %d", peer.ID, peer.baseOffset, peer.AckOffset.Load(), counted)
 		}
+	}
+}
+
+// TestWithNoReplicaRegisteredOnlyClientWritesSkipTheRegistryLock holds the
+// registry lock, as a replica registering holds it while it reads its base, and
+// propagates a frame with no replica registered. A client write is counted
+// without waiting: the sequencer orders it against the attach cut instead. An
+// expiry DEL must wait for the lock: a replica's full resync publishes expiries
+// holding no sequencer lock, so nothing else orders the DEL against the
+// registration, and counted without the lock it could lie above the new
+// replica's base without being sent to it.
+func TestWithNoReplicaRegisteredOnlyClientWritesSkipTheRegistryLock(t *testing.T) {
+	tests := []struct {
+		name      string
+		propagate func(srv *Server)
+		takesLock bool
+	}{
+		{name: "a client write", propagate: func(srv *Server) {
+			srv.propagateToReplicas([]protocol.Value{protocol.Array{Elements: []protocol.Value{
+				protocol.BulkString{Data: []byte("SET")},
+				protocol.BulkString{Data: []byte("key")},
+				protocol.BulkString{Data: []byte("value")},
+			}}})
+		}},
+		{name: "an expiry DEL", propagate: func(srv *Server) { srv.recordExpiredKeys([]string{"key"}) }, takesLock: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			srv.replicaPeers.mu.Lock()
+			locked := true
+			unlock := func() {
+				if locked {
+					locked = false
+					srv.replicaPeers.mu.Unlock()
+				}
+			}
+			defer unlock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				tt.propagate(srv)
+			}()
+
+			if tt.takesLock {
+				select {
+				case <-done:
+					t.Fatal("the frame was counted while the registry lock was held")
+				case <-time.After(50 * time.Millisecond):
+				}
+				if got := srv.replication.MasterOffset(); got != 0 {
+					t.Fatalf("MasterOffset() = %d while the frame waits for the registry lock, want 0", got)
+				}
+				unlock()
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the frame was not counted within 5s")
+			}
+			if got := srv.replication.MasterOffset(); got == 0 {
+				t.Fatal("MasterOffset() = 0 after the frame was propagated, want it counted")
+			}
+		})
 	}
 }
 

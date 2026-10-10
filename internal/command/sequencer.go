@@ -34,7 +34,14 @@ import (
 // (server.ReplicaRegistry.Propagate), which take neither gate nor stripe.
 // Counting a frame's replication offset and queueing it for every replica happen
 // under that one lock, so writers on different stripes, and WAIT's GETACK, reach
-// every replica in offset order.
+// every replica in offset order. While no replica is registered, a client write's
+// frames are only counted, without the registry lock
+// (server.ReplicaRegistry.PropagateOrdered): the attach cut below registers a
+// replica only when no write sits between being applied and having its frames
+// counted, so a write is counted either below the new replica's base, and is in
+// its snapshot, or after the replica is registered. WAIT's GETACK, which holds
+// neither gate nor stripe, and the expiry DELs, which a replica's full resync
+// publishes holding neither, always take the lock.
 //
 // PSYNC attaches a replica at an attach cut (attachCut): it copies the snapshot
 // it sends the replica and registers the replica while it holds gate shared and

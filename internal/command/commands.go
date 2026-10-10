@@ -1062,7 +1062,10 @@ func (e *Executor) requestReplicaAcknowledgements() error {
 
 	// GETACK is part of the stream and counts toward the offset like a write, so
 	// it is counted and queued in the same step as writes are; a replica that
-	// refuses it is dropped the way propagation drops one.
+	// refuses it is dropped the way propagation drops one. WAIT holds no sequencer
+	// lock here, so nothing orders it against an attach cut, and it takes the
+	// registry lock even with no replica registered (Propagate, not
+	// PropagateOrdered).
 	_, queued, refused := e.replicaPeers.Propagate(e.replication, encoded)
 	e.logger.Debug("requested replica acknowledgements", "replica_count", queued+refused, "payload_size", len(encoded))
 	if refused > 0 {
