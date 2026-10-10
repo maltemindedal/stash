@@ -298,11 +298,11 @@ func (e *Executor) keyShapeOf(name string) keyShape {
 // beginWrite orders one attempt of a command that orders itself (BLPOP) as a
 // write. Inside a transaction, EXEC already holds the gate exclusively, so it
 // returns a function that does nothing.
-func (e *Executor) beginWrite(ctx context.Context, shape keyShape, args [][]byte) (release func()) {
-	if inTransactionExecution(ctx) {
+func (e *Executor) beginWrite(shape keyShape, request *Request) (release func()) {
+	if request.inTransaction {
 		return func() {}
 	}
-	return e.seq.beginWrite(shape, args)
+	return e.seq.beginWrite(shape, request.Args)
 }
 
 // SetWriteOrdering tells the executor how to find out whether anything is
@@ -311,18 +311,4 @@ func (e *Executor) beginWrite(ctx context.Context, shape keyShape, args [][]byte
 // to different keys parallel. The default is to always order them.
 func (e *Executor) SetWriteOrdering(needed func() bool) {
 	e.seq.needsOrder = needed
-}
-
-type transactionExecutionKey struct{}
-
-// withTransactionExecution marks ctx as belonging to EXEC running its queued
-// commands, which hold the sequencer exclusively and so must not wait for
-// anything another request would have to provide.
-func withTransactionExecution(ctx context.Context) context.Context {
-	return context.WithValue(ctx, transactionExecutionKey{}, true)
-}
-
-func inTransactionExecution(ctx context.Context) bool {
-	inside, _ := ctx.Value(transactionExecutionKey{}).(bool)
-	return inside
 }

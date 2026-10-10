@@ -22,7 +22,7 @@ func (e *Executor) handleLPush(ctx context.Context, request *Request) (protocol.
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: length}, nil
 }
 
@@ -37,7 +37,7 @@ func (e *Executor) handleRPush(ctx context.Context, request *Request) (protocol.
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: length}, nil
 }
 
@@ -67,7 +67,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 	key := string(request.Args[0])
 	// Inside a transaction EXEC holds the sequencer exclusively, so nothing could
 	// push and wake this command: it answers from what is there, as in Redis.
-	inTransaction := inTransactionExecution(ctx)
+	inTransaction := request.inTransaction
 
 	// While it waits, the command checks now and then that its client is still
 	// there, and again when a push wakes it, before it pops. Otherwise it would
@@ -84,7 +84,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		// The pop is a write: it is ordered with the others, and stays so until
 		// the caller has logged it (result.Release). Waiting is done with nothing
 		// held, or a transaction could never start.
-		release := e.beginWrite(ctx, keysFirstArg, request.Args)
+		release := e.beginWrite(keysFirstArg, request)
 
 		// The push that woke this command can still hold the key's stripe: with an
 		// AOF or a Replica, a pusher keeps it until its own frame is logged

@@ -51,7 +51,7 @@ func (e *Executor) handleGeoAdd(ctx context.Context, request *Request) (protocol
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 

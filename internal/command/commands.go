@@ -163,14 +163,13 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 	state.UnwatchAll()
 
 	// The queued commands run with the sequencer held exclusively; none of them
-	// may wait for another request (see withTransactionExecution).
-	ctx = withTransactionExecution(ctx)
+	// may wait for another request (see Request.inTransaction).
 	queued := state.DrainTransaction()
 	responses := make([]protocol.Value, 0, len(queued))
 	propagation := make([]protocol.Value, 0, len(queued))
 	durability := make([]protocol.Value, 0, len(queued))
 	for _, queuedCommand := range queued {
-		result, execErr := e.executeRequestDetailed(ctx, &Request{Name: queuedCommand.Name, Args: queuedCommand.Args}, false)
+		result, execErr := e.executeRequestDetailed(ctx, &Request{Name: queuedCommand.Name, Args: queuedCommand.Args, inTransaction: true}, false)
 		if execErr != nil {
 			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
 				return server.ExecuteResult{}, execErr
@@ -280,7 +279,7 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	}
 	// Queueing refuses PSYNC (noTransaction); were it run by EXEC anyway, the
 	// attach cut would wait forever for the gate EXEC holds.
-	if inTransactionExecution(ctx) {
+	if request.inTransaction {
 		return server.ExecuteResult{}, ErrNotAllowedInTransactionError()
 	}
 
@@ -358,7 +357,7 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 	// Inside a transaction the sequencer is held exclusively, which would keep the
 	// replicas' acknowledgements from being processed, so it reports what is
 	// acknowledged now instead of waiting, as in Redis.
-	if int64(ackedReplicas) >= replicas || timeoutMillis == 0 || inTransactionExecution(ctx) {
+	if int64(ackedReplicas) >= replicas || timeoutMillis == 0 || request.inTransaction {
 		return e.finishWaitResult(replicas, ackedReplicas, targetOffset, startedAt, false), nil
 	}
 
@@ -556,11 +555,9 @@ func (e *Executor) handleSet(ctx context.Context, request *Request) (protocol.Va
 		}
 		return nil, err
 	}
-	if effects := executionEffectsFromContext(ctx); effects != nil {
-		effects.setExpiryMillis = expiresAt
-	}
+	request.effects.setExpiryMillis = expiresAt
 	e.touchWatchKeys(key)
-	e.recordEvictedKeys(ctx, evicted)
+	e.recordEvictedKeys(ctx, request, evicted)
 	return protocol.SimpleString{Value: "OK"}, nil
 }
 
@@ -600,7 +597,7 @@ func (e *Executor) handleSetBit(ctx context.Context, request *Request) (protocol
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: previous}, nil
 }
 
@@ -653,7 +650,7 @@ func (e *Executor) handlePFAdd(ctx context.Context, request *Request) (protocol.
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: changed}, nil
 }
 
@@ -716,7 +713,7 @@ func (e *Executor) handleIncr(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: value}, nil
 }
 
@@ -740,7 +737,7 @@ func (e *Executor) handleZAdd(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, key, evicted)
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 
@@ -777,10 +774,8 @@ func (e *Executor) handleXAdd(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	if effects := executionEffectsFromContext(ctx); effects != nil {
-		effects.streamID = id
-	}
-	e.recordWriteEffects(ctx, key, evicted)
+	request.effects.streamID = id
+	e.recordWriteEffects(ctx, request, key, evicted)
 	return protocol.TextBulkString{Value: id}, nil
 }
 
@@ -891,9 +886,9 @@ func storageCommandError(err error) error {
 	}
 }
 
-func (e *Executor) recordWriteEffects(ctx context.Context, key string, evicted []string) {
+func (e *Executor) recordWriteEffects(ctx context.Context, request *Request, key string, evicted []string) {
 	e.touchWatchKeys(key)
-	e.recordEvictedKeys(ctx, evicted)
+	e.recordEvictedKeys(ctx, request, evicted)
 }
 
 func pubSubAckResponse(kind string, channel protocol.Value, count int) protocol.Array {
