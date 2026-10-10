@@ -38,7 +38,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		result, err := executor.ExecuteSequenced(ctx, requestValue("BLPOP", "jobs"))
+		result, err := handle(ctx, executor, requestValue("BLPOP", "jobs"), true)
 		done <- outcome{result, err}
 	}()
 	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {

@@ -108,7 +108,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 					tag := fmt.Sprintf("%s-%d", key, i)
 					// As the server runs a client write (executeClientRequest): its
 					// frames are handed to the replicas before its locks are released.
-					result, err := executor.ExecuteSequenced(ctx, requestValue("SET", key, tag))
+					result, err := handle(ctx, executor, requestValue("SET", key, tag), true)
 					if err != nil {
 						t.Errorf("SET error = %v", err)
 						return false
@@ -155,7 +155,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				stream := &replicaStream{}
 				state := newTestClientState(executor, id)
 				state.BindResponseWriter(bufio.NewWriter(stream))
-				result, err := executor.ExecuteSequenced(server.WithClientState(context.Background(), state), requestValue("PSYNC", "?", "-1"))
+				result, err := handle(server.WithClientState(context.Background(), state), executor, requestValue("PSYNC", "?", "-1"), true)
 				if err != nil || !result.RegisterReplica {
 					t.Fatalf("PSYNC: RegisterReplica = %v, error = %v", result.RegisterReplica, err)
 				}
