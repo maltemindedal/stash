@@ -59,8 +59,15 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 	if exists && size > 0 {
 		s.logger.Info("AOF detected, skipping RDB startup load", "aof_path", s.cfg.AOFPath, "rdb_path", s.cfg.RDBPath)
 		startedAt := time.Now()
-		stats, err := aof.LoadFile(WithReplicationOrigin(ctx), s.cfg.AOFPath, func(replayCtx context.Context, value protocol.Value) error {
-			_, replayErr := s.executor.ExecuteDetailed(replayCtx, value)
+		// Replay is ordered like any request. Nothing records writes yet (the
+		// writer is assigned below, and recordsWrites checks it), so each one
+		// takes the sequencer's gate shared and no stripe, and gives it back here.
+		replayCall := Call{Origin: OriginReplay}
+		stats, err := aof.LoadFile(ctx, s.cfg.AOFPath, func(replayCtx context.Context, value protocol.Value) error {
+			result, replayErr := s.executor.Handle(replayCtx, replayCall, value)
+			if result.Release != nil {
+				result.Release()
+			}
 			return replayErr
 		})
 		if err != nil {
@@ -205,7 +212,7 @@ func (s *Server) prepareDurabilityBeforeResponse(values []protocol.Value, logger
 	return payload, nil
 }
 
-func (s *Server) finalizeMutationEffects(ctx context.Context, durability []protocol.Value, durabilityPayload []byte, propagation []protocol.Value, logger *slog.Logger) {
+func (s *Server) finalizeMutationEffects(client *ClientState, durability []protocol.Value, durabilityPayload []byte, propagation []protocol.Value, logger *slog.Logger) {
 	if s == nil {
 		return
 	}
@@ -229,7 +236,7 @@ func (s *Server) finalizeMutationEffects(ctx context.Context, durability []proto
 
 	if len(propagation) > 0 {
 		report := s.propagateToReplicas(propagation)
-		s.recordClientWriteOffset(ctx, report.endOffset)
+		s.recordClientWriteOffset(client, report.endOffset)
 	}
 }
 

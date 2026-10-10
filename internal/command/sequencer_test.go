@@ -1,7 +1,6 @@
 package command
 
 import (
-	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -239,7 +238,7 @@ func TestEveryDurableCommandDeclaresHowToOrderItsWrites(t *testing.T) {
 	// A command added without a key shape is ordered against every write, which
 	// is correct but slow. This lists the shapes the current commands have, so a
 	// change to one is a decision rather than an accident.
-	executor := NewExecutor(nil, nil)
+	executor := newTestExecutor()
 	want := map[string]keyShape{
 		"SET": keysFirstArg, "SETBIT": keysFirstArg, "PFADD": keysFirstArg, "INCR": keysFirstArg,
 		"LPUSH": keysFirstArg, "RPUSH": keysFirstArg, "LPOP": keysFirstArg, "RPOP": keysFirstArg,
@@ -269,7 +268,7 @@ func TestEveryDurableCommandDeclaresHowToOrderItsWrites(t *testing.T) {
 }
 
 func TestSequenceModeOfRequests(t *testing.T) {
-	executor := NewExecutor(nil, nil)
+	executor := newTestExecutor()
 	tests := []struct {
 		name string
 		want sequenceMode
@@ -285,7 +284,7 @@ func TestSequenceModeOfRequests(t *testing.T) {
 		{"NOSUCHCOMMAND", sequenceRead},
 	}
 	for _, tt := range tests {
-		if got := executor.sequenceModeFor(context.Background(), &Request{Name: tt.name}); got != tt.want {
+		if got := executor.sequenceModeFor(&Request{Name: tt.name}); got != tt.want {
 			t.Errorf("sequenceModeFor(%s) = %d, want %d", tt.name, got, tt.want)
 		}
 	}

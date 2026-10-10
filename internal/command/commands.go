@@ -53,7 +53,7 @@ func putPooledPubSubSubscribers(subscribers *[]*server.ClientState) {
 }
 
 func (e *Executor) handleWatch(ctx context.Context, request *Request) (protocol.Value, error) {
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +71,7 @@ func (e *Executor) handleWatch(ctx context.Context, request *Request) (protocol.
 }
 
 func (e *Executor) handleSubscribe(ctx context.Context, request *Request) (server.ExecuteResult, error) {
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
@@ -90,7 +90,7 @@ func (e *Executor) handleSubscribe(ctx context.Context, request *Request) (serve
 }
 
 func (e *Executor) handleUnsubscribe(ctx context.Context, request *Request) (server.ExecuteResult, error) {
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
@@ -124,7 +124,7 @@ func (e *Executor) handleMulti(ctx context.Context, request *Request) (protocol.
 		return nil, wrongNumberOfArgumentsError("MULTI")
 	}
 
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +143,7 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 		return server.ExecuteResult{}, wrongNumberOfArgumentsError("EXEC")
 	}
 
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
@@ -169,7 +169,15 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 	propagation := make([]protocol.Value, 0, len(queued))
 	durability := make([]protocol.Value, 0, len(queued))
 	for _, queuedCommand := range queued {
-		result, execErr := e.executeRequestDetailed(ctx, &Request{Name: queuedCommand.Name, Args: queuedCommand.Args, inTransaction: true}, false)
+		queuedRequest := &Request{
+			Name:          queuedCommand.Name,
+			Args:          queuedCommand.Args,
+			client:        request.client,
+			inTransaction: true,
+			origin:        request.origin,
+			inline:        request.inline,
+		}
+		result, execErr := e.executeRequestDetailed(ctx, queuedRequest, false)
 		if execErr != nil {
 			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
 				return server.ExecuteResult{}, execErr
@@ -196,9 +204,6 @@ func (e *Executor) handleBGRewriteAOF(ctx context.Context, request *Request) (pr
 	if len(request.Args) != 0 {
 		return nil, wrongNumberOfArgumentsError("BGREWRITEAOF")
 	}
-	if e.aofRewrite == nil {
-		return nil, fmt.Errorf("append only file persistence is not enabled")
-	}
 	if err := e.aofRewrite(ctx); err != nil {
 		return nil, err
 	}
@@ -220,7 +225,7 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 			return server.ExecuteResult{}, ErrSyntaxError()
 		}
 
-		if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
+		if state := request.client; state != nil {
 			state.SetReplicaListeningPort(port)
 		}
 
@@ -228,15 +233,11 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 	case "GETACK":
 		// The "*" argument is validated upstream; only the caller's origin,
 		// which the validator has no context for, is checked here.
-		if !server.IsReplicationOrigin(ctx) {
+		if !request.origin.AnswersGetAck() {
 			return server.ExecuteResult{}, ErrSyntaxError()
 		}
 
-		ackOffset := int64(0)
-		if e.replication != nil {
-			ackOffset = e.replication.ReplicaOffset()
-		}
-
+		ackOffset := e.replication.ReplicaOffset()
 		result := server.ExecuteResult{}
 		result.UpstreamReplies = []protocol.Value{propagationFrame(&Request{
 			Name: "REPLCONF",
@@ -249,7 +250,7 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 			return server.ExecuteResult{}, ErrSyntaxError()
 		}
 
-		if state, ok := server.ClientStateFromContext(ctx); ok && state != nil && state.IsReplica() && e.replicaPeers != nil {
+		if state := request.client; state != nil && state.IsReplica() {
 			if updated := e.replicaPeers.UpdateAck(state.ID, ackOffset); updated {
 				// The replica's own count, from zero when it attached. INFO and
 				// WAIT add the master offset it attached at.
@@ -270,10 +271,10 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	if string(request.Args[0]) != "?" || string(request.Args[1]) != "-1" {
 		return server.ExecuteResult{}, ErrSyntaxError()
 	}
-	if e.replication == nil || e.replication.MasterReplicationID == "" || e.replicaPeers == nil {
+	if e.replication.MasterReplicationID == "" {
 		return server.ExecuteResult{}, fmt.Errorf("replication state unavailable")
 	}
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
@@ -343,7 +344,7 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 		return server.ExecuteResult{}, err
 	}
 
-	targetOffset := e.waitTargetOffset(ctx)
+	targetOffset := e.waitTargetOffset(request)
 	startedAt := time.Now()
 
 	ackedReplicas := e.countReplicasAtOrAbove(targetOffset)
@@ -364,12 +365,12 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 	// On the event loop, waiting would deadlock: the GETACK frames queued
 	// below are flushed by the loop goroutine this command is blocking, and
 	// incoming REPLCONF ACK frames are read by it too.
-	if server.IsInlineExecution(ctx) {
+	if request.inline {
 		return server.ExecuteResult{}, blockingNotSupportedError("WAIT")
 	}
 
 	// Replies to the requests pipelined ahead of this one must not wait behind it.
-	if err := server.FlushClientResponses(ctx); err != nil {
+	if err := request.client.TryFlushResponses(); err != nil {
 		return server.ExecuteResult{}, err
 	}
 
@@ -397,15 +398,12 @@ func parseWaitArguments(request *Request) (int64, int64, error) {
 	return replicas, timeoutMillis, nil
 }
 
-func (e *Executor) waitTargetOffset(ctx context.Context) int64 {
-	if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
+func (e *Executor) waitTargetOffset(request *Request) int64 {
+	if state := request.client; state != nil {
 		return state.LastWriteReplicationOffset()
 	}
-	if e.replication != nil {
-		return e.replication.MasterOffset()
-	}
 
-	return 0
+	return e.replication.MasterOffset()
 }
 
 func (e *Executor) waitForReplicaAcknowledgements(ctx context.Context, replicas int64, timeoutMillis int64, targetOffset int64, startedAt time.Time) (server.ExecuteResult, error) {
@@ -447,7 +445,7 @@ func (e *Executor) handleDiscard(ctx context.Context, request *Request) (protoco
 		return nil, wrongNumberOfArgumentsError("DISCARD")
 	}
 
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +466,7 @@ func (e *Executor) handleAuth(ctx context.Context, request *Request) (protocol.V
 		return nil, ErrAuthNotConfiguredError()
 	}
 
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return nil, err
 	}
@@ -508,10 +506,6 @@ func (e *Executor) handleEcho(_ context.Context, request *Request) (protocol.Val
 }
 
 func (e *Executor) handlePublish(_ context.Context, request *Request) (protocol.Value, error) {
-	if e.pubSubRegistry == nil {
-		return protocol.Integer{Value: 0}, nil
-	}
-
 	channel := string(request.Args[0])
 	pooledSubscribers := getPooledPubSubSubscribers()
 	subscribers := e.pubSubRegistry.AppendSubscribers(channel, (*pooledSubscribers)[:0])
@@ -557,7 +551,7 @@ func (e *Executor) handleSet(ctx context.Context, request *Request) (protocol.Va
 	}
 	request.effects.setExpiryMillis = expiresAt
 	e.touchWatchKeys(key)
-	e.recordEvictedKeys(ctx, request, evicted)
+	e.recordEvictedKeys(request, evicted)
 	return protocol.SimpleString{Value: "OK"}, nil
 }
 
@@ -597,7 +591,7 @@ func (e *Executor) handleSetBit(ctx context.Context, request *Request) (protocol
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: previous}, nil
 }
 
@@ -650,7 +644,7 @@ func (e *Executor) handlePFAdd(ctx context.Context, request *Request) (protocol.
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: changed}, nil
 }
 
@@ -713,7 +707,7 @@ func (e *Executor) handleIncr(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: value}, nil
 }
 
@@ -737,7 +731,7 @@ func (e *Executor) handleZAdd(ctx context.Context, request *Request) (protocol.V
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 
@@ -775,7 +769,7 @@ func (e *Executor) handleXAdd(ctx context.Context, request *Request) (protocol.V
 	}
 
 	request.effects.streamID = id
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.TextBulkString{Value: id}, nil
 }
 
@@ -886,9 +880,9 @@ func storageCommandError(err error) error {
 	}
 }
 
-func (e *Executor) recordWriteEffects(ctx context.Context, request *Request, key string, evicted []string) {
+func (e *Executor) recordWriteEffects(request *Request, key string, evicted []string) {
 	e.touchWatchKeys(key)
-	e.recordEvictedKeys(ctx, request, evicted)
+	e.recordEvictedKeys(request, evicted)
 }
 
 func pubSubAckResponse(kind string, channel protocol.Value, count int) protocol.Array {
@@ -1012,17 +1006,16 @@ func clone(value []byte) []byte {
 	return copied
 }
 
-func clientStateFromContext(ctx context.Context) (*server.ClientState, error) {
-	state, ok := server.ClientStateFromContext(ctx)
-	if !ok || state == nil {
+func clientStateOf(request *Request) (*server.ClientState, error) {
+	if request.client == nil {
 		return nil, fmt.Errorf("client state unavailable")
 	}
 
-	return state, nil
+	return request.client, nil
 }
 
 func (e *Executor) touchWatchKeys(keys ...string) {
-	if e.watchRegistry == nil || len(keys) == 0 {
+	if len(keys) == 0 {
 		return
 	}
 
@@ -1030,26 +1023,14 @@ func (e *Executor) touchWatchKeys(keys ...string) {
 }
 
 func (e *Executor) countReplicasAtOrAbove(targetOffset int64) int {
-	if e.replicaPeers == nil {
-		return 0
-	}
-
 	return e.replicaPeers.CountReplicasAtOrAbove(targetOffset)
 }
 
 func (e *Executor) countReplicasAtOrAboveWithNotify(targetOffset int64) (int, <-chan struct{}) {
-	if e.replicaPeers == nil {
-		return 0, nil
-	}
-
 	return e.replicaPeers.CountReplicasAtOrAboveWithNotify(targetOffset)
 }
 
 func (e *Executor) requestReplicaAcknowledgements() error {
-	if e.replicaPeers == nil {
-		return nil
-	}
-
 	encoded, err := cachedReplConfGetAckPayload()
 	if err != nil {
 		return fmt.Errorf("encode REPLCONF GETACK: %w", err)

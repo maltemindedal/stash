@@ -17,7 +17,7 @@ func TestOverConnectionLimit(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.MaxClients = 2
-	srv := New(cfg, logger, storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, cfg, logger, storage.NewStore(), stubExecutor{})
 
 	if srv.overConnectionLimit() {
 		t.Fatal("overConnectionLimit() = true with 0 connections, want false")
@@ -33,7 +33,7 @@ func TestOverConnectionLimit(t *testing.T) {
 
 	unlimitedCfg := config.Default()
 	unlimitedCfg.MaxClients = 0
-	unlimited := New(unlimitedCfg, logger, storage.NewStore(), stubExecutor{})
+	unlimited := newTestServer(t, unlimitedCfg, logger, storage.NewStore(), stubExecutor{})
 	unlimited.registerClient(&stubConn{})
 	if unlimited.overConnectionLimit() {
 		t.Fatal("overConnectionLimit() = true with MaxClients=0, want false (disabled)")

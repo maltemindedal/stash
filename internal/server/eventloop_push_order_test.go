@@ -41,7 +41,7 @@ func (handDrivenPoller) Close() error                  { return nil }
 func newHandDrivenEventLoop(t *testing.T) (*eventLoop, *eventConn, int) {
 	t.Helper()
 
-	srv := New(config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
 	loop := &eventLoop{
 		srv:     srv,
 		poller:  handDrivenPoller{},

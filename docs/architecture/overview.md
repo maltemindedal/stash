@@ -24,7 +24,7 @@ flowchart LR
 Contains the `main` package and the production binary entrypoint. It is responsible for:
 
 - parsing runtime flags
-- creating the logger, store, command executor, and TCP server
+- creating the logger, store, and TCP server, and giving the server `command.New` to build the command executor with
 - starting the server with signal-aware shutdown
 
 ### `internal/config`
@@ -78,6 +78,10 @@ Current responsibilities:
 
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
+`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, and the server's INFO snapshot, AOF rewrite and write-recording check. It refuses a `Services` with a collaborator missing, naming the field.
+
+The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog, and only the Master's stream may answer `REPLCONF GETACK`. A Call without an Origin, a client request without its Client state, and a Master or replay request that carries one are refused.
+
 Implemented commands cover strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial data, streams, transactions, pub/sub, replication handshakes, `WAIT`, `BGREWRITEAOF`, `INFO`, `SLOWLOG`, and `MONITOR`. The `commandSpecs` table registers each command with its handler, argument validator, and replication and durability flags. The [command reference](../reference/commands.md) documents that table for users.
 
 ### `internal/server`
@@ -86,10 +90,11 @@ Owns the TCP lifecycle.
 
 Current responsibilities:
 
+- create the registries it shares with the command executor, and build the executor once from `Services` with the constructor `cmd/stash` gives it; the executor is a required interface (`CommandExecutor`), so a method renamed on either side is a compile error, and only `BeginBackgroundWrite`, which guards the expiry sweep and an AOF rewrite's snapshot, is still found by optional type assertion
 - create the listener with `net.Listen`
 - accept client connections in a loop
 - spawn one goroutine per client (default networking mode), which queues each reply and sends the queue just before it would wait for more input, so a client that pipelines requests gets its replies in as few writes as the requests arrived in
-- parse → execute → respond for each request
+- parse → execute → respond for each request, with a `Call` each networking mode builds once per connection (an event-loop connection's runs inline); the replica link passes the Master's Origin, and AOF replay the replay Origin, ordered like any request
 - answer a request it cannot parse with one error and close the connection, because the byte stream cannot be resynchronized (both networking modes)
 - close a connection that has not authenticated within `--auth-timeout` when a password is required (a read deadline in the default mode, a timer that asks the loop to close in event-loop mode)
 - hold a client that has not authenticated to small frames (arrays of at most 10 elements, bulk strings of at most 16 KiB) when a password is required; in event-loop mode the connection decodes one request at a time until then, so a request behind an `AUTH` is decoded under the limits in force after it

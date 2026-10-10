@@ -30,8 +30,7 @@ func TestServerHandlesMasterReplicaHandshake(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -184,8 +183,7 @@ func TestServerReplicaModeInitiatesHandshake(t *testing.T) {
 
 		logger := stashlogger.New(cfg.LogLevel)
 		store := storage.NewStore()
-		executor := command.NewExecutor(store, logger)
-		srv := server.New(cfg, logger, store, executor)
+		srv := newServer(t, cfg, logger, store)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -336,8 +334,7 @@ func TestServerReplicaModeInitiatesHandshake(t *testing.T) {
 
 		logger := stashlogger.New(cfg.LogLevel)
 		store := storage.NewStore()
-		executor := command.NewExecutor(store, logger)
-		srv := server.New(cfg, logger, store, executor)
+		srv := newServer(t, cfg, logger, store)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -468,8 +465,7 @@ func TestServerReplicaModeInitiatesHandshake(t *testing.T) {
 		cfg.ReplicaOf = masterListener.Addr().String()
 
 		store := storage.NewStore()
-		executor := command.NewExecutor(store, replicaLogger)
-		srv := server.New(cfg, replicaLogger, store, executor)
+		srv := newServer(t, cfg, replicaLogger, store)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -586,8 +582,7 @@ func TestServerReplicaModeInitiatesHandshake(t *testing.T) {
 		cfg.MasterAuth = "wrong"
 
 		store := storage.NewStore()
-		executor := command.NewExecutor(store, replicaLogger)
-		srv := server.New(cfg, replicaLogger, store, executor)
+		srv := newServer(t, cfg, replicaLogger, store)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -731,8 +726,7 @@ func TestServerReplicaFullResyncReplacesExistingData(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -869,8 +863,7 @@ func TestMasterPropagatesMutationsToReplica(t *testing.T) {
 	logger := stashlogger.New(masterCfg.LogLevel)
 
 	masterStore := storage.NewStore()
-	masterExecutor := command.NewExecutor(masterStore, logger)
-	master := server.New(masterCfg, logger, masterStore, masterExecutor)
+	master := newServer(t, masterCfg, logger, masterStore)
 
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
@@ -892,8 +885,7 @@ func TestMasterPropagatesMutationsToReplica(t *testing.T) {
 	replicaCfg.ReplicaOf = masterAddr
 
 	replicaStore := storage.NewStore()
-	replicaExecutor := command.NewExecutor(replicaStore, logger)
-	replica := server.New(replicaCfg, logger, replicaStore, replicaExecutor)
+	replica := newServer(t, replicaCfg, logger, replicaStore)
 
 	replicaCtx, cancelReplica := context.WithCancel(context.Background())
 	defer cancelReplica()
@@ -1009,8 +1001,7 @@ func TestMasterPropagatesActiveEvictionOfExpiredKey(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1137,8 +1128,7 @@ func TestMasterFullResyncTransfersExistingKeyspace(t *testing.T) {
 	logger := stashlogger.New(masterCfg.LogLevel)
 
 	masterStore := storage.NewStore()
-	masterExecutor := command.NewExecutor(masterStore, logger)
-	master := server.New(masterCfg, logger, masterStore, masterExecutor)
+	master := newServer(t, masterCfg, logger, masterStore)
 
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
@@ -1175,8 +1165,7 @@ func TestMasterFullResyncTransfersExistingKeyspace(t *testing.T) {
 	replicaCfg.ReplicaOf = masterAddr
 
 	replicaStore := storage.NewStore()
-	replicaExecutor := command.NewExecutor(replicaStore, logger)
-	replica := server.New(replicaCfg, logger, replicaStore, replicaExecutor)
+	replica := newServer(t, replicaCfg, logger, replicaStore)
 
 	replicaCtx, cancelReplica := context.WithCancel(context.Background())
 	defer cancelReplica()
@@ -1232,8 +1221,7 @@ func TestPublishPropagatesToReplicaSubscribers(t *testing.T) {
 	logger := stashlogger.New(masterCfg.LogLevel)
 
 	masterStore := storage.NewStore()
-	masterExecutor := command.NewExecutor(masterStore, logger)
-	master := server.New(masterCfg, logger, masterStore, masterExecutor)
+	master := newServer(t, masterCfg, logger, masterStore)
 
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
@@ -1255,8 +1243,7 @@ func TestPublishPropagatesToReplicaSubscribers(t *testing.T) {
 	replicaCfg.ReplicaOf = masterAddr
 
 	replicaStore := storage.NewStore()
-	replicaExecutor := command.NewExecutor(replicaStore, logger)
-	replica := server.New(replicaCfg, logger, replicaStore, replicaExecutor)
+	replica := newServer(t, replicaCfg, logger, replicaStore)
 
 	replicaCtx, cancelReplica := context.WithCancel(context.Background())
 	defer cancelReplica()
@@ -1385,8 +1372,7 @@ func TestWaitReturnsReplicaAcknowledgements(t *testing.T) {
 	logger := stashlogger.New(masterCfg.LogLevel)
 
 	masterStore := storage.NewStore()
-	masterExecutor := command.NewExecutor(masterStore, logger)
-	master := server.New(masterCfg, logger, masterStore, masterExecutor)
+	master := newServer(t, masterCfg, logger, masterStore)
 
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
@@ -1408,8 +1394,7 @@ func TestWaitReturnsReplicaAcknowledgements(t *testing.T) {
 	replicaCfg.ReplicaOf = masterAddr
 
 	replicaStore := storage.NewStore()
-	replicaExecutor := command.NewExecutor(replicaStore, logger)
-	replica := server.New(replicaCfg, logger, replicaStore, replicaExecutor)
+	replica := newServer(t, replicaCfg, logger, replicaStore)
 
 	replicaCtx, cancelReplica := context.WithCancel(context.Background())
 	defer cancelReplica()
@@ -1474,7 +1459,7 @@ func startMasterWithLateReplica(t *testing.T, writesBefore int) (net.Conn, *prot
 
 	logger := stashlogger.New("error")
 	masterStore := storage.NewStore()
-	master := server.New(defaultTestConfig(), logger, masterStore, command.NewExecutor(masterStore, logger))
+	master := newServer(t, defaultTestConfig(), logger, masterStore)
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	masterErrCh := make(chan error, 1)
 	go func() {
@@ -1671,8 +1656,7 @@ func TestReplicationStructuredLogs(t *testing.T) {
 	masterCfg.DumpPath = ""
 
 	masterStore := storage.NewStore()
-	masterExecutor := command.NewExecutor(masterStore, masterLogger)
-	master := server.New(masterCfg, masterLogger, masterStore, masterExecutor)
+	master := newServer(t, masterCfg, masterLogger, masterStore)
 
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
@@ -1697,8 +1681,7 @@ func TestReplicationStructuredLogs(t *testing.T) {
 	replicaCfg.ReplicaOf = masterAddr
 
 	replicaStore := storage.NewStore()
-	replicaExecutor := command.NewExecutor(replicaStore, replicaLogger)
-	replica := server.New(replicaCfg, replicaLogger, replicaStore, replicaExecutor)
+	replica := newServer(t, replicaCfg, replicaLogger, replicaStore)
 
 	replicaCtx, cancelReplica := context.WithCancel(context.Background())
 	defer cancelReplica()
@@ -1785,8 +1768,7 @@ func TestWaitTimesOutWithoutReplicas(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1830,8 +1812,7 @@ func TestWaitUsesPerClientReplicationOffset(t *testing.T) {
 	logger := stashlogger.New(masterCfg.LogLevel)
 
 	masterStore := storage.NewStore()
-	masterExecutor := command.NewExecutor(masterStore, logger)
-	master := server.New(masterCfg, logger, masterStore, masterExecutor)
+	master := newServer(t, masterCfg, logger, masterStore)
 
 	masterCtx, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
@@ -1853,8 +1834,7 @@ func TestWaitUsesPerClientReplicationOffset(t *testing.T) {
 	replicaCfg.ReplicaOf = masterAddr
 
 	replicaStore := storage.NewStore()
-	replicaExecutor := command.NewExecutor(replicaStore, logger)
-	replica := server.New(replicaCfg, logger, replicaStore, replicaExecutor)
+	replica := newServer(t, replicaCfg, logger, replicaStore)
 
 	replicaCtx, cancelReplica := context.WithCancel(context.Background())
 	defer cancelReplica()

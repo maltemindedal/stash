@@ -13,8 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -62,7 +60,7 @@ func TestServerWarnsWhenReachableFromTheNetworkWithoutAPassword(t *testing.T) {
 			logs := &syncBuffer{}
 			logger := slog.New(slog.NewTextHandler(logs, nil))
 			store := storage.NewStore()
-			srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+			srv := newServer(t, cfg, logger, store)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			errCh := make(chan error, 1)
@@ -102,7 +100,7 @@ func TestServerRefusesToListenBeyondLoopbackWithoutAPassword(t *testing.T) {
 			logs := &syncBuffer{}
 			logger := slog.New(slog.NewTextHandler(logs, nil))
 			store := storage.NewStore()
-			srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+			srv := newServer(t, cfg, logger, store)
 
 			// A server that wrongly starts would serve until the context ends.
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
@@ -76,7 +75,7 @@ func startAcceptFailureMaster(t *testing.T) (*server.Server, string) {
 	cfg := defaultTestConfig()
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	master := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	master := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)

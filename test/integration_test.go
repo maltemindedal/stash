@@ -28,6 +28,24 @@ func defaultTestConfig() config.Config {
 	return cfg
 }
 
+// newServer builds a server from cfg with the command executor, as cmd/stash
+// does.
+func newServer(t *testing.T, cfg config.Config, logger *slog.Logger, store *storage.Store) *server.Server {
+	t.Helper()
+
+	srv, err := server.New(cfg, logger, store, newCommandExecutor)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+// newCommandExecutor is command.New in the form server.New takes, as cmd/stash
+// adapts it.
+func newCommandExecutor(services server.Services) (server.CommandExecutor, error) {
+	return command.New(services)
+}
+
 func startTestServer(t *testing.T, cfg config.Config) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	return startTestServerWithLogger(t, cfg, stashlogger.New(cfg.LogLevel))
@@ -38,8 +56,7 @@ func startTestServer(t *testing.T, cfg config.Config) (string, context.CancelFun
 func startTestServerWithLogger(t *testing.T, cfg config.Config, logger *slog.Logger) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -75,8 +92,7 @@ func TestServerHandlesPhaseOneCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -138,8 +154,7 @@ func TestServerRequiresAuthWhenConfigured(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -197,8 +212,7 @@ func TestServerHandlesListCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -286,8 +300,7 @@ func TestServerHandlesSortedSetCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -349,8 +362,7 @@ func TestServerHandlesStreamCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -424,8 +436,7 @@ func TestServerHandlesTransactionCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -490,8 +501,7 @@ func TestServerHandlesWatchOptimisticLocking(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -549,8 +559,7 @@ func TestServerHandlesPubSubCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -634,8 +643,7 @@ func TestServerPubSubPublishesToEverySubscriber(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -716,8 +724,7 @@ func TestServerSubscribedClientsRejectTransactionCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -763,8 +770,7 @@ func TestServerPubSubDisconnectCleanup(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -837,8 +843,7 @@ func TestServerMonitorStreamsCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -895,8 +900,7 @@ func TestServerRejectsEmptyPubSubChannelNames(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

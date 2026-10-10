@@ -12,14 +12,13 @@ import (
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
-// passwordDroppingExecutor is the command executor with the password's wiring
-// cut: server.New hands it the configured password and it is dropped, as it is
-// when the method server.New looks for is renamed. Everything else is wired.
-type passwordDroppingExecutor struct {
-	*command.Executor
+// newExecutorWithoutPassword builds the command executor with the password's
+// wiring cut: the password server.New puts in Services is dropped on the way.
+// Everything else is wired.
+func newExecutorWithoutPassword(services server.Services) (server.CommandExecutor, error) {
+	services.RequirePass = ""
+	return command.New(services)
 }
-
-func (passwordDroppingExecutor) SetRequirePass(string) {}
 
 func TestAuthFailsClosedWhenThePasswordNeverReachesTheExecutor(t *testing.T) {
 	noAuth := protocol.ErrorValue{Message: "NOAUTH Authentication required."}
@@ -37,7 +36,10 @@ func TestAuthFailsClosedWhenThePasswordNeverReachesTheExecutor(t *testing.T) {
 
 			logger := stashlogger.New(cfg.LogLevel)
 			store := storage.NewStore()
-			srv := server.New(cfg, logger, store, passwordDroppingExecutor{command.NewExecutor(store, logger)})
+			srv, err := server.New(cfg, logger, store, newExecutorWithoutPassword)
+			if err != nil {
+				t.Fatalf("server.New() error = %v", err)
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			errCh := make(chan error, 1)
 			go func() {

@@ -219,7 +219,7 @@ const (
 
 // sequenceModeFor classifies a request. A client that is queueing commands for
 // EXEC executes nothing yet, so its requests are reads whatever they name.
-func (e *Executor) sequenceModeFor(ctx context.Context, request *Request) sequenceMode {
+func (e *Executor) sequenceModeFor(request *Request) sequenceMode {
 	spec, ok := e.command(request.Name)
 	if !ok {
 		return sequenceRead
@@ -232,7 +232,7 @@ func (e *Executor) sequenceModeFor(ctx context.Context, request *Request) sequen
 		return sequenceSelf
 	}
 	if !spec.transactionControl {
-		if state, ok := server.ClientStateFromContext(ctx); ok && state != nil && state.InTransactionActive() {
+		if state := request.client; state != nil && state.InTransactionActive() {
 			return sequenceRead
 		}
 	}
@@ -242,19 +242,19 @@ func (e *Executor) sequenceModeFor(ctx context.Context, request *Request) sequen
 	return sequenceRead
 }
 
-// ExecuteSequenced executes a request like ExecuteDetailed and orders it against
-// the other requests as described on sequencer. When the result has a Release
-// function the caller must call it once it has applied the result's durability
-// and propagation frames, and not before; nothing else can execute a write, or a
-// transaction, until then.
-func (e *Executor) ExecuteSequenced(ctx context.Context, value protocol.Value) (server.ExecuteResult, error) {
-	request, err := DecodeRequest(value)
+// Handle runs one request the server received, as call describes it, ordered
+// against the other requests as described on sequencer. When the result has a
+// Release function the caller must call it once it has applied the result's
+// durability and propagation frames, and not before; nothing else can execute
+// a write, or a transaction, until then.
+func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.Value) (server.ExecuteResult, error) {
+	request, err := decodeCall(call, value)
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
 
 	q := e.seq
-	switch e.sequenceModeFor(ctx, request) {
+	switch e.sequenceModeFor(request) {
 	case sequenceExclusive:
 		q.gate.Lock()
 		result, err := e.executeRequestDetailed(ctx, request, true)
@@ -303,12 +303,4 @@ func (e *Executor) beginWrite(shape keyShape, request *Request) (release func())
 		return func() {}
 	}
 	return e.seq.beginWrite(shape, request.Args)
-}
-
-// SetWriteOrdering tells the executor how to find out whether anything is
-// recording writes at the moment (an append-only file, a replica). While nothing
-// is, writes are not ordered against one another, which keeps concurrent writers
-// to different keys parallel. The default is to always order them.
-func (e *Executor) SetWriteOrdering(needed func() bool) {
-	e.seq.needsOrder = needed
 }
