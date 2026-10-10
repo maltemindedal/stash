@@ -36,7 +36,7 @@ go run ./cmd/stash --maxmemory 104857600
 
 `0`, the default, disables the feature entirely and skips the accounting overhead. Negative values are rejected at startup.
 
-When a write pushes the keyspace over the limit, the store evicts sampled least-recently-used candidates until usage is back at or below the limit. The server also enforces the limit once at startup after loading an AOF or RDB file. That pass logs:
+When a write pushes the keyspace over the limit, the store evicts sampled least-recently-used candidates until usage is back at or below the limit. The server also enforces the limit once at startup, after loading an AOF or RDB file and before it accepts connections. With `--aof`, it then appends a `DEL` of the keys this pass evicts to the AOF and fsyncs it under every `--appendfsync` policy, so a later start does not bring them back. If that append fails, the server refuses to start (see [Persistence](persistence.md#enable-the-append-only-file)). When the startup pass evicts keys, it logs how many, the memory in use afterwards, and the limit:
 
 ```
 level=INFO msg="applied startup maxmemory eviction" evicted_keys=42 used_memory=104857000 maxmemory=104857600
@@ -70,6 +70,8 @@ An eviction is a keyspace mutation, so it is not confined to the server that per
 - it is **propagated** to attached replicas, so a replica does not keep serving a key the master has dropped;
 - it is **appended to the AOF**, so replaying the log does not resurrect the key;
 - it **invalidates `WATCH`** on the evicted keys, so a transaction guarding one aborts.
+
+The startup pass runs before any client or replica connects, so its `DEL` goes to the AOF only. A replica that attaches later receives the keyspace without the evicted keys in its full resync.
 
 A replica runs its own `--maxmemory` enforcement and active TTL loop, so it can drop keys without an instruction from the master. If an eviction occurs while the replica applies a replicated command, the replica records the eviction in its own AOF but does not send it upstream or to other replicas. An eviction triggered by the replica itself is a local write. Set `--maxmemory` no lower on a replica than on its master, or the replica may drop keys that the master still holds.
 

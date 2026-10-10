@@ -97,6 +97,7 @@ Current responsibilities:
 - optionally serve all clients from one event-loop goroutine driven by OS readiness notifications (`--event-loop`), dispatching readable and writable sockets through per-connection state machines
 - maintain an active connection registry for shutdown
 - load startup persistence (RDB and/or AOF) before accepting TCP connections, and write the keys an RDB snapshot loaded into a missing or empty AOF before opening it, since every later start loads the AOF and skips the RDB snapshot
+- append a `DEL` of the keys the startup `--maxmemory` pass evicts to the AOF, fsynced, before accepting TCP connections, and refuse to start if that append fails
 - append durable command frames and fan out replication writes after successful execution
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
