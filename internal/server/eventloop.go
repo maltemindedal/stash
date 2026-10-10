@@ -144,10 +144,12 @@ func (s *Server) serveEventLoop(ctx context.Context, listener net.Listener) erro
 // connCommandRunner returns a ConnCommandRunner that executes one parsed
 // request through the command pipeline shared with the goroutine path.
 // Responses are returned for the ConnMachine to buffer rather than written
-// directly. Replica registration happens before the responses are buffered,
-// which is safe only because the loop is single-threaded: no other command can
-// propagate to the new peer between registration and the handshake responses
-// reaching the machine's write buffer.
+// directly. A replica's feed is started (PSYNC registered the replica at its
+// attach cut, and registerReplicaPeer marks the connection a replica first)
+// before the handshake responses are buffered. That is safe because
+// the feed writes through the connection's push queue, which the loop moves
+// into the write buffer only after the request that queued it, so the stream
+// follows the responses.
 func (s *Server) connCommandRunner(clientID uint64, conn ClientConn, logger *slog.Logger) ConnCommandRunner {
 	return func(ctx context.Context, request protocol.Value) ([]protocol.Value, error) {
 		responses, registerReplica, err := s.executeClientRequest(ctx, clientID, conn, logger, request)
@@ -155,10 +157,8 @@ func (s *Server) connCommandRunner(clientID uint64, conn ClientConn, logger *slo
 			return nil, err
 		}
 		if registerReplica {
+			// Marks the connection a replica (markReplica) before starting the feed.
 			s.registerReplicaPeer(clientID, conn)
-			if handle, ok := conn.(*eventConnHandle); ok {
-				handle.conn.replica.Store(true)
-			}
 		}
 		return responses, nil
 	}
@@ -806,6 +806,14 @@ func (h *eventConnHandle) Close() error {
 
 // RemoteAddr returns the peer address captured when the connection was accepted.
 func (h *eventConnHandle) RemoteAddr() net.Addr { return h.conn.remoteAddr }
+
+// markReplica holds the connection's waiting output to the replica limit from
+// now on. registerReplicaPeer calls it before the replica's feed starts pushing.
+func (h *eventConnHandle) markReplica() { h.conn.replica.Store(true) }
+
+// Asserted, since registerReplicaPeer finds markReplica by type assertion: a
+// renamed method would compile and leave replicas under the subscriber limit.
+var _ replicaMarker = (*eventConnHandle)(nil)
 
 func sockaddrTCPAddr(sa syscall.Sockaddr) net.Addr {
 	switch sa := sa.(type) {

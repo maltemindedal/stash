@@ -478,6 +478,208 @@ func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *test
 	}
 }
 
+// TestAReplicaAttachesInThreeSteps walks a replica through BeginAttach, Reserve
+// and Start, as PSYNC takes them, and checks what each step makes visible: the
+// registry is active from BeginAttach, so writes are ordered; Reserve registers
+// the replica at the master offset of that moment with a feed that queues every
+// frame counted after it without writing; Start writes what was queued and what
+// follows, in order.
+func TestAReplicaAttachesInThreeSteps(t *testing.T) {
+	offsets := &ReplicationState{}
+	registry := NewReplicaRegistry()
+	payload := []byte("*1\r\n$4\r\nPING\r\n")
+
+	if registry.Active() {
+		t.Fatal("Active() = true with no replica, want false")
+	}
+	registry.BeginAttach()
+	if !registry.Active() {
+		t.Fatal("Active() = false after BeginAttach, want true: writes must be ordered from then on")
+	}
+	registry.Propagate(offsets, payload) // before the cut: in the snapshot, not the stream
+
+	conn := &recordingConn{}
+	registry.Reserve(offsets, 1, 6380, newReplicaPeerStateForTest(1, conn))
+	if !registry.Active() || registry.Count() != 1 {
+		t.Fatalf("after Reserve: Active() = %v and Count() = %d, want true and 1", registry.Active(), registry.Count())
+	}
+	if _, queued, _ := registry.Propagate(offsets, payload); queued != 1 {
+		t.Fatalf("Propagate() during the transfer queued for %d replicas, want 1", queued)
+	}
+	// The feed holds the frame: it has no flusher yet to take it.
+	feed := peerFeed(registry, 1)
+	if feedStarted(feed) || feed.backlog() != len(payload) {
+		t.Fatalf("before Start: the feed started = %v with %d bytes waiting, want not started with %d", feedStarted(feed), feed.backlog(), len(payload))
+	}
+	if got := conn.Bytes(); len(got) != 0 {
+		t.Fatalf("the replica was sent %q before its feed started", got)
+	}
+
+	if !registry.Start(1, conn) {
+		t.Fatal("Start() = false for a reserved replica, want true")
+	}
+	registry.Propagate(offsets, payload)
+	if unfinished := registry.StopFeeds(5 * time.Second); unfinished != 0 {
+		t.Fatalf("%d replica feeds had not finished writing after 5s", unfinished)
+	}
+	if got, want := conn.Bytes(), bytes.Repeat(payload, 2); !bytes.Equal(got, want) {
+		t.Fatalf("the replica received %q, want the two frames counted after its base, %q", got, want)
+	}
+
+	// Acknowledging both frames puts it at the master's offset, since its base
+	// is the frame counted before Reserve.
+	registry.UpdateAck(1, int64(2*len(payload)))
+	if got := registry.CountReplicasAtOrAbove(offsets.MasterOffset()); got != 1 {
+		t.Fatalf("CountReplicasAtOrAbove(%d) = %d, want 1", offsets.MasterOffset(), got)
+	}
+	if got := registry.CountReplicasAtOrAbove(offsets.MasterOffset() + 1); got != 0 {
+		t.Fatalf("CountReplicasAtOrAbove(%d) = %d, want 0", offsets.MasterOffset()+1, got)
+	}
+
+	registry.Remove(1)
+	if registry.Active() {
+		t.Fatal("Active() = true after the only replica was removed, want false")
+	}
+}
+
+// TestAnAttachThatEndsWithoutAReplicaLeavesTheRegistryInactive has an attach
+// end without Reserve, as a PSYNC that fails inside its cut does, and checks
+// that the registry stops counting it, so writes stop being ordered for it.
+func TestAnAttachThatEndsWithoutAReplicaLeavesTheRegistryInactive(t *testing.T) {
+	registry := NewReplicaRegistry()
+	registry.BeginAttach()
+	registry.BeginAttach()
+	registry.EndAttach()
+	if !registry.Active() {
+		t.Fatal("Active() = false with one attach still open, want true")
+	}
+	registry.EndAttach()
+	if registry.Active() || registry.Count() != 0 {
+		t.Fatalf("Active() = %v and Count() = %d after both attaches ended, want false and 0", registry.Active(), registry.Count())
+	}
+}
+
+// TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted drops a reserved
+// replica before its feed starts, as a disconnect or a backlog past the limit
+// during the transfer does. The drop paths must cope with a replica that has no
+// connection yet, Start must then report false so that the caller closes the
+// connection, the feed must never write, and stopping feeds must not wait for it.
+func TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted(t *testing.T) {
+	tests := []struct {
+		name string
+		drop func(srv *Server)
+	}{
+		{name: "removed when the client disconnects", drop: func(srv *Server) { srv.replicaPeers.Remove(1) }},
+		{name: "removed and closed by the registry", drop: func(srv *Server) {
+			if err := srv.replicaPeers.RemoveAndClose(1); err != nil {
+				t.Fatalf("RemoveAndClose() error = %v", err)
+			}
+		}},
+		{name: "dropped for a backlog past the limit", drop: func(srv *Server) {
+			srv.replicaPeers.mu.RLock()
+			feed := srv.replicaPeers.replicas[1].feed
+			srv.replicaPeers.mu.RUnlock()
+			feed.mu.Lock()
+			feed.limit = 4
+			feed.mu.Unlock()
+			// Refused by the feed, so dropped through dropReplica.
+			srv.propagateToReplicas([]protocol.Value{protocol.Array{Elements: []protocol.Value{protocol.BulkString{Data: []byte("PING")}}}})
+		}},
+		{name: "stopped by a shutdown", drop: func(srv *Server) {
+			done := make(chan int, 1)
+			go func() { done <- srv.replicaPeers.StopFeeds(time.Minute) }()
+			select {
+			case unfinished := <-done:
+				if unfinished != 0 {
+					t.Fatalf("StopFeeds() = %d unfinished, want 0: a feed that never started has nothing to finish", unfinished)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("StopFeeds() waited for a feed that never started")
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			conn := &stubConn{}
+			written := &recordingConn{}
+			srv.replicaPeers.BeginAttach()
+			srv.replicaPeers.Reserve(srv.replication, 1, 6380, newReplicaPeerStateForTest(1, written))
+
+			tt.drop(srv)
+
+			srv.registerReplicaPeer(1, conn)
+			if got := conn.closes.Load(); got != 1 {
+				t.Fatalf("the connection was closed %d times, want once: a dropped replica's reply is followed by a close", got)
+			}
+			if srv.replicaPeers.Start(1, conn) {
+				t.Fatal("Start() = true for a dropped replica, want false")
+			}
+			srv.replicaPeers.StopFeeds(time.Second)
+			if got := written.Bytes(); len(got) != 0 {
+				t.Fatalf("a dropped replica was sent %q", got)
+			}
+		})
+	}
+}
+
+// TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts starts the feed of a
+// replica whose connection, like the event loop's, holds waiting output to a
+// limit that depends on being a replica. The connection must be marked before
+// the feed starts: the feed may push what it queued during the full resync at
+// once, and a connection not yet marked would hold it to a subscriber's 32 MiB
+// instead of a replica's 256 MiB.
+func TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts(t *testing.T) {
+	srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+	srv.replicaPeers.BeginAttach()
+	srv.replicaPeers.Reserve(srv.replication, 1, 6380, newReplicaPeerStateForTest(1, &recordingConn{}))
+	defer srv.replicaPeers.StopFeeds(time.Second)
+	feed := peerFeed(srv.replicaPeers, 1)
+
+	conn := &markedConn{}
+	conn.onMark = func() { conn.feedStartedWhenMarked = feedStarted(feed) }
+	srv.registerReplicaPeer(1, conn)
+
+	if conn.marks != 1 {
+		t.Fatalf("the connection was marked a replica %d times, want once", conn.marks)
+	}
+	if conn.feedStartedWhenMarked {
+		t.Fatal("the connection was marked a replica after its feed started")
+	}
+	if !feedStarted(feed) {
+		t.Fatal("the feed did not start")
+	}
+}
+
+// markedConn is a connection that, like the event loop's, is told when it
+// becomes a replica.
+type markedConn struct {
+	stubConn
+	marks                 int
+	onMark                func()
+	feedStartedWhenMarked bool
+}
+
+func (c *markedConn) markReplica() {
+	c.marks++
+	c.onMark()
+}
+
+// peerFeed returns the feed of the registered replica id.
+func peerFeed(registry *ReplicaRegistry, id uint64) *replicaFeed {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	return registry.replicas[id].feed
+}
+
+func feedStarted(feed *replicaFeed) bool {
+	feed.mu.Lock()
+	defer feed.mu.Unlock()
+	return feed.started
+}
+
 type stubConn struct {
 	writeErr error
 	closeErr error

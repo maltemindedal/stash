@@ -1507,7 +1507,7 @@ func startMasterWithLateReplica(t *testing.T, writesBefore int) (net.Conn, *prot
 	})
 
 	// Write only once the master has registered the replica, so that the write
-	// is sent to it rather than lost to the full resync.
+	// is in its stream, after its base offset, rather than in its snapshot.
 	waitForReplicaCount(t, master, 1, "before the write")
 	assertCommandResponse(t, writerConn, writerParser, protocol.SimpleString{Value: "OK"}, "SET", "greeting", "hello")
 
@@ -1623,6 +1623,39 @@ func infoFields(t *testing.T, conn net.Conn, parser *protocol.Parser, section st
 		}
 	}
 	return fields
+}
+
+// TestPsyncInsideMultiIsRefusedAndExecAborts sends PSYNC after MULTI. As in Redis,
+// which marks PSYNC NO_MULTI, it is refused when queued and EXEC aborts, and the
+// client is not left attached as a replica. It used to be queued, and EXEC
+// answered with an invalid-response error and left the client marked a replica.
+func TestPsyncInsideMultiIsRefusedAndExecAborts(t *testing.T) {
+	for _, eventLoop := range []bool{false, true} {
+		eventLoop := eventLoop
+		t.Run(fmt.Sprintf("eventLoop=%v", eventLoop), func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.EventLoop = eventLoop
+			addr, stop, errCh := startTestServer(t, cfg)
+			defer stop()
+
+			conn, parser := dialClient(t, addr)
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "REPLCONF", "listening-port", "6380")
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
+			assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "ERR Command not allowed inside a transaction"}, "PSYNC", "?", "-1")
+			assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
+
+			fields := infoFields(t, conn, parser, "replication")
+			if got := fields["connected_slaves"]; got != "0" {
+				t.Fatalf("connected_slaves = %q, want 0", got)
+			}
+			// The connection is still an ordinary client.
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "after", "exec")
+			assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("exec")}, "GET", "after")
+
+			stop()
+			waitForServerStop(t, errCh)
+		})
+	}
 }
 
 func TestReplicationStructuredLogs(t *testing.T) {

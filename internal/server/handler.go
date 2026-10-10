@@ -118,9 +118,11 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			logger.Warn("failed to write response", "error", err)
 			return
 		}
-		// Register only after the handshake response reached the socket, so a
-		// concurrently propagated command cannot precede the FULLRESYNC frames
-		// in the replica's stream. Replies are queued, so send them first.
+		// PSYNC registered the replica at its attach cut, and its feed has
+		// been holding every write since. Start the feed only once the
+		// handshake response has reached the socket, so a propagated command
+		// cannot precede the FULLRESYNC frames in the replica's stream.
+		// Replies are queued, so send them first.
 		if registerReplica {
 			if err := state.FlushResponses(); err != nil {
 				logger.Warn("failed to write handshake response", "error", err)
@@ -169,9 +171,9 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 // shared by both networking modes: monitor observation, execution, durability
 // preparation and its persistence-failure downgrade, mutation-effect
 // finalization, and the processed-command counter. It returns the RESP
-// responses to deliver and whether the caller must register the connection as
-// a replica peer once those responses have been written or buffered. A
-// non-nil error is fatal for the connection.
+// responses to deliver and whether the caller must start the feed of the
+// replica peer PSYNC registered (registerReplicaPeer) once those responses have
+// been written or buffered. A non-nil error is fatal for the connection.
 func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn ClientConn, logger *slog.Logger, request protocol.Value) ([]protocol.Value, bool, error) {
 	if s.monitorRegistry.HasSubscribers() {
 		s.broadcastMonitorEvent(observeCommand(request, clientID, conn))

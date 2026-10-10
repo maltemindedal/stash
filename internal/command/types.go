@@ -39,6 +39,10 @@ type commandSpec struct {
 	// to different keys are not ordered against each other. Left unset, the
 	// command is ordered against every write.
 	keys keyShape
+	// noTransaction refuses the command inside MULTI, when it is queued, and
+	// marks the transaction dirty so that EXEC aborts, as Redis does with its
+	// NO_MULTI commands.
+	noTransaction bool
 	// rewriteFrame optionally replaces the verbatim command frame used for
 	// replication and AOF durability with a deterministic equivalent. It returns
 	// (frame, true) to substitute the frame, or (_, false) to keep the verbatim
@@ -226,11 +230,17 @@ func (e *Executor) validateQueueableRequest(request *Request) error {
 	if !ok {
 		return ErrUnknownCommand(request.Name)
 	}
-	if spec.validate == nil {
-		return nil
+	// Refused before its arguments are checked: Redis checks only the arity of
+	// a NO_MULTI command inside MULTI, so PSYNC with arguments its validator
+	// rejects is still refused for being inside a transaction.
+	if spec.noTransaction {
+		return ErrNotAllowedInTransactionError()
+	}
+	if spec.validate != nil {
+		return spec.validate(request)
 	}
 
-	return spec.validate(request)
+	return nil
 }
 
 func (e *Executor) maybeQueueRequest(ctx context.Context, request *Request) (bool, protocol.Value, error) {
@@ -635,6 +645,11 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 		"PSYNC": {
 			detailed: e.handlePSync,
 			validate: validatePSyncRequest,
+			// As in Redis, which marks PSYNC NO_MULTI. EXEC returns one
+			// reply per queued command, and PSYNC answers with two frames
+			// and turns the connection into a replica. PSYNC's attach cut
+			// would also wait forever for the gate EXEC holds.
+			noTransaction: true,
 		},
 		"WAIT": {
 			detailed: e.handleWait,

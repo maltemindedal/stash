@@ -271,11 +271,21 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	if string(request.Args[0]) != "?" || string(request.Args[1]) != "-1" {
 		return server.ExecuteResult{}, ErrSyntaxError()
 	}
-	if e.replication == nil || e.replication.MasterReplicationID == "" {
+	if e.replication == nil || e.replication.MasterReplicationID == "" || e.replicaPeers == nil {
 		return server.ExecuteResult{}, fmt.Errorf("replication state unavailable")
 	}
+	state, err := clientStateFromContext(ctx)
+	if err != nil {
+		return server.ExecuteResult{}, err
+	}
+	// Queueing refuses PSYNC (noTransaction); were it run by EXEC anyway, the
+	// attach cut would wait forever for the gate EXEC holds.
+	if inTransactionExecution(ctx) {
+		return server.ExecuteResult{}, ErrNotAllowedInTransactionError()
+	}
 
-	entries, snapshotStats := e.store.SnapshotStrings()
+	entries, snapshotStats := e.attachReplica(state)
+	// Encoding the snapshot happens after the cut, so writers wait only for the copy.
 	payload, writeStats := rdb.BuildSnapshot(entries)
 	if snapshotStats.SkippedUnsupportedKeys > 0 {
 		// RDB support is scoped to DB 0 string keys, so a master holding
@@ -287,23 +297,45 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 		)
 	}
 
-	if state, ok := server.ClientStateFromContext(ctx); ok && state != nil {
-		state.PromoteToReplica()
-		e.logger.Info(
-			"serving full resync to replica",
-			"replica_id", state.ID,
-			"master_replid", e.replication.MasterReplicationID,
-			"snapshot_size_bytes", len(payload),
-			"snapshot_keys", writeStats.WrittenKeys,
-		)
-	}
+	state.PromoteToReplica()
+	e.logger.Info(
+		"serving full resync to replica",
+		"replica_id", state.ID,
+		"master_replid", e.replication.MasterReplicationID,
+		"snapshot_size_bytes", len(payload),
+		"snapshot_keys", writeStats.WrittenKeys,
+	)
 
 	result := server.MultiResponse(
 		protocol.SimpleString{Value: fmt.Sprintf("FULLRESYNC %s 0", e.replication.MasterReplicationID)},
 		protocol.BulkString{Data: payload},
 	)
+	// The replica is registered and its feed is holding every write made since
+	// the snapshot; the connection starts the feed once this reply is ahead of it.
 	result.RegisterReplica = true
 	return result, nil
+}
+
+// attachReplica copies the string keyspace for a replica's full resync and
+// registers the replica, at one attach cut (sequencer.attachCut): every write is
+// then in exactly one of the copy and the replica's stream. The replica's feed
+// holds that stream until the connection starts it, after the reply.
+func (e *Executor) attachReplica(state *server.ClientState) ([]storage.StringSnapshotEntry, storage.StringSnapshotStats) {
+	release := e.seq.attachCut(e.replicaPeers.BeginAttach)
+	defer release()
+	// Nothing below returns an error before Reserve, but a panic would leave the
+	// registry counting an attach that never ends, and every write ordered.
+	reserved := false
+	defer func() {
+		if !reserved {
+			e.replicaPeers.EndAttach()
+		}
+	}()
+
+	entries, stats := e.store.SnapshotStrings()
+	e.replicaPeers.Reserve(e.replication, state.ID, state.ReplicaListeningPort(), state)
+	reserved = true
+	return entries, stats
 }
 
 func (e *Executor) handleWait(ctx context.Context, request *Request) (server.ExecuteResult, error) {

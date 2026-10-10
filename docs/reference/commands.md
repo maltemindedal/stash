@@ -168,7 +168,7 @@ Subscriptions match exact channel names; there is no pattern subscription (`PSUB
 | `PSYNC ? -1` | – | – |
 | `WAIT <numreplicas> <timeout>` | – | – |
 
-`REPLCONF` supports the `LISTENING-PORT`, `GETACK`, and `ACK` subcommands. `WAIT` takes a replica count and a timeout in milliseconds, both non-negative; a timeout of `0` returns the current acknowledgement count immediately, and a timeout longer than about 292 years (the most a duration can hold) waits as long as that. On a password-protected master, replicas must authenticate before `REPLCONF` or `PSYNC`.
+`REPLCONF` supports the `LISTENING-PORT`, `GETACK`, and `ACK` subcommands. `WAIT` takes a replica count and a timeout in milliseconds, both non-negative; a timeout of `0` returns the current acknowledgement count immediately, and a timeout longer than about 292 years (the most a duration can hold) waits as long as that. On a password-protected master, replicas must authenticate before `REPLCONF` or `PSYNC`. `PSYNC` inside `MULTI` is refused when it is queued, with `ERR Command not allowed inside a transaction`, and `EXEC` then aborts the transaction, as in Redis.
 
 See [Setting up replication](../guides/replication.md).
 
