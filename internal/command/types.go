@@ -85,7 +85,6 @@ type Executor struct {
 	commands            map[string]commandSpec
 	replication         *server.ReplicationState
 	replicaPeers        *server.ReplicaRegistry
-	monitorRegistry     *server.MonitorRegistry
 	slowlogRegistry     *server.SlowlogRegistry
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
@@ -141,11 +140,6 @@ func (e *Executor) SetAOFRewriteTrigger(trigger func(context.Context) error) {
 func (e *Executor) SetSlowlogConfig(registry *server.SlowlogRegistry, threshold time.Duration) {
 	e.slowlogRegistry = registry
 	e.slowlogThreshold = threshold
-}
-
-// SetMonitorRegistry injects the shared MONITOR fan-out registry.
-func (e *Executor) SetMonitorRegistry(registry *server.MonitorRegistry) {
-	e.monitorRegistry = registry
 }
 
 // SetServerStatsProvider injects a snapshot provider used by INFO.

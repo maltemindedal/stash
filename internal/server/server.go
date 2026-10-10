@@ -68,10 +68,6 @@ type slowlogConfigSetter interface {
 	SetSlowlogConfig(*SlowlogRegistry, time.Duration)
 }
 
-type monitorRegistrySetter interface {
-	SetMonitorRegistry(*MonitorRegistry)
-}
-
 type serverStatsProviderSetter interface {
 	SetServerStatsProvider(func() Stats)
 }
@@ -160,9 +156,6 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 	}
 	if setter, ok := executor.(slowlogConfigSetter); ok {
 		setter.SetSlowlogConfig(srv.slowlogRegistry, cfg.SlowlogLogSlowerThan)
-	}
-	if setter, ok := executor.(monitorRegistrySetter); ok {
-		setter.SetMonitorRegistry(srv.monitorRegistry)
 	}
 	if setter, ok := executor.(serverStatsProviderSetter); ok {
 		setter.SetServerStatsProvider(srv.ServerStats)
