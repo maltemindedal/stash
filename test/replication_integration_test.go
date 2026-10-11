@@ -1229,6 +1229,103 @@ func waitForReplicaAcknowledgement(t *testing.T, conn net.Conn, parser *protocol
 	}
 }
 
+// TestAnAttachedReplicaIsPushedNoMessageOrMonitorEvent has an attached replica
+// send SUBSCRIBE or MONITOR on its replication link, whose stream a pushed
+// message or MONITOR event would corrupt. As in Redis, MONITOR from a replica is
+// ignored, and a replica that sends SUBSCRIBE is closed, as Redis closes a
+// replica whose command produces a reply. The master used to subscribe the
+// replica, or make it a monitor, and push into its stream.
+func TestAnAttachedReplicaIsPushedNoMessageOrMonitorEvent(t *testing.T) {
+	for _, eventLoop := range []bool{false, true} {
+		eventLoop := eventLoop
+		t.Run(fmt.Sprintf("SUBSCRIBE closes the replica, eventLoop=%v", eventLoop), func(t *testing.T) {
+			master, replica, replicaParser, client, clientParser := attachedReplicaForPushes(t, eventLoop)
+
+			if err := protocol.WriteValue(replica, request("SUBSCRIBE", "news")); err != nil {
+				t.Fatalf("WriteValue(SUBSCRIBE) error = %v", err)
+			}
+			waitForReplicaCount(t, master, 0, "after the replica sent SUBSCRIBE")
+			assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 0}, "PUBLISH", "news", "hello")
+
+			// What the master sent the replica: the stream so far, then the close.
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			for {
+				value, err := replicaParser.Parse()
+				if err != nil {
+					if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+						t.Fatalf("after SUBSCRIBE Parse() error = %v, want the link closed", err)
+					}
+					break
+				}
+				if _, err := command.DecodeRequest(value); err != nil {
+					t.Fatalf("after SUBSCRIBE the replica read %#v, which is not a command of the stream", value)
+				}
+			}
+		})
+
+		t.Run(fmt.Sprintf("MONITOR is ignored, eventLoop=%v", eventLoop), func(t *testing.T) {
+			_, replica, replicaParser, client, clientParser := attachedReplicaForPushes(t, eventLoop)
+
+			// The acknowledgement after MONITOR shows, through INFO, that the master
+			// has run MONITOR and still takes the replica's requests.
+			set, err := protocol.EncodeValues([]protocol.Value{request("SET", "before", "1")})
+			if err != nil {
+				t.Fatalf("EncodeValues() error = %v", err)
+			}
+			pipeline, err := protocol.EncodeValues([]protocol.Value{request("MONITOR"), request("REPLCONF", "ACK", fmt.Sprint(len(set)))})
+			if err != nil {
+				t.Fatalf("EncodeValues() error = %v", err)
+			}
+			if _, err := replica.Write(pipeline); err != nil {
+				t.Fatalf("Write(MONITOR, REPLCONF ACK) error = %v", err)
+			}
+			waitForReplicaAcknowledgement(t, client, clientParser)
+
+			assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "after", "2")
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			if err := assertReplicaRequest(replicaParser, "SET", "after", "2"); err != nil {
+				t.Fatalf("after MONITOR: %v", err)
+			}
+			if err := assertNoFurtherReplicaRequests(replica, replicaParser, 200*time.Millisecond); err != nil {
+				t.Fatalf("after MONITOR and a write: %v", err)
+			}
+		})
+	}
+}
+
+// attachedReplicaForPushes starts a master, attaches a replica to it, and has a
+// client write SET before 1, which the replica has read when it returns.
+func attachedReplicaForPushes(t *testing.T, eventLoop bool) (*server.Server, net.Conn, *protocol.Parser, net.Conn, *protocol.Parser) {
+	t.Helper()
+
+	cfg := defaultTestConfig()
+	cfg.EventLoop = eventLoop
+	master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- master.ListenAndServe(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		waitForServerStop(t, errCh)
+	})
+	addr := waitForAddr(t, master)
+
+	replica, replicaParser := attachTestReplica(t, master, addr)
+	client, clientParser := dialClient(t, addr)
+	assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "before", "1")
+	if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	if err := assertReplicaRequest(replicaParser, "SET", "before", "1"); err != nil {
+		t.Fatalf("first propagated write: %v", err)
+	}
+	return master, replica, replicaParser, client, clientParser
+}
+
 func TestMasterFullResyncTransfersExistingKeyspace(t *testing.T) {
 	masterCfg := config.Default()
 	masterCfg.Host = "127.0.0.1"

@@ -204,7 +204,7 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 		defer result.Release()
 	}
 	if execErr != nil {
-		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) || errors.Is(execErr, ErrClientDisconnected) {
+		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) || errors.Is(execErr, ErrClientDisconnected) || errors.Is(execErr, ErrCloseConnection) {
 			return nil, false, execErr
 		}
 		logger.Debug("command execution failed", "error", execErr)

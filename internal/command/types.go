@@ -685,7 +685,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			validate: validateSlowlogRequest,
 		},
 		"MONITOR": {
-			handler:            e.handleMonitor,
+			detailed:           e.handleMonitor,
 			validate:           exactArgsValidator("MONITOR", 0),
 			transactionControl: true,
 		},

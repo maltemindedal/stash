@@ -75,6 +75,14 @@ func (e *Executor) handleSubscribe(ctx context.Context, request *Request) (serve
 	if err != nil {
 		return server.ExecuteResult{}, err
 	}
+	// A replica's connection carries the replication stream alone, and a
+	// message pushed to it would land in the stream. Redis subscribes it, and
+	// then closes it because the subscription produced a reply; the replica is
+	// closed here before it is subscribed.
+	if state.IsReplica() {
+		e.logger.Warn("closing a replica that sent SUBSCRIBE on its replication link", "replica_id", state.ID)
+		return server.ExecuteResult{}, server.ErrCloseConnection
+	}
 	if state.InTransactionActive() {
 		return server.ExecuteResult{}, ErrSubscribeInsideMultiError()
 	}

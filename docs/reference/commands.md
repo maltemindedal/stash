@@ -156,7 +156,7 @@ Queued commands propagate and persist individually when `EXEC` runs them. `WATCH
 | `UNSUBSCRIBE [channel ...]` | – | – |
 | `PUBLISH <channel> <message>` | yes | – |
 
-Subscriptions match exact channel names; there is no pattern subscription (`PSUBSCRIBE`). Empty channel names return a syntax error. A subscribed client may only issue `PING`, `SUBSCRIBE`, and `UNSUBSCRIBE`.
+Subscriptions match exact channel names; there is no pattern subscription (`PSUBSCRIBE`). Empty channel names return a syntax error. A subscribed client may only issue `PING`, `SUBSCRIBE`, and `UNSUBSCRIBE`. `SUBSCRIBE` from an attached replica closes the replica's connection, which carries only the replication stream, as Redis closes a replica whose command produces a reply.
 
 `PUBLISH` is forwarded to replicas but never written to the AOF, since it mutates no durable state.
 
@@ -183,6 +183,6 @@ See [Setting up replication](../guides/replication.md).
 | `SLOWLOG RESET` | – | – |
 | `MONITOR` | – | – |
 
-`INFO` accepts at most one section name; an unrecognized section returns an error. A monitoring client may only issue `PING`.
+`INFO` accepts at most one section name; an unrecognized section returns an error. A monitoring client may only issue `PING`. `MONITOR` from an attached replica is ignored, without a reply, as in Redis.
 
 See [Observability](../guides/observability.md) and [Persistence](../guides/persistence.md).

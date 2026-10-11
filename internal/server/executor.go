@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -20,6 +21,13 @@ type CommandExecutor interface {
 	// durability and propagation frames, and not before.
 	Handle(ctx context.Context, call Call, request protocol.Value) (ExecuteResult, error)
 }
+
+// ErrCloseConnection is what the command executor returns for a request that
+// its connection may not make in its state, to have the server close the
+// connection without a reply: a SUBSCRIBE from an attached Replica, whose
+// connection carries the replication stream alone, as Redis closes a replica
+// whose command produces a reply.
+var ErrCloseConnection = errors.New("server: connection closed for a request it may not make")
 
 // Origin is where a request came from, which decides what it may do. The zero
 // Origin is none of them, so the executor refuses a Call that does not set one.
