@@ -2947,6 +2947,46 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	}
 }
 
+func TestAReplicaIsNeitherSubscribedNorMadeAMonitor(t *testing.T) {
+	// A replica's connection carries the replication stream alone, which a
+	// pushed message or MONITOR event would corrupt. As in Redis, MONITOR from a
+	// replica is ignored without a reply, and SUBSCRIBE closes the replica, as
+	// Redis closes a replica whose command produces a reply.
+	tests := []struct {
+		name        string
+		request     []string
+		wantErr     error
+		wantReplies int
+	}{
+		{name: "SUBSCRIBE", request: []string{"SUBSCRIBE", "news"}, wantErr: server.ErrCloseConnection},
+		{name: "MONITOR", request: []string{"MONITOR"}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			executor := newTestExecutorWith(func(*server.Services) {})
+			ctx := withClientStateForExecutor(context.Background(), executor, 1)
+			state, _ := clientOfContext(ctx)
+			state.PromoteToReplica()
+
+			result, err := handle(ctx, executor, requestValue(tt.request...), true)
+			if result.Release != nil {
+				result.Release()
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("%v from a replica error = %v, want %v", tt.request, err, tt.wantErr)
+			}
+			if len(result.Responses) != tt.wantReplies {
+				t.Fatalf("%v from a replica: %d replies, want %d", tt.request, len(result.Responses), tt.wantReplies)
+			}
+			if state.IsSubscribed() || state.IsMonitoring() {
+				t.Fatalf("%v from a replica left it subscribed = %v, monitoring = %v; want neither", tt.request, state.IsSubscribed(), state.IsMonitoring())
+			}
+		})
+	}
+}
+
 func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 	// As in Redis, whose syncCommand returns without a reply for a client that
 	// is already a replica, whatever it asks for. Attaching it again registered
