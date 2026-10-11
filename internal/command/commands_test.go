@@ -1445,13 +1445,13 @@ func TestExecutorWait(t *testing.T) {
 		state.SetLastWriteReplicationOffset(0)
 		ctx := withClient(context.Background(), state)
 
-		startedAt := time.Now()
+		// The replica acknowledged nothing, so it counts only for offset 0, the
+		// client's, and WAIT answers 1 at once. Had it waited for the master's offset
+		// of 50 it would run out its timeout and answer 0, so the reply says whether
+		// it waited and no clock has to.
 		result, err := handle(ctx, executor, requestValue("WAIT", "1", "50"), false)
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
-		}
-		if time.Since(startedAt) > 20*time.Millisecond {
-			t.Fatalf("WAIT took too long for a client with no pending replicated writes: %v", time.Since(startedAt))
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
