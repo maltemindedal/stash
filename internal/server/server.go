@@ -195,6 +195,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// replica connections, so it has to be finished before they are torn down.
 	stopEviction()
 	<-evictionDone
+	// Every connection is closed by now, so every replica's feed has ended or
+	// is ending; nothing it logs may come after ListenAndServe returns.
+	s.replicaPeers.WaitFeeds()
 
 	var errs []error
 	if serveErr != nil {

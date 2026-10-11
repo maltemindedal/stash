@@ -438,7 +438,7 @@ func (l *eventLoop) queuePush(conn *eventConn, payload []byte) (int, error) {
 	if limit := conn.pushLimit(); len(conn.pushBuf)+len(payload) > limit {
 		l.mu.Unlock()
 		l.requestClose(conn)
-		return 0, fmt.Errorf("server: push buffer exceeds %d byte limit", limit)
+		return 0, fmt.Errorf("%w: more than its %d byte limit waiting", errPushLimitExceeded, limit)
 	}
 	conn.pushBuf = append(conn.pushBuf, payload...)
 	alreadyQueued := conn.pushQueued
@@ -898,6 +898,12 @@ func (h *eventConnHandle) markReplica() { h.conn.replica.Store(true) }
 // Asserted, since registerReplicaPeer finds markReplica by type assertion: a
 // renamed method would compile and leave replicas under the subscriber limit.
 var _ replicaMarker = (*eventConnHandle)(nil)
+
+// Asserted, since ReplicaRegistry.EndStreams finds CloseWrite by type assertion:
+// a renamed method would compile, and shutdown would skip an event-loop
+// replica's half-close and the wait for the replica to close, leaving its end of
+// stream to CloseAll's close request.
+var _ streamEnder = (*eventConnHandle)(nil)
 
 func sockaddrTCPAddr(sa syscall.Sockaddr) net.Addr {
 	switch sa := sa.(type) {

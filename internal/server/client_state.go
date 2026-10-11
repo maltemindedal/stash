@@ -251,6 +251,14 @@ func (s *ClientState) flushLocked() error {
 // the client went away while it waited.
 var ErrClientDisconnected = errors.New("server: client disconnected")
 
+// errResponseWriterBusy reports that a write to a client waited longer than it
+// may for the connection's writer, which another write is holding.
+var errResponseWriterBusy = errors.New("server: client response writer busy")
+
+// errPushLimitExceeded reports that more output is waiting for a connection that
+// receives pushes than it may hold (the event loop's push limits).
+var errPushLimitExceeded = errors.New("server: push buffer full")
+
 // Disconnected reports whether the client has closed its side of the
 // connection, without reading from it. A command that blocks for a long time
 // polls it, so it can stop waiting for a client that is not there. It is false
@@ -325,7 +333,7 @@ func (s *ClientState) WriteEncoded(payload []byte) error {
 // reply is stuck cannot hold up the goroutine pushing to it.
 func (s *ClientState) WriteEncodedWithDeadline(payload []byte, timeout time.Duration) error {
 	if !s.lockResponses(timeout) {
-		return fmt.Errorf("client response writer busy for %v", timeout)
+		return fmt.Errorf("%w for %v", errResponseWriterBusy, timeout)
 	}
 	defer s.responseMu.Unlock()
 
@@ -348,9 +356,11 @@ func (s *ClientState) WriteEncodedWithDeadline(payload []byte, timeout time.Dura
 		writeErr = s.responseWriter.Flush()
 	}
 	if deadlineSet {
-		if clearErr := conn.SetWriteDeadline(time.Time{}); writeErr == nil {
-			writeErr = clearErr
-		}
+		// Clearing fails only on a connection closed since the write, which
+		// the next write finds out for itself. Reporting it here would make a
+		// write that succeeded look failed: a replica's feed would then drop a
+		// replica that has only just left.
+		_ = conn.SetWriteDeadline(time.Time{})
 	}
 
 	return writeErr

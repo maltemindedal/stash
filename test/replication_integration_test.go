@@ -859,25 +859,6 @@ func waitForLogFragments(t *testing.T, logs *synchronizedBuffer, timeout time.Du
 	t.Fatalf("logs did not contain expected fragments %q within %v\nlogs:\n%s", fragments, timeout, logs.String())
 }
 
-// waitForAnyLogFragment waits until logs contain at least one of fragments.
-func waitForAnyLogFragment(t *testing.T, logs *synchronizedBuffer, timeout time.Duration, fragments ...string) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		output := logs.String()
-		for _, fragment := range fragments {
-			if strings.Contains(output, fragment) {
-				return
-			}
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	t.Fatalf("logs contained none of the fragments %q within %v\nlogs:\n%s", fragments, timeout, logs.String())
-}
-
 func TestMasterPropagatesMutationsToReplica(t *testing.T) {
 	masterCfg := config.Default()
 	masterCfg.Host = "127.0.0.1"
@@ -1977,19 +1958,18 @@ func TestReplicationStructuredLogs(t *testing.T) {
 		t.Fatalf("ReplicaCount() after the master stopped = %d, want 0", got)
 	}
 
+	// Two paths remove a replica that leaves, the connection's teardown and the
+	// replica's feed when a write finds the connection ended, and whichever runs
+	// first logs it as disconnected. Both have run when ListenAndServe returns.
 	masterOutput := masterLogs.String()
-	for _, fragment := range []string{"replica registered", "requested replica acknowledgements", "replica acknowledged offset", "WAIT completed"} {
+	for _, fragment := range []string{"replica registered", "requested replica acknowledgements", "replica acknowledged offset", "WAIT completed", "replica disconnected"} {
 		if !strings.Contains(masterOutput, fragment) {
 			t.Fatalf("master logs missing %q\nlogs:\n%s", fragment, masterOutput)
 		}
 	}
-	// Two paths remove a replica that leaves, and the first to run logs it. The
-	// connection's teardown logs "replica disconnected". The replica's feed, when
-	// its last write has just succeeded and clearing the write deadline then finds
-	// the socket closed, drops the replica and logs "dropping a replica" from its
-	// own goroutine, which no shutdown waits for, so that line can come after
-	// ListenAndServe returned. Which path wins depends on scheduling.
-	waitForAnyLogFragment(t, &masterLogs, 10*time.Second, "replica disconnected", "dropping a replica")
+	if strings.Contains(masterOutput, "dropping a replica") {
+		t.Fatalf("master logs a replica that left as dropped\nlogs:\n%s", masterOutput)
+	}
 
 	replicaOutput := replicaLogs.String()
 	for _, fragment := range []string{"applied full resync snapshot", "replication stream command received"} {
