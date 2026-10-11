@@ -22,7 +22,7 @@ func newExecutorWithoutPassword(services server.Services) (server.CommandExecuto
 
 func TestAuthFailsClosedWhenThePasswordNeverReachesTheExecutor(t *testing.T) {
 	noAuth := protocol.ErrorValue{Message: "NOAUTH Authentication required."}
-	authNotConfigured := protocol.ErrorValue{Message: "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct"}
+	authNotConfigured := protocol.ErrorValue{Message: "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"}
 
 	for _, eventLoop := range []bool{false, true} {
 		name := "goroutine per connection"
