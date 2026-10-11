@@ -217,20 +217,13 @@ func (s *Store) withStringValue(key string, fn func(data []byte) error) (bool, e
 	return found, err
 }
 
-// Delete removes a key from the store.
+// Delete removes a key from the store and reports whether it held a live value.
 func (s *Store) Delete(key string) bool {
-	shard := s.shardForKey(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	value, ok := shard.data[key]
-	if ok && isExpired(value, s.now()) {
-		s.deleteKeyLocked(shard, key)
-		return false
-	}
-
-	s.deleteKeyLocked(shard, key)
-	return ok
+	// A mutation that accepts every kind and never fails cannot return an error.
+	deleted, _ := mutateKey(s, key, anyKind, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+		return nil, cur != nil, nil
+	})
+	return deleted
 }
 
 // DeleteMany removes the supplied keys and returns the keys actually removed.
@@ -341,162 +334,65 @@ func (s *Store) RightPop(key string) ([]byte, bool, error) {
 }
 
 // popOne removes one value from the left or right end of the list stored at key.
-// A pop that leaves elements behind wakes the next waiting client.
+// A pop that leaves values behind wakes the next waiting client, once the
+// shard lock is released.
 func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
-	item, remaining, ok, err := s.popOneFromShard(key, left)
+	// The mutation reports only whether it found a list. The popped value and
+	// the count left come back through variables it sets: a struct result
+	// carrying them was copied on every return and made a pop over 10% slower.
+	var item []byte
+	remaining := 0
+	ok, err := mutateKey(s, key, ValueKindList, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+		if cur == nil || len(cur.liveList()) == 0 {
+			return nil, false, nil
+		}
+		if left {
+			item, remaining = cur.popListFront()
+		} else {
+			item, remaining = cur.popListBack()
+		}
+		return cur, true, nil
+	})
 	if remaining > 0 {
 		s.wakeNextListWaiter(key)
 	}
 	return item, ok, err
 }
 
-// popOneFromShard does popOne's work under the key's shard lock, and also reports
-// how many elements the list has left.
-func (s *Store) popOneFromShard(key string, left bool) ([]byte, int, bool, error) {
-	shard := s.shardForKey(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	now := s.now()
-	value, ok := shard.data[key]
-	if ok && isExpired(value, now) {
-		s.deleteKeyLocked(shard, key)
-		ok = false
-	}
-	if !ok {
-		return nil, 0, false, nil
-	}
-	list, err := value.ListValue()
-	if err != nil {
-		return nil, 0, false, err
-	}
-	if len(list) == 0 {
-		s.deleteKeyLocked(shard, key)
-		return nil, 0, false, nil
-	}
-	accounting := s.maxMemoryEnabled()
-	var oldSize int64
-	if accounting {
-		oldSize = s.approximateValueObjectSize(key, value)
-	}
-
-	var item []byte
-	if left {
-		item = list[0]
-		list[0] = nil
-		list = list[1:]
-		value.dropListFront(1)
-	} else {
-		last := len(list) - 1
-		item = list[last]
-		list[last] = nil
-		list = list[:last]
-		value.dropListEnd(1)
-	}
-	value.touch(now)
-	if len(list) == 0 {
-		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return item, 0, true, nil
-	}
-	if accounting {
-		newSize := s.approximateValueObjectSize(key, value)
-		s.usedMemory.Add(newSize - oldSize)
-	}
-
-	return item, len(list), true, nil
-}
-
 // LeftPopN removes and returns up to count left-most values from the list stored at key.
 // Returns (nil, false, nil) when the key is missing or expired.
-func (s *Store) LeftPopN(key string, count int64) ([][]byte, bool, error) {
+func (s *Store) LeftPopN(key string, count int) ([][]byte, bool, error) {
 	return s.popN(key, count, true)
 }
 
 // RightPopN removes and returns up to count right-most values from the list stored at key.
 // Returns (nil, false, nil) when the key is missing or expired.
-func (s *Store) RightPopN(key string, count int64) ([][]byte, bool, error) {
+func (s *Store) RightPopN(key string, count int) ([][]byte, bool, error) {
 	return s.popN(key, count, false)
 }
 
 // popN removes up to count values from the left or right end of the list stored
-// at key. A pop that removes values and leaves elements behind wakes the next
-// waiting client.
-func (s *Store) popN(key string, count int64, left bool) ([][]byte, bool, error) {
+// at key. A pop that removes values and leaves values behind wakes the next
+// waiting client, once the shard lock is released.
+func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
 	if count < 0 {
 		return nil, false, ErrSyntax
 	}
 
-	popped, remaining, ok, err := s.popNFromShard(key, count, left)
-	if len(popped) > 0 && remaining > 0 {
+	// As in popOne, the values and the count left come back through variables.
+	var values [][]byte
+	remaining := 0
+	ok, err := mutateKey(s, key, ValueKindList, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+		if cur == nil || len(cur.liveList()) == 0 {
+			return nil, false, nil
+		}
+		values, remaining = cur.popListValues(count, left)
+		return cur, true, nil
+	})
+	if len(values) > 0 && remaining > 0 {
 		s.wakeNextListWaiter(key)
 	}
-	return popped, ok, err
-}
-
-// popNFromShard does popN's work under the key's shard lock, and also reports
-// how many elements the list has left.
-func (s *Store) popNFromShard(key string, count int64, left bool) ([][]byte, int, bool, error) {
-	shard := s.shardForKey(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	now := s.now()
-	value, ok := shard.data[key]
-	if ok && isExpired(value, now) {
-		s.deleteKeyLocked(shard, key)
-		ok = false
-	}
-	if !ok {
-		return nil, 0, false, nil
-	}
-	list, err := value.ListValue()
-	if err != nil {
-		return nil, 0, false, err
-	}
-	if len(list) == 0 {
-		s.deleteKeyLocked(shard, key)
-		return nil, 0, false, nil
-	}
-	accounting := s.maxMemoryEnabled()
-	var oldSize int64
-	if accounting {
-		oldSize = s.approximateValueObjectSize(key, value)
-	}
-
-	take := int64(len(list))
-	if count < take {
-		take = count
-	}
-	n := int(take)
-	popped := make([][]byte, n)
-	if left {
-		for i := 0; i < n; i++ {
-			popped[i] = list[i]
-			list[i] = nil
-		}
-		list = list[n:]
-		value.dropListFront(n)
-	} else {
-		for i := 0; i < n; i++ {
-			src := len(list) - 1 - i
-			popped[i] = list[src]
-			list[src] = nil
-		}
-		list = list[:len(list)-n]
-		value.dropListEnd(n)
-	}
-
-	value.touch(now)
-	if len(list) == 0 {
-		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return popped, 0, true, nil
-	}
-	if accounting {
-		newSize := s.approximateValueObjectSize(key, value)
-		s.usedMemory.Add(newSize - oldSize)
-	}
-
-	return popped, len(list), true, nil
+	return values, ok, err
 }
 
 // ListRange returns an inclusive range of values from the list stored at key.

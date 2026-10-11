@@ -88,12 +88,12 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						}
 						model = model[:len(model)-1]
 					case op == 8: // LPOP count
-						count := int64(1 + rng.Intn(4))
+						count := 1 + rng.Intn(4)
 						got, ok, err := store.LeftPopN("k", count)
 						if err != nil {
 							t.Fatalf("step %d: LeftPopN error = %v", step, err)
 						}
-						n := min(int(count), len(model))
+						n := min(count, len(model))
 						if ok != (len(model) > 0) || len(got) != n {
 							t.Fatalf("step %d: LeftPopN(%d) = (%d values, %v), want %d values", step, count, len(got), ok, n)
 						}
@@ -104,12 +104,12 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						}
 						model = model[n:]
 					default: // RPOP count
-						count := int64(1 + rng.Intn(4))
+						count := 1 + rng.Intn(4)
 						got, ok, err := store.RightPopN("k", count)
 						if err != nil {
 							t.Fatalf("step %d: RightPopN error = %v", step, err)
 						}
-						n := min(int(count), len(model))
+						n := min(count, len(model))
 						if ok != (len(model) > 0) || len(got) != n {
 							t.Fatalf("step %d: RightPopN(%d) = (%d values, %v), want %d values", step, count, len(got), ok, n)
 						}

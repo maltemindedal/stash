@@ -212,6 +212,81 @@ func (v *ValueObject) dropListEnd(n int) {
 	v.List = v.List[:len(v.List)-n]
 }
 
+// popListFront removes the left-most value of a list that is not empty, and
+// returns it with the number of values left. It and popListBack are two methods
+// rather than one taking a side so that each inlines: the call cost a pop about
+// 3% of its time.
+func (v *ValueObject) popListFront() ([]byte, int) {
+	list := v.liveList()
+	item := list[0]
+	list[0] = nil
+	v.dropListFront(1)
+	return item, len(list) - 1
+}
+
+// popListBack removes the right-most value of a list that is not empty, and
+// returns it with the number of values left.
+func (v *ValueObject) popListBack() ([]byte, int) {
+	list := v.liveList()
+	last := len(list) - 1
+	item := list[last]
+	list[last] = nil
+	v.dropListEnd(1)
+	return item, last
+}
+
+// popListValues removes up to count values, which must not be negative, from
+// the left or right end of a list that is not empty. It returns them in the
+// order they were popped, with the number of values left. count is an int, which
+// the command parses as one, so no int64 is narrowed on the way (6db82b0).
+func (v *ValueObject) popListValues(count int, left bool) ([][]byte, int) {
+	list := v.liveList()
+	n := min(count, len(list))
+	popped := make([][]byte, n)
+	if left {
+		for i := 0; i < n; i++ {
+			popped[i] = list[i]
+			list[i] = nil
+		}
+		v.dropListFront(n)
+	} else {
+		for i := 0; i < n; i++ {
+			src := len(list) - 1 - i
+			popped[i] = list[src]
+			list[src] = nil
+		}
+		v.dropListEnd(n)
+	}
+	return popped, len(list) - n
+}
+
+// emptied reports whether v is a list, hash, set or sorted set with nothing
+// left in it, which a write deletes rather than keeps. A string or a stream is
+// kept however short it is. The list case is answered here, where it inlines,
+// because the pops are the commonest shrinking writes.
+func (v *ValueObject) emptied() bool {
+	if v.Kind == ValueKindList {
+		return len(v.List) == int(v.ListHead)
+	}
+	return v.emptiedCollection()
+}
+
+// emptiedCollection is emptied for a value that is not a list.
+func (v *ValueObject) emptiedCollection() bool {
+	switch v.Kind {
+	case ValueKindHash:
+		n, err := v.hashLen()
+		return err == nil && n == 0
+	case ValueKindSet:
+		n, err := v.setLen()
+		return err == nil && n == 0
+	case ValueKindZSet:
+		n, err := v.zsetLen()
+		return err == nil && n == 0
+	}
+	return false
+}
+
 // ZSetValue returns the general sorted-set payload for a sorted-set value.
 // Compact sorted sets are materialized as detached general sorted sets.
 func (v *ValueObject) ZSetValue() (*SortedSet, error) {

@@ -58,8 +58,8 @@ func TestACountedPopWakesTheNextWaiterOnlyWhenItTakesElementsAndLeavesSome(t *te
 	// count that empties the list leaves nothing to hand on.
 	tests := []struct {
 		name      string
-		pop       func(s *Store, key string, count int64) ([][]byte, bool, error)
-		count     int64
+		pop       func(s *Store, key string, count int) ([][]byte, bool, error)
+		count     int
 		wantWoken bool
 	}{
 		{name: "LeftPopN of two leaving one", pop: (*Store).LeftPopN, count: 2, wantWoken: true},
@@ -77,7 +77,7 @@ func TestACountedPopWakesTheNextWaiterOnlyWhenItTakesElementsAndLeavesSome(t *te
 			waiter := store.SubscribeListPush("q")
 
 			popped, ok, err := tt.pop(store, "q", tt.count)
-			if err != nil || !ok || int64(len(popped)) != tt.count {
+			if err != nil || !ok || len(popped) != tt.count {
 				t.Fatalf("pop of %d = (%d values, %v, %v), want (%d values, true, nil)", tt.count, len(popped), ok, err, tt.count)
 			}
 			if tt.wantWoken {

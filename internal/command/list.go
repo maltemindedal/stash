@@ -3,7 +3,6 @@ package command
 import (
 	"context"
 	"errors"
-	"strconv"
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
@@ -211,7 +210,9 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 		return protocol.BulkString{Data: value}, nil
 	}
 
-	count, err := parseIntegerArgument(request.Args[1])
+	// Parsed straight into an int, which is what the store pops by, so nothing
+	// narrows an int64 on the way (6db82b0).
+	count, err := parseIntArgument(request.Args[1])
 	if err != nil {
 		return nil, err
 	}
@@ -260,9 +261,9 @@ func validatePopRequest(request *Request, name string) error {
 		return wrongNumberOfArgumentsError(name)
 	}
 	if len(request.Args) == 2 {
-		count, err := strconv.ParseInt(string(request.Args[1]), 10, 64)
+		count, err := parseIntArgument(request.Args[1])
 		if err != nil {
-			return ErrValueNotIntegerError()
+			return err
 		}
 		if count < 0 {
 			return newRESPMessageError("ERR", "value is out of range, must be positive")

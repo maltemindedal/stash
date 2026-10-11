@@ -66,6 +66,7 @@ Owns the in-memory key/value store.
 Current responsibilities:
 
 - route keys to a fixed shard set and protect each shard with its own `sync.RWMutex`
+- apply each single-key write through a primitive that owns its locking, expiry and memory accounting: `writeKey` for a growing write, and `mutateKey` for a shrinking write (a pop, `HDEL`, `SREM`, `DEL`), which takes only its key's shard lock even under `maxmemory` and so never evicts or sweeps
 - support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
 - store TTLs in Unix milliseconds
 - perform passive eviction when a read or write touches an expired key
@@ -118,7 +119,7 @@ Contains integration tests that verify the server end to end over a real TCP con
 
 ### Why shard-local store locks?
 
-The store now uses a fixed shard set with one `sync.RWMutex` per shard. Single-key commands only lock the owning shard, while multi-key commands group keys by shard and lock shard IDs in deterministic order to avoid deadlocks.
+The store now uses a fixed shard set with one `sync.RWMutex` per shard. Single-key commands only lock the owning shard, while multi-key commands group keys by shard and lock shard IDs in deterministic order to avoid deadlocks. The exception is a growing write under `maxmemory`, which locks every shard in ascending order because making room for it can evict a key from any of them. A shrinking write never needs room, so it keeps to its own shard even then.
 
 ### Why RESP3 placeholders now?
 

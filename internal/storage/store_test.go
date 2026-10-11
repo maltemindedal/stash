@@ -301,29 +301,38 @@ func TestStoreValueBehavior(t *testing.T) {
 			},
 		},
 		{
-			name: "SetBit leaves the stored payload intact while accounting",
+			name: "SetBit under accounting sets the bit, and a refused SetBit leaves the payload as it was",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 				if _, err := store.Set("bitmap", []byte{0x00}, 0); err != nil {
 					t.Fatalf("Set() error = %v", err)
 				}
 				store.ConfigureMaxMemory(1<<20, 16)
-				stored := store.valueObjectForTest("bitmap").String
 
 				if _, _, err := store.SetBit("bitmap", 0, 1); err != nil {
 					t.Fatalf("SetBit() error = %v", err)
 				}
-
-				// Accounting sizes a write against the value already under the
-				// key, so an in-range SETBIT must commit a replacement rather
-				// than edit that value where it lies.
-				if stored[0] != 0x00 {
-					t.Fatalf("pre-write payload = %#x, want 0x00 untouched", stored[0])
+				if got, _, err := store.Get("bitmap"); err != nil || len(got) != 1 || got[0] != 0x80 {
+					t.Fatalf("Get() = %#x, %v, want 0x80", got, err)
 				}
-				if got, _, err := store.Get("bitmap"); err != nil {
-					t.Fatalf("Get() error = %v", err)
-				} else if got[0] != 0x80 {
-					t.Fatalf("Get() = %#x, want 0x80", got[0])
+				if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
+					t.Fatalf("UsedMemory() = %d after SetBit, recount = %d", used, want)
+				}
+
+				// At the limit, a SetBit past the end needs room the store cannot
+				// make. It is refused, and the payload it would have grown stays
+				// as it was. Whether an in-range SetBit edits the stored payload
+				// in place is not pinned: a write that cannot change the value's
+				// size cannot be refused.
+				store.ConfigureMaxMemory(store.UsedMemory(), 16)
+				if _, _, err := store.SetBit("bitmap", 1<<20, 1); !errors.Is(err, ErrMemoryLimitExceeded) {
+					t.Fatalf("SetBit() past the end at the limit error = %v, want ErrMemoryLimitExceeded", err)
+				}
+				if got, _, err := store.Get("bitmap"); err != nil || len(got) != 1 || got[0] != 0x80 {
+					t.Fatalf("Get() after the refused SetBit = %#x, %v, want 0x80", got, err)
+				}
+				if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
+					t.Fatalf("UsedMemory() = %d after the refused SetBit, recount = %d", used, want)
 				}
 			},
 		},
@@ -537,10 +546,7 @@ func TestEachStoreOperationTakesOneClockReading(t *testing.T) {
 						}
 						want := int64(1)
 						if expired {
-							deadline := clock.now()
-							store.expireKeyForTest(key, deadline)
-							store.noteExpiry(deadline)
-							clock.advance(time.Millisecond)
+							expireForTest(store, clock, key)
 							if tt.read {
 								want = 2
 							}
