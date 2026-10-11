@@ -1643,6 +1643,97 @@ func TestPsyncInsideMultiIsRefusedAndExecAborts(t *testing.T) {
 	}
 }
 
+// TestPsyncFromAConnectionThatIsAlreadyAReplicaIsIgnored has an attached replica
+// send PSYNC again on its replication link. As in Redis, whose syncCommand
+// returns without a reply for a client that is already a replica, the master
+// answers nothing, keeps the replica attached once, and goes on sending it the
+// same stream. It used to attach the replica a second time and send it a new
+// FULLRESYNC and snapshot while the first attachment's feed could still write
+// writes the new snapshot already held, which the replica then applied twice.
+func TestPsyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
+	for _, eventLoop := range []bool{false, true} {
+		eventLoop := eventLoop
+		t.Run(fmt.Sprintf("eventLoop=%v", eventLoop), func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.EventLoop = eventLoop
+			master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			errCh := make(chan error, 1)
+			go func() { errCh <- master.ListenAndServe(ctx) }()
+			addr := waitForAddr(t, master)
+
+			replica, replicaParser := attachTestReplica(t, master, addr)
+			client, clientParser := dialClient(t, addr)
+
+			incr, err := protocol.EncodeValues([]protocol.Value{request("INCR", "counter")})
+			if err != nil {
+				t.Fatalf("EncodeValues() error = %v", err)
+			}
+			assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 1}, "INCR", "counter")
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			if err := assertReplicaRequest(replicaParser, "INCR", "counter"); err != nil {
+				t.Fatalf("first propagated write: %v", err)
+			}
+
+			// PSYNC again, then acknowledge what the stream has carried so far.
+			// The master runs a connection's requests in order, so once INFO shows
+			// the acknowledgement it has run the PSYNC.
+			again := append(mustEncode(t, request("PSYNC", "?", "-1")), mustEncode(t, request("REPLCONF", "ACK", fmt.Sprint(len(incr))))...)
+			if _, err := replica.Write(again); err != nil {
+				t.Fatalf("Write(PSYNC, REPLCONF ACK) error = %v", err)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			var fields map[string]string
+			for {
+				fields = infoFields(t, client, clientParser, "replication")
+				if !strings.HasSuffix(fields["slave0"], ",offset=0") || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if got := fields["connected_slaves"]; got != "1" {
+				t.Fatalf("connected_slaves = %q after a second PSYNC, want 1", got)
+			}
+			// Still the first attachment, which has acknowledged everything.
+			if want := ",offset=" + fields["master_repl_offset"]; !strings.HasSuffix(fields["slave0"], want) {
+				t.Fatalf("slave0 = %q after a second PSYNC and an acknowledgement of the whole stream, want it to end in %q", fields["slave0"], want)
+			}
+
+			assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 2}, "INCR", "counter")
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			next, err := replicaParser.Parse()
+			if err != nil {
+				t.Fatalf("Parse() after a second PSYNC error = %v", err)
+			}
+			if propagated, err := command.DecodeRequest(next); err != nil || propagated.Name != "INCR" {
+				t.Fatalf("after a second PSYNC the replica read %#v, want the propagated INCR counter", next)
+			}
+			if err := assertNoFurtherReplicaRequests(replica, replicaParser, 200*time.Millisecond); err != nil {
+				t.Fatalf("after the second write: %v", err)
+			}
+
+			cancel()
+			waitForServerStop(t, errCh)
+		})
+	}
+}
+
+// mustEncode encodes value as RESP.
+func mustEncode(t *testing.T, value protocol.Value) []byte {
+	t.Helper()
+
+	encoded, err := protocol.Encode(value)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	return encoded
+}
+
 func TestReplicationStructuredLogs(t *testing.T) {
 	var masterLogs synchronizedBuffer
 	masterLogger := slog.New(slog.NewTextHandler(&masterLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))

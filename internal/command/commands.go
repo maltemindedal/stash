@@ -268,6 +268,15 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	if len(request.Args) != 2 {
 		return server.ExecuteResult{}, wrongNumberOfArgumentsError("PSYNC")
 	}
+	// A connection that is already a replica gets no reply, whatever it asks
+	// for, and stays attached as it is, as in Redis, whose syncCommand returns
+	// at once for one. Attaching it again would register a second feed while
+	// the first could still write frames the new snapshot holds, which the
+	// replica would then apply twice.
+	if state := request.client; state != nil && state.IsReplica() {
+		e.logger.Debug("ignoring PSYNC from a connection that is already a replica", "replica_id", state.ID)
+		return server.ExecuteResult{}, nil
+	}
 	if string(request.Args[0]) != "?" || string(request.Args[1]) != "-1" {
 		return server.ExecuteResult{}, ErrSyntaxError()
 	}
