@@ -32,7 +32,7 @@ func (s *Store) ConfigureMaxMemory(limit int64, sampleSize int) {
 	s.maxMemory.Store(limit)
 	s.memoryEvictionSampleSize = sampleSize
 	if limit > 0 {
-		s.recalculateUsedMemoryLocked(time.Now().UnixMilli())
+		s.recalculateUsedMemoryLocked(s.now())
 	} else {
 		s.usedMemory.Store(0)
 	}
@@ -70,7 +70,7 @@ func (s *Store) EnforceMaxMemory() ([]string, error) {
 	defer s.writeUnlockAllShards()
 
 	limit := s.maxMemory.Load()
-	s.recalculateUsedMemoryLocked(time.Now().UnixMilli())
+	s.recalculateUsedMemoryLocked(s.now())
 	if s.usedMemory.Load() <= limit {
 		return nil, nil
 	}
@@ -430,7 +430,7 @@ func (s *Store) dropIfStillExpired(shard *Shard, key string) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if value, ok := shard.data[key]; ok && isExpired(value, time.Now().UnixMilli()) {
+	if value, ok := shard.data[key]; ok && isExpired(value, s.now()) {
 		s.deleteKeyLocked(shard, key)
 	}
 }

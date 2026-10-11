@@ -57,6 +57,14 @@ The Redis data type of a key's value: string, hash, list, set, sorted set, or st
 **TTL**:
 The deadline after which a key expires.
 
+**Clock reading**:
+The one time a read or write is anchored to: it decides whether the key's **TTL** has passed and becomes its **Access stamp**.
+_Avoid_: timestamp
+
+**Access stamp**:
+The time of the last successful read or write of a key, used to choose **Memory-pressure eviction** candidates.
+_Avoid_: LRU clock, last-used time
+
 **Eviction**:
 The server removing keys on its own rather than at a client's request: a **TTL eviction** or a **Memory-pressure eviction**. Every eviction except a passive TTL eviction is published to **Replicas**, the **AOF**, and `WATCH`. The **Memory-pressure eviction** at startup runs before any client or **Replica** connects, so it is published to the **AOF** only.
 

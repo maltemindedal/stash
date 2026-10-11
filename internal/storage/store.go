@@ -51,6 +51,32 @@ type Store struct {
 	// accounted write can skip the sweep-and-recount until it passes. Zero, the
 	// initial value, means unknown and forces one recount, which sets it exactly.
 	nextExpiry atomic.Int64
+	// clock returns the time, in Unix milliseconds, that now reads. Nil, as
+	// NewStore leaves it, means the system clock. Nothing guards the field, so a
+	// test that sets a manual clock sets it before the store is shared.
+	clock func() int64
+}
+
+// now takes a clock reading: the time in Unix milliseconds that decides whether
+// a TTL deadline has passed and that stamps a key's access. Every store
+// operation takes one and judges everything it touches by it, with one
+// exception: a read that finds its key expired takes a second reading under the
+// write lock before dropping the key, because the key may have been renewed
+// since the first (see dropIfStillExpired).
+//
+// Within the store, two things read the system clock directly because they pace
+// work rather than decide what a key holds: the time budget of a background
+// eviction pass, and the shard a key sample starts from. The value constructors
+// also stamp a new value from the system clock, but the write that stores it
+// stamps it again with its own reading. Code outside the store takes its own
+// reading of the system clock to judge TTLs: SET for its relative EX or PX
+// (ParseExpiryMillis is handed it), RDB loading and snapshot building, and the
+// AOF rewrite.
+func (s *Store) now() int64 {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now().UnixMilli()
 }
 
 // NewStore constructs an empty Store.
@@ -198,7 +224,7 @@ func (s *Store) Delete(key string) bool {
 	defer shard.mu.Unlock()
 
 	value, ok := shard.data[key]
-	if ok && isExpired(value, time.Now().UnixMilli()) {
+	if ok && isExpired(value, s.now()) {
 		s.deleteKeyLocked(shard, key)
 		return false
 	}
@@ -224,7 +250,7 @@ func (s *Store) DeleteMany(keys []string) []string {
 	groups.lock(s)
 	defer groups.unlock(s)
 
-	now := time.Now().UnixMilli()
+	now := s.now()
 	removed := make([]string, 0, len(keys))
 	for shardID, count := range groups.counts {
 		if count == 0 {
@@ -282,9 +308,7 @@ func (s *Store) Increment(key string) (int64, []string, error) {
 		// Size the write against the pre-write value, and leave the counter
 		// untouched if it turns out to breach maxmemory, by committing a
 		// replacement rather than editing the string still stored under the key.
-		newValue := newOwnedStringValue(next, w.current.ExpiresAt)
-		newValue.touch(w.now)
-		evicted, err := w.commit(newValue)
+		evicted, err := w.commit(newOwnedStringValue(next, w.current.ExpiresAt))
 		if err != nil {
 			return 0, nil, err
 		}
@@ -333,8 +357,9 @@ func (s *Store) popOneFromShard(key string, left bool) ([]byte, int, bool, error
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	now := s.now()
 	value, ok := shard.data[key]
-	if ok && isExpired(value, time.Now().UnixMilli()) {
+	if ok && isExpired(value, now) {
 		s.deleteKeyLocked(shard, key)
 		ok = false
 	}
@@ -368,7 +393,7 @@ func (s *Store) popOneFromShard(key string, left bool) ([]byte, int, bool, error
 		list = list[:last]
 		value.dropListEnd(1)
 	}
-	value.touch(time.Now().UnixMilli())
+	value.touch(now)
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
 		return item, 0, true, nil
@@ -415,8 +440,9 @@ func (s *Store) popNFromShard(key string, count int64, left bool) ([][]byte, int
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	now := s.now()
 	value, ok := shard.data[key]
-	if ok && isExpired(value, time.Now().UnixMilli()) {
+	if ok && isExpired(value, now) {
 		s.deleteKeyLocked(shard, key)
 		ok = false
 	}
@@ -460,7 +486,7 @@ func (s *Store) popNFromShard(key string, count int64, left bool) ([][]byte, int
 		value.dropListEnd(n)
 	}
 
-	value.touch(time.Now().UnixMilli())
+	value.touch(now)
 	if len(list) == 0 {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
 		return popped, 0, true, nil
@@ -533,7 +559,6 @@ func (s *Store) ZAdd(key string, entries []ZSetEntry) (int64, []string, error) {
 			}
 			added = int64(newLen)
 		}
-		newValue.touch(w.now)
 
 		evicted, err := w.commit(newValue)
 		if err != nil {
@@ -651,10 +676,7 @@ func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, erro
 			return "", nil, err
 		}
 
-		newValue := newStreamValue(stream, expiresAt)
-		newValue.touch(w.now)
-
-		evicted, err := w.commit(newValue)
+		evicted, err := w.commit(newStreamValue(stream, expiresAt))
 		if err != nil {
 			return "", nil, err
 		}
@@ -734,7 +756,7 @@ func (s *Store) Len() int {
 // SnapshotStrings returns defensive copies of the currently supported
 // shutdown-persistence scope: non-expired DB 0 string keys only.
 func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
-	now := time.Now().UnixMilli()
+	now := s.now()
 
 	s.readLockAllShards()
 	defer s.readUnlockAllShards()
@@ -775,7 +797,7 @@ func (s *Store) SnapshotAll() ([]SnapshotEntry, SnapshotStats) {
 	s.readLockAllShards()
 	defer s.readUnlockAllShards()
 
-	return s.snapshotAllLocked(time.Now().UnixMilli())
+	return s.snapshotAllLocked(s.now())
 }
 
 // SnapshotAllWithWriteBarrier snapshots the full keyspace while holding the store's
@@ -784,7 +806,7 @@ func (s *Store) SnapshotAllWithWriteBarrier(barrier func()) ([]SnapshotEntry, Sn
 	s.writeLockAllShards()
 	defer s.writeUnlockAllShards()
 
-	entries, stats := s.snapshotAllLocked(time.Now().UnixMilli())
+	entries, stats := s.snapshotAllLocked(s.now())
 	if barrier != nil {
 		barrier()
 	}
@@ -816,7 +838,7 @@ func (s *Store) ReplaceWith(other *Store) {
 	}
 	s.recalculateKeyStatsLocked()
 	if s.maxMemoryEnabled() {
-		s.recalculateUsedMemoryLocked(time.Now().UnixMilli())
+		s.recalculateUsedMemoryLocked(s.now())
 	}
 	s.writeUnlockAllShards()
 	s.publishExpiredKeys()
@@ -1235,8 +1257,10 @@ func deadlineAfter(nowMillis, value, millisPerUnit int64) (int64, error) {
 	return nowMillis + value*millisPerUnit, nil
 }
 
-// ParseExpiryMillis parses Redis-style EX/PX/PXAT arguments into a Unix-millis deadline.
-func ParseExpiryMillis(args [][]byte) (int64, error) {
+// ParseExpiryMillis parses Redis-style EX/PX/PXAT arguments into a Unix-millis
+// deadline. A relative EX or PX counts from nowMillis, the caller's clock
+// reading in Unix milliseconds.
+func ParseExpiryMillis(args [][]byte, nowMillis int64) (int64, error) {
 	if len(args) == 0 {
 		return 0, nil
 	}
@@ -1249,7 +1273,6 @@ func ParseExpiryMillis(args [][]byte) (int64, error) {
 		return 0, ErrInvalidExpireTime
 	}
 
-	nowMillis := time.Now().UnixMilli()
 	switch strings.ToUpper(string(args[0])) {
 	case "EX":
 		return deadlineAfter(nowMillis, value, 1000)

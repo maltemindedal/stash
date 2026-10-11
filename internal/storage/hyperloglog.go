@@ -45,9 +45,7 @@ func (s *Store) PFAdd(key string, elements [][]byte) (int64, []string, error) {
 		if w.current == nil {
 			payload := newHyperLogLogPayload()
 			updateHyperLogLogRegisters(payload[hllHeaderSize:], elements)
-			newValue := newOwnedStringValue(payload, 0)
-			newValue.touch(w.now)
-			evicted, err := w.commit(newValue)
+			evicted, err := w.commit(newOwnedStringValue(payload, 0))
 			if err != nil {
 				return 0, nil, err
 			}

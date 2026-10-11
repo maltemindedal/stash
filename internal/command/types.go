@@ -837,7 +837,7 @@ func validateSetRequest(request *Request) error {
 	if len(request.Args) < 2 {
 		return wrongNumberOfArgumentsError("SET")
 	}
-	if _, err := storage.ParseExpiryMillis(request.Args[2:]); err != nil {
+	if _, err := parseSetExpiry(request.Args[2:]); err != nil {
 		switch {
 		case errors.Is(err, storage.ErrSyntax):
 			return ErrSyntaxError()

@@ -1,7 +1,5 @@
 package storage
 
-import "time"
-
 // SAdd adds the supplied members to the set stored at key and returns the
 // number of newly added members. When maxmemory is configured it first frees
 // space and reports the keys evicted to make room; otherwise it evicts nothing.
@@ -39,7 +37,6 @@ func (s *Store) SAdd(key string, members [][]byte) (int64, []string, error) {
 			}
 			added = int64(newLen)
 		}
-		newValue.touch(w.now)
 
 		evicted, err := w.commit(newValue)
 		if err != nil {
@@ -68,7 +65,7 @@ func (s *Store) SRem(key string, members [][]byte) (int64, error) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	now := time.Now().UnixMilli()
+	now := s.now()
 	value, ok := shard.data[key]
 	if ok && isExpired(value, now) {
 		s.deleteKeyLocked(shard, key)

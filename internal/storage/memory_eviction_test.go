@@ -14,7 +14,7 @@ import (
 // it does, and the store ends within its limit. The sample is larger than the
 // keyspace, so the choice of victim is deterministic.
 func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
-	store := NewStore()
+	store, clock := newStoreWithManualClock()
 	payload := []byte(strings.Repeat("x", 64))
 	keys := make([]string, 20)
 	for i := range keys {
@@ -22,13 +22,11 @@ func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
 		if _, err := store.Set(keys[i], payload, 0); err != nil {
 			t.Fatalf("Set(%s) error = %v", keys[i], err)
 		}
+		clock.advance(time.Millisecond) // key-00 is the stalest
 	}
 	store.ConfigureMaxMemory(1<<40, 1000)
 	limit := store.UsedMemory()
 	store.ConfigureMaxMemory(limit, 1000)
-	for i, key := range keys {
-		store.valueObjectForTest(key).touch(int64(1000 + i)) // key-00 is the stalest
-	}
 
 	evicted, err := store.Set("a-new-key", payload, 0)
 	if err != nil {
@@ -97,15 +95,15 @@ func TestStoreMaxMemoryRefusesAnImpossibleWriteWithoutEvicting(t *testing.T) {
 // once one can have expired, so the sweep has to happen on the first write after
 // the deadline and not before it.
 func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
-	store := NewStore()
+	store, clock := newStoreWithManualClock()
 	store.ConfigureMaxMemory(1<<20, 16)
 	reported := make(chan []string, 4)
 	store.SetExpirationListener(func(keys []string) { reported <- keys })
 
-	if _, err := store.Set("soon", []byte("v"), time.Now().Add(60*time.Millisecond).UnixMilli()); err != nil {
+	if _, err := store.Set("soon", []byte("v"), clock.now()+60); err != nil {
 		t.Fatalf("Set(soon) error = %v", err)
 	}
-	if _, err := store.Set("later", []byte("v"), time.Now().Add(time.Hour).UnixMilli()); err != nil {
+	if _, err := store.Set("later", []byte("v"), clock.now()+time.Hour.Milliseconds()); err != nil {
 		t.Fatalf("Set(later) error = %v", err)
 	}
 
@@ -122,7 +120,7 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 		t.Fatal("the key was swept before its deadline")
 	}
 
-	time.Sleep(90 * time.Millisecond)
+	clock.advance(90 * time.Millisecond)
 	if _, err := store.Set("other-2", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-2) error = %v", err)
 	}

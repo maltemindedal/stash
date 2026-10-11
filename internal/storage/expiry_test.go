@@ -2,11 +2,14 @@ package storage
 
 import (
 	"errors"
+	"math"
+	"strconv"
 	"testing"
-	"time"
 )
 
 func TestParseExpiryMillis(t *testing.T) {
+	const now = 1_700_000_000_000 // the caller's clock reading, in Unix milliseconds
+
 	tests := []struct {
 		name    string
 		args    []string
@@ -24,6 +27,9 @@ func TestParseExpiryMillis(t *testing.T) {
 		{name: "milliseconds beyond time.Duration", args: []string{"PX", "9223372036855"}, wantAdd: 9223372036855},
 		{name: "seconds far beyond time.Duration", args: []string{"EX", "10000000000"}, wantAdd: 10000000000 * 1000},
 		// A deadline that does not fit in int64 milliseconds is rejected, not wrapped.
+		// Where that limit falls depends on the clock reading the deadline counts from.
+		{name: "milliseconds up to the latest deadline", args: []string{"PX", strconv.FormatInt(math.MaxInt64-now, 10)}, wantAdd: math.MaxInt64 - now},
+		{name: "milliseconds one past the latest deadline", args: []string{"PX", strconv.FormatInt(math.MaxInt64-now+1, 10)}, wantErr: ErrInvalidExpireTime},
 		{name: "seconds that overflow int64 milliseconds", args: []string{"EX", "9223372036854775807"}, wantErr: ErrInvalidExpireTime},
 		{name: "seconds just over the limit", args: []string{"EX", "9223372036854776"}, wantErr: ErrInvalidExpireTime},
 		{name: "milliseconds that overflow", args: []string{"PX", "9223372036854775807"}, wantErr: ErrInvalidExpireTime},
@@ -41,9 +47,7 @@ func TestParseExpiryMillis(t *testing.T) {
 				args[i] = []byte(arg)
 			}
 
-			before := time.Now()
-			got, err := ParseExpiryMillis(args)
-			after := time.Now()
+			got, err := ParseExpiryMillis(args, now)
 
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("ParseExpiryMillis(%q) error = %v, want %v", tt.args, err, tt.wantErr)
@@ -57,9 +61,8 @@ func TestParseExpiryMillis(t *testing.T) {
 				}
 				return
 			}
-			low, high := before.UnixMilli()+tt.wantAdd, after.UnixMilli()+tt.wantAdd
-			if got < low || got > high {
-				t.Fatalf("ParseExpiryMillis(%q) = %d, want within [%d, %d]", tt.args, got, low, high)
+			if want := now + tt.wantAdd; got != want {
+				t.Fatalf("ParseExpiryMillis(%q) = %d, want %d", tt.args, got, want)
 			}
 		})
 	}

@@ -537,8 +537,17 @@ func (e *Executor) handlePublish(_ context.Context, request *Request) (protocol.
 	return protocol.Integer{Value: matched}, nil
 }
 
+// parseSetExpiry parses SET's EX, PX or PXAT arguments into a Unix-millis
+// deadline, reading the clock only when there are any.
+func parseSetExpiry(args [][]byte) (int64, error) {
+	if len(args) == 0 {
+		return 0, nil
+	}
+	return storage.ParseExpiryMillis(args, time.Now().UnixMilli())
+}
+
 func (e *Executor) handleSet(ctx context.Context, request *Request) (protocol.Value, error) {
-	expiresAt, err := storage.ParseExpiryMillis(request.Args[2:])
+	expiresAt, err := parseSetExpiry(request.Args[2:])
 	if err != nil {
 		switch {
 		case errors.Is(err, storage.ErrSyntax):

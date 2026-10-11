@@ -3,7 +3,6 @@ package storage
 import (
 	"hash/maphash"
 	"sync"
-	"time"
 )
 
 const defaultShardCount = 256
@@ -44,7 +43,7 @@ func newShards(count int) []Shard {
 func readKey[T any](s *Store, key string, fn func(value *ValueObject) (T, error)) (T, bool, error) {
 	var zero T
 
-	now := time.Now().UnixMilli()
+	now := s.now()
 	shard := s.shardForKey(key)
 
 	shard.mu.RLock()
@@ -84,8 +83,8 @@ type keyWrite struct {
 	accounting bool
 }
 
-// commit stores newValue under the key and reports the keys evicted to make
-// room for it.
+// commit stores newValue under the key, stamped with the write's clock reading
+// as its access, and reports the keys evicted to make room for it.
 //
 // While the store is accounting for memory the write is sized against the
 // pre-write value, so newValue must be a distinct object from current: a write
@@ -94,6 +93,7 @@ type keyWrite struct {
 // unchanged. Without accounting there is nothing to size and newValue may be
 // current itself.
 func (w keyWrite) commit(newValue *ValueObject) ([]string, error) {
+	newValue.touch(w.now)
 	if w.accounting {
 		return w.store.commitValueWithEvictionLocked(w.shard, w.key, w.current, newValue, w.now)
 	}
@@ -117,9 +117,7 @@ func (w keyWrite) commitString(length int, expiresAt int64, fill func(payload []
 
 	payload := make([]byte, length)
 	fill(payload)
-	newValue := newOwnedStringValue(payload, expiresAt)
-	newValue.touch(w.now)
-	return w.commit(newValue)
+	return w.commit(newOwnedStringValue(payload, expiresAt))
 }
 
 // writeKey applies fn to the value stored at key while holding the write locks
@@ -139,7 +137,7 @@ func (w keyWrite) commitString(length int, expiresAt int64, fill func(payload []
 // handed; it must not retain that keyWrite, or memory borrowed from the value,
 // after it returns.
 func writeKey[T any](s *Store, key string, fn func(w keyWrite) (T, []string, error)) (T, []string, error) {
-	now := time.Now().UnixMilli()
+	now := s.now()
 	// Decide the locking mode and the accounting mode from a single read of the
 	// maxmemory setting. Reading it again under the narrower lock would be a
 	// TOCTOU: if accounting turned on in between, this call would hold one shard
