@@ -453,6 +453,42 @@ func (w *stringWrite) resize(length int) ([]byte, []string, error) {
 	return payload, evicted, nil
 }
 
+// deleteKeys removes several keys, as DEL does, and returns the ones that held
+// a live value, in no particular order.
+//
+// It is mutateKey's counterpart for a DEL of several keys, which DeleteMany
+// hands it; one key goes through Delete. Deleting is a shrinking write, so even
+// under maxmemory deleteKeys locks only the keys' own shards, in ascending
+// order, and it neither evicts nor sweeps. It takes one clock reading under
+// those locks, by which a key whose TTL has passed is absent: it is reclaimed
+// and not reported.
+func deleteKeys(s *Store, keys []string) []string {
+	groups := s.groupKeysByShard(keys)
+	groups.lock(s)
+	defer groups.unlock(s)
+
+	now := s.now()
+	removed := make([]string, 0, len(keys))
+	for shardID, count := range groups.counts {
+		if count == 0 {
+			continue
+		}
+		shard := &s.shards[shardID]
+		for _, key := range groups.keysForShard(shardID) {
+			value, ok := shard.data[key]
+			if !ok {
+				continue
+			}
+			s.deleteKeyLocked(shard, key)
+			if !isExpired(value, now) {
+				removed = append(removed, key)
+			}
+		}
+	}
+
+	return removed
+}
+
 func (s *Store) shardIndex(key string) int {
 	return int(maphash.String(s.seed, key) % uint64(len(s.shards)))
 }

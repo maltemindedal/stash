@@ -64,6 +64,22 @@ func shrinkingWrites() []shrinkingWrite {
 		{name: "DEL", setup: list, anyKind: true, deletes: true, write: func(s *Store, key string) (bool, error) {
 			return s.Delete(key), nil
 		}},
+		{name: "DEL of several keys", setup: list, anyKind: true, deletes: true, write: func(s *Store, key string) (bool, error) {
+			// The other key is absent and lives on key's shard, so the write
+			// needs no shard lock but key's own.
+			return len(s.DeleteMany([]string{key, anotherKeyOnShardOf(s, key)})) > 0, nil
+		}},
+	}
+}
+
+// anotherKeyOnShardOf returns a key other than key that the store places on
+// key's shard.
+func anotherKeyOnShardOf(store *Store, key string) string {
+	index := store.shardIndex(key)
+	for i := 0; ; i++ {
+		if candidate := "other" + strconv.Itoa(i); store.shardIndex(candidate) == index {
+			return candidate
+		}
 	}
 }
 

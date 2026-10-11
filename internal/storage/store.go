@@ -235,33 +235,7 @@ func (s *Store) DeleteMany(keys []string) []string {
 		return nil
 	}
 
-	groups := s.groupKeysByShard(keys)
-	groups.lock(s)
-	defer groups.unlock(s)
-
-	now := s.now()
-	removed := make([]string, 0, len(keys))
-	for shardID, count := range groups.counts {
-		if count == 0 {
-			continue
-		}
-		shard := &s.shards[shardID]
-		for _, key := range groups.keysForShard(shardID) {
-			value, ok := shard.data[key]
-			if !ok {
-				continue
-			}
-			if isExpired(value, now) {
-				s.deleteKeyLocked(shard, key)
-				continue
-			}
-
-			s.deleteKeyLocked(shard, key)
-			removed = append(removed, key)
-		}
-	}
-
-	return removed
+	return deleteKeys(s, keys)
 }
 
 // Increment atomically increments the string value stored at key by one. When
