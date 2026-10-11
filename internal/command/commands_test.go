@@ -2944,6 +2944,50 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	}
 }
 
+func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
+	// As in Redis, whose syncCommand returns without a reply for a client that
+	// is already a replica, whatever it asks for. Attaching it again registered
+	// a second feed beside the first. Any other client is still refused the
+	// partial resync Stash does not support.
+	tests := []struct {
+		name    string
+		replica bool
+		args    []string
+		wantErr error
+	}{
+		{name: "a replica asking for a full resync", replica: true, args: []string{"?", "-1"}},
+		{name: "a replica asking for a partial resync", replica: true, args: []string{"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb", "100"}},
+		{name: "a client asking for a partial resync", args: []string{"8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb", "100"}, wantErr: ErrSyntax},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			registry := server.NewReplicaRegistry()
+			executor := newTestExecutorWith(func(s *server.Services) {
+				s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+				s.Replicas = registry
+			})
+			ctx := withClientStateForExecutor(context.Background(), executor, 1)
+			state, _ := clientOfContext(ctx)
+			if tt.replica {
+				state.PromoteToReplica()
+			}
+
+			result, err := handle(ctx, executor, requestValue(append([]string{"PSYNC"}, tt.args...)...), true)
+			if result.Release != nil {
+				result.Release()
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("PSYNC %v error = %v, want %v", tt.args, err, tt.wantErr)
+			}
+			if len(result.Responses) != 0 || result.RegisterReplica || registry.Count() != 0 {
+				t.Fatalf("PSYNC %v: %d replies, RegisterReplica = %v, %d replicas registered; want none, false and 0", tt.args, len(result.Responses), result.RegisterReplica, registry.Count())
+			}
+		})
+	}
+}
+
 // testServices is a Services whose every collaborator is a working stand-in:
 // a new store and registries, a logger that discards, INFO's view of a lone
 // master, no AOF, a Slowlog that records nothing, and writes always ordered.

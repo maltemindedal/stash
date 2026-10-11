@@ -1022,12 +1022,12 @@ func validateReplConfRequest(request *Request) error {
 	return nil
 }
 
+// validatePSyncRequest checks only the arity. The handler checks the arguments,
+// after it has ignored a PSYNC from a connection that is already a replica,
+// whatever that PSYNC asks for.
 func validatePSyncRequest(request *Request) error {
 	if len(request.Args) != 2 {
 		return wrongNumberOfArgumentsError("PSYNC")
-	}
-	if string(request.Args[0]) != "?" || string(request.Args[1]) != "-1" {
-		return ErrSyntaxError()
 	}
 	return nil
 }
