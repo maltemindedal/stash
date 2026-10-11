@@ -369,133 +369,77 @@ func TestStoreValueBehavior(t *testing.T) {
 
 func TestStoreAccessTracking(t *testing.T) {
 	tests := []struct {
-		name string
-		run  func(*testing.T, *Store, string)
+		name  string
+		write func(store *Store, key string) error
+		read  func(store *Store, key string) error
 	}{
 		{
 			name: "Get refreshes string last accessed",
-			run: func(t *testing.T, store *Store, key string) {
-				t.Helper()
-				_, _ = store.Set(key, []byte("Stash"), 0)
-
-				before := store.lastAccessedAtForTest(key)
-				time.Sleep(2 * time.Millisecond)
-
-				if _, ok, err := store.Get(key); err != nil {
-					t.Fatalf("Get() error = %v", err)
-				} else if !ok {
-					t.Fatal("Get() ok = false, want true")
+			write: func(store *Store, key string) error {
+				_, err := store.Set(key, []byte("Stash"), 0)
+				return err
+			},
+			read: func(store *Store, key string) error {
+				_, ok, err := store.Get(key)
+				if err == nil && !ok {
+					return errors.New("Get() ok = false, want the value")
 				}
-
-				after := store.lastAccessedAtForTest(key)
-				if after <= before {
-					t.Fatalf("lastAccessedAt after Get = %d, want > %d", after, before)
-				}
+				return err
 			},
 		},
 		{
 			name: "ListRange refreshes list last accessed",
-			run: func(t *testing.T, store *Store, key string) {
-				t.Helper()
-				if _, _, err := store.RightPush(key, [][]byte{[]byte("a"), []byte("b")}); err != nil {
-					t.Fatalf("RightPush() error = %v", err)
-				}
-
-				before := store.lastAccessedAtForTest(key)
-				time.Sleep(2 * time.Millisecond)
-
-				if _, err := store.ListRange(key, 0, -1); err != nil {
-					t.Fatalf("ListRange() error = %v", err)
-				}
-
-				after := store.lastAccessedAtForTest(key)
-				if after <= before {
-					t.Fatalf("lastAccessedAt after ListRange = %d, want > %d", after, before)
-				}
+			write: func(store *Store, key string) error {
+				_, _, err := store.RightPush(key, [][]byte{[]byte("a"), []byte("b")})
+				return err
+			},
+			read: func(store *Store, key string) error {
+				_, err := store.ListRange(key, 0, -1)
+				return err
 			},
 		},
 		{
 			name: "HGet refreshes hash last accessed even for missing fields",
-			run: func(t *testing.T, store *Store, key string) {
-				t.Helper()
-				if _, _, err := store.HSet(key, []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
-					t.Fatalf("HSet() error = %v", err)
-				}
-
-				before := store.lastAccessedAtForTest(key)
-				time.Sleep(2 * time.Millisecond)
-
-				if _, _, err := store.HGet(key, "missing"); err != nil {
-					t.Fatalf("HGet() error = %v", err)
-				}
-
-				after := store.lastAccessedAtForTest(key)
-				if after <= before {
-					t.Fatalf("lastAccessedAt after HGet = %d, want > %d", after, before)
-				}
+			write: func(store *Store, key string) error {
+				_, _, err := store.HSet(key, []HashFieldValue{{Field: "lang", Value: []byte("go")}})
+				return err
+			},
+			read: func(store *Store, key string) error {
+				_, _, err := store.HGet(key, "missing")
+				return err
 			},
 		},
 		{
 			name: "SIsMember refreshes set last accessed for misses",
-			run: func(t *testing.T, store *Store, key string) {
-				t.Helper()
-				if _, _, err := store.SAdd(key, [][]byte{[]byte("alpha")}); err != nil {
-					t.Fatalf("SAdd() error = %v", err)
-				}
-
-				before := store.lastAccessedAtForTest(key)
-				time.Sleep(2 * time.Millisecond)
-
-				if _, err := store.SIsMember(key, []byte("beta")); err != nil {
-					t.Fatalf("SIsMember() error = %v", err)
-				}
-
-				after := store.lastAccessedAtForTest(key)
-				if after <= before {
-					t.Fatalf("lastAccessedAt after SIsMember = %d, want > %d", after, before)
-				}
+			write: func(store *Store, key string) error {
+				_, _, err := store.SAdd(key, [][]byte{[]byte("alpha")})
+				return err
+			},
+			read: func(store *Store, key string) error {
+				_, err := store.SIsMember(key, []byte("beta"))
+				return err
 			},
 		},
 		{
 			name: "ZRange refreshes sorted set last accessed",
-			run: func(t *testing.T, store *Store, key string) {
-				t.Helper()
-				if _, _, err := store.ZAdd(key, []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
-					t.Fatalf("ZAdd() error = %v", err)
-				}
-
-				before := store.lastAccessedAtForTest(key)
-				time.Sleep(2 * time.Millisecond)
-
-				if _, err := store.ZRange(key, 0, -1); err != nil {
-					t.Fatalf("ZRange() error = %v", err)
-				}
-
-				after := store.lastAccessedAtForTest(key)
-				if after <= before {
-					t.Fatalf("lastAccessedAt after ZRange = %d, want > %d", after, before)
-				}
+			write: func(store *Store, key string) error {
+				_, _, err := store.ZAdd(key, []ZSetEntry{{Member: []byte("alpha"), Score: 1}})
+				return err
+			},
+			read: func(store *Store, key string) error {
+				_, err := store.ZRange(key, 0, -1)
+				return err
 			},
 		},
 		{
 			name: "XRead refreshes stream last accessed when no newer entries exist",
-			run: func(t *testing.T, store *Store, key string) {
-				t.Helper()
-				if _, _, err := store.XAdd(key, "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
-					t.Fatalf("XAdd() error = %v", err)
-				}
-
-				before := store.lastAccessedAtForTest(key)
-				time.Sleep(2 * time.Millisecond)
-
-				if _, err := store.XRead(key, "$"); err != nil {
-					t.Fatalf("XRead() error = %v", err)
-				}
-
-				after := store.lastAccessedAtForTest(key)
-				if after <= before {
-					t.Fatalf("lastAccessedAt after XRead = %d, want > %d", after, before)
-				}
+			write: func(store *Store, key string) error {
+				_, _, err := store.XAdd(key, "1-0", [][]byte{[]byte("field"), []byte("value")})
+				return err
+			},
+			read: func(store *Store, key string) error {
+				_, err := store.XRead(key, "$")
+				return err
 			},
 		},
 	}
@@ -503,8 +447,115 @@ func TestStoreAccessTracking(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewStore()
-			tt.run(t, store, "phase11")
+			const key = "phase11"
+			store, clock := newStoreWithManualClock()
+
+			if err := tt.write(store, key); err != nil {
+				t.Fatalf("write error = %v", err)
+			}
+			if got, want := store.lastAccessedAtForTest(key), clock.now(); got != want {
+				t.Fatalf("lastAccessedAt after the write = %d, want its clock reading %d", got, want)
+			}
+
+			readAt := clock.advance(time.Millisecond)
+			if err := tt.read(store, key); err != nil {
+				t.Fatalf("read error = %v", err)
+			}
+			if got := store.lastAccessedAtForTest(key); got != readAt {
+				t.Fatalf("lastAccessedAt after the read = %d, want its clock reading %d", got, readAt)
+			}
+		})
+	}
+}
+
+// TestEachStoreOperationTakesOneClockReading pins that a store operation judges
+// its key's TTL and stamps its access by one clock reading, with maxmemory off
+// and on, and whether the key is live or has expired. The one exception is a
+// read that finds its key expired: it takes a second reading under the write
+// lock before dropping the key (dropIfStillExpired), because the key may have
+// been renewed after the read lock was released.
+func TestEachStoreOperationTakesOneClockReading(t *testing.T) {
+	const key = "k"
+	a, b, c := []byte("a"), []byte("b"), []byte("c")
+
+	str := func(s *Store) error { _, err := s.Set(key, []byte("9"), 0); return err }
+	list := func(s *Store) error { _, _, err := s.RightPush(key, [][]byte{a, b, c}); return err }
+	hash := func(s *Store) error {
+		_, _, err := s.HSet(key, []HashFieldValue{{Field: "f", Value: a}, {Field: "g", Value: b}})
+		return err
+	}
+	set := func(s *Store) error { _, _, err := s.SAdd(key, [][]byte{a, b}); return err }
+	zset := func(s *Store) error { _, _, err := s.ZAdd(key, []ZSetEntry{{Member: a, Score: 1}}); return err }
+	stream := func(s *Store) error { _, _, err := s.XAdd(key, "1-0", [][]byte{a, b}); return err }
+	hll := func(s *Store) error { _, _, err := s.PFAdd(key, [][]byte{a}); return err }
+
+	tests := []struct {
+		name  string
+		setup func(*Store) error
+		op    func(*Store) error
+		read  bool // a read, which takes a second reading when its key has expired
+	}{
+		{name: "GET", setup: str, read: true, op: func(s *Store) error { _, _, err := s.Get(key); return err }},
+		{name: "LRANGE", setup: list, read: true, op: func(s *Store) error { _, err := s.ListRange(key, 0, -1); return err }},
+		{name: "HGET", setup: hash, read: true, op: func(s *Store) error { _, _, err := s.HGet(key, "f"); return err }},
+		{name: "SISMEMBER", setup: set, read: true, op: func(s *Store) error { _, err := s.SIsMember(key, a); return err }},
+		{name: "ZRANGE", setup: zset, read: true, op: func(s *Store) error { _, err := s.ZRange(key, 0, -1); return err }},
+		{name: "XREAD", setup: stream, read: true, op: func(s *Store) error { _, err := s.XRead(key, "0"); return err }},
+		{name: "SET", setup: str, op: func(s *Store) error { _, err := s.Set(key, []byte("longer"), 0); return err }},
+		{name: "INCR", setup: str, op: func(s *Store) error { _, _, err := s.Increment(key); return err }},
+		{name: "SETBIT", setup: str, op: func(s *Store) error { _, _, err := s.SetBit(key, 30, 1); return err }},
+		{name: "PFADD", setup: hll, op: func(s *Store) error { _, _, err := s.PFAdd(key, [][]byte{b}); return err }},
+		{name: "LPUSH", setup: list, op: func(s *Store) error { _, _, err := s.LeftPush(key, [][]byte{a}); return err }},
+		{name: "RPUSH", setup: list, op: func(s *Store) error { _, _, err := s.RightPush(key, [][]byte{a}); return err }},
+		{name: "HSET", setup: hash, op: func(s *Store) error { _, _, err := s.HSet(key, []HashFieldValue{{Field: "h", Value: c}}); return err }},
+		{name: "SADD", setup: set, op: func(s *Store) error { _, _, err := s.SAdd(key, [][]byte{c}); return err }},
+		{name: "ZADD", setup: zset, op: func(s *Store) error { _, _, err := s.ZAdd(key, []ZSetEntry{{Member: b, Score: 2}}); return err }},
+		{name: "XADD", setup: stream, op: func(s *Store) error { _, _, err := s.XAdd(key, "*", [][]byte{a, c}); return err }},
+		{name: "LPOP", setup: list, op: func(s *Store) error { _, _, err := s.LeftPop(key); return err }},
+		{name: "RPOP", setup: list, op: func(s *Store) error { _, _, err := s.RightPop(key); return err }},
+		{name: "LPOP with a count", setup: list, op: func(s *Store) error { _, _, err := s.LeftPopN(key, 2); return err }},
+		{name: "RPOP with a count", setup: list, op: func(s *Store) error { _, _, err := s.RightPopN(key, 2); return err }},
+		{name: "HDEL", setup: hash, op: func(s *Store) error { _, err := s.HDel(key, []string{"f"}); return err }},
+		{name: "SREM", setup: set, op: func(s *Store) error { _, err := s.SRem(key, [][]byte{a}); return err }},
+		{name: "DEL", setup: str, op: func(s *Store) error { s.Delete(key); return nil }},
+		{name: "DEL of several keys", setup: str, op: func(s *Store) error { s.DeleteMany([]string{key, "absent"}); return nil }},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			for _, maxMemory := range []bool{false, true} {
+				for _, expired := range []bool{false, true} {
+					maxMemory, expired := maxMemory, expired
+					t.Run(fmt.Sprintf("maxmemory %v, key expired %v", maxMemory, expired), func(t *testing.T) {
+						store, clock := newStoreWithManualClock()
+						if maxMemory {
+							store.ConfigureMaxMemory(1<<30, 16)
+						}
+						if err := tt.setup(store); err != nil {
+							t.Fatalf("setup error = %v", err)
+						}
+						want := int64(1)
+						if expired {
+							deadline := clock.now()
+							store.expireKeyForTest(key, deadline)
+							store.noteExpiry(deadline)
+							clock.advance(time.Millisecond)
+							if tt.read {
+								want = 2
+							}
+						}
+
+						before := clock.readings()
+						if err := tt.op(store); err != nil {
+							t.Fatalf("%s error = %v", tt.name, err)
+						}
+						if got := clock.readings() - before; got != want {
+							t.Fatalf("%s took %d clock readings, want %d", tt.name, got, want)
+						}
+					})
+				}
+			}
 		})
 	}
 }

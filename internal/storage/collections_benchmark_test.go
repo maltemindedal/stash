@@ -303,3 +303,196 @@ func BenchmarkList(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkAccountedCollections measures collection writes at three sizes, with
+// maxmemory off and on. With it on, a write that grows its value takes every
+// shard lock and is sized against the limit, and a write that shrinks it takes
+// only its own shard's lock. Each growing write is paired with the shrinking
+// write that undoes it, so the collection stays at its size; RPOP, with and
+// without a count, runs alone. Every call's result is checked, so a write that
+// silently did nothing fails the benchmark instead of speeding it up.
+func BenchmarkAccountedCollections(b *testing.B) {
+	payload := []byte("value")
+	extra := []byte("extra")
+
+	modes := []struct {
+		name  string
+		limit int64
+	}{
+		{"maxmemory off", 0},
+		{"maxmemory on", 1 << 40}, // far above what the benchmark stores, so nothing is evicted
+	}
+
+	// filled returns a store holding one collection of n values, made by fill
+	// before maxmemory is configured: with it on, every write while filling would
+	// take every shard lock.
+	filled := func(b *testing.B, limit int64, fill func(*Store) error) *Store {
+		b.Helper()
+		store := NewStore()
+		if err := fill(store); err != nil {
+			b.Fatal(err)
+		}
+		if limit > 0 {
+			store.ConfigureMaxMemory(limit, 16)
+		}
+		return store
+	}
+
+	for _, n := range []int{16, 1_000, 10_000} {
+		pairs := make([]HashFieldValue, n)
+		members := make([][]byte, n)
+		values := make([][]byte, n)
+		for i := 0; i < n; i++ {
+			pairs[i] = HashFieldValue{Field: fmt.Sprintf("f%d", i), Value: payload}
+			members[i] = fmt.Appendf(nil, "m%d", i)
+			values[i] = payload
+		}
+
+		b.Run(fmt.Sprintf("HSet+HDel at %d", n), func(b *testing.B) {
+			field := []HashFieldValue{{Field: "extra", Value: payload}}
+			fieldName := []string{"extra"}
+			for _, mode := range modes {
+				b.Run(mode.name, func(b *testing.B) {
+					store := filled(b, mode.limit, func(s *Store) error { _, _, err := s.HSet("h", pairs); return err })
+					b.ReportAllocs()
+					b.ResetTimer()
+
+					for i := 0; i < b.N; i++ {
+						if added, _, err := store.HSet("h", field); err != nil || added != 1 {
+							b.Fatalf("HSet() = %d, %v, want 1 field added", added, err)
+						}
+						if removed, err := store.HDel("h", fieldName); err != nil || removed != 1 {
+							b.Fatalf("HDel() = %d, %v, want 1 field removed", removed, err)
+						}
+					}
+				})
+			}
+		})
+
+		b.Run(fmt.Sprintf("SAdd+SRem at %d", n), func(b *testing.B) {
+			one := [][]byte{extra}
+			for _, mode := range modes {
+				b.Run(mode.name, func(b *testing.B) {
+					store := filled(b, mode.limit, func(s *Store) error { _, _, err := s.SAdd("s", members); return err })
+					b.ReportAllocs()
+					b.ResetTimer()
+
+					for i := 0; i < b.N; i++ {
+						if added, _, err := store.SAdd("s", one); err != nil || added != 1 {
+							b.Fatalf("SAdd() = %d, %v, want 1 member added", added, err)
+						}
+						if removed, err := store.SRem("s", one); err != nil || removed != 1 {
+							b.Fatalf("SRem() = %d, %v, want 1 member removed", removed, err)
+						}
+					}
+				})
+			}
+		})
+
+		b.Run(fmt.Sprintf("RPush+RPop at %d", n), func(b *testing.B) {
+			one := [][]byte{payload}
+			for _, mode := range modes {
+				b.Run(mode.name, func(b *testing.B) {
+					store := filled(b, mode.limit, func(s *Store) error { _, _, err := s.RightPush("l", values); return err })
+					b.ReportAllocs()
+					b.ResetTimer()
+
+					for i := 0; i < b.N; i++ {
+						if length, _, err := store.RightPush("l", one); err != nil || length != int64(n+1) {
+							b.Fatalf("RightPush() = %d, %v, want length %d", length, err, n+1)
+						}
+						if _, ok, err := store.RightPop("l"); err != nil || !ok {
+							b.Fatalf("RightPop() ok = %v, err = %v, want a value", ok, err)
+						}
+					}
+				})
+			}
+		})
+
+		// A pop on its own cannot keep its list at n values, so the pop rows pop
+		// lists of n values until they are empty, then refill them with the timer
+		// stopped. Stopping the timer reads the memory statistics, which stops the
+		// world, so enough lists are filled at once to pay for that only about
+		// once every 16,384 values popped. The lists hold n values down to the
+		// last pop, which deletes the key. Besides the pop, the timed loop only
+		// counts down the values left in the current list and the lists left.
+		popLists := func(b *testing.B, limit int64) (*Store, []string, func()) {
+			b.Helper()
+			keys := make([]string, max(1, 16_384/n))
+			for i := range keys {
+				keys[i] = fmt.Sprintf("l%d", i)
+			}
+			store := NewStore()
+			if limit > 0 {
+				store.ConfigureMaxMemory(limit, 16)
+			}
+			refill := func() {
+				for _, key := range keys {
+					if _, _, err := store.RightPush(key, values); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+			return store, keys, refill
+		}
+
+		b.Run(fmt.Sprintf("RPop from %d", n), func(b *testing.B) {
+			for _, mode := range modes {
+				b.Run(mode.name, func(b *testing.B) {
+					store, keys, refill := popLists(b, mode.limit)
+					list, left := 0, 0 // the list being popped, and the values it has left
+					b.ReportAllocs()
+					b.ResetTimer()
+
+					for i := 0; i < b.N; i++ {
+						if left == 0 {
+							if list == 0 {
+								b.StopTimer()
+								refill()
+								list = len(keys)
+								b.StartTimer()
+							}
+							list--
+							left = n
+						}
+						left--
+						if _, ok, err := store.RightPop(keys[list]); err != nil || !ok {
+							b.Fatalf("RightPop() ok = %v, err = %v, want a value", ok, err)
+						}
+					}
+				})
+			}
+		})
+
+		// RPOP with a count, which pops through RightPopN. Each n is a multiple of
+		// the count, so every call pops a full count.
+		const popCount = 4
+		b.Run(fmt.Sprintf("RPop count %d from %d", popCount, n), func(b *testing.B) {
+			for _, mode := range modes {
+				b.Run(mode.name, func(b *testing.B) {
+					store, keys, refill := popLists(b, mode.limit)
+					list, left := 0, 0 // the list being popped, and the values it has left
+					b.ReportAllocs()
+					b.ResetTimer()
+
+					for i := 0; i < b.N; i++ {
+						if left == 0 {
+							if list == 0 {
+								b.StopTimer()
+								refill()
+								list = len(keys)
+								b.StartTimer()
+							}
+							list--
+							left = n
+						}
+						left -= popCount
+						if popped, ok, err := store.RightPopN(keys[list], popCount); err != nil || !ok || len(popped) != popCount {
+							b.Fatalf("RightPopN() = %d values, ok = %v, err = %v, want %d values", len(popped), ok, err, popCount)
+						}
+					}
+				})
+			}
+		})
+	}
+}

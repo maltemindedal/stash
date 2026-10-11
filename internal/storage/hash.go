@@ -1,7 +1,5 @@
 package storage
 
-import "time"
-
 // HSet assigns one or more field/value pairs on the hash stored at key and
 // returns the number of newly created fields. Existing fields are overwritten.
 // When maxmemory is configured it first frees space and reports the keys
@@ -40,7 +38,6 @@ func (s *Store) HSet(key string, pairs []HashFieldValue) (int64, []string, error
 			}
 			added = int64(newLen)
 		}
-		newValue.touch(w.now)
 
 		evicted, err := w.commit(newValue)
 		if err != nil {
@@ -84,8 +81,9 @@ func (s *Store) HDel(key string, fields []string) (int64, error) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	now := s.now()
 	value, ok := shard.data[key]
-	if ok && isExpired(value, time.Now().UnixMilli()) {
+	if ok && isExpired(value, now) {
 		s.deleteKeyLocked(shard, key)
 		ok = false
 	}
@@ -103,7 +101,7 @@ func (s *Store) HDel(key string, fields []string) (int64, error) {
 		return 0, err
 	}
 
-	value.touch(time.Now().UnixMilli())
+	value.touch(now)
 	hashLen, err := value.hashLen()
 	if err != nil {
 		return 0, err

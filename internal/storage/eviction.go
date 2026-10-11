@@ -92,7 +92,7 @@ func (s *Store) sweepSample(sampleSize int) (sampled, removed int) {
 	release := s.acquireEvictionGuard()
 	defer release()
 
-	sampled, expired := s.evictExpiredSample(time.Now().UnixMilli(), sampleSize)
+	sampled, expired := s.evictExpiredSample(s.now(), sampleSize)
 	if len(expired) > 0 {
 		s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
 		// Published once evictExpiredSample has released every shard lock
