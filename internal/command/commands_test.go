@@ -1332,34 +1332,37 @@ func TestExecutorWait(t *testing.T) {
 		replication.AdvanceMasterOffset(50)
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(50)
-		ctx := withClient(context.Background(), writer)
+		// This WAIT ends when the replica acknowledges, not when a clock says so: the
+		// replica acknowledges the moment GETACK reaches it, and WAIT's own timeout
+		// is an hour, so a replica goroutine that the machine does not schedule for a
+		// while cannot make WAIT answer 0 first. ctx only bounds a WAIT whose
+		// acknowledgement never comes, which the replica goroutine cancels when it
+		// knows it will not send one.
+		ctx, cancel := context.WithTimeout(withClient(context.Background(), writer), 30*time.Second)
+		defer cancel()
 
-		requestSeen := make(chan struct{})
+		replicaDone := make(chan struct{})
+		var replicaErr error
 		go func() {
-			defer close(requestSeen)
+			defer close(replicaDone)
 
-			parser := protocol.NewParser(replicaConn)
-			value, err := parser.Parse()
-			if err != nil {
-				return
+			replicaErr = acknowledgeGetAck(replicaConn, registry, 11, 50)
+			if replicaErr != nil {
+				cancel()
 			}
-			request, err := DecodeRequest(value)
-			if err != nil {
-				return
-			}
-			if request.Name != "REPLCONF" || len(request.Args) != 2 || string(request.Args[0]) != "GETACK" || string(request.Args[1]) != "*" {
-				return
-			}
-
-			time.Sleep(20 * time.Millisecond)
-			registry.UpdateAck(11, 50)
 		}()
 
-		result, err := handle(ctx, executor, requestValue("WAIT", "1", "200"), false)
+		result, err := handle(ctx, executor, requestValue("WAIT", "1", "3600000"), false)
+		// WAIT can only answer 1 after the replica has acknowledged; in any other
+		// case the replica may still be reading, so closing its end ends that.
+		_ = replicaConn.Close()
+		<-replicaDone
+		if replicaErr != nil {
+			t.Fatalf("replica did not acknowledge: %v (WAIT error = %v)", replicaErr, err)
+		}
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
-		<-requestSeen
 
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -3130,6 +3133,28 @@ func newReplicaPeerStateForExecutor(executor *Executor, id uint64, conn net.Conn
 	state.PromoteToReplica()
 	state.BindResponseWriter(bufio.NewWriter(conn))
 	return state
+}
+
+// acknowledgeGetAck is the replica at the far end of conn: it reads the next
+// request, requires it to be REPLCONF GETACK *, and acknowledges offset for
+// replica id in registry as soon as it has, which is what a replica does with
+// GETACK.
+func acknowledgeGetAck(conn net.Conn, registry *server.ReplicaRegistry, id uint64, offset int64) error {
+	value, err := protocol.NewParser(conn).Parse()
+	if err != nil {
+		return fmt.Errorf("read GETACK: %w", err)
+	}
+	request, err := DecodeRequest(value)
+	if err != nil {
+		return fmt.Errorf("decode GETACK: %w", err)
+	}
+	if request.Name != "REPLCONF" || len(request.Args) != 2 || string(request.Args[0]) != "GETACK" || string(request.Args[1]) != "*" {
+		return fmt.Errorf("request = %s %q, want REPLCONF GETACK *", request.Name, request.Args)
+	}
+	if !registry.UpdateAck(id, offset) {
+		return fmt.Errorf("replica %d is not registered", id)
+	}
+	return nil
 }
 
 func storedExpiryMillis(t *testing.T, executor *Executor, key string) int64 {
