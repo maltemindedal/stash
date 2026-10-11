@@ -183,6 +183,14 @@ type eventLoop struct {
 	// pushOutput is the output waiting for the push-receiving connections that
 	// are not replicas, as last accounted by accountPushOutput.
 	pushOutput int
+	// draining is set once the server shuts down or accepting fails
+	// (beginDrain). The loop then serves only the replicas, to send them what is
+	// queued for them, and returns drainErr once shutdown has stopped their feeds
+	// and each replica has received the end of its stream and closed its
+	// connection, or once drainExpired is set, replicaShutdownGrace later.
+	draining     bool
+	drainErr     error
+	drainExpired atomic.Bool
 
 	mu           sync.Mutex
 	pushed       []*eventConn
@@ -214,6 +222,12 @@ type eventConn struct {
 	// replica is set once the connection has become a replica peer. It is read
 	// from other goroutines (queuePush), hence atomic.
 	replica atomic.Bool
+	// endStream is set when shutdown asks for a replica's connection to be
+	// closed while the loop drains: once its output has reached the kernel, the
+	// loop shuts the write side (writeShut) and closes the connection when the
+	// replica closes its own.
+	endStream bool
+	writeShut bool
 
 	pushBuf        []byte
 	pushQueued     bool
@@ -231,21 +245,21 @@ func (l *eventLoop) run(ctx context.Context) error {
 	defer stopWake()
 
 	for {
+		if l.draining && (len(l.conns) == 0 || l.drainExpired.Load()) {
+			return l.drainErr
+		}
 		n, err := l.poller.Wait(l.events)
 		if err != nil {
 			return fmt.Errorf("server: event loop wait: %w", err)
-		}
-		if ctx.Err() != nil {
-			return nil
 		}
 
 		l.applyQueuedWork()
 
 		for _, event := range l.events[:n] {
 			if event.fd == l.listenFD {
-				if event.readable {
+				if event.readable && !l.draining {
 					if err := l.acceptReady(); err != nil {
-						return err
+						l.beginDrain(err)
 					}
 				}
 				continue
@@ -296,6 +310,13 @@ func (l *eventLoop) applyQueuedWork() {
 	l.resumeAccept = false
 	l.mu.Unlock()
 
+	// Checked after the queues are taken: shutdown, which the cancellation
+	// starts, asks for the replicas to be closed only after it has stopped
+	// their feeds, and those requests must find the loop draining.
+	if l.ctx.Err() != nil && !l.draining {
+		l.beginDrain(nil)
+	}
+
 	for _, push := range pushes {
 		if l.conns[push.conn.fd] != push.conn {
 			continue
@@ -308,17 +329,57 @@ func (l *eventLoop) applyQueuedWork() {
 	}
 
 	for _, conn := range closes {
-		if l.conns[conn.fd] == conn {
-			l.closeConn(conn, nil)
+		if l.conns[conn.fd] != conn {
+			continue
 		}
+		if l.draining && conn.replica.Load() {
+			// Shutdown has stopped the replica's feed, whose last frames the
+			// pushes above buffered: send them and end the stream
+			// (finishConnEvent).
+			conn.endStream = true
+			l.finishConnEvent(conn)
+			continue
+		}
+		l.closeConn(conn, nil)
 	}
 
-	if resumeAccept && l.acceptPaused {
+	if resumeAccept && l.acceptPaused && !l.draining {
 		if err := l.poller.Set(l.listenFD, true, false); err != nil {
 			l.srv.logger.Warn("failed to resume accepting after descriptor exhaustion", "error", err)
 			return
 		}
 		l.acceptPaused = false
+	}
+}
+
+// beginDrain starts the loop's end, when the server shuts down (cause is nil) or
+// accepting fails (cause, which run then returns). It stops accepting and closes
+// every connection but the replicas'. The replicas' feeds go on pushing until
+// shutdown stops them (ReplicaRegistry.StopFeeds) and then ends their streams
+// (ReplicaRegistry.EndStreams): each connection is sent what it holds, has its
+// write side shut, and is closed once the replica closes its own
+// (applyQueuedWork, finishConnEvent). Whatever is left when
+// replicaShutdownGrace has passed is dropped with the connections when run
+// returns.
+func (l *eventLoop) beginDrain(cause error) {
+	l.draining = true
+	l.drainErr = cause
+	if err := l.poller.Set(l.listenFD, false, false); err != nil {
+		l.srv.logger.Debug("failed to stop accepting connections for shutdown", "error", err)
+	}
+	for _, conn := range l.conns {
+		if !conn.replica.Load() {
+			l.closeConn(conn, nil)
+		}
+	}
+	time.AfterFunc(replicaShutdownGrace, func() {
+		l.drainExpired.Store(true)
+		_ = l.poller.Wake()
+	})
+	if cause != nil {
+		// Only a cancelled context starts shutdown on its own; serve would start
+		// it once run returns, which waits for it.
+		go l.srv.shutdown()
 	}
 }
 
@@ -650,6 +711,18 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 		l.closeConn(conn, nil)
 		return
 	}
+	if conn.endStream && !conn.writeShut && !conn.machine.HasPendingOutput() {
+		// The end of the replica's stream may still be in the kernel's send
+		// queue, and closing the socket now would let the replica's next
+		// request (an acknowledgement) draw a reset that discards it. Shutting
+		// the write side sends it, then the end of the stream; the replica's own
+		// close is read as peerClosed above.
+		if err := syscall.Shutdown(conn.fd, syscall.SHUT_WR); err != nil {
+			l.closeConn(conn, err)
+			return
+		}
+		conn.writeShut = true
+	}
 
 	// Reading stays off after EOF (level-triggered readiness would spin) and
 	// while output is backed up beyond the high-water mark.
@@ -808,6 +881,15 @@ func (h *eventConnHandle) Close() error {
 
 // RemoteAddr returns the peer address captured when the connection was accepted.
 func (h *eventConnHandle) RemoteAddr() net.Addr { return h.conn.remoteAddr }
+
+// CloseWrite asks the loop to end the stream to a replica (ReplicaRegistry.EndStreams):
+// to send what the connection holds, shut its write side, and close it once
+// the replica has closed its own. The loop, draining by then, does that for a
+// replica asked to close at all (applyQueuedWork).
+func (h *eventConnHandle) CloseWrite() error {
+	h.loop.requestClose(h.conn)
+	return nil
+}
 
 // markReplica holds the connection's waiting output to the replica limit from
 // now on. registerReplicaPeer calls it before the replica's feed starts pushing.

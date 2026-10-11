@@ -157,6 +157,12 @@ type ReplicaRegistry struct {
 	// attaching counts the replicas between BeginAttach and their Reserve or
 	// EndAttach, which Active counts as replicas already.
 	attaching int
+	// stopping is set by StopPropagating once the server is shutting down and
+	// drains what each feed holds. Propagate then counts frames but queues them
+	// for no replica: a feed closed for the drain would refuse them, and the
+	// refusal would drop the replica and close its socket in the middle of the
+	// drain.
+	stopping bool
 
 	// onFeedError is called, with mu not held, when a replica can no longer be
 	// fed: on the feed's own goroutine when a write to its socket fails, and on
@@ -355,13 +361,17 @@ func (r *ReplicaRegistry) Start(id uint64, conn ClientConn) bool {
 // never for a socket write. A replica whose feed refuses payload (it is closed,
 // or too far behind) is sent nothing after it, and is dropped once the lock is
 // released, through the feed-error handler, or by RemoveAndClose when none is
-// set.
+// set. Once shutdown has begun (StopPropagating), Propagate only counts payload.
 func (r *ReplicaRegistry) Propagate(offsets *ReplicationState, payload []byte) (end int64, queued, refused int) {
 	// Refusals are rare, so the slice is only allocated when one happens.
 	var refusals []replicaRefusal
 
 	r.mu.Lock()
 	end = offsets.AdvanceMasterOffset(int64(len(payload)))
+	if r.stopping {
+		r.mu.Unlock()
+		return end, 0, 0
+	}
 	for id, peer := range r.replicas {
 		if err := peer.WriteEncoded(payload); err != nil {
 			// Close the feed so that it refuses every later frame as well. A
@@ -423,13 +433,28 @@ func (r *ReplicaRegistry) SetFeedErrorHandler(handler func(id uint64, err error)
 	r.onFeedError = handler
 }
 
-// StopFeeds gives every replica's feed up to grace to write what is queued for it
-// and then stops them, returning how many had not finished. The server calls it
-// on shutdown, before it closes the sockets, so that commands already propagated
-// are not lost to a graceful stop. A feed that has not started, because its
-// replica is still being sent its full resync, is stopped without waiting: that
-// replica has to synchronise again from the start anyway.
+// StopPropagating makes Propagate queue nothing more for any replica, and
+// returns how many replicas are registered. Frames are still counted. The server
+// calls it when shutdown begins: a write made from then on reaches no replica,
+// which has to synchronise again from the start anyway, and no replica is
+// dropped for it while its feed drains.
+func (r *ReplicaRegistry) StopPropagating() (replicas int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.stopping = true
+	return len(r.replicas)
+}
+
+// StopFeeds stops propagating (StopPropagating), gives every replica's feed up to
+// grace to write what is queued for it and then stops them, returning how many
+// had not finished. The server calls it on shutdown, before it closes the
+// sockets, so that commands already propagated are not lost to a graceful stop.
+// A feed that has not started, because its replica is still being sent its full
+// resync, is stopped without waiting: that replica has to synchronise again from
+// the start anyway.
 func (r *ReplicaRegistry) StopFeeds(grace time.Duration) (unfinished int) {
+	r.StopPropagating()
 	peers := r.Snapshot()
 	deadline := time.Now().Add(grace)
 	for _, peer := range peers {
@@ -438,6 +463,60 @@ func (r *ReplicaRegistry) StopFeeds(grace time.Duration) (unfinished int) {
 		}
 	}
 	return unfinished
+}
+
+// streamEnder is a replica connection whose write side can be shut on its own:
+// a TCP connection in the default networking mode, the event loop's handle in
+// the other.
+type streamEnder interface {
+	CloseWrite() error
+}
+
+// EndStreams shuts the write side of every started replica's connection, once
+// StopFeeds has sent them what was queued, and waits until deadline for those
+// replicas to close their own side, which removes them from the registry. It
+// returns how many had not. Closing a replica's socket outright while the end of
+// its stream is still in the kernel's send queue would let the replica's next
+// acknowledgement draw a reset that discards it.
+func (r *ReplicaRegistry) EndStreams(deadline time.Time) (remaining int) {
+	r.mu.RLock()
+	enders := make(map[uint64]streamEnder, len(r.replicas))
+	for id, peer := range r.replicas {
+		if ender, ok := peer.Conn.(streamEnder); ok {
+			enders[id] = ender
+		}
+	}
+	r.mu.RUnlock()
+
+	for id, ender := range enders {
+		// One that fails is closed with every other connection afterwards.
+		if err := ender.CloseWrite(); err != nil {
+			delete(enders, id)
+		}
+	}
+
+	for {
+		r.mu.RLock()
+		remaining = 0
+		for id := range enders {
+			if _, ok := r.replicas[id]; ok {
+				remaining++
+			}
+		}
+		changed := r.changed
+		r.mu.RUnlock()
+
+		wait := time.Until(deadline)
+		if remaining == 0 || wait <= 0 {
+			return remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-changed:
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
 }
 
 // UpdateAck records the latest replication offset a replica peer acknowledged,

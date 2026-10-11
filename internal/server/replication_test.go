@@ -699,6 +699,126 @@ func TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted(t *testing.T) {
 	}
 }
 
+// TestAFrameCountedWhileShutdownDrainsAFeedDoesNotDropItsReplica propagates a
+// frame while StopFeeds waits for a replica that is slow to read to take what is
+// queued for it. The frame reaches no replica, and the replica keeps its socket
+// until it has taken everything queued before the shutdown. Its feed, closed for
+// the drain, used to refuse the frame, and the refusal dropped the replica and
+// closed its socket in the middle of the drain.
+func TestAFrameCountedWhileShutdownDrainsAFeedDoesNotDropItsReplica(t *testing.T) {
+	registry := NewReplicaRegistry()
+	offsets := &ReplicationState{}
+	var drops atomic.Int32
+	registry.SetFeedErrorHandler(func(uint64, error) { drops.Add(1) })
+
+	serverConn, replicaConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = replicaConn.Close() }()
+	registry.Add(offsets, 1, serverConn, 6380, newReplicaPeerStateForTest(1, serverConn))
+
+	// The replica reads nothing yet, so the feed's write waits on the pipe.
+	queued := bytes.Repeat([]byte("q"), 1<<10)
+	if _, queuedFor, _ := registry.Propagate(offsets, queued); queuedFor != 1 {
+		t.Fatalf("Propagate() before the shutdown queued for %d replicas, want 1", queuedFor)
+	}
+
+	stopped := make(chan int, 1)
+	go func() { stopped <- registry.StopFeeds(10 * time.Second) }()
+	registry.mu.RLock()
+	feed := registry.replicas[1].feed
+	registry.mu.RUnlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		feed.mu.Lock()
+		closed := feed.closed
+		feed.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("StopFeeds() had not closed the feed after 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if _, queuedFor, refused := registry.Propagate(offsets, []byte("during the drain")); queuedFor != 0 || refused != 0 {
+		t.Fatalf("Propagate() during the drain: queued for %d replicas, refused by %d; want neither", queuedFor, refused)
+	}
+
+	received := make([]byte, len(queued))
+	if _, err := io.ReadFull(replicaConn, received); err != nil {
+		t.Fatalf("reading what was queued before the shutdown: %v", err)
+	}
+	if !bytes.Equal(received, queued) {
+		t.Fatalf("the replica received %q, want what was queued before the shutdown", received)
+	}
+	if unfinished := <-stopped; unfinished != 0 {
+		t.Fatalf("StopFeeds() = %d unfinished, want 0", unfinished)
+	}
+	if got := drops.Load(); got != 0 {
+		t.Fatalf("the replica was dropped %d times, want never", got)
+	}
+}
+
+// halfClosingConn is a replica connection that records CloseWrite.
+type halfClosingConn struct {
+	stubConn
+	closeWrites atomic.Int32
+}
+
+func (c *halfClosingConn) CloseWrite() error {
+	c.closeWrites.Add(1)
+	return nil
+}
+
+// TestEndStreamsHalfClosesEachReplicaAndWaitsForItToLeave ends the streams of
+// the replicas at shutdown. Each started replica's connection is half-closed,
+// never closed, so the end of its stream still reaches it, and EndStreams waits
+// until the replica has closed its own side, which removes it from the
+// registry, or until the deadline.
+func TestEndStreamsHalfClosesEachReplicaAndWaitsForItToLeave(t *testing.T) {
+	tests := []struct {
+		name          string
+		replicaCloses bool
+		wantRemaining int
+	}{
+		{name: "the replica closes its side", replicaCloses: true, wantRemaining: 0},
+		{name: "the replica does not close its side before the deadline", wantRemaining: 1},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			registry := NewReplicaRegistry()
+			offsets := &ReplicationState{}
+			conn := &halfClosingConn{}
+			registry.Add(offsets, 1, conn, 6380, newReplicaPeerStateForTest(1, &recordingConn{}))
+			if tt.replicaCloses {
+				// As the replica's connection handler does when it reads the
+				// replica's close.
+				go func() {
+					for conn.closeWrites.Load() == 0 {
+						time.Sleep(time.Millisecond)
+					}
+					registry.Remove(1)
+				}()
+			}
+
+			remaining := registry.EndStreams(time.Now().Add(200 * time.Millisecond))
+			if remaining != tt.wantRemaining {
+				t.Fatalf("EndStreams() = %d remaining, want %d", remaining, tt.wantRemaining)
+			}
+			if got := conn.closeWrites.Load(); got != 1 {
+				t.Fatalf("CloseWrite() called %d times, want once", got)
+			}
+			if got := conn.closes.Load(); got != 0 {
+				t.Fatalf("Close() called %d times, want never: closing would reset a replica still acknowledging", got)
+			}
+			registry.StopFeeds(time.Second)
+		})
+	}
+}
+
 // TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts starts the feed of a
 // replica whose connection, like the event loop's, holds waiting output to a
 // limit that depends on being a replica. The connection must be marked before
