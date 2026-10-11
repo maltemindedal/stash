@@ -186,7 +186,7 @@ func ErrWrongPassError() error {
 
 // ErrAuthNotConfiguredError reports that AUTH is unavailable because no password is configured.
 func ErrAuthNotConfiguredError() error {
-	return newRESPWrappedError("ERR", ErrAuthNotConfigured)
+	return newRESPError("ERR", "AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?", ErrAuthNotConfigured)
 }
 
 // ErrSubscribedModeOnlyError reports that only pub/sub-safe commands are allowed.

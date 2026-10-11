@@ -207,6 +207,26 @@ func TestServerRequiresAuthWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestAuthOnAServerWithoutAPasswordAnswersRedisError(t *testing.T) {
+	addr, cancel, errCh := startTestServer(t, defaultTestConfig())
+	defer func() {
+		cancel()
+		waitForServerStop(t, errCh)
+	}()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial(%q) error = %v", addr, err)
+	}
+	defer closeTestResource(t, conn)
+	parser := protocol.NewParser(conn)
+
+	// Redis's text, question mark included (authCommand in Redis's src/acl.c).
+	authNotConfigured := protocol.ErrorValue{Message: "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"}
+	assertCommandResponse(t, conn, parser, authNotConfigured, "AUTH", "secret")
+	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "name", "Stash")
+}
+
 func TestServerHandlesListCommands(t *testing.T) {
 	cfg := defaultTestConfig()
 
