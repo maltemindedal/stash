@@ -33,7 +33,7 @@ go run ./cmd/stash --requirepass-file /etc/stash/password
 
 For a replica, use `--masterauth-file` the same way. Startup fails if the file is empty or unreadable, and if you give both `--requirepass` and `--requirepass-file`.
 
-Unauthenticated clients may still issue `PING`. Every other command, including the replication handshake, requires authentication first.
+Unauthenticated clients may still issue `PING`. Every other command, including the replication handshake, requires authentication first. It is refused before the server orders it against other clients' requests, so a client without the password cannot make them wait, not even by sending `EXEC`, which runs with every other request held back.
 
 Authentication fails closed. Whether a client may run a command is decided by its own connection's Client state alone: on a server started with `--requirepass` every connection starts unauthenticated, and only a successful `AUTH` on that connection changes that. Should the password not reach the code that checks `AUTH`, clients are locked out (`AUTH` answers that no password is configured) rather than let in, and a client request that arrives without its Client state is refused. Besides a client's `AUTH` and `PING`, only two kinds of request run without authenticating: the writes a replica receives from its master and the commands replayed from the append-only file at startup, because they come from no client. One of those that carries a client's state is refused rather than let it borrow their rights.
 
