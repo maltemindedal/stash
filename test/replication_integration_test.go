@@ -1923,7 +1923,13 @@ func TestReplicationStructuredLogs(t *testing.T) {
 	replicaParser := protocol.NewParser(replicaConn)
 
 	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "name", "Stash")
-	assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "WAIT", "1", "1000")
+	// WAIT is what waits for the replica, so it answers as soon as the replica
+	// acknowledges and its timeout only bounds a replica that never does. The
+	// replica can still be loading its snapshot when WAIT starts, since the master
+	// counts it from the moment it copies the snapshot, and a process that the
+	// machine leaves unscheduled for longer than a short timeout would answer 0
+	// with the acknowledgement already waiting on the socket.
+	assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "WAIT", "1", "30000")
 	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("Stash")}, 2*time.Second, "GET", "name")
 
 	cancelReplica()
