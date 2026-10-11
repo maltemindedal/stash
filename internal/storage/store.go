@@ -67,8 +67,8 @@ type Store struct {
 // Within the store, two things read the system clock directly because they pace
 // work rather than decide what a key holds: the time budget of a background
 // eviction pass, and the shard a key sample starts from. The value constructors
-// also stamp a new value from the system clock, but the write that stores it
-// stamps it again with its own reading. Code outside the store takes its own
+// read no clock: they leave a new value unstamped, and the write that stores it
+// stamps it with its own reading. Code outside the store takes its own
 // reading of the system clock to judge TTLs: SET for its relative EX or PX
 // (ParseExpiryMillis is handed it), RDB loading and snapshot building, and the
 // AOF rewrite.
@@ -181,11 +181,7 @@ func (s *Store) publishExpiredKeys() {
 // it first frees space and reports the keys evicted to make room; otherwise it
 // evicts nothing.
 func (s *Store) Set(key string, value []byte, expiresAt int64) ([]string, error) {
-	_, evicted, err := writeKey(s, key, func(w keyWrite) (struct{}, []string, error) {
-		evicted, err := w.commit(newStringValue(value, expiresAt))
-		return struct{}{}, evicted, err
-	})
-	return evicted, err
+	return replaceKey(s, key, newStringValue(value, expiresAt))
 }
 
 // Get fetches a value from the store, passively evicting it if it has expired.
@@ -272,39 +268,24 @@ func (s *Store) DeleteMany(keys []string) []string {
 // maxmemory is configured it first frees space and reports the keys evicted to
 // make room; otherwise it evicts nothing.
 func (s *Store) Increment(key string) (int64, []string, error) {
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		if w.current == nil {
-			evicted, err := w.commit(newOwnedStringValue([]byte("1"), 0))
-			if err != nil {
-				return 0, nil, err
+	return mutateString(s, key, func(w stringWrite) (int64, []string, error) {
+		parsed := int64(0)
+		if current, ok := w.Current(); ok {
+			n, err := strconv.ParseInt(string(current), 10, 64)
+			if err != nil || n == math.MaxInt64 {
+				return 0, nil, ErrValueNotInteger
 			}
-			return 1, evicted, nil
-		}
-
-		currentValue, err := w.current.StringValue()
-		if err != nil {
-			return 0, nil, err
-		}
-		parsed, err := strconv.ParseInt(string(currentValue), 10, 64)
-		if err != nil || parsed == math.MaxInt64 {
-			return 0, nil, ErrValueNotInteger
+			parsed = n
 		}
 		parsed++
-		next := []byte(strconv.FormatInt(parsed, 10))
 
-		if !w.accounting {
-			w.current.String = next
-			w.current.touch(w.now)
-			return parsed, nil, nil
-		}
-
-		// Size the write against the pre-write value, and leave the counter
-		// untouched if it turns out to breach maxmemory, by committing a
-		// replacement rather than editing the string still stored under the key.
-		evicted, err := w.commit(newOwnedStringValue(next, w.current.ExpiresAt))
+		var digits [20]byte // the longest int64, with its sign
+		next := strconv.AppendInt(digits[:0], parsed, 10)
+		payload, evicted, err := w.Payload(len(next))
 		if err != nil {
 			return 0, nil, err
 		}
+		copy(payload, next)
 		return parsed, evicted, nil
 	})
 }

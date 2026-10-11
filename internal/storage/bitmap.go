@@ -28,40 +28,19 @@ func (s *Store) SetBit(key string, offset int64, bit int64) (int64, []string, er
 		return 0, nil, err
 	}
 
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		var (
-			data      []byte
-			expiresAt int64
-		)
-		if w.current != nil {
-			current, err := w.current.StringValue()
-			if err != nil {
-				return 0, nil, err
-			}
-			data = current
-			expiresAt = w.current.ExpiresAt
-		}
-
+	return mutateString(s, key, func(w stringWrite) (int64, []string, error) {
+		data, _ := w.Current()
 		previous := bitAt(data, offset)
 		byteIndex := int(offset / 8)
 		mask := byte(1 << uint(7-(offset%8)))
-		if byteIndex < len(data) && !w.accounting {
-			// The payload already reaches the offset, so the bit can be flipped
-			// where it lies. While accounting the write still goes through commit
-			// below, which sizes it against the stored value and therefore needs
-			// that value intact.
-			setBitInByte(&data[byteIndex], mask, bit)
-			w.current.touch(w.now)
-			return previous, nil, nil
-		}
 
-		evicted, err := w.commitString(max(byteIndex+1, len(data)), expiresAt, func(payload []byte) {
-			copy(payload, data)
-			setBitInByte(&payload[byteIndex], mask, bit)
-		})
+		// Within the string the bit is set where it lies. Past its end Payload
+		// gives a longer copy, sized before it is allocated.
+		payload, evicted, err := w.Payload(max(byteIndex+1, len(data)))
 		if err != nil {
 			return 0, nil, err
 		}
+		setBitInByte(&payload[byteIndex], mask, bit)
 		return previous, evicted, nil
 	})
 }

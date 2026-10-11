@@ -5,7 +5,6 @@ import (
 	"maps"
 	"math"
 	"sync/atomic"
-	"time"
 )
 
 var errInvalidValueObjectState = errors.New("storage: invalid value object state")
@@ -366,10 +365,9 @@ func newStringValue(data []byte, expiresAt int64) *ValueObject {
 // Callers must only pass byte slices that are not aliased with caller-controlled memory.
 func newOwnedStringValue(data []byte, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		String:         data,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindString,
+		String:    data,
+		ExpiresAt: expiresAt,
+		Kind:      ValueKindString,
 	}
 }
 
@@ -378,38 +376,34 @@ func newOwnedStringValue(data []byte, expiresAt int64) *ValueObject {
 // controlled memory.
 func newListValue(items [][]byte, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		List:           items,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindList,
+		List:      items,
+		ExpiresAt: expiresAt,
+		Kind:      ValueKindList,
 	}
 }
 
 func newZSetValue(set *SortedSet, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		ZSet:           set,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindZSet,
+		ZSet:      set,
+		ExpiresAt: expiresAt,
+		Kind:      ValueKindZSet,
 	}
 }
 
 func newCompactZSetValue(set *CompactZSet, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		CompactZSet:    set,
-		ZSetEncoding:   ValueEncodingCompact,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindZSet,
+		CompactZSet:  set,
+		ZSetEncoding: ValueEncodingCompact,
+		ExpiresAt:    expiresAt,
+		Kind:         ValueKindZSet,
 	}
 }
 
 func newStreamValue(stream *StreamValue, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		Stream:         stream,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindStream,
+		Stream:    stream,
+		ExpiresAt: expiresAt,
+		Kind:      ValueKindStream,
 	}
 }
 
@@ -463,38 +457,34 @@ func (v *ValueObject) SetValue() (map[string]struct{}, error) {
 
 func newHashValue(fields map[string][]byte, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		Hash:           fields,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindHash,
+		Hash:      fields,
+		ExpiresAt: expiresAt,
+		Kind:      ValueKindHash,
 	}
 }
 
 func newCompactHashValue(hash *CompactHash, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		CompactHash:    hash,
-		HashEncoding:   ValueEncodingCompact,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindHash,
+		CompactHash:  hash,
+		HashEncoding: ValueEncodingCompact,
+		ExpiresAt:    expiresAt,
+		Kind:         ValueKindHash,
 	}
 }
 
 func newSetValue(members map[string]struct{}, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		Set:            members,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindSet,
+		Set:       members,
+		ExpiresAt: expiresAt,
+		Kind:      ValueKindSet,
 	}
 }
 
 func newIntSetValue(members *IntSet, expiresAt int64) *ValueObject {
 	return &ValueObject{
-		IntSet:         members,
-		SetEncoding:    ValueEncodingCompact,
-		ExpiresAt:      expiresAt,
-		LastAccessedAt: time.Now().UnixMilli(),
-		Kind:           ValueKindSet,
+		IntSet:      members,
+		SetEncoding: ValueEncodingCompact,
+		ExpiresAt:   expiresAt,
+		Kind:        ValueKindSet,
 	}
 }

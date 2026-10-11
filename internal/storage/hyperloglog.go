@@ -41,32 +41,27 @@ var hllRankReciprocal = func() [hllMaxRank + 1]float64 {
 // cardinality estimate changed. When maxmemory is configured it first frees
 // space and reports the keys evicted to make room; otherwise it evicts nothing.
 func (s *Store) PFAdd(key string, elements [][]byte) (int64, []string, error) {
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		if w.current == nil {
-			payload := newHyperLogLogPayload()
-			updateHyperLogLogRegisters(payload[hllHeaderSize:], elements)
-			evicted, err := w.commit(newOwnedStringValue(payload, 0))
-			if err != nil {
+	return mutateString(s, key, func(w stringWrite) (int64, []string, error) {
+		data, exists := w.Current()
+		if exists {
+			if _, err := hyperLogLogRegisters(data); err != nil {
 				return 0, nil, err
 			}
+		}
+		// A HyperLogLog's layout is fixed at creation, and hyperLogLogRegisters
+		// rejects a payload of any other length, so for an existing key Payload
+		// hands back the stored buffer and the registers are updated where they
+		// lie.
+		payload, evicted, err := w.Payload(hllValueSize)
+		if err != nil {
+			return 0, nil, err
+		}
+		if !exists {
+			writeHyperLogLogHeader(payload)
+			updateHyperLogLogRegisters(payload[hllHeaderSize:], elements)
 			return 1, evicted, nil
 		}
-
-		data, err := w.current.StringValue()
-		if err != nil {
-			return 0, nil, err
-		}
-		registers, err := hyperLogLogRegisters(data)
-		if err != nil {
-			return 0, nil, err
-		}
-		// Registers are updated where they lie, even while accounting: the
-		// layout is fixed at creation and hyperLogLogRegisters rejects any
-		// payload of another length, so this write cannot change the key's size
-		// and has nothing for commit to weigh.
-		changed := updateHyperLogLogRegisters(registers, elements)
-		w.current.touch(w.now)
-		return changed, nil, nil
+		return updateHyperLogLogRegisters(payload[hllHeaderSize:], elements), evicted, nil
 	})
 }
 
@@ -101,11 +96,11 @@ func (s *Store) mergeHyperLogLogRegisters(key string, merged []byte) error {
 	return err
 }
 
-func newHyperLogLogPayload() []byte {
-	payload := make([]byte, hllValueSize)
+// writeHyperLogLogHeader writes the header of an empty HyperLogLog into payload,
+// a zeroed buffer of hllValueSize bytes.
+func writeHyperLogLogHeader(payload []byte) {
 	copy(payload, hllMagic)
 	payload[len(hllMagic)] = hllDenseEncoding
-	return payload
 }
 
 // hyperLogLogRegisters validates the header and register ranges of a stored

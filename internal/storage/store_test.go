@@ -186,6 +186,29 @@ func TestStoreValueBehavior(t *testing.T) {
 			},
 		},
 		{
+			name: "SetBit past the end keeps the bytes before it and the key's TTL",
+			run: func(t *testing.T, store *Store) {
+				t.Helper()
+				for _, maxMemory := range []int64{0, 1 << 30} {
+					store.ConfigureMaxMemory(maxMemory, 16)
+					deadline := time.Now().Add(time.Hour).UnixMilli()
+					if _, err := store.Set("bitmap", []byte("ab"), deadline); err != nil {
+						t.Fatalf("Set() error = %v", err)
+					}
+
+					if _, _, err := store.SetBit("bitmap", 31, 1); err != nil {
+						t.Fatalf("SetBit() with maxmemory %d error = %v", maxMemory, err)
+					}
+					if got, _, err := store.Get("bitmap"); err != nil || !bytes.Equal(got, []byte{'a', 'b', 0, 1}) {
+						t.Fatalf("Get() with maxmemory %d = %q, %v, want %q", maxMemory, got, err, []byte{'a', 'b', 0, 1})
+					}
+					if got := store.valueObjectForTest("bitmap").ExpiresAt; got != deadline {
+						t.Fatalf("SetBit() with maxmemory %d left the TTL deadline at %d, want %d", maxMemory, got, deadline)
+					}
+				}
+			},
+		},
+		{
 			name: "SetBit returns previous bit when overwriting",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
@@ -321,9 +344,9 @@ func TestStoreValueBehavior(t *testing.T) {
 
 				// At the limit, a SetBit past the end needs room the store cannot
 				// make. It is refused, and the payload it would have grown stays
-				// as it was. Whether an in-range SetBit edits the stored payload
-				// in place is not pinned: a write that cannot change the value's
-				// size cannot be refused.
+				// as it was. An in-range SetBit edits the stored payload in place
+				// (TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas): a write
+				// that cannot change the value's size cannot be refused.
 				store.ConfigureMaxMemory(store.UsedMemory(), 16)
 				if _, _, err := store.SetBit("bitmap", 1<<20, 1); !errors.Is(err, ErrMemoryLimitExceeded) {
 					t.Fatalf("SetBit() past the end at the limit error = %v, want ErrMemoryLimitExceeded", err)

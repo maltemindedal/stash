@@ -67,14 +67,22 @@ func shrinkingWrites() []shrinkingWrite {
 	}
 }
 
-// growingWrite is a growing Store operation that goes through mutateKey.
+// growingWrite is a growing Store operation: one that goes through mutateKey
+// as mayGrow, or a write of a string through replaceKey or mutateString.
 type growingWrite struct {
 	name string
 	// setup stores a value of the kind the write works on at key.
 	setup func(s *Store, key string) error
-	// write runs the operation on key, which it grows, and returns its reply as
-	// text with the keys it evicted.
+	// write runs the operation on key, which it grows unless sameSize is set,
+	// and returns its reply as text with the keys it evicted.
 	write func(s *Store, key string) (reply string, evicted []string, err error)
+	// onString is set for a write that works on a string.
+	onString bool
+	// anyKind is set for a write that replaces a value of every kind.
+	anyKind bool
+	// sameSize is set for a write that leaves an existing key's size as it was,
+	// which therefore needs no room.
+	sameSize bool
 }
 
 func growingWrites() []growingWrite {
@@ -152,6 +160,23 @@ func growingWrites() []growingWrite {
 			return reply(s.ZAdd(key, []ZSetEntry{{Member: []byte(member), Score: 0.5}}))
 		}
 	}
+	set := func(value string) func(*Store, string) error {
+		return func(s *Store, key string) error { _, err := s.Set(key, []byte(value), 0); return err }
+	}
+	setX := func(value string) func(*Store, string) (string, []string, error) {
+		return func(s *Store, key string) (string, []string, error) {
+			evicted, err := s.Set(key, []byte(value), 0)
+			return "OK", evicted, err
+		}
+	}
+	incr := func(s *Store, key string) (string, []string, error) { return reply(s.Increment(key)) }
+	setbit := func(offset, bit int64) func(*Store, string) (string, []string, error) {
+		return func(s *Store, key string) (string, []string, error) { return reply(s.SetBit(key, offset, bit)) }
+	}
+	pfadd := func(elements ...string) func(*Store, string) error {
+		return func(s *Store, key string) error { _, _, err := s.PFAdd(key, bulks(elements...)); return err }
+	}
+	pfaddX := func(s *Store, key string) (string, []string, error) { return reply(s.PFAdd(key, bulks("x"))) }
 
 	return []growingWrite{
 		{name: "LPUSH", setup: rpush("a", "b", "c"), write: lpushX},
@@ -176,6 +201,12 @@ func growingWrites() []growingWrite {
 			},
 			write: func(s *Store, key string) (string, []string, error) { return s.XAdd(key, "2-1", bulks("f", "x")) },
 		},
+		{name: "SET of a longer value", setup: set("abc"), write: setX("abcdef"), onString: true, anyKind: true},
+		{name: "INCR that adds a digit", setup: set("9"), write: incr, onString: true},
+		{name: "INCR of the same length", setup: set("11"), write: incr, onString: true, sameSize: true},
+		{name: "SETBIT past the end", setup: set("a"), write: setbit(64, 1), onString: true},
+		{name: "SETBIT within the string", setup: set("a"), write: setbit(7, 0), onString: true, sameSize: true},
+		{name: "PFADD", setup: pfadd("a", "b"), write: pfaddX, onString: true, sameSize: true},
 	}
 }
 
@@ -322,13 +353,22 @@ func TestAWriteToAKeyOfAnotherKindChangesNothing(t *testing.T) {
 		w := w
 		writes = append(writes, write{name: w.name, run: func(s *Store, key string) error { _, err := w.write(s, key); return err }})
 	}
+	var onString []write
 	for _, w := range growingWrites() {
+		if w.anyKind {
+			continue
+		}
 		w := w
-		writes = append(writes, write{name: w.name, run: func(s *Store, key string) error { _, _, err := w.write(s, key); return err }})
+		run := write{name: w.name, run: func(s *Store, key string) error { _, _, err := w.write(s, key); return err }}
+		if w.onString {
+			onString = append(onString, run)
+		} else {
+			writes = append(writes, run)
+		}
 	}
 
-	for _, w := range writes {
-		w := w
+	check := func(t *testing.T, w write, setup func(*Store) error) {
+		t.Helper()
 		for _, maxMemory := range []bool{false, true} {
 			maxMemory := maxMemory
 			t.Run(fmt.Sprintf("%s, maxmemory %v", w.name, maxMemory), func(t *testing.T) {
@@ -336,26 +376,32 @@ func TestAWriteToAKeyOfAnotherKindChangesNothing(t *testing.T) {
 				if maxMemory {
 					store.ConfigureMaxMemory(1<<30, 16)
 				}
-				if _, err := store.Set(key, []byte("text"), 0); err != nil {
-					t.Fatalf("Set() error = %v", err)
+				if err := setup(store); err != nil {
+					t.Fatalf("setup error = %v", err)
 				}
 				before := store.valueObjectForTest(key)
+				described := describeValueForTest(store, key)
 				stampedAt := store.lastAccessedAtForTest(key)
 				clock.advance(time.Millisecond)
 
 				if err := w.run(store, key); !errors.Is(err, ErrWrongType) {
-					t.Fatalf("%s on a string error = %v, want ErrWrongType", w.name, err)
+					t.Fatalf("%s on %s error = %v, want ErrWrongType", w.name, described, err)
 				}
-				after := store.valueObjectForTest(key)
-				if after != before || string(after.String) != "text" {
-					t.Fatalf("%s on a string left %+v under the key, want the string %q unchanged", w.name, after, "text")
+				if after := store.valueObjectForTest(key); after != before || describeValueForTest(store, key) != described {
+					t.Fatalf("%s left %s under the key, want %s unchanged", w.name, describeValueForTest(store, key), described)
 				}
 				if got := store.lastAccessedAtForTest(key); got != stampedAt {
-					t.Fatalf("%s on a string stamped its access at %d, want it left at %d", w.name, got, stampedAt)
+					t.Fatalf("%s stamped its key at %d, want it left at %d", w.name, got, stampedAt)
 				}
 				requireExactUsedMemory(t, store)
 			})
 		}
+	}
+	for _, w := range writes {
+		check(t, w, func(s *Store) error { _, err := s.Set(key, []byte("text"), 0); return err })
+	}
+	for _, w := range onString {
+		check(t, w, func(s *Store) error { _, _, err := s.RightPush(key, [][]byte{[]byte("a")}); return err })
 	}
 }
 
@@ -555,6 +601,9 @@ func TestWritesStampTheirKeyWithTheStoreClock(t *testing.T) {
 func TestARefusedGrowingWriteLeavesTheStoredValueAsItWas(t *testing.T) {
 	const key = "k"
 	for _, w := range growingWrites() {
+		if w.sameSize {
+			continue
+		}
 		w := w
 		t.Run(w.name, func(t *testing.T) {
 			store, clock := newStoreWithManualClock()
@@ -592,6 +641,9 @@ func TestARefusedGrowingWriteLeavesTheStoredValueAsItWas(t *testing.T) {
 func TestGrowingWritesEvictTheStalestKeyToMakeRoom(t *testing.T) {
 	const key, victim = "k", "victim"
 	for _, w := range growingWrites() {
+		if w.sameSize {
+			continue
+		}
 		w := w
 		t.Run(w.name, func(t *testing.T) {
 			store, clock := newStoreWithManualClock()
@@ -621,6 +673,95 @@ func TestGrowingWritesEvictTheStalestKeyToMakeRoom(t *testing.T) {
 			}
 			requireExactUsedMemory(t, store)
 		})
+	}
+}
+
+// TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas pins what makes an
+// in-place string edit safe: nothing read from a stored string outlives the
+// shard lock. GET's reply and the snapshots that an RDB file and an AOF rewrite
+// are written from each hold a copy, so an INCR, SETBIT or PFADD that edits the
+// stored buffer where it lies leaves them as they were.
+func TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas(t *testing.T) {
+	const key = "k"
+	tests := []struct {
+		name  string
+		setup func(*Store) error
+		write func(*Store) error
+	}{
+		{
+			name:  "INCR of the same length",
+			setup: func(s *Store) error { _, err := s.Set(key, []byte("11"), 0); return err },
+			write: func(s *Store) error { _, _, err := s.Increment(key); return err },
+		},
+		{
+			name:  "SETBIT within the string",
+			setup: func(s *Store) error { _, err := s.Set(key, []byte("a"), 0); return err },
+			write: func(s *Store) error { _, _, err := s.SetBit(key, 7, 0); return err },
+		},
+		{
+			name:  "PFADD",
+			setup: func(s *Store) error { _, _, err := s.PFAdd(key, [][]byte{[]byte("a")}); return err },
+			write: func(s *Store) error { _, _, err := s.PFAdd(key, [][]byte{[]byte("b")}); return err },
+		},
+	}
+
+	snapshotted := func(t *testing.T, store *Store) (fromStrings, fromAll []byte) {
+		t.Helper()
+		stringEntries, _ := store.SnapshotStrings()
+		for _, entry := range stringEntries {
+			if entry.Key == key {
+				fromStrings = entry.Value
+			}
+		}
+		all, _ := store.SnapshotAll()
+		for _, entry := range all {
+			if entry.Key == key {
+				fromAll = entry.String
+			}
+		}
+		return fromStrings, fromAll
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		for _, maxMemory := range []bool{false, true} {
+			maxMemory := maxMemory
+			t.Run(fmt.Sprintf("%s, maxmemory %v", tt.name, maxMemory), func(t *testing.T) {
+				store, _ := newStoreWithManualClock()
+				if maxMemory {
+					store.ConfigureMaxMemory(1<<30, 16)
+				}
+				if err := tt.setup(store); err != nil {
+					t.Fatalf("setup error = %v", err)
+				}
+				got, _, err := store.Get(key)
+				if err != nil {
+					t.Fatalf("Get() error = %v", err)
+				}
+				want := string(got)
+				fromStrings, fromAll := snapshotted(t, store)
+				stored := &store.valueObjectForTest(key).String[0]
+
+				if err := tt.write(store); err != nil {
+					t.Fatalf("write error = %v", err)
+				}
+				if now, _, _ := store.Get(key); string(now) == want {
+					t.Fatal("the write left the string as it was, so it tests nothing")
+				}
+				if &store.valueObjectForTest(key).String[0] != stored {
+					t.Fatal("the write did not edit the stored buffer in place, so it tests nothing")
+				}
+				if string(got) != want {
+					t.Fatalf("an earlier GET reply now reads %q, want %q", got, want)
+				}
+				if string(fromStrings) != want {
+					t.Fatalf("an earlier string snapshot now reads %q, want %q", fromStrings, want)
+				}
+				if string(fromAll) != want {
+					t.Fatalf("an earlier full snapshot now reads %q, want %q", fromAll, want)
+				}
+			})
+		}
 	}
 }
 

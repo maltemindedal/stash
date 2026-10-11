@@ -70,99 +70,6 @@ func readKey[T any](s *Store, key string, fn func(value *ValueObject) (T, error)
 	return result, true, nil
 }
 
-// keyWrite is the state one single-key write runs against: the shard that owns
-// the key, the live value stored under it (nil when the key is absent), the
-// clock reading the write is anchored to, and whether the store is accounting
-// for memory. It is produced by writeKey and is only valid while that call
-// holds its locks.
-type keyWrite struct {
-	store      *Store
-	shard      *Shard
-	key        string
-	current    *ValueObject
-	now        int64
-	accounting bool
-}
-
-// commit stores newValue under the key, stamped with the write's clock reading
-// as its access, and reports the keys evicted to make room for it.
-//
-// While the store is accounting for memory the write is sized against the
-// pre-write value, so newValue must be a distinct object from current: a write
-// that turns out to breach maxmemory fails with ErrMemoryLimitExceeded and
-// stores nothing, and the value already under the key must survive that
-// unchanged. Without accounting there is nothing to size and newValue may be
-// current itself.
-func (w keyWrite) commit(newValue *ValueObject) ([]string, error) {
-	newValue.touch(w.now)
-	if w.accounting {
-		return w.store.commitValueWithEvictionLocked(w.shard, w.key, w.current, newValue, w.now)
-	}
-
-	w.store.setKeyLocked(w.shard, w.key, newValue)
-	return nil, nil
-}
-
-// commitString stores a string payload of length bytes under the key, written
-// by fill, and reports the keys evicted to make room for it.
-//
-// commit takes a value that already exists, which is the wrong shape when the
-// payload is the expensive part of the write: SETBIT can address an offset half
-// a gigabyte out, and that buffer must not be allocated and zeroed under every
-// shard write lock only for the write to be rejected. A string's size follows
-// from its length alone, so this decides the write before it calls fill.
-func (w keyWrite) commitString(length int, expiresAt int64, fill func(payload []byte)) ([]string, error) {
-	if w.accounting {
-		return w.store.commitStringWithEvictionLocked(w.shard, w.key, w.current, length, expiresAt, w.now, fill)
-	}
-
-	payload := make([]byte, length)
-	fill(payload)
-	return w.commit(newOwnedStringValue(payload, expiresAt))
-}
-
-// writeKey applies fn to the value stored at key while holding the write locks
-// that a write of that key needs, and reports the keys evicted to make room for
-// it.
-//
-// It serves the growing writes of a string: SET, INCR, SETBIT and PFADD. Every
-// other write goes through mutateKey. Before the operation runs, it takes one
-// clock reading, reads the maxmemory setting once, and locks the owning shard
-// for writing. It may lock every shard because eviction can cross shard
-// boundaries. It also reclaims the key when its TTL has passed and releases all
-// locks on every path. fn therefore sees either a live value of unknown kind or
-// nil when the key is absent. The one clock reading decides every expiry the
-// write sees: its own key's and, under maxmemory, those in the sweep that makes
-// room for it, so the sweep cannot remove a key fn was handed as live.
-//
-// fn runs under the write locks and stores its result through the keyWrite it is
-// handed; it must not retain that keyWrite, or memory borrowed from the value,
-// after it returns.
-func writeKey[T any](s *Store, key string, fn func(w keyWrite) (T, []string, error)) (T, []string, error) {
-	now := s.now()
-	// Decide the locking mode and the accounting mode from a single read of the
-	// maxmemory setting. Reading it again under the narrower lock would be a
-	// TOCTOU: if accounting turned on in between, this call would hold one shard
-	// lock yet enter the cross-shard eviction path and touch other shards' maps
-	// without holding their locks.
-	accounting := s.maxMemoryEnabled()
-	if accounting {
-		// Registered before the unlock below so it runs after it: an accounted
-		// write recalculates the keyspace and sweeps expired keys out of it, and
-		// the listener that hears about them must not be entered under a lock.
-		defer s.publishExpiredKeys()
-		s.writeLockAllShards()
-		defer s.writeUnlockAllShards()
-	} else {
-		shard := s.shardForKey(key)
-		shard.mu.Lock()
-		defer shard.mu.Unlock()
-	}
-
-	shard, current := s.prepareExistingValueLocked(key, now)
-	return fn(keyWrite{store: s, shard: shard, key: key, current: current, now: now, accounting: accounting})
-}
-
 // anyKind is the want of a mutation that accepts a value of every kind, as DEL
 // does.
 const anyKind ValueKind = ""
@@ -384,6 +291,166 @@ func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int
 	s.setKeyLocked(shard, key, next)
 	s.usedMemory.Add(newSize - oldSize)
 	return result, evicted, nil
+}
+
+// replaceKey stores value under key in place of whatever the key held, and
+// reports the keys evicted to make room for it.
+//
+// It serves SET, which writes a whole value: what the key held does not shape
+// the new value, so replaceKey never copies it, and only sizes it while the
+// store accounts for memory. It takes one clock reading, which stamps value and,
+// under maxmemory, decides whether the key's TTL has passed and which keys the
+// sweep that makes room removes. Under maxmemory it locks every shard, because
+// making room can evict a key from any of them, and a write refused with
+// ErrMemoryLimitExceeded stores nothing.
+func replaceKey(s *Store, key string, value *ValueObject) ([]string, error) {
+	now := s.now()
+	value.touch(now)
+	// One read of the maxmemory setting decides the locks, as in mutateGrowing.
+	if s.maxMemoryEnabled() {
+		// Registered before the unlock below so it runs after it, as in
+		// mutateGrowingAccounted.
+		defer s.publishExpiredKeys()
+		s.writeLockAllShards()
+		defer s.writeUnlockAllShards()
+
+		shard, stored := s.prepareExistingValueLocked(key, now)
+		oldSize := s.approximateValueObjectSize(key, stored)
+		newSize := s.approximateValueObjectSize(key, value)
+		evicted, err := s.ensureMemoryAvailableLocked(newSize-oldSize, protectedKeys(key), now)
+		if err != nil {
+			return nil, err
+		}
+		s.setKeyLocked(shard, key, value)
+		s.usedMemory.Add(newSize - oldSize)
+		return evicted, nil
+	}
+
+	// Without a memory limit an expired value needs no reclaiming first: it is
+	// replaced like a live one.
+	shard := s.shardForKey(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	s.setKeyLocked(shard, key, value)
+	return nil, nil
+}
+
+// mutateString applies fn, a write of a string's bytes, to the string stored at
+// key, and returns fn's result with the keys evicted to make room for it.
+//
+// It serves INCR, SETBIT and PFADD. Like mutateKey for a growing write, it takes
+// one clock reading, locks the key's shard, or every shard under maxmemory,
+// reclaims the key when its TTL has passed, and answers ErrWrongType, without
+// calling fn, for a live value that is not a string. fn reads the string through
+// the stringWrite it is handed and writes it through Payload, which it calls at
+// most once, and only once nothing else can make it fail. A write that fails
+// before it calls Payload leaves the key as it was.
+//
+// fn runs under the locks and must not retain the stringWrite, or memory
+// borrowed from the string, after it returns.
+func mutateString[T any](s *Store, key string, fn func(w stringWrite) (T, []string, error)) (T, []string, error) {
+	var zero T
+
+	now := s.now()
+	// One read of the maxmemory setting decides the locks, as in mutateGrowing.
+	accounting := s.maxMemoryEnabled()
+	if accounting {
+		// Registered before the unlock below so it runs after it, as in
+		// mutateGrowingAccounted.
+		defer s.publishExpiredKeys()
+		s.writeLockAllShards()
+		defer s.writeUnlockAllShards()
+	} else {
+		shard := s.shardForKey(key)
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
+	}
+
+	shard, cur := s.prepareExistingValueLocked(key, now)
+	if cur != nil && cur.Kind != ValueKindString {
+		return zero, nil, ErrWrongType
+	}
+	return fn(stringWrite{store: s, shard: shard, key: key, cur: cur, now: now, accounting: accounting})
+}
+
+// stringWrite is what a write of a string's bytes runs against: the live string
+// stored under the key, if any, and what Payload needs to replace it. mutateString
+// hands it to fn by value, which keeps it off the heap, and its methods take a
+// pointer to fn's copy, so that a call does not copy it again: with value
+// receivers SETBIT within a string was 7% to 13% slower. It is valid only while
+// mutateString holds its locks.
+type stringWrite struct {
+	store      *Store
+	shard      *Shard
+	key        string
+	cur        *ValueObject // nil when the key is absent
+	now        int64
+	accounting bool
+}
+
+// Current returns the string stored under the key and whether the key holds
+// one. It is for reading: a write changes the string's bytes only through
+// Payload.
+func (w *stringWrite) Current() ([]byte, bool) {
+	if w.cur == nil {
+		return nil, false
+	}
+	return w.cur.String, true
+}
+
+// Payload resizes the string stored under the key to length bytes, creating it
+// when the key is absent, and returns its bytes for the write to edit, with the
+// keys evicted to make room for it. It stamps the key with the write's clock
+// reading.
+//
+// When the string already has length bytes, Payload returns the stored buffer
+// itself, and the write edits it in place: the key's size does not change, so
+// there is nothing to size and the write cannot be refused. Otherwise it stores a
+// new buffer holding as many of the stored bytes as fit, zero after them, and
+// leaves the old buffer as it was (#46 decision 2). While the store accounts for
+// memory, the new buffer is sized, and room made for it, before it is allocated:
+// SETBIT can address an offset half a gigabyte out, and that buffer must not be
+// allocated and zeroed under every shard lock only for the write to be refused.
+// A refused write gets ErrMemoryLimitExceeded and leaves the key as it was. A
+// stored string keeps its TTL.
+func (w *stringWrite) Payload(length int) ([]byte, []string, error) {
+	if w.cur != nil && len(w.cur.String) == length {
+		w.cur.touch(w.now)
+		return w.cur.String, nil, nil
+	}
+	return w.resize(length)
+}
+
+// resize is Payload for a length the stored string does not have, or for an
+// absent key: it admits the new length and copies the string into a new buffer.
+func (w *stringWrite) resize(length int) ([]byte, []string, error) {
+	var evicted []string
+	if w.accounting {
+		var expiresAt int64
+		if w.cur != nil {
+			expiresAt = w.cur.ExpiresAt
+		}
+		oldSize := w.store.approximateValueObjectSize(w.key, w.cur)
+		newSize := w.store.approximateStringValueObjectSize(w.key, length, expiresAt)
+		var err error
+		evicted, err = w.store.ensureMemoryAvailableLocked(newSize-oldSize, protectedKeys(w.key), w.now)
+		if err != nil {
+			return nil, nil, err
+		}
+		w.store.usedMemory.Add(newSize - oldSize)
+	}
+
+	payload := make([]byte, length)
+	if w.cur == nil {
+		value := newOwnedStringValue(payload, 0)
+		value.touch(w.now)
+		w.store.setKeyLocked(w.shard, w.key, value)
+		return payload, evicted, nil
+	}
+	copy(payload, w.cur.String)
+	w.cur.String = payload
+	w.cur.touch(w.now)
+	return payload, evicted, nil
 }
 
 func (s *Store) shardIndex(key string) int {
