@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -804,6 +805,61 @@ type stubAddr string
 
 func (a stubAddr) Network() string { return "tcp" }
 func (a stubAddr) String() string  { return string(a) }
+
+// psyncLikeExecutor answers PSYNC as the command executor does, making the
+// client a replica and answering with FULLRESYNC and a snapshot, and answers
+// every other request with +OK.
+type psyncLikeExecutor struct{}
+
+func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
+	if replicationCommandName(request) != "PSYNC" {
+		return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
+	}
+	call.Client.PromoteToReplica()
+	result := MultiResponse(protocol.SimpleString{Value: "FULLRESYNC test-replid 0"}, protocol.BulkString{Data: []byte("snapshot")})
+	result.RegisterReplica = true
+	return result, nil
+}
+
+// TestRequestsOnAReplicasLinkGetNoReplies runs requests from one connection
+// through the pipeline both networking modes share. The PSYNC that makes it a
+// replica is answered, and nothing it sends after is: as in Redis, the link
+// carries the replication stream alone. Its requests used to be answered into
+// the stream.
+func TestRequestsOnAReplicasLinkGetNoReplies(t *testing.T) {
+	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), psyncLikeExecutor{})
+	state := &ClientState{ID: 1, Authenticated: true}
+	call := Call{Client: state, Origin: OriginClient}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	steps := []struct {
+		request     []string
+		wantReplies int
+	}{
+		{request: []string{"PING"}, wantReplies: 1},
+		{request: []string{"PSYNC", "?", "-1"}, wantReplies: 2},
+		{request: []string{"REPLCONF", "ACK", "0", "FACK", "0"}, wantReplies: 0},
+		{request: []string{"PING"}, wantReplies: 0},
+	}
+	for _, step := range steps {
+		responses, _, err := srv.executeClientRequest(context.Background(), call, state.ID, &stubConn{}, logger, requestFrame(step.request...))
+		if err != nil {
+			t.Fatalf("%v error = %v", step.request, err)
+		}
+		if len(responses) != step.wantReplies {
+			t.Fatalf("%v got %d replies %v, want %d", step.request, len(responses), responses, step.wantReplies)
+		}
+	}
+}
+
+// requestFrame is the RESP array a client sends for parts.
+func requestFrame(parts ...string) protocol.Array {
+	elements := make([]protocol.Value, len(parts))
+	for i, part := range parts {
+		elements[i] = protocol.BulkString{Data: []byte(part)}
+	}
+	return protocol.Array{Elements: elements}
+}
 
 func newReplicaPeerStateForTest(id uint64, conn net.Conn) *ClientState {
 	state := &ClientState{ID: id, Authenticated: true}

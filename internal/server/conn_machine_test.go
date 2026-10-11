@@ -211,6 +211,45 @@ func TestConnMachineProtocolErrorClosesAfterOrderedReplies(t *testing.T) {
 	}
 }
 
+// TestConnMachineClosesAReplicaUnansweredAfterAFrameItCannotParse feeds a frame
+// that cannot be parsed to a replica's connection. Its link carries the
+// replication stream alone, so the stream already queued drains and the
+// connection closes with no error reply after it. The reply used to follow the
+// stream, as the replica's next frame.
+func TestConnMachineClosesAReplicaUnansweredAfterAFrameItCannotParse(t *testing.T) {
+	run, executed := echoRunner(t)
+	state := &ClientState{ID: 1, Authenticated: true}
+	state.PromoteToReplica()
+	machine := NewConnMachine(state)
+
+	stream := machineFrame("SET", "k", "v")
+	if err := machine.BufferEncoded(stream); err != nil {
+		t.Fatalf("BufferEncoded() error = %v", err)
+	}
+	if err := machine.Feed([]byte("*x\r\n")); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if machine.State() != ConnStateClosing {
+		t.Fatalf("State() = %d, want ConnStateClosing", machine.State())
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v", err)
+	}
+	if len(*executed) != 0 {
+		t.Fatalf("executed %d requests, want 0", len(*executed))
+	}
+
+	var out bytes.Buffer
+	for machine.State() != ConnStateClosed {
+		if err := machine.Flush(&out); err != nil {
+			t.Fatalf("Flush() error = %v", err)
+		}
+	}
+	if !bytes.Equal(out.Bytes(), stream) {
+		t.Fatalf("a replica was sent %q, want only the stream %q", out.Bytes(), stream)
+	}
+}
+
 // TestConnMachineFeedRejectsHostileFrames covers the frames a malicious peer can
 // send to make the machine allocate or recurse without bound. Feed itself always
 // succeeds. A hostile frame is reported by moving the machine to ConnStateClosing
