@@ -68,7 +68,7 @@ func (c *scriptedConn) SetWriteDeadline(_ time.Time) error { return nil }
 func serveScripted(t *testing.T, conn *scriptedConn) <-chan struct{} {
 	t.Helper()
 
-	srv := New(config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
 	clientID, _ := srv.registerClient(conn)
 	srv.handlerWG.Add(1)
 	done := make(chan struct{})

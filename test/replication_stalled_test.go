@@ -8,11 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -23,7 +21,7 @@ func TestAStalledReplicaDoesNotBlockWritersOnTheMaster(t *testing.T) {
 	cfg := defaultTestConfig()
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
@@ -122,7 +120,7 @@ func TestReplicaReconnectsAndResynchronisesWhenItsMasterDrops(t *testing.T) {
 	cfg.ReplicaOf = masterListener.Addr().String()
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)

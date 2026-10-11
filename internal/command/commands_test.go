@@ -725,7 +725,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 
 		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -740,7 +740,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 
 		result, err := handle(clientContext(executor), executor, requestValue("INCR", "counter"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -755,7 +755,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 
 		result, err := handle(clientContext(executor), executor, requestValue("SETBIT", "bitmap", "0", "1"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -771,7 +771,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 
 		result, err := handle(clientContext(executor), executor, requestValue("PFADD", "visitors", "alice"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -787,7 +787,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 
 		result, err := handle(clientContext(executor), executor, requestValue("PUBLISH", "news", "hello"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -802,7 +802,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 
 		result, err := handle(clientContext(executor), executor, requestValue("DEL", "missing"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -812,12 +812,12 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		assertPropagationFrames(t, result.Propagation, requestValue("DEL", "missing"))
 	})
 
-	t.Run("replication-origin commands do not re-propagate", func(t *testing.T) {
+	t.Run("a command from the Master's stream is not propagated again", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := handle(server.WithReplicationOrigin(context.Background()), executor, requestValue("PUBLISH", "news", "replica"), false)
+		result, err := handle(withOrigin(context.Background(), server.OriginMaster), executor, requestValue("PUBLISH", "news", "replica"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Propagation) != 0 {
 			t.Fatalf("len(result.Propagation) = %d, want 0", len(result.Propagation))
@@ -1025,9 +1025,11 @@ func TestExecutorInfo(t *testing.T) {
 
 func TestExecutorSlowlog(t *testing.T) {
 	t.Run("records commands at zero threshold", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
@@ -1049,9 +1051,11 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("negative threshold disables recording", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, -time.Microsecond)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = -time.Microsecond
+		})
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
@@ -1062,9 +1066,11 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("reset clears entries", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("PING")); err != nil {
 			t.Fatalf("PING error = %v", err)
@@ -1079,10 +1085,12 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("does not record commands rejected before dispatch", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 77)
 
 		if _, err := executor.Execute(ctx, requestValue("SET", "name", "Stash")); !errors.Is(err, ErrNoAuth) {
@@ -1094,10 +1102,12 @@ func TestExecutorSlowlog(t *testing.T) {
 	})
 
 	t.Run("redacts sensitive command arguments", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 78)
 
 		if _, err := executor.Execute(ctx, requestValue("AUTH", "secret")); err != nil {
@@ -1133,9 +1143,10 @@ func TestInfoPersistence(t *testing.T) {
 	})
 
 	t.Run("a failed AOF write is reported as err", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetServerStatsProvider(func() server.Stats {
-			return server.Stats{Role: "master", AOFEnabled: true, AOFLastWriteOK: false}
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Stats = func() server.Stats {
+				return server.Stats{Role: "master", AOFEnabled: true, AOFLastWriteOK: false}
+			}
 		})
 
 		text := info(t, executor, "persistence")
@@ -1160,9 +1171,11 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 	record := func(t *testing.T, args ...string) []string {
 		t.Helper()
 
-		executor := newTestExecutor()
 		registry := server.NewSlowlogRegistry()
-		executor.SetSlowlogConfig(registry, 0)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Slowlog = registry
+			s.SlowlogThreshold = 0
+		})
 		if _, err := executor.Execute(clientContext(executor), requestValue(args...)); err != nil {
 			t.Fatalf("%s error = %v", args[0], err)
 		}
@@ -1239,14 +1252,13 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 
 func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	t.Run("replica-origin GETACK emits upstream ACK reply", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceReplicaOffset(123)
-		executor.SetReplicationState(replication)
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 
-		result, err := handle(server.WithReplicationOrigin(context.Background()), executor, requestValue("REPLCONF", "GETACK", "*"), false)
+		result, err := handle(withOrigin(context.Background(), server.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 0 {
 			t.Fatalf("len(result.Responses) = %d, want 0", len(result.Responses))
@@ -1258,22 +1270,36 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		assertValueEqual(t, result.UpstreamReplies[0], requestValue("REPLCONF", "ACK", "123"))
 	})
 
+	t.Run("only the Master's stream may answer GETACK", func(t *testing.T) {
+		for _, origin := range []server.Origin{server.OriginClient, server.OriginReplay} {
+			executor := newTestExecutor()
+			ctx := withOrigin(context.Background(), origin)
+			if origin == server.OriginClient {
+				ctx = clientContext(executor)
+			}
+
+			result, err := handle(ctx, executor, requestValue("REPLCONF", "GETACK", "*"), false)
+			if !errors.Is(err, ErrSyntax) || len(result.UpstreamReplies) != 0 {
+				t.Fatalf("GETACK from Origin %d = (%d upstream replies, error %v), want ErrSyntax and no reply", origin, len(result.UpstreamReplies), err)
+			}
+		}
+	})
+
 	t.Run("ACK updates tracked replica offset", func(t *testing.T) {
-		executor := newTestExecutor()
 		registry := server.NewReplicaRegistry()
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replicas = registry })
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		state := newReplicaPeerStateForExecutor(executor, 7, serverConn)
 		registry.Add(nil, 7, serverConn, 6380, state)
-		executor.SetReplicaRegistry(registry)
 
-		ctx := server.WithClientState(context.Background(), state)
+		ctx := withClient(context.Background(), state)
 
 		result, err := handle(ctx, executor, requestValue("REPLCONF", "ACK", "42"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if len(result.Responses) != 0 {
 			t.Fatalf("len(result.Responses) = %d, want 0", len(result.Responses))
@@ -1289,23 +1315,24 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 
 func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT requests ACKs and returns once enough replicas catch up", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
-		executor.SetReplicationState(replication)
-
 		registry := server.NewReplicaRegistry()
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Replication = replication
+			s.Replicas = registry
+		})
+
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		registry.Add(replication, 11, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 11, serverConn))
-		executor.SetReplicaRegistry(registry)
 		// The client wrote 50 bytes after the replica attached, which the replica
 		// acknowledges below.
 		replication.AdvanceMasterOffset(50)
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(50)
-		ctx := server.WithClientState(context.Background(), writer)
+		ctx := withClient(context.Background(), writer)
 
 		requestSeen := make(chan struct{})
 		go func() {
@@ -1330,7 +1357,7 @@ func TestExecutorWait(t *testing.T) {
 
 		result, err := handle(ctx, executor, requestValue("WAIT", "1", "200"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		<-requestSeen
 
@@ -1341,18 +1368,17 @@ func TestExecutorWait(t *testing.T) {
 	})
 
 	t.Run("WAIT times out when replicas do not acknowledge", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(5)
-		executor.SetReplicationState(replication)
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(5)
-		ctx := server.WithClientState(context.Background(), writer)
+		ctx := withClient(context.Background(), writer)
 
 		startedAt := time.Now()
 		result, err := handle(ctx, executor, requestValue("WAIT", "1", "25"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if time.Since(startedAt) < 20*time.Millisecond {
 			t.Fatalf("WAIT returned too quickly: %v", time.Since(startedAt))
@@ -1366,14 +1392,13 @@ func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT with a timeout past what a duration can hold keeps waiting", func(t *testing.T) {
 		// 9223372036855 ms overflows time.Duration; it used to wrap negative, so the
 		// timer fired at once and WAIT answered without waiting at all.
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(5)
-		executor.SetReplicationState(replication)
+		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(5)
-		ctx, cancel := context.WithCancel(server.WithClientState(context.Background(), writer))
+		ctx, cancel := context.WithCancel(withClient(context.Background(), writer))
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
@@ -1399,27 +1424,28 @@ func TestExecutorWait(t *testing.T) {
 	})
 
 	t.Run("WAIT uses the calling client's last write offset", func(t *testing.T) {
-		executor := newTestExecutor()
 		replication := &server.ReplicationState{}
 		replication.AdvanceMasterOffset(50)
-		executor.SetReplicationState(replication)
-
 		registry := server.NewReplicaRegistry()
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.Replication = replication
+			s.Replicas = registry
+		})
+
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		registry.Add(replication, 12, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 12, serverConn))
-		executor.SetReplicaRegistry(registry)
 
 		state := &server.ClientState{ID: 99, Authenticated: true}
 		state.SetLastWriteReplicationOffset(0)
-		ctx := server.WithClientState(context.Background(), state)
+		ctx := withClient(context.Background(), state)
 
 		startedAt := time.Now()
 		result, err := handle(ctx, executor, requestValue("WAIT", "1", "50"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		if time.Since(startedAt) > 20*time.Millisecond {
 			t.Fatalf("WAIT took too long for a client with no pending replicated writes: %v", time.Since(startedAt))
@@ -1433,12 +1459,11 @@ func TestExecutorWait(t *testing.T) {
 
 func TestExecutorAuth(t *testing.T) {
 	t.Run("unauthenticated clients may only use AUTH and PING", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 1)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		pong, err := executor.Execute(ctx, requestValue("PING"))
@@ -1476,12 +1501,11 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("AUTH success unlocks subsequent commands on the same connection", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 2)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		value, err := executor.Execute(ctx, requestValue("AUTH", "secret"))
@@ -1507,12 +1531,11 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("AUTH failure keeps the client blocked", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 3)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		if _, err := executor.Execute(ctx, requestValue("AUTH", "wrong")); !errors.Is(err, ErrWrongPass) {
@@ -1528,12 +1551,11 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("AUTH failure after successful AUTH keeps the client authenticated", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
+		executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 33)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		if _, err := executor.Execute(ctx, requestValue("AUTH", "secret")); err != nil {
@@ -1563,13 +1585,14 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("unauthenticated clients cannot start replica handshake when password protection is enabled", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
-		executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		if _, err := handle(ctx, executor, requestValue("REPLCONF", "listening-port", "6380"), false); !errors.Is(err, ErrNoAuth) {
@@ -1584,15 +1607,16 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("authenticated clients may perform replica handshake on protected masters", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
-		executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
 		registry := server.NewReplicaRegistry()
-		executor.SetReplicaRegistry(registry)
+		executor := newTestExecutorWith(func(s *server.Services) {
+			s.RequirePass = "secret"
+			s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+			s.Replicas = registry
+		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		value, err := executor.Execute(ctx, requestValue("AUTH", "secret"))
@@ -1627,18 +1651,6 @@ func TestExecutorAuth(t *testing.T) {
 			t.Fatal("IsAuthenticated() = false after authenticated PSYNC, want true")
 		}
 	})
-
-	t.Run("replication-origin traffic bypasses the auth gate", func(t *testing.T) {
-		executor := newTestExecutor()
-		executor.SetRequirePass("secret")
-		ctx := server.WithReplicationOrigin(withUnauthenticatedClientStateForExecutor(context.Background(), executor, 6))
-
-		value, err := executor.Execute(ctx, requestValue("SET", "replicated", "1"))
-		if err != nil {
-			t.Fatalf("replication-origin SET error = %v", err)
-		}
-		assertValueEqual(t, value, protocol.SimpleString{Value: "OK"})
-	})
 }
 
 func TestAuthIsRequiredEvenWhenTheExecutorHasNoPassword(t *testing.T) {
@@ -1662,7 +1674,7 @@ func TestAuthIsRequiredEvenWhenTheExecutorHasNoPassword(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			executor := newTestExecutor()
 			ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 1)
-			state, _ := server.ClientStateFromContext(ctx)
+			state, _ := clientOfContext(ctx)
 
 			value, err := executor.Execute(ctx, requestValue(tt.request...))
 			if tt.wantErr != nil {
@@ -1685,41 +1697,104 @@ func TestAuthIsRequiredEvenWhenTheExecutorHasNoPassword(t *testing.T) {
 	}
 }
 
+// handleSet runs SET name Stash through Handle with call, as the server runs a
+// request, and returns its reply, whether the key was stored, and the error.
+func handleSet(t *testing.T, executor *Executor, call server.Call) (protocol.Value, bool, error) {
+	t.Helper()
+
+	result, err := executor.Handle(context.Background(), call, requestValue("SET", "name", "Stash"))
+	if result.Release != nil {
+		result.Release()
+	}
+	_, stored, _ := executor.store.Get("name")
+	var reply protocol.Value
+	if len(result.Responses) == 1 {
+		reply = result.Responses[0]
+	}
+	return reply, stored, err
+}
+
 func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
+	for _, requirePass := range []string{"", "secret"} {
+		name := "on a server without a password"
+		if requirePass != "" {
+			name = "on a server with a password"
+		}
+		t.Run(name, func(t *testing.T) {
+			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = requirePass })
+
+			reply, stored, err := handleSet(t, executor, server.Call{Origin: server.OriginClient})
+			if !errors.Is(err, errNoClientState) || stored {
+				t.Fatalf("SET = (%#v, stored %v, error %v), want errNoClientState and nothing stored", reply, stored, err)
+			}
+		})
+	}
+}
+
+func TestACallWithoutAnOriginIsRefused(t *testing.T) {
+	// The zero Origin has none of an Origin's rights, NeedsAuth included, so a
+	// Call that forgets to set one must not run as if it needed no AUTH.
 	tests := []struct {
-		name        string
-		ctx         context.Context
-		requirePass string
-		wantRefused bool
+		name string
+		call func(*Executor) server.Call
 	}{
-		{name: "a client request on a server without a password", ctx: context.Background(), wantRefused: true},
-		{name: "a client request on a server with a password", ctx: context.Background(), requirePass: "secret", wantRefused: true},
-		{name: "the Master's replication stream and AOF replay run without one", ctx: server.WithReplicationOrigin(context.Background()), requirePass: "secret"},
+		{name: "the zero Call", call: func(*Executor) server.Call { return server.Call{} }},
+		{name: "an authenticated client's Call without its Origin", call: func(executor *Executor) server.Call {
+			return server.Call{Client: newTestClientState(executor, 1)}
+		}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor := newTestExecutor()
-			executor.SetRequirePass(tt.requirePass)
+			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 
-			value, err := executor.Execute(tt.ctx, requestValue("SET", "name", "Stash"))
-			_, stored, _ := executor.store.Get("name")
-			if tt.wantRefused {
-				if !errors.Is(err, errNoClientState) {
-					t.Fatalf("SET error = %v (reply %#v), want errNoClientState", err, value)
-				}
-				if stored {
-					t.Fatal("refused SET stored its key")
+			reply, stored, err := handleSet(t, executor, tt.call(executor))
+			if !errors.Is(err, errNoOrigin) || stored {
+				t.Fatalf("SET = (%#v, stored %v, error %v), want errNoOrigin and nothing stored", reply, stored, err)
+			}
+		})
+	}
+}
+
+func TestAnUnauthenticatedClientStateNeverRunsACommand(t *testing.T) {
+	// Only the Master's replication stream and AOF replay run without AUTH, and
+	// neither comes from a client. A request that carried an unauthenticated
+	// Client state used to pass the auth gate when its context also carried the
+	// replication-origin flag; a Call has one Origin, and one that is not a
+	// client's is refused if it carries a Client state.
+	tests := []struct {
+		name            string
+		origin          server.Origin
+		unauthenticated bool
+		wantErr         error
+	}{
+		{name: "a client that has not authenticated is refused", origin: server.OriginClient, unauthenticated: true, wantErr: ErrNoAuth},
+		{name: "its Client state lent to the Master's stream is refused", origin: server.OriginMaster, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
+		{name: "its Client state lent to AOF replay is refused", origin: server.OriginReplay, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
+		{name: "the Master's stream, which has no Client state, runs", origin: server.OriginMaster},
+		{name: "AOF replay, which has no Client state, runs", origin: server.OriginReplay},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
+			call := server.Call{Origin: tt.origin}
+			if tt.unauthenticated {
+				call.Client = newTestClientState(executor, 6)
+				call.Client.SetAuthenticated(false)
+			}
+
+			reply, stored, err := handleSet(t, executor, call)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) || stored {
+					t.Fatalf("SET = (%#v, stored %v, error %v), want %v and nothing stored", reply, stored, err, tt.wantErr)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("SET error = %v", err)
+			if err != nil || !stored {
+				t.Fatalf("SET = (%#v, stored %v, error %v), want it to run", reply, stored, err)
 			}
-			assertValueEqual(t, value, protocol.SimpleString{Value: "OK"})
-			if !stored {
-				t.Fatal("SET did not store its key")
-			}
+			assertValueEqual(t, reply, protocol.SimpleString{Value: "OK"})
 		})
 	}
 }
@@ -1994,9 +2069,9 @@ func TestExecutorTransactions(t *testing.T) {
 	t.Run("DISCARD clears queued state so later commands execute immediately", func(t *testing.T) {
 		executor := newTestExecutor()
 		ctx := withClientStateForExecutor(context.Background(), executor, 1)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		if _, err := executor.Execute(ctx, requestValue("MULTI")); err != nil {
@@ -2040,9 +2115,9 @@ func TestExecutorTransactions(t *testing.T) {
 	t.Run("DISCARD clears dirty transaction state for the next MULTI", func(t *testing.T) {
 		executor := newTestExecutor()
 		ctx := withClientStateForExecutor(context.Background(), executor, 1)
-		state, ok := server.ClientStateFromContext(ctx)
+		state, ok := clientOfContext(ctx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no state")
+			t.Fatal("clientOfContext() returned no state")
 		}
 
 		if _, err := executor.Execute(ctx, requestValue("MULTI")); err != nil {
@@ -2082,9 +2157,9 @@ func TestExecutorTransactions(t *testing.T) {
 		executor := newTestExecutor()
 		watcherCtx := withClientStateForExecutor(context.Background(), executor, 1)
 		writerCtx := withClientStateForExecutor(context.Background(), executor, 2)
-		state, ok := server.ClientStateFromContext(watcherCtx)
+		state, ok := clientOfContext(watcherCtx)
 		if !ok || state == nil {
-			t.Fatal("ClientStateFromContext() returned no watcher state")
+			t.Fatal("clientOfContext() returned no watcher state")
 		}
 
 		if _, err := executor.Execute(watcherCtx, requestValue("WATCH", "counter")); err != nil {
@@ -2267,10 +2342,11 @@ func TestExecutorTransactions(t *testing.T) {
 		for _, tt := range tests {
 			tt := tt
 			t.Run(tt.name, func(t *testing.T) {
-				executor := newTestExecutor()
-				executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
+				executor := newTestExecutorWith(func(s *server.Services) {
+					s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+				})
 				ctx := withClientStateForExecutor(context.Background(), executor, 1)
-				state, _ := server.ClientStateFromContext(ctx)
+				state, _ := clientOfContext(ctx)
 
 				if _, err := executor.Execute(ctx, requestValue("MULTI")); err != nil {
 					t.Fatalf("MULTI error = %v", err)
@@ -2330,7 +2406,7 @@ func TestExecutorPubSub(t *testing.T) {
 		state := newTestClientState(executor, 1)
 		var outbound bytes.Buffer
 		state.BindResponseWriter(bufio.NewWriter(&outbound))
-		ctx := server.WithClientState(context.Background(), state)
+		ctx := withClient(context.Background(), state)
 
 		result, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false)
 		if err != nil {
@@ -2450,7 +2526,7 @@ func TestExecutorPubSub(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
 		state.BindResponseWriter(bufio.NewWriter(io.Discard))
-		ctx := server.WithClientState(context.Background(), state)
+		ctx := withClient(context.Background(), state)
 
 		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
@@ -2463,7 +2539,7 @@ func TestExecutorPubSub(t *testing.T) {
 			t.Fatalf("PUBLISH error = %v", err)
 		}
 		assertValueEqual(t, published, protocol.Integer{Value: 0})
-		if got := len(executor.PubSubRegistry().Subscribers("news")); got != 0 {
+		if got := len(executor.pubSubRegistry.Subscribers("news")); got != 0 {
 			t.Fatalf("len(Subscribers(news)) = %d after disconnected publish, want 0", got)
 		}
 		if state.IsSubscribed() {
@@ -2486,7 +2562,7 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("SUBSCRIBE rejects empty channel names", func(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
-		ctx := server.WithClientState(context.Background(), state)
+		ctx := withClient(context.Background(), state)
 
 		_, err := handle(ctx, executor, requestValue("SUBSCRIBE", ""), false)
 		if !errors.Is(err, ErrSyntax) {
@@ -2509,7 +2585,7 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("UNSUBSCRIBE rejects empty channel names without altering state", func(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
-		ctx := server.WithClientState(context.Background(), state)
+		ctx := withClient(context.Background(), state)
 
 		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE news error = %v", err)
@@ -2532,7 +2608,7 @@ func BenchmarkExecutorPublish(b *testing.B) {
 			for i := 0; i < subscriberCount; i++ {
 				state := newTestClientState(executor, uint64(i+1))
 				state.BindResponseWriter(bufio.NewWriter(io.Discard))
-				ctx := server.WithClientState(context.Background(), state)
+				ctx := withClient(context.Background(), state)
 				if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 					b.Fatalf("SUBSCRIBE error = %v", err)
 				}
@@ -2560,14 +2636,15 @@ func BenchmarkExecutorDetailedPropagation(b *testing.B) {
 	executor := newTestExecutor()
 	request := requestValue("SET", "name", "Stash")
 	ctx := clientContext(executor)
+	call := callFromContext(ctx)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		result, err := executor.ExecuteDetailed(ctx, request)
+		result, err := executor.executeCall(ctx, call, request)
 		if err != nil {
-			b.Fatalf("ExecuteDetailed() error = %v", err)
+			b.Fatalf("executeCall() error = %v", err)
 		}
 		if len(result.Propagation) != 1 {
 			b.Fatalf("len(result.Propagation) = %d, want 1", len(result.Propagation))
@@ -2678,7 +2755,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		before := time.Now().UnixMilli()
 		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash", "EX", "100"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		after := time.Now().UnixMilli()
 
@@ -2720,7 +2797,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		executor := newTestExecutor()
 		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", err)
+			t.Fatalf("handle() error = %v", err)
 		}
 		assertPropagationFrames(t, result.Propagation, requestValue("SET", "name", "Stash"))
 		assertPropagationFrames(t, result.Durability, requestValue("SET", "name", "Stash"))
@@ -2731,13 +2808,13 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		future := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
 		result, err := handle(clientContext(executor), executor, requestValue("SET", "k", "v", "PXAT", future), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed(SET PXAT) error = %v", err)
+			t.Fatalf("handle(SET PXAT) error = %v", err)
 		}
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
 
 		got, err := handle(clientContext(executor), executor, requestValue("GET", "k"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed(GET) error = %v", err)
+			t.Fatalf("handle(GET) error = %v", err)
 		}
 		assertValueEqual(t, got.Responses[0], protocol.BulkString{Data: []byte("v")})
 	})
@@ -2751,7 +2828,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		executor := newTestExecutor()
 		result, err := handle(clientContext(executor), executor, requestValue("XADD", "events", "*", "type", "start"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed(XADD *) error = %v", err)
+			t.Fatalf("handle(XADD *) error = %v", err)
 		}
 		id, ok := result.Responses[0].(protocol.TextBulkString)
 		if !ok || id.Value == "" || id.Value == "*" {
@@ -2765,7 +2842,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok {
 			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
 		}
-		if _, err := handle(server.WithReplicationOrigin(context.Background()), replayed, frame, false); err != nil {
+		if _, err := handle(withOrigin(context.Background(), server.OriginReplay), replayed, frame, false); err != nil {
 			t.Fatalf("replaying the logged frame: %v", err)
 		}
 		entries, err := replayed.store.XRead("events", "0-0")
@@ -2782,12 +2859,12 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 			requestValue("XADD", "events", "*", "type", "start"),
 		} {
 			if _, err := handle(ctx, executor, step, false); err != nil {
-				t.Fatalf("ExecuteDetailed(%v) error = %v", step, err)
+				t.Fatalf("handle(%v) error = %v", step, err)
 			}
 		}
 		result, err := handle(ctx, executor, requestValue("EXEC"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed(EXEC) error = %v", err)
+			t.Fatalf("handle(EXEC) error = %v", err)
 		}
 		replies, ok := result.Responses[0].(protocol.Array)
 		if !ok || len(replies.Elements) != 1 {
@@ -2804,7 +2881,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		executor := newTestExecutor()
 		result, err := handle(clientContext(executor), executor, requestValue("XADD", "events", "5-1", "type", "start"), false)
 		if err != nil {
-			t.Fatalf("ExecuteDetailed(XADD 5-1) error = %v", err)
+			t.Fatalf("handle(XADD 5-1) error = %v", err)
 		}
 		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", "5-1", "type", "start"))
 	})
@@ -2825,9 +2902,9 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 	executor.store.ConfigureMaxMemory(baseline+baseline/2, 16)
 	time.Sleep(2 * time.Millisecond)
 
-	request, err := DecodeRequest(requestValue("SET", "hot!", payload))
+	request, err := decodeCall(callFromContext(ctx), requestValue("SET", "hot!", payload))
 	if err != nil {
-		t.Fatalf("DecodeRequest() error = %v", err)
+		t.Fatalf("decodeCall() error = %v", err)
 	}
 	first, err := executor.executeRequestDetailed(ctx, request, true)
 	if err != nil {
@@ -2846,14 +2923,15 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	// Queueing refuses PSYNC, so EXEC never runs one. Should it, the attach cut
 	// would wait forever for the gate EXEC holds, so PSYNC refuses itself too.
-	executor := newTestExecutor()
-	executor.SetReplicationState(&server.ReplicationState{MasterReplicationID: "test-replid"})
 	registry := server.NewReplicaRegistry()
-	executor.SetReplicaRegistry(registry)
+	executor := newTestExecutorWith(func(s *server.Services) {
+		s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
+		s.Replicas = registry
+	})
 	ctx := withClientStateForExecutor(context.Background(), executor, 1)
-	state, _ := server.ClientStateFromContext(ctx)
+	state, _ := clientOfContext(ctx)
 
-	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, inTransaction: true}
+	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, client: state, inTransaction: true, origin: server.OriginClient}
 	result, err := executor.executeRequestDetailed(ctx, request, false)
 	if result.Release != nil {
 		result.Release()
@@ -2866,9 +2944,45 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	}
 }
 
+// testServices is a Services whose every collaborator is a working stand-in:
+// a new store and registries, a logger that discards, INFO's view of a lone
+// master, no AOF, a Slowlog that records nothing, and writes always ordered.
+func testServices() server.Services {
+	return server.Services{
+		Store:            storage.NewStore(),
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Watches:          server.NewWatchRegistry(),
+		PubSub:           server.NewPubSubRegistry(),
+		Slowlog:          server.NewSlowlogRegistry(),
+		SlowlogThreshold: -1,
+		Replication:      &server.ReplicationState{},
+		Replicas:         server.NewReplicaRegistry(),
+		Stats: func() server.Stats {
+			return server.Stats{Role: "master", AOFLastWriteOK: true}
+		},
+		RewriteAOF: func(context.Context) error {
+			return errors.New("append only file persistence is not enabled")
+		},
+		RecordsWrites: func() bool { return true },
+	}
+}
+
 func newTestExecutor() *Executor {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewExecutor(storage.NewStore(), logger)
+	return newTestExecutorWith(nil)
+}
+
+// newTestExecutorWith builds an executor from testServices, after configure has
+// changed what a test needs.
+func newTestExecutorWith(configure func(*server.Services)) *Executor {
+	services := testServices()
+	if configure != nil {
+		configure(&services)
+	}
+	executor, err := New(services)
+	if err != nil {
+		panic(err)
+	}
+	return executor
 }
 
 // clientContext is the context of a request from a client that has
@@ -2879,28 +2993,88 @@ func clientContext(executor *Executor) context.Context {
 	return withClientStateForExecutor(context.Background(), executor, 0)
 }
 
-// handle is the tests' only way into ExecuteDetailed (sequenced false) and ExecuteSequenced (true); step 3 of #43 swaps its body for a Call and Handle.
-func handle(ctx context.Context, executor *Executor, request protocol.Value, sequenced bool) (server.ExecuteResult, error) {
-	if sequenced {
-		return executor.ExecuteSequenced(ctx, request)
+// callContextKey carries the Call of a request a test runs through Execute or
+// handle. Only tests use it: the server passes every Call to Handle, and no
+// request state travels in the context.
+type callContextKey struct{}
+
+func callFromContext(ctx context.Context) server.Call {
+	call, _ := ctx.Value(callContextKey{}).(server.Call)
+	return call
+}
+
+// Execute runs a parsed RESP frame, unordered, with the Call that ctx carries,
+// and returns its single reply: the way the command tests run a request.
+func (e *Executor) Execute(ctx context.Context, value protocol.Value) (protocol.Value, error) {
+	result, err := e.executeCall(ctx, callFromContext(ctx), value)
+	if err != nil {
+		return nil, err
 	}
-	return executor.ExecuteDetailed(ctx, request)
+	if len(result.Responses) == 1 {
+		return result.Responses[0], nil
+	}
+
+	return nil, fmt.Errorf("command: expected single response, got %d", len(result.Responses))
+}
+
+// executeCall runs a parsed RESP frame as call describes it, without ordering
+// it against other requests.
+func (e *Executor) executeCall(ctx context.Context, call server.Call, value protocol.Value) (server.ExecuteResult, error) {
+	request, err := decodeCall(call, value)
+	if err != nil {
+		return server.ExecuteResult{}, err
+	}
+
+	return e.executeRequestDetailed(ctx, request, true)
+}
+
+// handle runs request with the Call ctx carries: through Handle, ordered as
+// the server orders it (sequenced), or without ordering (not sequenced).
+func handle(ctx context.Context, executor *Executor, request protocol.Value, sequenced bool) (server.ExecuteResult, error) {
+	call := callFromContext(ctx)
+	if sequenced {
+		return executor.Handle(ctx, call, request)
+	}
+	return executor.executeCall(ctx, call, request)
+}
+
+// withCall is ctx carrying call, for Execute and handle.
+func withCall(ctx context.Context, call server.Call) context.Context {
+	return context.WithValue(ctx, callContextKey{}, call)
+}
+
+// withClient is the context of a request from the client whose Client state is
+// state.
+func withClient(ctx context.Context, state *server.ClientState) context.Context {
+	return withCall(ctx, server.Call{Client: state, Origin: server.OriginClient})
+}
+
+// withOrigin is the context of a request from origin, which carries no Client
+// state: the Master's replication stream or AOF replay.
+func withOrigin(ctx context.Context, origin server.Origin) context.Context {
+	return withCall(ctx, server.Call{Origin: origin})
+}
+
+// clientOfContext returns the Client state of the request ctx carries.
+func clientOfContext(ctx context.Context) (*server.ClientState, bool) {
+	state := callFromContext(ctx).Client
+	return state, state != nil
 }
 
 func withClientStateForExecutor(ctx context.Context, executor *Executor, id uint64) context.Context {
-	return server.WithClientState(ctx, newTestClientState(executor, id))
+	return withClient(ctx, newTestClientState(executor, id))
 }
 
 func withUnauthenticatedClientStateForExecutor(ctx context.Context, executor *Executor, id uint64) context.Context {
 	state := newTestClientState(executor, id)
 	state.SetAuthenticated(false)
-	return server.WithClientState(ctx, state)
+	return withClient(ctx, state)
 }
 
 func newTestClientState(executor *Executor, id uint64) *server.ClientState {
 	state := &server.ClientState{ID: id, Authenticated: true}
-	state.SetWatchRegistry(executor.WatchRegistry())
-	state.SetPubSubRegistry(executor.PubSubRegistry())
+	state.SetWatchRegistry(executor.watchRegistry)
+	state.SetPubSubRegistry(executor.pubSubRegistry)
 	return state
 }
 
@@ -3037,12 +3211,12 @@ func assertPropagationFrames(t *testing.T, got []protocol.Value, want ...protoco
 }
 
 // TestCommandSpecsAlwaysValidate locks the invariant the handlers rely on:
-// ExecuteDetailed runs spec.validate before spec.handler/spec.detailed, so an
+// executeRequestDetailed runs spec.validate before spec.handler/spec.detailed, so an
 // executable command must register a validator. Handlers may then read their
 // arguments without repeating the arity check. A new command registered with a
 // handler but no validate would reach that handler unvalidated.
 func TestCommandSpecsAlwaysValidate(t *testing.T) {
-	executor := NewExecutor(storage.NewStore(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	executor := newTestExecutor()
 
 	for name, spec := range executor.commands {
 		t.Run(name, func(t *testing.T) {

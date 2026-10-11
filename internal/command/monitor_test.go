@@ -16,7 +16,7 @@ func TestMonitorRegistersTheClientWithTheRegistryItsClientStateHolds(t *testing.
 	registry := server.NewMonitorRegistry()
 	state := newTestClientState(executor, 1)
 	state.SetMonitorRegistry(registry)
-	ctx := server.WithClientState(context.Background(), state)
+	ctx := withClient(context.Background(), state)
 
 	value, err := executor.Execute(ctx, requestValue("MONITOR"))
 	if err != nil {

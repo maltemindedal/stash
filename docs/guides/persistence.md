@@ -107,7 +107,15 @@ cp appendonly.aof appendonly.aof.damaged   # keep the original
 truncate -s 88213 appendonly.aof           # drop the damaged command and everything after it
 ```
 
-That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server, or one holding only the keys `--rdb` loads, which then become the whole append-only file (see [Understand the AOF/RDB precedence](#understand-the-aofrdb-precedence)).
+That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup.
+
+A command that replay refuses stops startup the same way, with the error the command returned. Stash writes only commands that replay, but a file edited by hand can hold one that does not, such as `REPLCONF GETACK`, which only a master's replication stream may send:
+
+```
+server: load aof "appendonly.aof": aof: replay command 2 from "appendonly.aof": syntax error
+```
+
+Remove that command from the file, or from a copy of it, and start again. Do not delete the file to get past the error: an empty or missing append-only file starts an empty server, or one holding only the keys `--rdb` loads, which then become the whole append-only file (see [Understand the AOF/RDB precedence](#understand-the-aofrdb-precedence)).
 
 ## Watching for write failures
 

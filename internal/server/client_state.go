@@ -3,7 +3,6 @@ package server
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -53,19 +52,6 @@ type ClientState struct {
 	TxFailed          bool
 	TxDirty           bool
 	TxQueue           []QueuedCommand
-}
-
-type clientStateContextKey struct{}
-
-// WithClientState attaches a connection-scoped client state to ctx.
-func WithClientState(ctx context.Context, state *ClientState) context.Context {
-	return context.WithValue(ctx, clientStateContextKey{}, state)
-}
-
-// ClientStateFromContext retrieves the connection-scoped client state from ctx.
-func ClientStateFromContext(ctx context.Context) (*ClientState, bool) {
-	state, ok := ctx.Value(clientStateContextKey{}).(*ClientState)
-	return state, ok
 }
 
 // BeginTransaction marks the client as inside a transaction.
@@ -261,37 +247,24 @@ func (s *ClientState) flushLocked() error {
 	return s.responseWriter.Flush()
 }
 
-// FlushClientResponses flushes the replies queued for the client that ctx belongs
-// to, without waiting for other writers (see TryFlushResponses). A command that is
-// about to block the connection calls it first, so replies to the requests before
-// it are not held back behind it.
-func FlushClientResponses(ctx context.Context) error {
-	state, ok := ClientStateFromContext(ctx)
-	if !ok {
-		return nil
-	}
-	return state.TryFlushResponses()
-}
-
 // ErrClientDisconnected reports that a command was waiting for something and
 // the client went away while it waited.
 var ErrClientDisconnected = errors.New("server: client disconnected")
 
-// ClientDisconnected reports whether the client behind ctx has closed its side of
-// the connection, without reading from it. A command that blocks for a long time
+// Disconnected reports whether the client has closed its side of the
+// connection, without reading from it. A command that blocks for a long time
 // polls it, so it can stop waiting for a client that is not there. It is false
 // when there is no connection to look at (the event loop, an unsupported
-// platform, a context with no client) and while the client has sent requests the
-// server has not yet read.
-func ClientDisconnected(ctx context.Context) bool {
-	state, ok := ClientStateFromContext(ctx)
-	if !ok || state == nil {
+// platform, no client) and while the client has sent requests the server has
+// not yet read.
+func (s *ClientState) Disconnected() bool {
+	if s == nil {
 		return false
 	}
 
-	state.mu.RLock()
-	conn := state.responseConn
-	state.mu.RUnlock()
+	s.mu.RLock()
+	conn := s.responseConn
+	s.mu.RUnlock()
 	if conn == nil {
 		return false
 	}

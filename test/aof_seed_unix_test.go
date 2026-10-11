@@ -12,9 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -45,7 +43,7 @@ func TestServerRefusesToSeedAnAOFPathThatIsNotARegularFile(t *testing.T) {
 	))
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 
 	// A server that wrongly starts would serve until the context ends.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

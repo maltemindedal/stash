@@ -66,19 +66,6 @@ func DeleteFrame(keys []string) protocol.Array {
 	return protocol.Array{Elements: elements}
 }
 
-type replicationOriginContextKey struct{}
-
-// WithReplicationOrigin marks a command as originating from the upstream replication stream.
-func WithReplicationOrigin(ctx context.Context) context.Context {
-	return context.WithValue(ctx, replicationOriginContextKey{}, true)
-}
-
-// IsReplicationOrigin reports whether the current command came from the upstream replication stream.
-func IsReplicationOrigin(ctx context.Context) bool {
-	origin, _ := ctx.Value(replicationOriginContextKey{}).(bool)
-	return origin
-}
-
 // ReplicationState stores process-wide replication metadata.
 type ReplicationState struct {
 	MasterReplicationID string
@@ -710,17 +697,12 @@ func (s *Server) dropReplica(id uint64, cause error) {
 	}
 }
 
-func (s *Server) recordClientWriteOffset(ctx context.Context, offset int64) {
-	if offset <= 0 {
+func (s *Server) recordClientWriteOffset(client *ClientState, offset int64) {
+	if offset <= 0 || client == nil {
 		return
 	}
 
-	state, ok := ClientStateFromContext(ctx)
-	if !ok || state == nil {
-		return
-	}
-
-	state.SetLastWriteReplicationOffset(offset)
+	client.SetLastWriteReplicationOffset(offset)
 }
 
 func (s *Server) setUpstreamConn(conn net.Conn) {
@@ -869,7 +851,7 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 	s.logger.Info("replica handshake completed", "master_addr", masterAddr, "listening_port", listeningPort)
 	synchronised = true
 
-	replicationCtx := WithReplicationOrigin(ctx)
+	masterCall := Call{Origin: OriginMaster}
 
 	for {
 		value, err := parser.Parse()
@@ -898,7 +880,7 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 			"replica_offset", replicaOffset,
 		)
 
-		result, execErr := s.executeRequest(replicationCtx, value)
+		result, execErr := s.executor.Handle(ctx, masterCall, value)
 		if execErr != nil {
 			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
 				return

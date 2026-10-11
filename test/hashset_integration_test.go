@@ -7,10 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -19,8 +17,7 @@ func TestServerHandlesHashSetAndListPopCommands(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

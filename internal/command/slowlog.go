@@ -23,14 +23,9 @@ func (e *Executor) handleSlowlog(_ context.Context, request *Request) (protocol.
 		}
 		return slowlogEntriesResponse(e.slowlogEntries(limit)), nil
 	case "LEN":
-		if e.slowlogRegistry == nil {
-			return protocol.Integer{Value: 0}, nil
-		}
 		return protocol.Integer{Value: int64(e.slowlogRegistry.Len())}, nil
 	case "RESET":
-		if e.slowlogRegistry != nil {
-			e.slowlogRegistry.Reset()
-		}
+		e.slowlogRegistry.Reset()
 		return protocol.SimpleString{Value: "OK"}, nil
 	default:
 		return nil, ErrSyntaxError()
@@ -65,9 +60,6 @@ func validateSlowlogRequest(request *Request) error {
 }
 
 func (e *Executor) slowlogEntries(limit int) []server.SlowlogEntry {
-	if e.slowlogRegistry == nil {
-		return nil
-	}
 	return e.slowlogRegistry.Entries(limit)
 }
 

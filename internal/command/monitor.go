@@ -12,7 +12,7 @@ func (e *Executor) handleMonitor(ctx context.Context, request *Request) (protoco
 		return nil, wrongNumberOfArgumentsError("MONITOR")
 	}
 
-	state, err := clientStateFromContext(ctx)
+	state, err := clientStateOf(request)
 	if err != nil {
 		return nil, err
 	}

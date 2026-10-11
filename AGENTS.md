@@ -60,7 +60,7 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 ## Gotchas
 
 - `stash`, `dump.rdb` and `*.aof` are not gitignored. Delete any you created before committing, so `git status --porcelain` shows only your changes.
-- `server` cannot import `command`, so `server.New` wires the executor by optional type assertion (`executor.(writeOrderingSetter)` and others in `internal/server/server.go`). Renaming one of those methods still compiles and silently switches the feature off; only integration tests notice.
+- `server` cannot import `command`, so `server.New` builds the executor once, from `server.Services`, with the constructor it is given (`cmd/stash` adapts `command.New`), and calls it through the required `server.CommandExecutor` interface in `internal/server/executor.go`. A renamed method is a compile error, and `command.New` refuses a `Services` with a nil collaborator. Only `BeginBackgroundWrite` is still found by optional type assertion (`backgroundWriteSequencer`), until #44 makes it required, at two sites: `server.New` (the expiry sweep's guard) and `initializePersistence` in `aof.go` (an AOF rewrite's guard). Renaming it still compiles and silently drops both guards.
 - CodeQL (enabled in repo settings, not in `.github/workflows`) flags an `int64` to `int` conversion bounded by the `min` builtin as high severity. Write an explicit clamp (6db82b0).
 - CI only vets darwin and windows. The kqueue poller (`internal/server/poller_darwin.go`) and the darwin paths in `peer_unix.go` have never run in CI: after changing them, run `go test ./...` natively on macOS, and say in the PR whether you did.
 

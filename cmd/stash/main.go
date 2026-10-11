@@ -23,8 +23,13 @@ func main() {
 	cfg := config.ParseFlags()
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv, err := server.New(cfg, logger, store, func(services server.Services) (server.CommandExecutor, error) {
+		return command.New(services)
+	})
+	if err != nil {
+		logger.Error("Stash could not start", "error", err)
+		os.Exit(1)
+	}
 
 	if err := srv.ListenAndServe(ctx); err != nil {
 		logger.Error("Stash exited with error", "error", err)

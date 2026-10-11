@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -95,7 +93,7 @@ func startUnderAFileSizeLimit(t *testing.T, aofPath, policy string) {
 	cfg.MaxMemory = 2000
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	store := storage.NewStore()
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 
 	var limit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &limit); err != nil {

@@ -26,7 +26,7 @@ func BenchmarkPropagateToReplicas(b *testing.B) {
 	for _, replicas := range []int{0, 1, 3} {
 		replicas := replicas
 		b.Run(fmt.Sprintf("replicas=%d", replicas), func(b *testing.B) {
-			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			srv := newTestServer(b, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 			for id := uint64(1); id <= uint64(replicas); id++ {
 				conn := &stubConn{}
 				srv.replicaPeers.Add(srv.replication, id, conn, 6380, newReplicaPeerStateForTest(id, conn))

@@ -15,7 +15,6 @@ import (
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -73,7 +72,7 @@ func writeDuringFullResync(t *testing.T, cfg config.Config, wait bool) {
 
 	var logs synchronizedBuffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)

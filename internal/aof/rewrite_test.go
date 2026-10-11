@@ -58,8 +58,7 @@ func TestGenerateRewriteRoundTripsState(t *testing.T) {
 	}
 
 	replayedStore := storage.NewStore()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	executor := command.NewExecutor(replayedStore, logger)
+	executor := replayExecutor(t, replayedStore)
 	parser := protocol.NewParser(bytes.NewReader(payload.Bytes()))
 	for {
 		value, parseErr := parser.Parse()
@@ -70,8 +69,12 @@ func TestGenerateRewriteRoundTripsState(t *testing.T) {
 			t.Fatalf("Parse() error = %v", parseErr)
 		}
 		// Replayed as the server replays its AOF at startup.
-		if _, execErr := executor.ExecuteDetailed(server.WithReplicationOrigin(context.Background()), value); execErr != nil {
-			t.Fatalf("ExecuteDetailed() error = %v", execErr)
+		result, execErr := executor.Handle(context.Background(), server.Call{Origin: server.OriginReplay}, value)
+		if result.Release != nil {
+			result.Release()
+		}
+		if execErr != nil {
+			t.Fatalf("Handle() error = %v", execErr)
 		}
 	}
 
@@ -377,9 +380,12 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 			}
 
 			replayedStore := storage.NewStore()
-			executor := command.NewExecutor(replayedStore, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			loaded, err := aof.LoadFile(server.WithReplicationOrigin(context.Background()), path, func(ctx context.Context, value protocol.Value) error {
-				_, execErr := executor.ExecuteDetailed(ctx, value)
+			executor := replayExecutor(t, replayedStore)
+			loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
+				result, execErr := executor.Handle(ctx, server.Call{Origin: server.OriginReplay}, value)
+				if result.Release != nil {
+					result.Release()
+				}
 				return execErr
 			})
 			if err != nil {
@@ -534,6 +540,31 @@ func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// replayExecutor is a command executor over store, as the server builds one,
+// with stand-ins for the server's other collaborators: nothing records writes,
+// as nothing does while a server replays its AOF at startup.
+func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
+	t.Helper()
+
+	executor, err := command.New(server.Services{
+		Store:            store,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Watches:          server.NewWatchRegistry(),
+		PubSub:           server.NewPubSubRegistry(),
+		Slowlog:          server.NewSlowlogRegistry(),
+		SlowlogThreshold: -1,
+		Replication:      &server.ReplicationState{},
+		Replicas:         server.NewReplicaRegistry(),
+		Stats:            func() server.Stats { return server.Stats{Role: "master", AOFLastWriteOK: true} },
+		RewriteAOF:       func(context.Context) error { return errors.New("append only file persistence is not enabled") },
+		RecordsWrites:    func() bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("command.New() error = %v", err)
+	}
+	return executor
 }
 
 // sortedSnapshot orders a snapshot by key, which SnapshotAll does not.

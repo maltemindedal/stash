@@ -14,11 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltemindedal/stash/internal/command"
 	"github.com/maltemindedal/stash/internal/config"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -321,8 +319,7 @@ func TestServerRejectsInvalidReplicaConfigBeforeOpeningAOF(t *testing.T) {
 
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	executor := command.NewExecutor(store, logger)
-	srv := server.New(cfg, logger, store, executor)
+	srv := newServer(t, cfg, logger, store)
 
 	err := srv.ListenAndServe(context.Background())
 	if err == nil {
@@ -542,7 +539,7 @@ func TestServerRefusesToStartOnACorruptAOF(t *testing.T) {
 	cfg := testAOFConfig(aofPath)
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
-	srv := server.New(cfg, logger, store, command.NewExecutor(store, logger))
+	srv := newServer(t, cfg, logger, store)
 
 	// A server that wrongly starts would serve until the context ends.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -560,6 +557,31 @@ func TestServerRefusesToStartOnACorruptAOF(t *testing.T) {
 	got, readErr := os.ReadFile(aofPath)
 	if readErr != nil || !bytes.Equal(got, content) {
 		t.Fatalf("the append-only file changed (read error %v)", readErr)
+	}
+}
+
+func TestServerRefusesToStartOnAnAOFThatAsksForAnAcknowledgement(t *testing.T) {
+	// Only a Master's replication stream may ask for REPLCONF GETACK, and Stash
+	// never logs one. A hand-edited file that holds one stops startup with the
+	// error instead of being replayed past it.
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	content, err := protocol.EncodeValues([]protocol.Value{request("SET", "a", "1"), request("REPLCONF", "GETACK", "*")})
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	if err := os.WriteFile(aofPath, content, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := testAOFConfig(aofPath)
+	srv := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
+
+	// A server that wrongly starts would serve until the context ends.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err = srv.ListenAndServe(ctx)
+	if err == nil || !strings.Contains(err.Error(), "load aof") || !strings.Contains(err.Error(), "syntax error") {
+		t.Fatalf("ListenAndServe() error = %v, want a refusal to load the append-only file", err)
 	}
 }
 

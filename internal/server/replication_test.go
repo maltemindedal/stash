@@ -63,7 +63,7 @@ func TestReplicaRegistryRemoveAndCloseReturnsCloseError(t *testing.T) {
 
 func TestServerPropagateToReplicasRemovesFailingReplica(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(config.Config{}, logger, storage.NewStore(), nil)
+	srv := newTestServer(t, config.Config{}, logger, storage.NewStore(), nil)
 
 	serverConn := &recordingConn{}
 	srv.replicaPeers.Add(srv.replication, 1, serverConn, 6380, newReplicaPeerStateForTest(1, serverConn))
@@ -118,7 +118,7 @@ func TestConcurrentWritesReachEveryReplicaInOffsetOrder(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 			conns := make([]*recordingConn, tt.replicas)
 			for i := range conns {
 				id := uint64(i + 1)
@@ -402,7 +402,7 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 // TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt in the
 // command package.
 func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *testing.T) {
-	srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 	frame := []protocol.Value{DeleteFrame([]string{"key"})}
 
 	const writers = 8
@@ -512,7 +512,7 @@ func TestWithNoReplicaRegisteredOnlyClientWritesSkipTheRegistryLock(t *testing.T
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 			srv.replicaPeers.mu.Lock()
 			locked := true
 			unlock := func() {
@@ -675,7 +675,7 @@ func TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+			srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 			conn := &stubConn{}
 			written := &recordingConn{}
 			srv.replicaPeers.BeginAttach()
@@ -705,7 +705,7 @@ func TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted(t *testing.T) {
 // once, and a connection not yet marked would hold it to a subscriber's 32 MiB
 // instead of a replica's 256 MiB.
 func TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts(t *testing.T) {
-	srv := New(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
+	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 	srv.replicaPeers.BeginAttach()
 	srv.replicaPeers.Reserve(srv.replication, 1, 6380, newReplicaPeerStateForTest(1, &recordingConn{}))
 	defer srv.replicaPeers.StopFeeds(time.Second)
@@ -817,7 +817,7 @@ func newReplicaPeerStateForTest(id uint64, conn net.Conn) *ClientState {
 // the shared peer without the registry lock that UpdateAck writes it under; the
 // race detector reports that, so this test is meaningful under -race.
 func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
-	srv := New(config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
+	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
 	srv.replicaPeers.Add(srv.replication, 1, &stubConn{}, 6380, nil)
 
 	stop := make(chan struct{})

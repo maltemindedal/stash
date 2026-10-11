@@ -38,7 +38,7 @@ func TestCheckBindSafety(t *testing.T) {
 			cfg.Host = tt.host
 			cfg.RequirePass = tt.password
 			cfg.AllowOpenBind = tt.allowOpenBind
-			srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
+			srv := newTestServer(t, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
 
 			err := srv.checkBindSafety()
 			if refused := err != nil; refused != tt.wantRefused {

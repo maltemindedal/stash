@@ -25,6 +25,9 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	}()
 
 	state := s.getClientState(clientID)
+	// Built once for the connection. A connection whose Client state shutdown
+	// has already cleared gets a Call without one, which the executor refuses.
+	call := Call{Client: state, Origin: OriginClient}
 	var input io.Reader = conn
 	if state != nil {
 		// Replies are queued while requests keep arriving and are sent when the
@@ -43,7 +46,6 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		state.BindResponseWriter(writer)
 		state.BindResponseConn(conn)
 		state.SetRemoteAddr(remoteAddr)
-		ctx = WithClientState(ctx, state)
 	}
 
 	logger := s.logger.With("client_id", clientID, "remote_addr", remoteAddr)
@@ -98,13 +100,13 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			// the event loop and Redis do. Carrying on made every further byte of
 			// the garbage draw its own error reply and log line.
 			logger.Warn("failed to parse request", "error", err)
-			if writeErr := s.writeClientResponses(ctx, writer, []protocol.Value{protocol.ErrorValue{Message: "ERR " + err.Error()}}); writeErr != nil {
+			if writeErr := s.writeClientResponses(state, writer, []protocol.Value{protocol.ErrorValue{Message: "ERR " + err.Error()}}); writeErr != nil {
 				logger.Warn("failed to write parser error", "parse_error", err, "write_error", writeErr)
 			}
 			return
 		}
 
-		responses, registerReplica, execErr := s.executeClientRequest(ctx, clientID, conn, logger, value)
+		responses, registerReplica, execErr := s.executeClientRequest(ctx, call, clientID, conn, logger, value)
 		if execErr != nil {
 			return
 		}
@@ -114,7 +116,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			authDeadlineSet = false
 		}
 
-		if err := s.writeClientResponses(ctx, writer, responses); err != nil {
+		if err := s.writeClientResponses(state, writer, responses); err != nil {
 			logger.Warn("failed to write response", "error", err)
 			return
 		}
@@ -174,12 +176,12 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 // responses to deliver and whether the caller must start the feed of the
 // replica peer PSYNC registered (registerReplicaPeer) once those responses have
 // been written or buffered. A non-nil error is fatal for the connection.
-func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn ClientConn, logger *slog.Logger, request protocol.Value) ([]protocol.Value, bool, error) {
+func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID uint64, conn ClientConn, logger *slog.Logger, request protocol.Value) ([]protocol.Value, bool, error) {
 	if s.monitorRegistry.HasSubscribers() {
 		s.broadcastMonitorEvent(observeCommand(request, clientID, conn))
 	}
 
-	result, execErr := s.executeRequest(ctx, request)
+	result, execErr := s.executor.Handle(ctx, call, request)
 	// Until the result's frames have been logged and sent to the replicas, no
 	// other write may run; see sequencer in the command package.
 	if result.Release != nil {
@@ -201,23 +203,14 @@ func (s *Server) executeClientRequest(ctx context.Context, clientID uint64, conn
 		durabilityPayload = nil
 	}
 
-	s.finalizeMutationEffects(ctx, result.Durability, durabilityPayload, result.Propagation, logger)
+	s.finalizeMutationEffects(call.Client, result.Durability, durabilityPayload, result.Propagation, logger)
 	s.commandsProcessed.Add(1)
 
 	return result.Responses, result.RegisterReplica, nil
 }
 
-// executeRequest runs one request through the executor, ordered against other
-// requests when the executor supports it.
-func (s *Server) executeRequest(ctx context.Context, request protocol.Value) (ExecuteResult, error) {
-	if sequenced, ok := s.executor.(sequencedExecutor); ok {
-		return sequenced.ExecuteSequenced(ctx, request)
-	}
-	return s.executor.ExecuteDetailed(ctx, request)
-}
-
-func (s *Server) writeClientResponses(ctx context.Context, writer *bufio.Writer, values []protocol.Value) error {
-	if state, ok := ClientStateFromContext(ctx); ok && state != nil {
+func (s *Server) writeClientResponses(state *ClientState, writer *bufio.Writer, values []protocol.Value) error {
+	if state != nil {
 		return state.QueueResponses(values)
 	}
 

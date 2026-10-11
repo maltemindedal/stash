@@ -18,60 +18,6 @@ import (
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
-type executor interface {
-	ExecuteDetailed(context.Context, protocol.Value) (ExecuteResult, error)
-}
-
-// sequencedExecutor is an executor that can order requests against one another.
-// Its results carry a Release function that the caller calls once it has applied
-// the result's durability and propagation frames.
-type sequencedExecutor interface {
-	ExecuteSequenced(context.Context, protocol.Value) (ExecuteResult, error)
-}
-
-type writeOrderingSetter interface {
-	SetWriteOrdering(func() bool)
-}
-
-// backgroundWriteSequencer orders work the server does on its own (the expiry
-// sweep, the snapshot of an AOF rewrite) against client requests. The returned
-// function is called when that work's frames have been applied.
-type backgroundWriteSequencer interface {
-	BeginBackgroundWrite() (release func())
-}
-
-type watchRegistryProvider interface {
-	WatchRegistry() *WatchRegistry
-}
-
-type pubSubRegistryProvider interface {
-	PubSubRegistry() *PubSubRegistry
-}
-
-type replicationStateSetter interface {
-	SetReplicationState(*ReplicationState)
-}
-
-type replicaRegistrySetter interface {
-	SetReplicaRegistry(*ReplicaRegistry)
-}
-
-type authConfigSetter interface {
-	SetRequirePass(string)
-}
-
-type aofRewriteTriggerSetter interface {
-	SetAOFRewriteTrigger(func(context.Context) error)
-}
-
-type slowlogConfigSetter interface {
-	SetSlowlogConfig(*SlowlogRegistry, time.Duration)
-}
-
-type serverStatsProviderSetter interface {
-	SetServerStatsProvider(func() Stats)
-}
-
 type temporaryError interface {
 	error
 	Temporary() bool
@@ -82,7 +28,7 @@ type Server struct {
 	cfg               config.Config
 	logger            *slog.Logger
 	store             *storage.Store
-	executor          executor
+	executor          CommandExecutor
 	registry          *ClientRegistry
 	replicaPeers      *ReplicaRegistry
 	watchRegistry     *WatchRegistry
@@ -111,21 +57,50 @@ type Server struct {
 	handlerWG    sync.WaitGroup
 }
 
-// New constructs a server ready to listen for TCP clients.
-func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor executor) *Server {
+// New constructs a server ready to listen for TCP clients. It creates the
+// registries the server and the command executor share, and builds the
+// executor once, from Services, with newExecutor.
+func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecutor NewExecutorFunc) (*Server, error) {
+	if newExecutor == nil {
+		return nil, errors.New("server: no command executor constructor")
+	}
 	srv := &Server{
 		cfg:             cfg,
 		logger:          logger,
 		store:           store,
-		executor:        executor,
 		registry:        NewClientRegistry(),
 		replicaPeers:    NewReplicaRegistry(),
+		watchRegistry:   NewWatchRegistry(),
+		pubSubRegistry:  NewPubSubRegistry(),
 		monitorRegistry: NewMonitorRegistry(),
 		slowlogRegistry: NewSlowlogRegistry(),
 		replication:     newReplicationState(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
 	srv.replicaPeers.SetFeedErrorHandler(srv.dropReplica)
+
+	executor, err := newExecutor(Services{
+		Store:            store,
+		Logger:           logger,
+		RequirePass:      cfg.RequirePass,
+		Watches:          srv.watchRegistry,
+		PubSub:           srv.pubSubRegistry,
+		Slowlog:          srv.slowlogRegistry,
+		SlowlogThreshold: cfg.SlowlogLogSlowerThan,
+		Replication:      srv.replication,
+		Replicas:         srv.replicaPeers,
+		Stats:            srv.ServerStats,
+		RewriteAOF:       srv.beginAOFRewrite,
+		RecordsWrites:    srv.recordsWrites,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("server: build the command executor: %w", err)
+	}
+	if executor == nil {
+		return nil, errors.New("server: the command executor constructor returned no executor")
+	}
+	srv.executor = executor
+
 	if store != nil {
 		store.SetLogger(logger)
 		store.SetExpirationListener(srv.recordExpiredKeys)
@@ -133,35 +108,8 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, executor 
 			store.SetEvictionGuard(sequencer.BeginBackgroundWrite)
 		}
 	}
-	if provider, ok := executor.(watchRegistryProvider); ok {
-		srv.watchRegistry = provider.WatchRegistry()
-	}
-	if provider, ok := executor.(pubSubRegistryProvider); ok {
-		srv.pubSubRegistry = provider.PubSubRegistry()
-	}
-	if setter, ok := executor.(replicationStateSetter); ok {
-		setter.SetReplicationState(srv.replication)
-	}
-	if setter, ok := executor.(replicaRegistrySetter); ok {
-		setter.SetReplicaRegistry(srv.replicaPeers)
-	}
-	if setter, ok := executor.(writeOrderingSetter); ok {
-		setter.SetWriteOrdering(srv.recordsWrites)
-	}
-	if setter, ok := executor.(authConfigSetter); ok {
-		setter.SetRequirePass(cfg.RequirePass)
-	}
-	if setter, ok := executor.(aofRewriteTriggerSetter); ok {
-		setter.SetAOFRewriteTrigger(srv.beginAOFRewrite)
-	}
-	if setter, ok := executor.(slowlogConfigSetter); ok {
-		setter.SetSlowlogConfig(srv.slowlogRegistry, cfg.SlowlogLogSlowerThan)
-	}
-	if setter, ok := executor.(serverStatsProviderSetter); ok {
-		setter.SetServerStatsProvider(srv.ServerStats)
-	}
 
-	return srv
+	return srv, nil
 }
 
 // ListenAndServe starts the TCP listener and blocks until shutdown.
@@ -269,21 +217,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // errEventLoopUnsupported reports that the current platform has no OS I/O
 // multiplexing backend (epoll on Linux, kqueue on macOS).
 var errEventLoopUnsupported = errors.New("server: event loop networking is not supported on this platform")
-
-type inlineExecutionContextKey struct{}
-
-// WithInlineExecution marks ctx as executing commands inline on a shared
-// event-loop goroutine, where a blocked command stalls every connection.
-func WithInlineExecution(ctx context.Context) context.Context {
-	return context.WithValue(ctx, inlineExecutionContextKey{}, true)
-}
-
-// IsInlineExecution reports whether commands on ctx run inline on a shared
-// event-loop goroutine and therefore must fail instead of blocking.
-func IsInlineExecution(ctx context.Context) bool {
-	inline, _ := ctx.Value(inlineExecutionContextKey{}).(bool)
-	return inline
-}
 
 // serve accepts and serves client connections until shutdown. With event-loop
 // mode enabled it dispatches sockets through OS readiness notifications where

@@ -22,7 +22,7 @@ func (e *Executor) handleLPush(ctx context.Context, request *Request) (protocol.
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: length}, nil
 }
 
@@ -37,7 +37,7 @@ func (e *Executor) handleRPush(ctx context.Context, request *Request) (protocol.
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(ctx, request, key, evicted)
+	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: length}, nil
 }
 
@@ -92,7 +92,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		// leave while beginWrite waits for it. So the client is looked at here,
 		// after that wait and just before the pop. The look never blocks, so it is
 		// safe to make holding the stripe.
-		if woken && server.ClientDisconnected(ctx) {
+		if woken && request.client.Disconnected() {
 			release()
 			e.store.UnsubscribeListPush(key, waiter)
 			e.store.PassListPushWake(key)
@@ -122,7 +122,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 			// restart, or a replica, would still have the element.
 			frame := propagationFrame(&Request{Name: "LPOP", Args: [][]byte{clone(request.Args[0])}})
 			result.Durability = []protocol.Value{frame}
-			if !server.IsReplicationOrigin(ctx) {
+			if request.origin.Propagates() {
 				result.Propagation = []protocol.Value{frame}
 			}
 			return result, nil
@@ -137,13 +137,13 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		// On the event loop, blocking would deadlock the whole server: the
 		// LPUSH that fires the waiter can only execute on the loop goroutine
 		// this command is blocking.
-		if server.IsInlineExecution(ctx) {
+		if request.inline {
 			e.store.UnsubscribeListPush(key, waiter)
 			return server.ExecuteResult{}, blockingNotSupportedError("BLPOP")
 		}
 
 		// Replies to the requests pipelined ahead of this one must not wait behind it.
-		if err := server.FlushClientResponses(ctx); err != nil {
+		if err := request.client.TryFlushResponses(); err != nil {
 			e.store.UnsubscribeListPush(key, waiter)
 			return server.ExecuteResult{}, err
 		}
@@ -154,7 +154,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 				woken = true
 				waiting = false
 			case <-clientCheck.C:
-				if server.ClientDisconnected(ctx) {
+				if request.client.Disconnected() {
 					e.store.UnsubscribeListPush(key, waiter)
 					return server.ExecuteResult{}, server.ErrClientDisconnected
 				}
