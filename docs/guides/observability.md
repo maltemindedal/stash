@@ -128,7 +128,7 @@ Logging uses Go's `log/slog` text handler writing to stdout. Set the level with 
 go run ./cmd/stash --log-level debug
 ```
 
-At `info`, Stash logs listener startup, AOF and RDB load decisions, replica handshakes and disconnects, shutdown snapshots, and startup eviction.
+At `info`, Stash logs listener startup, AOF and RDB load decisions, replica handshakes and disconnects, the replicas being sent what is queued for them at shutdown, shutdown snapshots, and startup eviction.
 
 ## Related
 

@@ -390,9 +390,18 @@ func (s *Server) shutdown() {
 		s.closeUpstreamConn()
 		// Commands already propagated are written to the replicas before their
 		// sockets are closed, as they were when propagation wrote them directly.
-		if unfinished := s.replicaPeers.StopFeeds(replicaShutdownGrace); unfinished > 0 {
+		// Their connections stay open, in both networking modes, until each
+		// replica has closed its own side after the end of its stream, or until
+		// CloseAll below once the grace has passed. A write made from here on
+		// reaches no replica.
+		deadline := time.Now().Add(replicaShutdownGrace)
+		if replicas := s.replicaPeers.StopPropagating(); replicas > 0 {
+			s.logger.Info("sending the replicas what is queued for them before shutting down", "replicas", replicas, "grace", replicaShutdownGrace)
+		}
+		if unfinished := s.replicaPeers.StopFeeds(time.Until(deadline)); unfinished > 0 {
 			s.logger.Warn("some replicas did not receive the last propagated commands before shutdown", "replicas", unfinished)
 		}
+		s.replicaPeers.EndStreams(deadline)
 
 		s.listenerMu.RLock()
 		listener := s.listener
