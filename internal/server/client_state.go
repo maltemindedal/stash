@@ -406,7 +406,12 @@ func (s *ClientState) PromoteToReplica() {
 }
 
 // IsReplica reports whether the connection has completed replica handshake setup.
+// A nil ClientState is not a replica.
 func (s *ClientState) IsReplica() bool {
+	if s == nil {
+		return false
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

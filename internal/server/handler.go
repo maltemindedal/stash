@@ -98,8 +98,12 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			// After a frame that cannot be parsed the stream is out of step and
 			// nothing that follows can be trusted, so answer once and close, as
 			// the event loop and Redis do. Carrying on made every further byte of
-			// the garbage draw its own error reply and log line.
+			// the garbage draw its own error reply and log line. A replica's
+			// link carries only the stream, so a replica is closed unanswered.
 			logger.Warn("failed to parse request", "error", err)
+			if state.IsReplica() {
+				return
+			}
 			if writeErr := s.writeClientResponses(state, writer, []protocol.Value{protocol.ErrorValue{Message: "ERR " + err.Error()}}); writeErr != nil {
 				logger.Warn("failed to write parser error", "parse_error", err, "write_error", writeErr)
 			}
@@ -176,11 +180,17 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 // responses to deliver and whether the caller must start the feed of the
 // replica peer PSYNC registered (registerReplicaPeer) once those responses have
 // been written or buffered. A non-nil error is fatal for the connection.
+//
+// A request from a connection that is already an attached replica gets no
+// responses.
 func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID uint64, conn ClientConn, logger *slog.Logger, request protocol.Value) ([]protocol.Value, bool, error) {
 	if s.monitorRegistry.HasSubscribers() {
 		s.broadcastMonitorEvent(observeCommand(request, clientID, conn))
 	}
 
+	// Read before the request runs, so that the reply to the PSYNC that makes
+	// the connection a replica still goes out.
+	attachedReplica := call.Client.IsReplica()
 	result, execErr := s.executor.Handle(ctx, call, request)
 	// Until the result's frames have been logged and sent to the replicas, no
 	// other write may run; see sequencer in the command package.
@@ -206,6 +216,19 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 	s.finalizeMutationEffects(call.Client, result.Durability, durabilityPayload, result.Propagation, logger)
 	s.commandsProcessed.Add(1)
 
+	if attachedReplica {
+		// A replica's connection carries the replication stream and nothing
+		// else. A reply would reach the replica as part of the stream, and could
+		// land inside a propagated frame, since the stream is written in chunks
+		// that ignore frame boundaries. Redis never answers a replica's REPLCONF
+		// ACK either (Stash's has no reply), and closes the link of a replica
+		// whose command produces a reply; Stash drops the reply and keeps the
+		// replica, which may be a Redis 7 one acknowledging with FACK.
+		if len(result.Responses) > 0 {
+			logger.Debug("not answering a request on a replica's replication link", "replies", len(result.Responses))
+		}
+		return nil, result.RegisterReplica, nil
+	}
 	return result.Responses, result.RegisterReplica, nil
 }
 

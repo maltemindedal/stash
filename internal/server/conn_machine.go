@@ -326,6 +326,11 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	m.pending = m.pending[1:]
 
 	if event.protoErr != nil {
+		// A replica's connection carries the replication stream and nothing
+		// else, so a replica is closed unanswered once its output has drained.
+		if m.client.IsReplica() {
+			return len(m.pending) > 0, nil
+		}
 		if err := m.bufferResponses([]protocol.Value{protocol.ErrorValue{Message: "ERR " + event.protoErr.Error()}}); err != nil {
 			m.Close(err)
 			return false, err

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -95,7 +96,14 @@ func TestServerHandlesMasterReplicaHandshake(t *testing.T) {
 		t.Fatalf("ReplicaCount() = %d, want 1", srv.ReplicaCount())
 	}
 
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "PONG"}, "PING")
+	// The link of an attached replica carries the stream alone, so its PING
+	// is not answered (TestTheMasterSendsAnAttachedReplicaNothingButTheStream).
+	if err := protocol.WriteValue(conn, request("PING")); err != nil {
+		t.Fatalf("WriteValue(PING) error = %v", err)
+	}
+	if err := assertNoFurtherReplicaRequests(conn, parser, 100*time.Millisecond); err != nil {
+		t.Fatalf("after the replica's PING: %v", err)
+	}
 
 	cancel()
 	select {
@@ -1113,6 +1121,111 @@ func waitForPropagatedDelete(t *testing.T, conn net.Conn, parser *protocol.Parse
 			t.Fatalf("propagated DEL args = %q, want [%s]", propagated.Args, key)
 		}
 		return
+	}
+}
+
+// TestTheMasterSendsAnAttachedReplicaNothingButTheStream has an attached replica
+// send requests on its replication link that would each get a reply from a
+// client's connection: Redis 7's REPLCONF ACK with an AOF offset (FACK), which
+// Stash refuses for its arity, a command, an unknown command, and a frame that
+// cannot be parsed. Redis never answers a replica's REPLCONF ACK, and its
+// replication link carries nothing but the stream. The master used to answer
+// each request into the stream, where under --event-loop a reply could land
+// inside a replication frame, since the stream is written in 1 MiB chunks that
+// ignore frame boundaries. Acknowledgements must still count.
+func TestTheMasterSendsAnAttachedReplicaNothingButTheStream(t *testing.T) {
+	for _, eventLoop := range []bool{false, true} {
+		eventLoop := eventLoop
+		t.Run(fmt.Sprintf("eventLoop=%v", eventLoop), func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.EventLoop = eventLoop
+			master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			errCh := make(chan error, 1)
+			go func() { errCh <- master.ListenAndServe(ctx) }()
+			addr := waitForAddr(t, master)
+
+			replica, replicaParser := attachTestReplica(t, master, addr)
+			client, clientParser := dialClient(t, addr)
+
+			set, err := protocol.EncodeValues([]protocol.Value{request("SET", "k", "v")})
+			if err != nil {
+				t.Fatalf("EncodeValues() error = %v", err)
+			}
+			assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "k", "v")
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			if err := assertReplicaRequest(replicaParser, "SET", "k", "v"); err != nil {
+				t.Fatalf("first propagated write: %v", err)
+			}
+
+			// Each would get a reply on a client's connection. The acknowledgement
+			// last shows, through INFO, that the master has run all of them.
+			acked := fmt.Sprint(len(set))
+			pipeline, err := protocol.EncodeValues([]protocol.Value{
+				request("REPLCONF", "ACK", acked, "FACK", "0"),
+				request("PING"),
+				request("GET", "k"),
+				request("NOSUCHCOMMAND"),
+				request("REPLCONF", "ACK", acked),
+			})
+			if err != nil {
+				t.Fatalf("EncodeValues() error = %v", err)
+			}
+			if _, err := replica.Write(pipeline); err != nil {
+				t.Fatalf("Write(pipeline) error = %v", err)
+			}
+			waitForReplicaAcknowledgement(t, client, clientParser)
+
+			assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "k2", "v2")
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			next, err := replicaParser.Parse()
+			if err != nil {
+				t.Fatalf("Parse() after the replica's requests error = %v", err)
+			}
+			if propagated, err := command.DecodeRequest(next); err != nil || propagated.Name != "SET" {
+				t.Fatalf("after its own requests the replica read %#v, want the propagated SET k2 v2", next)
+			}
+
+			// A frame that cannot be parsed closes the link, with no reply first.
+			if _, err := replica.Write([]byte("*x\r\n")); err != nil {
+				t.Fatalf("Write(garbage) error = %v", err)
+			}
+			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline() error = %v", err)
+			}
+			if value, err := replicaParser.Parse(); err == nil {
+				t.Fatalf("after a frame that cannot be parsed the replica read %#v, want the link closed", value)
+			} else if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("after a frame that cannot be parsed Parse() error = %v, want the link closed", err)
+			}
+
+			cancel()
+			waitForServerStop(t, errCh)
+		})
+	}
+}
+
+// waitForReplicaAcknowledgement waits until INFO replication on conn shows the
+// one replica attached having acknowledged the whole stream.
+func waitForReplicaAcknowledgement(t *testing.T, conn net.Conn, parser *protocol.Parser) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fields := infoFields(t, conn, parser, "replication")
+		want := ",offset=" + fields["master_repl_offset"]
+		if strings.HasSuffix(fields["slave0"], want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("INFO replication slave0 = %q, want it to end in %q", fields["slave0"], want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
