@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"maps"
 	"math"
 	"sync/atomic"
 	"time"
@@ -285,6 +286,35 @@ func (v *ValueObject) emptiedCollection() bool {
 		return err == nil && n == 0
 	}
 	return false
+}
+
+// containerCopy returns a copy of v that a growing write can edit while v stays
+// stored under its key, so that a write refused for want of memory leaves v as
+// it was. It copies the container and not the elements: a list's array, a
+// hash's map or compact entries and arena, a set's map or integers, a sorted
+// set's index and skip list or compact entries and arena, and a stream's
+// records. The element byte strings are shared, because nothing edits one in
+// place once it is stored. A string's bytes are shared too, so a write that
+// edits a string's bytes in place must not be handed this copy.
+func (v *ValueObject) containerCopy() *ValueObject {
+	c := *v
+	switch v.Kind {
+	case ValueKindList:
+		c.List = append([][]byte(nil), v.liveList()...)
+		c.ListHead = 0
+	case ValueKindHash:
+		c.Hash = maps.Clone(v.Hash)
+		c.CompactHash = cloneCompactHash(v.CompactHash)
+	case ValueKindSet:
+		c.Set = maps.Clone(v.Set)
+		c.IntSet = cloneIntSet(v.IntSet)
+	case ValueKindZSet:
+		c.ZSet = cloneSortedSet(v.ZSet)
+		c.CompactZSet = cloneCompactZSet(v.CompactZSet)
+	case ValueKindStream:
+		c.Stream = v.Stream.containerCopy()
+	}
+	return &c
 }
 
 // ZSetValue returns the general sorted-set payload for a sorted-set value.

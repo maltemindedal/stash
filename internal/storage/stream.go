@@ -30,25 +30,18 @@ func newStream() *StreamValue {
 	return &StreamValue{}
 }
 
-func cloneStreamValue(src *StreamValue) *StreamValue {
-	if src == nil {
+// containerCopy returns a copy of s that XADD can append to while s stays
+// stored: a new slice of the same records. A record is never edited once it is
+// added, so the copies share them.
+func (s *StreamValue) containerCopy() *StreamValue {
+	if s == nil {
 		return nil
 	}
-
-	cloned := &StreamValue{
-		entries:    make([]streamRecord, 0, len(src.entries)),
-		lastID:     src.lastID,
-		hasEntries: src.hasEntries,
+	return &StreamValue{
+		entries:    append([]streamRecord(nil), s.entries...),
+		lastID:     s.lastID,
+		hasEntries: s.hasEntries,
 	}
-	for _, entry := range src.entries {
-		cloned.entries = append(cloned.entries, streamRecord{
-			id:     entry.id,
-			idText: entry.idText,
-			values: cloneList(entry.values),
-		})
-	}
-
-	return cloned
 }
 
 // ValidateXAddID reports whether raw is a syntactically valid XADD ID.

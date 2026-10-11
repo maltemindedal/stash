@@ -8,41 +8,14 @@ func (s *Store) SAdd(key string, members [][]byte) (int64, []string, error) {
 		return 0, nil, ErrSyntax
 	}
 
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		var (
-			newValue *ValueObject
-			added    int64
-			err      error
-		)
-		if w.current != nil {
-			newValue = w.current
-			if w.accounting {
-				// Size the write against the pre-write value, and leave the set
-				// untouched if it turns out to breach maxmemory, by mutating a copy
-				// rather than the value still stored under the key.
-				newValue, err = w.current.cloneSetValue(w.current.ExpiresAt)
-				if err != nil {
-					return 0, nil, err
-				}
-			}
-			added, err = newValue.setAdd(members)
-			if err != nil {
-				return 0, nil, err
-			}
-		} else {
-			newValue = newSetValueForMembers(members, 0)
-			newLen, lenErr := newValue.setLen()
-			if lenErr != nil {
-				return 0, nil, lenErr
-			}
-			added = int64(newLen)
+	return mutateKey(s, key, ValueKindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+		if cur == nil {
+			created := newSetValueForMembers(members, 0)
+			n, err := created.setLen()
+			return created, int64(n), err
 		}
-
-		evicted, err := w.commit(newValue)
-		if err != nil {
-			return 0, nil, err
-		}
-		return added, evicted, nil
+		added, err := cur.setAdd(members)
+		return cur, added, err
 	})
 }
 
@@ -61,13 +34,14 @@ func (s *Store) SRem(key string, members [][]byte) (int64, error) {
 		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindSet, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, _, err := mutateKey(s, key, ValueKindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			return nil, 0, nil
 		}
 		removed, err := cur.setRemove(members)
 		return cur, removed, err
 	})
+	return removed, err
 }
 
 // SMembers returns every member of the set stored at key. Order is not

@@ -9,41 +9,14 @@ func (s *Store) HSet(key string, pairs []HashFieldValue) (int64, []string, error
 		return 0, nil, ErrSyntax
 	}
 
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		var (
-			newValue *ValueObject
-			added    int64
-			err      error
-		)
-		if w.current != nil {
-			newValue = w.current
-			if w.accounting {
-				// Size the write against the pre-write value, and leave the hash
-				// untouched if it turns out to breach maxmemory, by mutating a copy
-				// rather than the value still stored under the key.
-				newValue, err = w.current.cloneHashValue(w.current.ExpiresAt)
-				if err != nil {
-					return 0, nil, err
-				}
-			}
-			added, err = newValue.hashSet(pairs)
-			if err != nil {
-				return 0, nil, err
-			}
-		} else {
-			newValue = newHashValueForPairs(pairs, 0)
-			newLen, lenErr := newValue.hashLen()
-			if lenErr != nil {
-				return 0, nil, lenErr
-			}
-			added = int64(newLen)
+	return mutateKey(s, key, ValueKindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+		if cur == nil {
+			created := newHashValueForPairs(pairs, 0)
+			n, err := created.hashLen()
+			return created, int64(n), err
 		}
-
-		evicted, err := w.commit(newValue)
-		if err != nil {
-			return 0, nil, err
-		}
-		return added, evicted, nil
+		added, err := cur.hashSet(pairs)
+		return cur, added, err
 	})
 }
 
@@ -77,13 +50,14 @@ func (s *Store) HDel(key string, fields []string) (int64, error) {
 		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindHash, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, _, err := mutateKey(s, key, ValueKindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			return nil, 0, nil
 		}
 		removed, err := cur.hashDel(fields)
 		return cur, removed, err
 	})
+	return removed, err
 }
 
 // HGetAll returns every field/value pair on the hash stored at key. Order is

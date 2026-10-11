@@ -66,7 +66,7 @@ Owns the in-memory key/value store.
 Current responsibilities:
 
 - route keys to a fixed shard set and protect each shard with its own `sync.RWMutex`
-- apply each single-key write through a primitive that owns its locking, expiry and memory accounting: `writeKey` for a growing write, and `mutateKey` for a shrinking write (a pop, `HDEL`, `SREM`, `DEL`), which takes only its key's shard lock even under `maxmemory` and so never evicts or sweeps
+- apply each single-key write through a primitive that owns its locking, expiry and memory accounting: `mutateKey`, which the write tells whether it is shrinking (a pop, `HDEL`, `SREM`, `DEL`) and so takes only its key's shard lock even under `maxmemory` and never evicts or sweeps, or growing, and so under `maxmemory` edits a copy of the key's container and locks every shard to make room, leaving the stored value as it was if the write is refused; and `writeKey`, which still serves `SET`, `INCR`, `SETBIT` and `PFADD`
 - support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
 - store TTLs in Unix milliseconds
 - perform passive eviction when a read or write touches an expired key
