@@ -3017,11 +3017,14 @@ func (e *Executor) Execute(ctx context.Context, value protocol.Value) (protocol.
 	return nil, fmt.Errorf("command: expected single response, got %d", len(result.Responses))
 }
 
-// executeCall runs a parsed RESP frame as call describes it, without ordering
-// it against other requests.
+// executeCall runs a parsed RESP frame as call describes it, admitted as Handle
+// admits it but without ordering it against other requests.
 func (e *Executor) executeCall(ctx context.Context, call server.Call, value protocol.Value) (server.ExecuteResult, error) {
 	request, err := decodeCall(call, value)
 	if err != nil {
+		return server.ExecuteResult{}, err
+	}
+	if err := e.admit(request); err != nil {
 		return server.ExecuteResult{}, err
 	}
 

@@ -16,6 +16,11 @@ import (
 // watched key between EXEC's check and its queued commands, and nobody observes
 // the transaction half way through.
 //
+// Handle admits a request (Executor.admit) before it takes any of these locks.
+// One refused for its Call, or because its client has not authenticated, takes
+// none, so a client without the password can neither wait for another request
+// nor hold one up.
+//
 // A request that writes also holds the stripe of each key it writes, from before
 // it executes until its frames have reached the AOF and the replicas
 // (ExecuteResult.Release). Two writers to the same key therefore append in the
@@ -250,6 +255,9 @@ func (e *Executor) sequenceModeFor(request *Request) sequenceMode {
 func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.Value) (server.ExecuteResult, error) {
 	request, err := decodeCall(call, value)
 	if err != nil {
+		return server.ExecuteResult{}, err
+	}
+	if err := e.admit(request); err != nil {
 		return server.ExecuteResult{}, err
 	}
 

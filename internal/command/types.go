@@ -187,17 +187,26 @@ func validateCall(request *Request) error {
 	return nil
 }
 
+// admit refuses a request whose Call the server does not make (validateCall)
+// or that must authenticate first (validateAuth). Handle admits a request
+// before it takes any sequencer lock, so a request refused here neither waits
+// for another request nor holds one up: a client that has not authenticated
+// cannot, for instance, take gate exclusively by sending EXEC.
+func (e *Executor) admit(request *Request) error {
+	if err := validateCall(request); err != nil {
+		return err
+	}
+	return e.validateAuth(request)
+}
+
+// executeRequestDetailed runs a request that has been admitted: one Handle
+// admitted, or a command queued by the client of an EXEC that Handle admitted,
+// which runs with the EXEC's Call.
 func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request, allowQueue bool) (server.ExecuteResult, error) {
 	request.effects = executionEffects{}
 	effects := &request.effects
 
-	if err := validateCall(request); err != nil {
-		return server.ExecuteResult{}, err
-	}
 	if err := e.validateSubscriptionContext(request); err != nil {
-		return server.ExecuteResult{}, err
-	}
-	if err := e.validateAuth(request); err != nil {
 		return server.ExecuteResult{}, err
 	}
 

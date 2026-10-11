@@ -1,9 +1,13 @@
 package command
 
 import (
+	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/maltemindedal/stash/internal/server"
 )
 
 // blocked reports whether f is still waiting after a short time.
@@ -131,6 +135,69 @@ func TestSequencerExclusiveGateWaitsForAndBlocksEverything(t *testing.T) {
 		t.Fatal("a read ran while a transaction held the gate")
 	}
 	q.gate.Unlock()
+}
+
+// TestUnauthenticatedRequestsAreRefusedBeforeTheyTakeASequencerLock holds gate
+// exclusively, as a transaction does, and sends requests from a client that has
+// not authenticated. Each must be refused at once: a request that took gate, or
+// a write's stripes, before the auth check refused it would let a client
+// without the password make every other client wait, and an EXEC, which takes
+// gate exclusively, would stall them all each time it was sent.
+func TestUnauthenticatedRequestsAreRefusedBeforeTheyTakeASequencerLock(t *testing.T) {
+	tests := []struct {
+		name     string
+		requests [][]string
+	}{
+		{name: "EXEC", requests: [][]string{{"EXEC"}}},
+		{name: "MULTI then EXEC", requests: [][]string{{"MULTI"}, {"EXEC"}}},
+		{name: "a read", requests: [][]string{{"GET", "k"}}},
+		{name: "a write to one key", requests: [][]string{{"SET", "k", "v"}}},
+		{name: "a write to several keys", requests: [][]string{{"DEL", "k", "l"}}},
+	}
+
+	for _, inline := range []bool{false, true} {
+		mode := "goroutine per connection"
+		if inline {
+			mode = "event loop"
+		}
+		for _, tt := range tests {
+			t.Run(mode+"/"+tt.name, func(t *testing.T) {
+				executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
+				state := newTestClientState(executor, 1)
+				state.SetAuthenticated(false)
+				call := server.Call{Client: state, Origin: server.OriginClient, Inline: inline}
+
+				executor.seq.gate.Lock()
+				replied := make(chan []error, 1)
+				go func() {
+					errs := make([]error, 0, len(tt.requests))
+					for _, parts := range tt.requests {
+						result, err := executor.Handle(context.Background(), call, requestValue(parts...))
+						if result.Release != nil {
+							result.Release()
+						}
+						errs = append(errs, err)
+					}
+					replied <- errs
+				}()
+
+				var errs []error
+				select {
+				case errs = <-replied:
+					executor.seq.gate.Unlock()
+				case <-time.After(5 * time.Second):
+					executor.seq.gate.Unlock()
+					<-replied
+					t.Fatalf("%v from a client that has not authenticated waited for the sequencer gate", tt.requests)
+				}
+				for i, err := range errs {
+					if !errors.Is(err, ErrNoAuth) {
+						t.Errorf("%v error = %v, want NOAUTH", tt.requests[i], err)
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestSequencerSkipsWriteOrderingWhenNothingRecordsWrites(t *testing.T) {
