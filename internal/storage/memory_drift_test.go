@@ -42,7 +42,7 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 	for seed := int64(0); seed < 20; seed++ {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
-			store := NewStore()
+			store, _ := newStoreWithManualClock()
 			store.ConfigureMaxMemory(1<<40, 16)
 			member := func() []byte { return []byte(fmt.Sprintf("m%d", rng.Intn(12))) }
 			members := func() [][]byte {
@@ -64,7 +64,7 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					_, _ = store.Set(key, []byte(fmt.Sprintf("value-%d", rng.Intn(1000))), 0)
 				case 1:
 					desc = "Set with TTL"
-					_, _ = store.Set(key, []byte("ttl"), time.Now().Add(time.Hour).UnixMilli())
+					_, _ = store.Set(key, []byte("ttl"), store.deadlineAfter(time.Hour))
 				case 2:
 					desc, shrinking = "Delete", true
 					store.Delete(key)
@@ -121,7 +121,7 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					_, _, _ = store.Get(key)
 				default:
 					desc = "Set (expired)"
-					_, _ = store.Set(key, []byte("gone"), time.Now().Add(-time.Second).UnixMilli())
+					_, _ = store.Set(key, []byte("gone"), store.deadlineAfter(-time.Second))
 				}
 
 				if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
