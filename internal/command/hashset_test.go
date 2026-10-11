@@ -112,6 +112,28 @@ func TestExecutorLPopRPop(t *testing.T) {
 		}
 	})
 
+	t.Run("LPOP and RPOP answer a bad count with Redis's errors", func(t *testing.T) {
+		executor := newTestExecutor()
+		ctx := clientContext(executor)
+		if _, err := executor.Execute(ctx, requestValue("RPUSH", "k", "a")); err != nil {
+			t.Fatalf("RPUSH error = %v", err)
+		}
+		notPositive := newRESPMessageError("ERR", "value is out of range, must be positive").Error()
+		notInteger := ErrValueNotIntegerError().Error()
+		counts := []struct{ count, want string }{
+			{"-1", notPositive},
+			{"9223372036854775808", notInteger}, // one past the largest int64
+			{"two", notInteger},
+		}
+		for _, name := range []string{"LPOP", "RPOP"} {
+			for _, c := range counts {
+				if _, err := executor.Execute(ctx, requestValue(name, "k", c.count)); err == nil || err.Error() != c.want {
+					t.Fatalf("%s k %s error = %v, want %q", name, c.count, err, c.want)
+				}
+			}
+		}
+	})
+
 	t.Run("LPOP on wrong type returns WRONGTYPE", func(t *testing.T) {
 		executor := newTestExecutor()
 		ctx := clientContext(executor)

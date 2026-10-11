@@ -78,6 +78,21 @@ The approximate limit on keyspace memory above which **Memory-pressure eviction*
 The removal of live keys, sampled for the least recently used, while keyspace memory is over **Maxmemory**.
 _Avoid_: LRU eviction, memory eviction
 
+**Mutation**:
+One write to one key as the **Store** applies it: from the key's live value, if any, to what the key holds after, under the key's lock and by one **Clock reading**.
+
+**Shrinking write**:
+A write that can only remove bytes from its key's value (a pop, `HDEL`, `SREM`, `DEL`), so it never causes a **Memory-pressure eviction**.
+_Avoid_: delete op, reducing write
+
+**Growing write**:
+A write that may add bytes to its key's value, and so may need a **Memory-pressure eviction** to make room.
+_Avoid_: insert, expanding write
+
+**Accounted write**:
+A **Growing write** made while **Maxmemory** is set, sized against the limit before it is applied.
+_Avoid_: maxmemory write, metered write
+
 **HyperLogLog**:
 A fixed-size approximate cardinality structure stored as a string value, used by `PFADD` and `PFCOUNT`.
 

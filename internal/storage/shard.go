@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"hash/maphash"
 	"sync"
 )
@@ -124,10 +125,12 @@ func (w keyWrite) commitString(length int, expiresAt int64, fill func(payload []
 // that a write of that key needs, and reports the keys evicted to make room for
 // it.
 //
-// It is the write-path counterpart to readKey. Before the operation runs, it
-// takes one clock reading, reads the maxmemory setting once, and locks the owning
-// shard for writing. It may lock every shard because eviction can cross shard
-// boundaries. It also reclaims the key when its TTL has passed and releases all
+// It is the write-path counterpart to readKey for a growing write, one that may
+// add bytes to its key's value; a shrinking write goes through mutateKey instead.
+// Before the operation runs, it takes one clock reading, reads the maxmemory
+// setting once, and locks the owning shard for writing. It may lock every shard
+// because eviction can cross shard boundaries. It also reclaims the key when its
+// TTL has passed and releases all
 // locks on every path. fn therefore sees either a live value of unknown kind or
 // nil when the key is absent. The one clock reading decides every expiry the
 // write sees: its own key's and, under maxmemory, those in the sweep that makes
@@ -159,6 +162,109 @@ func writeKey[T any](s *Store, key string, fn func(w keyWrite) (T, []string, err
 
 	shard, current := s.prepareExistingValueLocked(key, now)
 	return fn(keyWrite{store: s, shard: shard, key: key, current: current, now: now, accounting: accounting})
+}
+
+// anyKind is the want of a mutation that accepts a value of every kind, as DEL
+// does.
+const anyKind ValueKind = ""
+
+// mutateKey applies fn, a shrinking write, to the value stored at key, and
+// returns fn's result.
+//
+// A shrinking write can only remove bytes from its key's value: a pop, HDEL,
+// SREM or DEL. It never needs room, so even under maxmemory mutateKey locks only
+// the key's own shard, and it neither evicts nor sweeps expired keys. The
+// maxmemory setting is read under that lock, where it cannot change:
+// ConfigureMaxMemory changes it under every shard lock.
+//
+// mutateKey takes one clock reading, locks the key's shard for writing,
+// reclaims the key when its TTL has passed, and answers ErrWrongType, without
+// calling fn, for a live value of a kind other than want (anyKind accepts
+// every kind). fn gets the live value, or nil when the key is absent, and the
+// clock reading. It returns what the key holds after it: nil deletes the key,
+// and cur keeps the edit fn made to it in place; fn returns no other value. A
+// list, hash, set or sorted set that fn emptied is deleted as well, while an
+// empty string or stream stays. A value that stays is stamped with the clock
+// reading, and the memory counter takes the change in its size. When fn fails it
+// must have left cur unchanged: its error is returned, and the key is neither
+// stamped nor deleted.
+//
+// fn runs under the shard lock and must not retain cur, or memory borrowed from
+// it, after it returns. mutateKey releases the lock on every path and calls
+// nothing outside the store, so a caller that wakes a list waiter does so after
+// it returns.
+func mutateKey[T any](s *Store, key string, want ValueKind, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
+	var zero T
+
+	now := s.now()
+	shard := s.shardForKey(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	cur := shard.data[key]
+	if cur != nil && isExpired(cur, now) {
+		s.deleteKeyLocked(shard, key)
+		cur = nil
+	}
+	if cur != nil && want != anyKind && cur.Kind != want {
+		return zero, ErrWrongType
+	}
+	if s.maxMemoryEnabled() {
+		return mutateAccountedLocked(s, shard, key, cur, now, fn)
+	}
+
+	// Without a memory limit there is nothing to size, and this path does no
+	// more than the hand-written ones it replaced.
+	next, result, err := fn(cur, now)
+	if err != nil {
+		return zero, err
+	}
+	if next != nil && next != cur {
+		panic(errNotAShrinkingWrite)
+	}
+	if cur == nil {
+		return result, nil
+	}
+	if next == nil || cur.emptied() {
+		s.removeKeyLocked(shard, key)
+		return result, nil
+	}
+	cur.touch(now)
+	return result, nil
+}
+
+// errNotAShrinkingWrite is the panic of a mutation that returned a value other
+// than nil or the one it was given, which a shrinking write never does.
+var errNotAShrinkingWrite = errors.New("storage: a shrinking write returned a value other than the one it was given")
+
+// mutateAccountedLocked is mutateKey's path while the store accounts for
+// memory: it sizes the value before and after fn and moves the counter by the
+// difference. The caller holds the key's shard lock and has already reclaimed an
+// expired key and checked the kind.
+func mutateAccountedLocked[T any](s *Store, shard *Shard, key string, cur *ValueObject, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
+	var zero T
+	var oldSize int64
+	if cur != nil {
+		oldSize = s.approximateValueObjectSize(key, cur)
+	}
+
+	next, result, err := fn(cur, now)
+	if err != nil {
+		return zero, err
+	}
+	if next != nil && next != cur {
+		panic(errNotAShrinkingWrite)
+	}
+	if cur == nil {
+		return result, nil
+	}
+	if next == nil || cur.emptied() {
+		s.deleteKeyWithSizeLocked(shard, key, oldSize)
+		return result, nil
+	}
+	cur.touch(now)
+	s.usedMemory.Add(s.approximateValueObjectSize(key, cur) - oldSize)
+	return result, nil
 }
 
 func (s *Store) shardIndex(key string) int {

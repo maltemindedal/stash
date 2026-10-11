@@ -44,6 +44,24 @@ func (c *manualClock) advance(d time.Duration) int64 {
 	return c.millis.Add(d.Milliseconds())
 }
 
+// expireForTest gives the value stored at key a TTL deadline at the clock's
+// reading, accounting for it as the store would, and moves the clock past it:
+// the key has expired, but no operation has seen it yet.
+func expireForTest(store *Store, clock *manualClock, key string) {
+	deadline := clock.now()
+	shard := store.shardForKey(key)
+	shard.mu.Lock()
+	value := shard.data[key]
+	before := store.approximateValueObjectSize(key, value)
+	value.ExpiresAt = deadline
+	if store.maxMemoryEnabled() {
+		store.usedMemory.Add(store.approximateValueObjectSize(key, value) - before)
+	}
+	shard.mu.Unlock()
+	store.noteExpiry(deadline)
+	clock.advance(time.Millisecond)
+}
+
 func (s *Store) setValueObjectForTest(key string, value *ValueObject) {
 	shard := s.shardForKey(key)
 	shard.mu.Lock()

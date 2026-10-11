@@ -22,10 +22,20 @@ func recountUsedMemory(s *Store) int64 {
 	return total
 }
 
+// keySizeForTest returns the approximate size of the value stored at key, or 0
+// when the key is absent.
+func keySizeForTest(s *Store, key string) int64 {
+	shard := s.shardForKey(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return s.approximateValueObjectSize(key, shard.data[key])
+}
+
 // TestUsedMemoryCounterStaysExact drives every mutating operation with random
 // sequences and checks after each one that the incrementally maintained counter
 // equals a fresh measurement of the keyspace. Skipping the full recount on every
-// growing write is only sound while that holds.
+// growing write is only sound while that holds. It also checks that no shrinking
+// write grows its key: one that did could not make room, since it never evicts.
 func TestUsedMemoryCounterStaysExact(t *testing.T) {
 	keys := []string{"a", "b", "c", "d", "e", "f"}
 
@@ -45,7 +55,9 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 
 			for step := 0; step < 400; step++ {
 				key := keys[rng.Intn(len(keys))]
+				before := keySizeForTest(store, key)
 				var desc string
+				shrinking := false // a shrinking write, which must never grow its key
 				switch rng.Intn(21) {
 				case 0:
 					desc = "Set"
@@ -54,10 +66,10 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					desc = "Set with TTL"
 					_, _ = store.Set(key, []byte("ttl"), time.Now().Add(time.Hour).UnixMilli())
 				case 2:
-					desc = "Delete"
+					desc, shrinking = "Delete", true
 					store.Delete(key)
 				case 3:
-					desc = "DeleteMany"
+					desc, shrinking = "DeleteMany", true
 					store.DeleteMany([]string{key, keys[rng.Intn(len(keys))]})
 				case 4:
 					desc = "Increment"
@@ -69,17 +81,17 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					desc = "RightPush"
 					_, _, _ = store.RightPush(key, members())
 				case 7:
-					desc = "LeftPop"
+					desc, shrinking = "LeftPop", true
 					_, _, _ = store.LeftPop(key)
 				case 8:
-					desc = "RightPop"
+					desc, shrinking = "RightPop", true
 					_, _, _ = store.RightPop(key)
 				case 9:
-					desc = "LeftPopN"
-					_, _, _ = store.LeftPopN(key, int64(1+rng.Intn(3)))
+					desc, shrinking = "LeftPopN", true
+					_, _, _ = store.LeftPopN(key, 1+rng.Intn(3))
 				case 10:
-					desc = "RightPopN"
-					_, _, _ = store.RightPopN(key, int64(1+rng.Intn(3)))
+					desc, shrinking = "RightPopN", true
+					_, _, _ = store.RightPopN(key, 1+rng.Intn(3))
 				case 11:
 					desc = "ZAdd"
 					_, _, _ = store.ZAdd(key, []ZSetEntry{{Member: member(), Score: float64(rng.Intn(50))}})
@@ -96,13 +108,13 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					desc = "HSet"
 					_, _, _ = store.HSet(key, []HashFieldValue{{Field: string(member()), Value: []byte("hv")}})
 				case 16:
-					desc = "HDel"
+					desc, shrinking = "HDel", true
 					_, _ = store.HDel(key, []string{string(member())})
 				case 17:
 					desc = "SAdd"
 					_, _, _ = store.SAdd(key, members())
 				case 18:
-					desc = "SRem"
+					desc, shrinking = "SRem", true
 					_, _ = store.SRem(key, members())
 				case 19:
 					desc = "Get"
@@ -114,6 +126,9 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 
 				if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
 					t.Fatalf("step %d after %s(%q): UsedMemory() = %d, recount = %d (drift %d)", step, desc, key, used, want, used-want)
+				}
+				if after := keySizeForTest(store, key); shrinking && after > before {
+					t.Fatalf("step %d: %s(%q) grew its key from %d to %d bytes; a shrinking write must not", step, desc, key, before, after)
 				}
 			}
 		})

@@ -77,45 +77,13 @@ func (s *Store) HDel(key string, fields []string) (int64, error) {
 		return 0, ErrSyntax
 	}
 
-	shard := s.shardForKey(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	now := s.now()
-	value, ok := shard.data[key]
-	if ok && isExpired(value, now) {
-		s.deleteKeyLocked(shard, key)
-		ok = false
-	}
-	if !ok {
-		return 0, nil
-	}
-	accounting := s.maxMemoryEnabled()
-	var oldSize int64
-	if accounting {
-		oldSize = s.approximateValueObjectSize(key, value)
-	}
-
-	removed, err := value.hashDel(fields)
-	if err != nil {
-		return 0, err
-	}
-
-	value.touch(now)
-	hashLen, err := value.hashLen()
-	if err != nil {
-		return 0, err
-	}
-	if hashLen == 0 {
-		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return removed, nil
-	}
-	if accounting {
-		newSize := s.approximateValueObjectSize(key, value)
-		s.usedMemory.Add(newSize - oldSize)
-	}
-
-	return removed, nil
+	return mutateKey(s, key, ValueKindHash, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+		if cur == nil {
+			return nil, 0, nil
+		}
+		removed, err := cur.hashDel(fields)
+		return cur, removed, err
+	})
 }
 
 // HGetAll returns every field/value pair on the hash stored at key. Order is
