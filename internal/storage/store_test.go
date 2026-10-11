@@ -72,7 +72,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Get passively evicts expired key",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set("expired", []byte("value"), time.Now().Add(-time.Millisecond).UnixMilli())
+				_, _ = store.Set("expired", []byte("value"), store.deadlineAfter(-time.Millisecond))
 
 				if _, ok, err := store.Get("expired"); err != nil {
 					t.Fatalf("Get() error = %v", err)
@@ -88,7 +88,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Delete treats expired key as absent",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set("expired", []byte("value"), time.Now().Add(-time.Millisecond).UnixMilli())
+				_, _ = store.Set("expired", []byte("value"), store.deadlineAfter(-time.Millisecond))
 
 				if ok := store.Delete("expired"); ok {
 					t.Fatal("Delete() ok = true, want false for expired key")
@@ -182,6 +182,29 @@ func TestStoreValueBehavior(t *testing.T) {
 				}
 				if bit != 1 {
 					t.Fatalf("GetBit(16) = %d, want 1", bit)
+				}
+			},
+		},
+		{
+			name: "SetBit past the end keeps the bytes before it and the key's TTL",
+			run: func(t *testing.T, store *Store) {
+				t.Helper()
+				for _, maxMemory := range []int64{0, 1 << 30} {
+					store.ConfigureMaxMemory(maxMemory, 16)
+					deadline := store.deadlineAfter(time.Hour)
+					if _, err := store.Set("bitmap", []byte("ab"), deadline); err != nil {
+						t.Fatalf("Set() error = %v", err)
+					}
+
+					if _, _, err := store.SetBit("bitmap", 31, 1); err != nil {
+						t.Fatalf("SetBit() with maxmemory %d error = %v", maxMemory, err)
+					}
+					if got, _, err := store.Get("bitmap"); err != nil || !bytes.Equal(got, []byte{'a', 'b', 0, 1}) {
+						t.Fatalf("Get() with maxmemory %d = %q, %v, want %q", maxMemory, got, err, []byte{'a', 'b', 0, 1})
+					}
+					if got := store.valueObjectForTest("bitmap").ExpiresAt; got != deadline {
+						t.Fatalf("SetBit() with maxmemory %d left the TTL deadline at %d, want %d", maxMemory, got, deadline)
+					}
 				}
 			},
 		},
@@ -321,9 +344,9 @@ func TestStoreValueBehavior(t *testing.T) {
 
 				// At the limit, a SetBit past the end needs room the store cannot
 				// make. It is refused, and the payload it would have grown stays
-				// as it was. Whether an in-range SetBit edits the stored payload
-				// in place is not pinned: a write that cannot change the value's
-				// size cannot be refused.
+				// as it was. An in-range SetBit edits the stored payload in place
+				// (TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas): a write
+				// that cannot change the value's size cannot be refused.
 				store.ConfigureMaxMemory(store.UsedMemory(), 16)
 				if _, _, err := store.SetBit("bitmap", 1<<20, 1); !errors.Is(err, ErrMemoryLimitExceeded) {
 					t.Fatalf("SetBit() past the end at the limit error = %v, want ErrMemoryLimitExceeded", err)
@@ -370,7 +393,7 @@ func TestStoreValueBehavior(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewStore()
+			store, _ := newStoreWithManualClock()
 			tt.run(t, store)
 		})
 	}
@@ -651,10 +674,10 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 }
 
 func TestStoreMaxMemoryAccountingReclaimsExpiredBytesOnLegacyWrite(t *testing.T) {
-	store := NewStore()
+	store, _ := newStoreWithManualClock()
 	store.ConfigureMaxMemory(1<<30, 16)
 
-	_, _ = store.Set("stale", []byte(strings.Repeat("x", 4096)), time.Now().Add(-time.Millisecond).UnixMilli())
+	_, _ = store.Set("stale", []byte(strings.Repeat("x", 4096)), store.deadlineAfter(-time.Millisecond))
 	before := store.UsedMemory()
 	if before == 0 {
 		t.Fatal("UsedMemory() before expired replacement = 0, want non-zero")
@@ -686,7 +709,7 @@ func TestStoreDropIfStillExpired(t *testing.T) {
 			name: "reclaims a key that is still expired",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set("key", []byte("stale"), time.Now().Add(-time.Millisecond).UnixMilli())
+				_, _ = store.Set("key", []byte("stale"), store.deadlineAfter(-time.Millisecond))
 			},
 			wantFound: false,
 		},
@@ -703,7 +726,7 @@ func TestStoreDropIfStillExpired(t *testing.T) {
 			name: "keeps a key whose expiry moved into the future",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set("key", []byte("renewed"), time.Now().Add(time.Hour).UnixMilli())
+				_, _ = store.Set("key", []byte("renewed"), store.deadlineAfter(time.Hour))
 			},
 			wantFound: true,
 			wantValue: "renewed",
@@ -718,7 +741,7 @@ func TestStoreDropIfStillExpired(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewStore()
+			store, _ := newStoreWithManualClock()
 			store.ConfigureMaxMemory(1<<30, 16)
 			tt.setup(t, store)
 
@@ -870,14 +893,14 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			baseline := NewStore()
+			baseline, _ := newStoreWithManualClock()
 			baseline.ConfigureMaxMemory(1<<30, 16)
 			tt.write(t, baseline)
 			want := baseline.UsedMemory()
 
-			store := NewStore()
+			store, _ := newStoreWithManualClock()
 			store.ConfigureMaxMemory(1<<30, 16)
-			_, _ = store.Set("stale", []byte(strings.Repeat("x", 4096)), time.Now().Add(-time.Millisecond).UnixMilli())
+			_, _ = store.Set("stale", []byte(strings.Repeat("x", 4096)), store.deadlineAfter(-time.Millisecond))
 			tt.write(t, store)
 
 			if got := store.UsedMemory(); got != want {
@@ -1079,9 +1102,9 @@ func TestStoreMaxMemoryConcurrentConfiguration(t *testing.T) {
 }
 
 func TestStoreActiveEvictionRemovesExpiredKeys(t *testing.T) {
-	store := NewStore()
-	_, _ = store.Set("a", []byte("1"), time.Now().Add(-time.Millisecond).UnixMilli())
-	_, _ = store.Set("b", []byte("2"), time.Now().Add(-time.Millisecond).UnixMilli())
+	store, _ := newStoreWithManualClock()
+	_, _ = store.Set("a", []byte("1"), store.deadlineAfter(-time.Millisecond))
+	_, _ = store.Set("b", []byte("2"), store.deadlineAfter(-time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1105,8 +1128,8 @@ func TestStoreActiveEvictionRemovesExpiredKeys(t *testing.T) {
 // serving expired data. Redis repeats the sample while a quarter of it had
 // expired, and so does the loop now.
 func TestStoreActiveEvictionKeepsUpWithAKeyspaceFullOfExpiredKeys(t *testing.T) {
-	store := NewStore()
-	expiredAt := time.Now().Add(-time.Second).UnixMilli()
+	store, _ := newStoreWithManualClock()
+	expiredAt := store.deadlineAfter(-time.Second)
 	for i := 0; i < 50_000; i++ {
 		_, _ = store.Set("key-"+strconv.Itoa(i), []byte("v"), expiredAt)
 	}
@@ -1126,8 +1149,8 @@ func TestStoreActiveEvictionKeepsUpWithAKeyspaceFullOfExpiredKeys(t *testing.T) 
 }
 
 func TestEvictionPassRepeatsWhileMostOfTheSampleHadExpiredAndStopsAtItsBudget(t *testing.T) {
-	store := NewStore()
-	expiredAt := time.Now().Add(-time.Second).UnixMilli()
+	store, _ := newStoreWithManualClock()
+	expiredAt := store.deadlineAfter(-time.Second)
 	for i := 0; i < 200_000; i++ {
 		_, _ = store.Set("key-"+strconv.Itoa(i), []byte("v"), expiredAt)
 	}
@@ -1150,11 +1173,11 @@ func TestEvictionPassRepeatsWhileMostOfTheSampleHadExpiredAndStopsAtItsBudget(t 
 }
 
 func TestEvictionPassTakesOneSampleWhenFewKeysHaveExpired(t *testing.T) {
-	store := NewStore()
+	store, _ := newStoreWithManualClock()
 	for i := 0; i < 5_000; i++ {
 		_, _ = store.Set("live-"+strconv.Itoa(i), []byte("v"), 0)
 	}
-	_, _ = store.Set("dead", []byte("v"), time.Now().Add(-time.Second).UnixMilli())
+	_, _ = store.Set("dead", []byte("v"), store.deadlineAfter(-time.Second))
 
 	// At most one key in any sample of 20 can have expired, far below the quarter
 	// that would justify sampling again.
@@ -1167,8 +1190,8 @@ func TestEvictionPassTakesOneSampleWhenFewKeysHaveExpired(t *testing.T) {
 // the keys it removed rather than only counting them: the caller turns them into
 // the DEL that reaches replicas, the AOF, and WATCH.
 func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
-	store := NewStore()
-	_, _ = store.Set("gone", []byte("1"), time.Now().Add(-time.Millisecond).UnixMilli())
+	store, _ := newStoreWithManualClock()
+	_, _ = store.Set("gone", []byte("1"), store.deadlineAfter(-time.Millisecond))
 	_, _ = store.Set("kept", []byte("2"), 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1196,8 +1219,8 @@ func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 // outside the loop and one panic silently stopped all active expiry for the life
 // of the process.
 func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
-	store := NewStore()
-	past := time.Now().Add(-time.Millisecond).UnixMilli()
+	store, _ := newStoreWithManualClock()
+	past := store.deadlineAfter(-time.Millisecond)
 	_, _ = store.Set("first", []byte("1"), past)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1245,7 +1268,7 @@ func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
 // background loop's. Otherwise, the deletions reach nobody whenever maxmemory is
 // the thing driving them.
 func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
-	store := NewStore()
+	store, _ := newStoreWithManualClock()
 	store.ConfigureMaxMemory(1<<20, 16)
 
 	reported := make(chan []string, 8)
@@ -1255,7 +1278,7 @@ func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
 
 	// Stored while accounting is already on, so the sweep that removes it is the
 	// one the next write runs rather than anything this one did.
-	if _, err := store.Set("stale", []byte("value"), time.Now().Add(-time.Minute).UnixMilli()); err != nil {
+	if _, err := store.Set("stale", []byte("value"), store.deadlineAfter(-time.Minute)); err != nil {
 		t.Fatalf("Set(stale) error = %v", err)
 	}
 	if len(reported) != 0 {
@@ -1277,7 +1300,7 @@ func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
 }
 
 func TestStoreKeyStatsTracksMutations(t *testing.T) {
-	store := NewStore()
+	store, _ := newStoreWithManualClock()
 	_, _ = store.Set("name", []byte("Stash"), 0)
 	if _, _, err := store.RightPush("jobs", [][]byte{[]byte("build")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
@@ -1319,7 +1342,7 @@ func TestStoreKeyStatsTracksMutations(t *testing.T) {
 		ValueKindStream: 1,
 	})
 
-	_, _ = store.Set("soon-gone", []byte("ttl"), time.Now().Add(-time.Millisecond).UnixMilli())
+	_, _ = store.Set("soon-gone", []byte("ttl"), store.deadlineAfter(-time.Millisecond))
 	if _, ok, err := store.Get("soon-gone"); err != nil {
 		t.Fatalf("Get() error = %v", err)
 	} else if ok {
@@ -1397,9 +1420,9 @@ func TestStoreSnapshotStrings(t *testing.T) {
 	})
 
 	t.Run("skips expired and unsupported keys", func(t *testing.T) {
-		store := NewStore()
+		store, _ := newStoreWithManualClock()
 		_, _ = store.Set("alive", []byte("yes"), 0)
-		_, _ = store.Set("expired", []byte("gone"), time.Now().Add(-time.Millisecond).UnixMilli())
+		_, _ = store.Set("expired", []byte("gone"), store.deadlineAfter(-time.Millisecond))
 		if _, _, err := store.RightPush("jobs", [][]byte{[]byte("one")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
@@ -1497,12 +1520,12 @@ func TestStoreConcurrentAccess(t *testing.T) {
 
 func TestStoreDeleteMany(t *testing.T) {
 	t.Run("removes present keys across distinct shards", func(t *testing.T) {
-		store := NewStore()
+		store, _ := newStoreWithManualClock()
 		keys := keysInDistinctShards(t, store, 3)
 
 		_, _ = store.Set(keys[0], []byte("one"), 0)
 		_, _ = store.Set(keys[1], []byte("two"), 0)
-		_, _ = store.Set(keys[2], []byte("stale"), time.Now().Add(-time.Millisecond).UnixMilli())
+		_, _ = store.Set(keys[2], []byte("stale"), store.deadlineAfter(-time.Millisecond))
 
 		removed := store.DeleteMany([]string{keys[0], "missing", keys[1], keys[0], keys[2]})
 		if len(removed) != 2 {
@@ -1967,8 +1990,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 	})
 
 	t.Run("ZAdd recreates expired key", func(t *testing.T) {
-		store := NewStore()
-		_, _ = store.Set("leaders", []byte("stale"), time.Now().Add(-time.Millisecond).UnixMilli())
+		store, _ := newStoreWithManualClock()
+		_, _ = store.Set("leaders", []byte("stale"), store.deadlineAfter(-time.Millisecond))
 
 		added, _, err := store.ZAdd("leaders", []ZSetEntry{{Member: []byte("fresh"), Score: 1}})
 		if err != nil {
@@ -2051,14 +2074,14 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 	})
 
 	t.Run("Compact sorted set upgrades when member count exceeds threshold", func(t *testing.T) {
-		store := NewStore()
+		store, _ := newStoreWithManualClock()
 		for i := 0; i < compactZSetMaxEntries; i++ {
 			member := fmt.Appendf(nil, "m%d", i)
 			if _, _, err := store.ZAdd("leaders", []ZSetEntry{{Member: member, Score: float64(i)}}); err != nil {
 				t.Fatalf("ZAdd() seed error = %v", err)
 			}
 		}
-		expiresAt := time.Now().Add(time.Hour).UnixMilli()
+		expiresAt := store.deadlineAfter(time.Hour)
 		if ok := store.expireKeyForTest("leaders", expiresAt); !ok {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}
@@ -2257,8 +2280,8 @@ func TestStoreStreamBehavior(t *testing.T) {
 	})
 
 	t.Run("XAdd recreates expired stream key", func(t *testing.T) {
-		store := NewStore()
-		store.setValueObjectForTest("events", newStreamValue(newStream(), time.Now().Add(-time.Millisecond).UnixMilli()))
+		store, _ := newStoreWithManualClock()
+		store.setValueObjectForTest("events", newStreamValue(newStream(), store.deadlineAfter(-time.Millisecond)))
 
 		id, _, err := store.XAdd("events", "5-0", [][]byte{[]byte("field"), []byte("value")})
 		if err != nil {

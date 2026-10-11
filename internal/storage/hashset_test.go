@@ -226,11 +226,11 @@ func TestStoreHash(t *testing.T) {
 	})
 
 	t.Run("Hash passively expires", func(t *testing.T) {
-		store := NewStore()
+		store, _ := newStoreWithManualClock()
 		if _, _, err := store.HSet("h", []HashFieldValue{{Field: "f", Value: []byte("v")}}); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
-		if ok := store.expireKeyForTest("h", time.Now().Add(-time.Second).UnixMilli()); !ok {
+		if ok := store.expireKeyForTest("h", store.deadlineAfter(-time.Second)); !ok {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}
 
@@ -305,13 +305,13 @@ func TestStoreHash(t *testing.T) {
 	})
 
 	t.Run("Compact hash upgrades when entry count exceeds threshold", func(t *testing.T) {
-		store := NewStore()
+		store, _ := newStoreWithManualClock()
 		for i := 0; i < compactHashMaxEntries; i++ {
 			if _, _, err := store.HSet("h", []HashFieldValue{{Field: string(rune('a' + i)), Value: []byte("v")}}); err != nil {
 				t.Fatalf("HSet() seed error = %v", err)
 			}
 		}
-		expiresAt := time.Now().Add(time.Hour).UnixMilli()
+		expiresAt := store.deadlineAfter(time.Hour)
 		if ok := store.expireKeyForTest("h", expiresAt); !ok {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}
@@ -576,11 +576,11 @@ func TestStoreSet(t *testing.T) {
 	})
 
 	t.Run("Integer set upgrades when non-integer member is added", func(t *testing.T) {
-		store := NewStore()
+		store, _ := newStoreWithManualClock()
 		if _, _, err := store.SAdd("s", [][]byte{[]byte("1"), []byte("2")}); err != nil {
 			t.Fatalf("SAdd() seed error = %v", err)
 		}
-		expiresAt := time.Now().Add(time.Hour).UnixMilli()
+		expiresAt := store.deadlineAfter(time.Hour)
 		if ok := store.expireKeyForTest("s", expiresAt); !ok {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}

@@ -128,30 +128,6 @@ func (v *ValueObject) hashEntries() ([]HashFieldValue, error) {
 	return entries, nil
 }
 
-func (v *ValueObject) cloneHashValue(expiresAt int64) (*ValueObject, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindHash {
-		return nil, ErrWrongType
-	}
-	if v.HashEncoding == ValueEncodingCompact {
-		if v.CompactHash == nil {
-			return nil, errInvalidValueObjectState
-		}
-		return newCompactHashValue(cloneCompactHash(v.CompactHash), expiresAt), nil
-	}
-	if v.Hash == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	fields := make(map[string][]byte, len(v.Hash))
-	for field, raw := range v.Hash {
-		fields[field] = cloneBytes(raw)
-	}
-	return newHashValue(fields, expiresAt), nil
-}
-
 func (v *ValueObject) zsetLen() (int, error) {
 	if v == nil {
 		return 0, errInvalidValueObjectState
@@ -259,25 +235,6 @@ func (v *ValueObject) zsetRangeByScore(scoreRange ScoreRange) ([]ZSetRangeEntry,
 		return nil, errInvalidValueObjectState
 	}
 	return v.ZSet.rangeByScore(scoreRange), nil
-}
-
-func (v *ValueObject) cloneZSetValue(expiresAt int64) (*ValueObject, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindZSet {
-		return nil, ErrWrongType
-	}
-	if v.ZSetEncoding == ValueEncodingCompact {
-		if v.CompactZSet == nil {
-			return nil, errInvalidValueObjectState
-		}
-		return newCompactZSetValue(cloneCompactZSet(v.CompactZSet), expiresAt), nil
-	}
-	if v.ZSet == nil {
-		return nil, errInvalidValueObjectState
-	}
-	return newZSetValue(cloneSortedSet(v.ZSet), expiresAt), nil
 }
 
 func (v *ValueObject) setLen() (int, error) {
@@ -411,30 +368,6 @@ func (v *ValueObject) setMembers() ([][]byte, error) {
 		members = append(members, []byte(member))
 	}
 	return members, nil
-}
-
-func (v *ValueObject) cloneSetValue(expiresAt int64) (*ValueObject, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindSet {
-		return nil, ErrWrongType
-	}
-	if v.SetEncoding == ValueEncodingCompact {
-		if v.IntSet == nil {
-			return nil, errInvalidValueObjectState
-		}
-		return newIntSetValue(cloneIntSet(v.IntSet), expiresAt), nil
-	}
-	if v.Set == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	members := make(map[string]struct{}, len(v.Set))
-	for member := range v.Set {
-		members[member] = struct{}{}
-	}
-	return newSetValue(members, expiresAt), nil
 }
 
 func newSetValueForMembers(members [][]byte, expiresAt int64) *ValueObject {

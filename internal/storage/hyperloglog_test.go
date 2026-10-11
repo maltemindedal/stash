@@ -203,7 +203,8 @@ func TestStoreHyperLogLogBehavior(t *testing.T) {
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 
-				payload := newHyperLogLogPayload()
+				payload := make([]byte, hllValueSize)
+				writeHyperLogLogHeader(payload)
 				for i := hllHeaderSize; i < len(payload); i++ {
 					payload[i] = 0xFF
 				}
@@ -222,7 +223,8 @@ func TestStoreHyperLogLogBehavior(t *testing.T) {
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 
-				payload := newHyperLogLogPayload()
+				payload := make([]byte, hllValueSize)
+				writeHyperLogLogHeader(payload)
 				for i := hllHeaderSize; i < len(payload); i++ {
 					payload[i] = hllMaxRank
 				}

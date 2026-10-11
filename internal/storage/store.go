@@ -67,8 +67,8 @@ type Store struct {
 // Within the store, two things read the system clock directly because they pace
 // work rather than decide what a key holds: the time budget of a background
 // eviction pass, and the shard a key sample starts from. The value constructors
-// also stamp a new value from the system clock, but the write that stores it
-// stamps it again with its own reading. Code outside the store takes its own
+// read no clock: they leave a new value unstamped, and the write that stores it
+// stamps it with its own reading. Code outside the store takes its own
 // reading of the system clock to judge TTLs: SET for its relative EX or PX
 // (ParseExpiryMillis is handed it), RDB loading and snapshot building, and the
 // AOF rewrite.
@@ -181,11 +181,7 @@ func (s *Store) publishExpiredKeys() {
 // it first frees space and reports the keys evicted to make room; otherwise it
 // evicts nothing.
 func (s *Store) Set(key string, value []byte, expiresAt int64) ([]string, error) {
-	_, evicted, err := writeKey(s, key, func(w keyWrite) (struct{}, []string, error) {
-		evicted, err := w.commit(newStringValue(value, expiresAt))
-		return struct{}{}, evicted, err
-	})
-	return evicted, err
+	return replaceKey(s, key, newStringValue(value, expiresAt))
 }
 
 // Get fetches a value from the store, passively evicting it if it has expired.
@@ -220,7 +216,7 @@ func (s *Store) withStringValue(key string, fn func(data []byte) error) (bool, e
 // Delete removes a key from the store and reports whether it held a live value.
 func (s *Store) Delete(key string) bool {
 	// A mutation that accepts every kind and never fails cannot return an error.
-	deleted, _ := mutateKey(s, key, anyKind, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	deleted, _, _ := mutateKey(s, key, anyKind, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		return nil, cur != nil, nil
 	})
 	return deleted
@@ -239,72 +235,31 @@ func (s *Store) DeleteMany(keys []string) []string {
 		return nil
 	}
 
-	groups := s.groupKeysByShard(keys)
-	groups.lock(s)
-	defer groups.unlock(s)
-
-	now := s.now()
-	removed := make([]string, 0, len(keys))
-	for shardID, count := range groups.counts {
-		if count == 0 {
-			continue
-		}
-		shard := &s.shards[shardID]
-		for _, key := range groups.keysForShard(shardID) {
-			value, ok := shard.data[key]
-			if !ok {
-				continue
-			}
-			if isExpired(value, now) {
-				s.deleteKeyLocked(shard, key)
-				continue
-			}
-
-			s.deleteKeyLocked(shard, key)
-			removed = append(removed, key)
-		}
-	}
-
-	return removed
+	return deleteKeys(s, keys)
 }
 
 // Increment atomically increments the string value stored at key by one. When
 // maxmemory is configured it first frees space and reports the keys evicted to
 // make room; otherwise it evicts nothing.
 func (s *Store) Increment(key string) (int64, []string, error) {
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		if w.current == nil {
-			evicted, err := w.commit(newOwnedStringValue([]byte("1"), 0))
-			if err != nil {
-				return 0, nil, err
+	return mutateString(s, key, func(w stringWrite) (int64, []string, error) {
+		parsed := int64(0)
+		if current, ok := w.Current(); ok {
+			n, err := strconv.ParseInt(string(current), 10, 64)
+			if err != nil || n == math.MaxInt64 {
+				return 0, nil, ErrValueNotInteger
 			}
-			return 1, evicted, nil
-		}
-
-		currentValue, err := w.current.StringValue()
-		if err != nil {
-			return 0, nil, err
-		}
-		parsed, err := strconv.ParseInt(string(currentValue), 10, 64)
-		if err != nil || parsed == math.MaxInt64 {
-			return 0, nil, ErrValueNotInteger
+			parsed = n
 		}
 		parsed++
-		next := []byte(strconv.FormatInt(parsed, 10))
 
-		if !w.accounting {
-			w.current.String = next
-			w.current.touch(w.now)
-			return parsed, nil, nil
-		}
-
-		// Size the write against the pre-write value, and leave the counter
-		// untouched if it turns out to breach maxmemory, by committing a
-		// replacement rather than editing the string still stored under the key.
-		evicted, err := w.commit(newOwnedStringValue(next, w.current.ExpiresAt))
+		var digits [20]byte // the longest int64, with its sign
+		next := strconv.AppendInt(digits[:0], parsed, 10)
+		payload, evicted, err := w.Payload(len(next))
 		if err != nil {
 			return 0, nil, err
 		}
+		copy(payload, next)
 		return parsed, evicted, nil
 	})
 }
@@ -342,7 +297,7 @@ func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
 	// carrying them was copied on every return and made a pop over 10% slower.
 	var item []byte
 	remaining := 0
-	ok, err := mutateKey(s, key, ValueKindList, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, _, err := mutateKey(s, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil || len(cur.liveList()) == 0 {
 			return nil, false, nil
 		}
@@ -382,7 +337,7 @@ func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
 	// As in popOne, the values and the count left come back through variables.
 	var values [][]byte
 	remaining := 0
-	ok, err := mutateKey(s, key, ValueKindList, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, _, err := mutateKey(s, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil || len(cur.liveList()) == 0 {
 			return nil, false, nil
 		}
@@ -426,41 +381,14 @@ func (s *Store) ZAdd(key string, entries []ZSetEntry) (int64, []string, error) {
 		return 0, nil, ErrSyntax
 	}
 
-	return writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		var (
-			newValue *ValueObject
-			added    int64
-			err      error
-		)
-		if w.current != nil {
-			newValue = w.current
-			if w.accounting {
-				// Size the write against the pre-write value, and leave the sorted
-				// set untouched if it turns out to breach maxmemory, by mutating a
-				// copy rather than the value still stored under the key.
-				newValue, err = w.current.cloneZSetValue(w.current.ExpiresAt)
-				if err != nil {
-					return 0, nil, err
-				}
-			}
-			added, err = newValue.zsetAdd(entries)
-			if err != nil {
-				return 0, nil, err
-			}
-		} else {
-			newValue = newZSetValueForEntries(entries, 0)
-			newLen, lenErr := newValue.zsetLen()
-			if lenErr != nil {
-				return 0, nil, lenErr
-			}
-			added = int64(newLen)
+	return mutateKey(s, key, ValueKindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+		if cur == nil {
+			created := newZSetValueForEntries(entries, 0)
+			n, err := created.zsetLen()
+			return created, int64(n), err
 		}
-
-		evicted, err := w.commit(newValue)
-		if err != nil {
-			return 0, nil, err
-		}
-		return added, evicted, nil
+		added, err := cur.zsetAdd(entries)
+		return cur, added, err
 	})
 }
 
@@ -545,38 +473,16 @@ func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, erro
 		return "", nil, ErrSyntax
 	}
 
-	return writeKey(s, key, func(w keyWrite) (string, []string, error) {
-		var (
-			stream    *StreamValue
-			expiresAt int64
-		)
-		if w.current != nil {
-			existing, err := w.current.StreamValue()
-			if err != nil {
-				return "", nil, err
-			}
-			expiresAt = w.current.ExpiresAt
-			stream = existing
-			if w.accounting {
-				// Size the write against the pre-write stream, and leave it
-				// untouched if it turns out to breach maxmemory, by appending to a
-				// copy rather than the stream still stored under the key.
-				stream = cloneStreamValue(existing)
-			}
-		} else {
-			stream = newStream()
+	return mutateKey(s, key, ValueKindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
+		if cur == nil {
+			cur = newStreamValue(newStream(), 0)
 		}
-
-		id, err := stream.add(rawID, values, w.now)
+		stream, err := cur.StreamValue()
 		if err != nil {
-			return "", nil, err
+			return nil, "", err
 		}
-
-		evicted, err := w.commit(newStreamValue(stream, expiresAt))
-		if err != nil {
-			return "", nil, err
-		}
-		return id, evicted, nil
+		id, err := stream.add(rawID, values, now)
+		return cur, id, err
 	})
 }
 
@@ -1013,37 +919,18 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 		return 0, nil, ErrSyntax
 	}
 
-	length, evicted, err := writeKey(s, key, func(w keyWrite) (int64, []string, error) {
-		var (
-			list      [][]byte // the values of the list
-			full      [][]byte // the array they live in, ListHead dead slots ahead of them
-			head      int
-			expiresAt int64
-		)
-		if w.current != nil {
-			currentList, err := w.current.ListValue()
-			if err != nil {
-				return 0, nil, err
-			}
-			expiresAt = w.current.ExpiresAt
-			list = currentList
-			if w.accounting {
-				// Size the write against the pre-write list, and leave it untouched
-				// if it turns out to breach maxmemory, by appending to a copy rather
-				// than to the slice still stored under the key. The copy shares no
-				// array with the stored list, so there is nothing to reuse.
-				list = append([][]byte(nil), currentList...)
-			} else {
-				full, head = w.current.List, int(w.current.ListHead)
-			}
+	length, evicted, err := mutateKey(s, key, ValueKindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+		if cur == nil {
+			cur = newListValue(nil, 0)
 		}
-
+		full, head := cur.List, int(cur.ListHead) // the array the list lives in, and the dead slots ahead of it
+		list := full[head:]
 		additions := cloneList(values)
 		if left {
 			full, head = prependList(full, head, list, additions)
 		} else {
 			grown := append(list, additions...)
-			if full != nil && len(list) > 0 && &grown[0] == &list[0] {
+			if len(list) > 0 && &grown[0] == &list[0] {
 				// It fitted: the list still lives in the same array, and so do the
 				// dead slots ahead of it.
 				full = full[:head+len(grown)]
@@ -1051,14 +938,8 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 				full, head = grown, 0
 			}
 		}
-
-		value := newListValue(full, expiresAt)
-		value.ListHead = int32(head)
-		evicted, err := w.commit(value)
-		if err != nil {
-			return 0, nil, err
-		}
-		return int64(len(full) - head), evicted, nil
+		cur.List, cur.ListHead = full, int32(head)
+		return cur, int64(len(full) - head), nil
 	})
 	if err != nil {
 		return 0, nil, err

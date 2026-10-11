@@ -167,7 +167,7 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 		{
 			name: "SET to a longer value with a TTL",
 			write: func(store *Store, key string) error {
-				_, err := store.Set(key, []byte("longer"), time.Now().Add(time.Hour).UnixMilli())
+				_, err := store.Set(key, []byte("longer"), store.deadlineAfter(time.Hour))
 				return err
 			},
 		},
@@ -196,14 +196,15 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 //
 // An accounted write reads the clock and then takes every shard lock in
 // ascending order, so while the test holds the last shard's lock the write
-// parks there, holding shard 0 and past its clock reading. The test then moves
-// the key's deadline to a clock reading of its own, which cannot precede the
-// write's, under that same lock, and lets the write go on once the clock has
-// passed it.
+// parks there, holding shard 0 and past its clock reading. The store's manual
+// clock still reads what the write read, so the test moves the key's deadline
+// to that reading, under that same lock, and moves the clock past it before it
+// lets the write go on: any reading the write took after its first would find
+// the key expired.
 func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key string) error) (*Store, string, []string) {
 	t.Helper()
 
-	store := NewStore()
+	store, clock := newStoreWithManualClock()
 	store.ConfigureMaxMemory(1<<20, 16)
 	var heard []string
 	store.SetExpirationListener(func(keys []string) { heard = append(heard, keys...) })
@@ -215,7 +216,7 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 			key = candidate
 		}
 	}
-	if _, err := store.Set(key, []byte("9"), time.Now().Add(time.Hour).UnixMilli()); err != nil {
+	if _, err := store.Set(key, []byte("9"), store.deadlineAfter(time.Hour)); err != nil {
 		t.Fatalf("Set(%s) error = %v", key, err)
 	}
 
@@ -227,12 +228,10 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 		store.shards[0].mu.Unlock()
 		runtime.Gosched()
 	}
-	deadline := time.Now().UnixMilli()
+	deadline := clock.now()
 	last.data[key].ExpiresAt = deadline
 	store.noteExpiry(deadline)
-	for time.Now().UnixMilli() <= deadline {
-		runtime.Gosched()
-	}
+	clock.advance(time.Millisecond)
 	last.mu.Unlock()
 
 	if err := <-done; err != nil {
@@ -245,10 +244,10 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 // (zero) until the first recount, exact after one, lowered by an earlier deadline
 // and untouched by a later one, and not tracked at all while maxmemory is off.
 func TestStoreExpiryLowerBound(t *testing.T) {
-	soon := time.Now().Add(time.Hour).UnixMilli()
+	store, _ := newStoreWithManualClock()
+	soon := store.deadlineAfter(time.Hour)
 	later := soon + 60_000
 
-	store := NewStore()
 	if _, err := store.Set("off", []byte("v"), soon); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}

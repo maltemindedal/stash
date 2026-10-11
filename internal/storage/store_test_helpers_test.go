@@ -44,6 +44,13 @@ func (c *manualClock) advance(d time.Duration) int64 {
 	return c.millis.Add(d.Milliseconds())
 }
 
+// deadlineAfter returns the TTL deadline d after a reading of the store's
+// clock; a negative d gives one that has already passed. On a store from
+// newStoreWithManualClock, whose clock stands still, the deadline is exact.
+func (s *Store) deadlineAfter(d time.Duration) int64 {
+	return s.now() + d.Milliseconds()
+}
+
 // expireForTest gives the value stored at key a TTL deadline at the clock's
 // reading, accounting for it as the store would, and moves the clock past it:
 // the key has expired, but no operation has seen it yet.
