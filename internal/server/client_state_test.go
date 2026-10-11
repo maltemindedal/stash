@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -234,6 +235,47 @@ func TestClientStateWriteEncodedWithDeadlineTimesOut(t *testing.T) {
 
 	if err := state.WriteEncodedWithDeadline([]byte("+OK\r\n"), 5*time.Millisecond); err == nil {
 		t.Fatal("WriteEncodedWithDeadline() error = nil, want timeout error")
+	}
+}
+
+// closesAfterWriteConn is a connection that is closed by the time a write to it
+// has gone through: the write succeeds, and clearing the write deadline after
+// it fails as on a closed connection.
+type closesAfterWriteConn struct {
+	recordingConn
+	written atomic.Bool
+}
+
+func (c *closesAfterWriteConn) Write(p []byte) (int, error) {
+	n, err := c.recordingConn.Write(p)
+	c.written.Store(true)
+	return n, err
+}
+
+func (c *closesAfterWriteConn) SetWriteDeadline(time.Time) error {
+	if c.written.Load() {
+		return net.ErrClosed
+	}
+	return nil
+}
+
+// TestClientStateWriteEncodedWithDeadlineReportsAWriteThatSucceeded writes to a
+// connection that closes once the write has gone through, as a replica's does
+// when the replica leaves just then. The write succeeded, so it must not be
+// reported as failed: clearing the write deadline after it fails, and that error
+// used to be returned, which had the replica's feed drop a replica that had only
+// left.
+func TestClientStateWriteEncodedWithDeadlineReportsAWriteThatSucceeded(t *testing.T) {
+	conn := &closesAfterWriteConn{}
+	state := &ClientState{ID: 7, Authenticated: true}
+	state.BindResponseWriter(bufio.NewWriter(conn))
+	state.BindResponseConn(conn)
+
+	if err := state.WriteEncodedWithDeadline([]byte("+OK\r\n"), time.Second); err != nil {
+		t.Fatalf("WriteEncodedWithDeadline() error = %v, want nil for a write that went through", err)
+	}
+	if got := string(conn.Bytes()); got != "+OK\r\n" {
+		t.Fatalf("written = %q, want %q", got, "+OK\r\n")
 	}
 }
 

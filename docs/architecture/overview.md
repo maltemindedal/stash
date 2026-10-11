@@ -107,7 +107,7 @@ Current responsibilities:
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
 - stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck
-- on shutdown, stop handing writes to the replicas and give them up to a second to take what is queued for them: the default mode's handlers leave a replica's connection open when the context is cancelled, and the event loop keeps serving the replicas (below). Once a replica's stream has reached its socket, shutdown shuts only the sending side (`ReplicaRegistry.EndStreams`) and waits for the replica to close its own, because closing the socket with data still in the kernel's send queue lets the replica's next acknowledgement reset the connection and discard that data
+- on shutdown, stop handing writes to the replicas and give them up to a second to take what is queued for them: the default mode's handlers leave a replica's connection open when the context is cancelled, and the event loop keeps serving the replicas (below). Once a replica's stream has reached its socket, shutdown shuts only the sending side (`ReplicaRegistry.EndStreams`) and waits for the replica to close its own, because closing the socket with data still in the kernel's send queue lets the replica's next acknowledgement reset the connection and discard that data. `ListenAndServe` returns only once every replica's feed goroutine has ended (`ReplicaRegistry.WaitFeeds`), so nothing a feed logs comes after it
 - stop, returning the error, when the accept loop fails with an error that is not temporary; a Replica's link to its Master ends with the server
 
 ### `test`

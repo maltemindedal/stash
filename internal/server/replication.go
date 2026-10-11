@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,6 +151,9 @@ func (p *ReplicaPeer) send(chunk []byte) error {
 type ReplicaRegistry struct {
 	mu       sync.RWMutex
 	replicas map[uint64]*ReplicaPeer
+	// feeds counts the feed goroutines Start started and that have not yet
+	// returned from their feed-error handler (WaitFeeds).
+	feeds sync.WaitGroup
 	// registered is len(replicas), stored under mu whenever it changes, so that
 	// PropagateOrdered can find out without mu that no replica is registered.
 	registered atomic.Int64
@@ -329,7 +333,9 @@ func (r *ReplicaRegistry) Start(id uint64, conn ClientConn) bool {
 		return false
 	}
 	onFeedError := r.onFeedError
+	r.feeds.Add(1)
 	stopped := func(err error) {
+		defer r.feeds.Done()
 		if err != nil && onFeedError != nil {
 			onFeedError(id, err)
 		}
@@ -338,10 +344,20 @@ func (r *ReplicaRegistry) Start(id uint64, conn ClientConn) bool {
 	// finds the connection to close.
 	peer.Conn = conn
 	if !peer.feed.start(peer.send, stopped) {
+		r.feeds.Done()
 		peer.Conn = nil
 		return false
 	}
 	return true
+}
+
+// WaitFeeds waits until the goroutine of every feed Start started has ended,
+// including the feed-error handler it called, so that nothing a feed does, such
+// as logging why its replica was dropped, comes after it returns. A feed ends
+// once its replica is removed or its connection closes, so the server calls it
+// once every connection has been torn down, before ListenAndServe returns.
+func (r *ReplicaRegistry) WaitFeeds() {
+	r.feeds.Wait()
 }
 
 // Propagate counts payload into the master's replication offset and queues it
@@ -756,24 +772,45 @@ func (s *Server) propagate(values []protocol.Value, ordered bool) propagationRep
 	return report
 }
 
-// dropReplica logs why a replica can no longer be fed and closes it. It has to
-// synchronise again from the start. It is the registry's feed-error handler, so
-// it is called with the registry lock not held, and takes it. A replica dropped
-// while its full resync reply is being sent has no connection here yet; its feed
-// never starts, and registerReplicaPeer closes the connection once the reply is
-// sent.
+// dropReplica removes a replica that can no longer be fed, logs why, and closes
+// it. It has to synchronise again from the start. It is the registry's
+// feed-error handler, so it is called with the registry lock not held, and
+// takes it. A replica dropped while its full resync reply is being sent has no
+// connection here yet; its feed never starts, and registerReplicaPeer closes the
+// connection once the reply is sent.
+//
+// Only a replica that fell behind (replicaFellBehind) is logged as dropped. Any
+// other cause means its connection ended, because the replica left or the
+// connection is being torn down, and it is logged as the connection's teardown
+// logs it (teardownClient), which finds it removed already.
 func (s *Server) dropReplica(id uint64, cause error) {
 	peer := s.replicaPeers.Remove(id)
 	if peer == nil {
 		return
 	}
-	s.logger.Warn("dropping a replica: it can no longer be fed the propagated stream", "replica_id", id, "error", cause)
+	if replicaFellBehind(cause) {
+		s.logger.Warn("dropping a replica: it can no longer be fed the propagated stream", "replica_id", id, "error", cause)
+	} else {
+		s.logger.Info("replica disconnected", "replica_id", id, "listening_port", peer.ListeningPort, "error", cause)
+	}
 	if peer.Conn == nil {
 		return
 	}
 	if err := peer.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		s.logger.Debug("failed to close replica after propagation failure", "replica_id", id, "error", err)
 	}
+}
+
+// replicaFellBehind reports whether a replica's feed stopped because the replica
+// did not keep up: its queue passed its limit (errReplicaBacklog, or the event
+// loop's push limit), or a write to it, or the wait for its connection's writer,
+// took longer than the replica feed allows. Anything else means its connection
+// ended.
+func replicaFellBehind(cause error) bool {
+	return errors.Is(cause, errReplicaBacklog) ||
+		errors.Is(cause, errPushLimitExceeded) ||
+		errors.Is(cause, os.ErrDeadlineExceeded) ||
+		errors.Is(cause, errResponseWriterBusy)
 }
 
 func (s *Server) recordClientWriteOffset(client *ClientState, offset int64) {

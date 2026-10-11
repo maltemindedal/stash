@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -816,6 +818,85 @@ func TestEndStreamsHalfClosesEachReplicaAndWaitsForItToLeave(t *testing.T) {
 			}
 			registry.StopFeeds(time.Second)
 		})
+	}
+}
+
+// TestADroppedReplicaIsLoggedByWhyItsFeedStopped drops a replica for each cause
+// its feed can stop with. Only a replica that fell behind (its queue past the
+// limit, or a write to it stalled) is logged as dropped. One whose connection
+// ended left, or is being torn down, and is logged as disconnected, as the
+// connection's teardown would have logged it: a replica that closed its socket
+// just as its feed wrote used to be logged as dropped.
+func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
+	tests := []struct {
+		name    string
+		cause   error
+		wantLog string
+	}{
+		{name: "the connection was closed", cause: net.ErrClosed, wantLog: "replica disconnected"},
+		{name: "the replica reset the connection", cause: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrClosedPipe}, wantLog: "replica disconnected"},
+		{name: "the client state was disconnected", cause: errors.New("client response writer unavailable"), wantLog: "replica disconnected"},
+		{name: "its queue passed the limit", cause: errReplicaBacklog, wantLog: "dropping a replica"},
+		{name: "the event loop's push limit", cause: fmt.Errorf("%w: more than its 268435456 byte limit waiting", errPushLimitExceeded), wantLog: "dropping a replica"},
+		{name: "a write stalled", cause: &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}, wantLog: "dropping a replica"},
+		{name: "the writer stayed busy", cause: fmt.Errorf("%w for 30s", errResponseWriterBusy), wantLog: "dropping a replica"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(&logs, nil)), storage.NewStore(), nil)
+			conn := &stubConn{}
+			srv.replicaPeers.Add(srv.replication, 1, conn, 6380, newReplicaPeerStateForTest(1, &recordingConn{}))
+
+			srv.dropReplica(1, tt.cause)
+
+			for _, line := range []string{"replica disconnected", "dropping a replica"} {
+				if got, want := strings.Count(logs.String(), line), map[bool]int{true: 1}[line == tt.wantLog]; got != want {
+					t.Fatalf("logged %q %d times, want %d\nlogs:\n%s", line, got, want, logs.String())
+				}
+			}
+			if srv.replicaPeers.Count() != 0 || conn.closes.Load() != 1 {
+				t.Fatalf("after the drop: %d replicas registered, connection closed %d times; want 0 and once", srv.replicaPeers.Count(), conn.closes.Load())
+			}
+			srv.replicaPeers.StopFeeds(time.Second)
+		})
+	}
+}
+
+// TestWaitFeedsWaitsForTheFeedErrorHandler stops a replica's feed with a failed
+// write while the feed-error handler is held up. WaitFeeds must not return until
+// the handler has, so that nothing a feed logs comes after ListenAndServe, which
+// calls it, has returned. The feed's goroutine used to outlive the server.
+func TestWaitFeedsWaitsForTheFeedErrorHandler(t *testing.T) {
+	registry := NewReplicaRegistry()
+	handling := make(chan struct{})
+	release := make(chan struct{})
+	registry.SetFeedErrorHandler(func(uint64, error) {
+		close(handling)
+		<-release
+	})
+	conn := &stubConn{writeErr: io.ErrClosedPipe}
+	registry.Add(&ReplicationState{}, 1, conn, 6380, newReplicaPeerStateForTest(1, conn))
+	registry.Propagate(&ReplicationState{}, []byte("frame"))
+	<-handling
+
+	waited := make(chan struct{})
+	go func() {
+		registry.WaitFeeds()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("WaitFeeds() returned while the feed-error handler was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitFeeds() had not returned 5s after the feed-error handler did")
 	}
 }
 
