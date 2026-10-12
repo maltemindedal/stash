@@ -29,7 +29,7 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 
 - Standard library only, in code and tests: lint (`depguard` in `.golangci.yml`) fails any import outside the standard library and this module. `go.mod` has no `require` block and there is no `go.sum`; lint does not check that, review does. Reach for `syscall` and the standard library instead, as the epoll/kqueue pollers do (PR #36 rejected `golang.org/x/sys`).
 - Write Go 1.21. Loop variables are shared across iterations even on new toolchains, so copy one before a closure or goroutine captures it, as `newSequencer` in `internal/command/sequencer.go` does. Raising the floor is its own change, decided by the owner, with no `toolchain` line.
-- Skills are installed globally: keep `.agents/skills/` and `skills-lock.json` out of the repo (removed twice, last in f6e2ace). The per-repo settings skills read are `## Agent skills` below and `docs/agents/`.
+- Generic skills are installed globally: never vendor them into `.agents/skills/` or add a `skills-lock.json` (removed twice, last in f6e2ace). `.agents/skills/` holds only skills written for this repo, today `verify-stash`. The per-repo settings skills read are `## Agent skills` below and `docs/agents/`.
 - Unsupported input fails explicitly: an unrecognized modifier returns `ERR syntax error`. Wire errors use Redis's exact text through the `Err*` sentinels and `newRESPError` in `internal/command/executor.go`. Go errors start with their package (`"aof: ..."`, `"server: ..."`).
 - Storage operations go through `readKey`, `mutateKey` (told whether the write shrinks or may grow its key), `mutateString` (INCR, SETBIT, PFADD), `replaceKey` (SET) or `deleteKeys` (DEL of several keys) in `internal/storage/shard.go`, which own locking, expiry and memory accounting. A callback keeps no reference to the value or its memory after it returns: returning internal slices and mutating shared buffers were repeat review findings.
 - Before changing any lock, read the header of `internal/command/sequencer.go` and the docs of the storage primitives in `internal/storage/shard.go`. Locks are taken in the order sequencer gate, write stripes ascending, shards ascending; a write's command frames are recorded (`record.Recorder`) after the shard locks are released and before the stripes are, taking the AOF writer's lock and then the replica registry's, never together. Nothing waits for another request while holding the gate or a stripe, and no shard lock is held while calling an expiry listener or taking `waiters.mu`.
@@ -79,6 +79,10 @@ The code is the source of truth: when docs and behavior disagree, fix the docs. 
 - Adding a doc: give it a row in `docs/README.md`.
 
 ## Agent skills
+
+### Verification
+
+`.agents/skills/verify-stash/` launches its own server on a free loopback port, drives it over RESP, checks AOF replay across a restart, and runs `go test` and `scripts/gate.sh`. Run `.agents/skills/verify-stash/scripts/verify.sh all` and read its exit status. Evidence goes to `/tmp/stash-verify/<run>/`.
 
 ### Issue tracker
 
