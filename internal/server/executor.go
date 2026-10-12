@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -16,11 +17,16 @@ import (
 // side is a compile error rather than a feature that silently switches off.
 type CommandExecutor interface {
 	// Handle runs one request, ordered against the others (see the command
-	// package's sequencer), as call describes it. When the result has a
-	// Release function, the caller calls it once it has applied the result's
-	// durability and propagation frames, and not before.
+	// package's sequencer), as call describes it, and records the command
+	// frames of its write (record.Recorder) before it returns.
 	Handle(ctx context.Context, call Call, request protocol.Value) (ExecuteResult, error)
 }
+
+// ErrNotRecorded is what the command executor returns, wrapping the cause, for
+// a request from the Master's stream whose command frames could not be
+// appended to the AOF: the replica link ends, and the Replica synchronises
+// again when it reconnects.
+var ErrNotRecorded = errors.New("server: the command frames could not be recorded")
 
 // ErrCloseConnection is what the command executor returns for a request that
 // its connection may not make in its state, to have the server close the
@@ -29,39 +35,13 @@ type CommandExecutor interface {
 // whose command produces a reply.
 var ErrCloseConnection = errors.New("server: connection closed for a request it may not make")
 
-// Origin is where a request came from, which decides what it may do. The zero
-// Origin is none of them, so the executor refuses a Call that does not set one.
-type Origin uint8
-
-const (
-	// OriginClient is a client connection.
-	OriginClient Origin = iota + 1
-	// OriginMaster is the Master's replication stream, applied on a Replica.
-	OriginMaster
-	// OriginReplay is AOF replay at startup.
-	OriginReplay
-)
-
-// Propagates reports whether the request's writes are forwarded to Replicas.
-func (o Origin) Propagates() bool { return o == OriginClient }
-
-// RecordsSlowlog reports whether the request can be recorded in the Slowlog.
-func (o Origin) RecordsSlowlog() bool { return o == OriginClient }
-
-// NeedsAuth reports whether the request runs only for a client that has
-// authenticated, on a server that requires a password.
-func (o Origin) NeedsAuth() bool { return o == OriginClient }
-
-// AnswersGetAck reports whether the request may answer REPLCONF GETACK.
-func (o Origin) AnswersGetAck() bool { return o == OriginMaster }
-
 // Call is what the command executor is told about one request besides its
 // arguments.
 type Call struct {
 	// Client is the Client state of the connection the request came from. It
 	// is required for OriginClient and must be nil for every other Origin.
 	Client *ClientState
-	Origin Origin
+	Origin record.Origin
 	// Inline marks a request run on the Event loop's goroutine, where whatever
 	// would block returns an error instead.
 	Inline bool
@@ -101,7 +81,8 @@ type Services struct {
 	// RewriteAOF starts the background AOF rewrite BGREWRITEAOF asks for, or
 	// reports that there is no AOF.
 	RewriteAOF func(context.Context) error
-	// RecordsWrites reports whether anything records writes at the moment (an
-	// AOF, a Replica attached or attaching), so that writes must be ordered.
-	RecordsWrites func() bool
+	// Recorder records each applied write's command frames. Its Records
+	// reports whether anything records writes at the moment (an AOF, a Replica
+	// attached or attaching), so that writes must be ordered.
+	Recorder *record.Recorder
 }

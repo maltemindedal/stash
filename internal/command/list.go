@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -81,8 +82,8 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		waiter := e.store.SubscribeListPush(key)
 
 		// The pop is a write: it is ordered with the others, and stays so until
-		// the caller has logged it (result.Release). Waiting is done with nothing
-		// held, or a transaction could never start.
+		// it is recorded. Waiting is done with nothing held, or a transaction
+		// could never start.
 		release := e.beginWrite(keysFirstArg, request)
 
 		// The push that woke this command can still hold the key's stripe: with an
@@ -114,17 +115,16 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 				protocol.BulkString{Data: clone(request.Args[0])},
 				protocol.BulkString{Data: value},
 			}})
-			if !inTransaction {
-				result.Release = release
-			}
 			// The pop is a write like LPOP: log and replicate it as one, or a
-			// restart, or a replica, would still have the element.
-			frame := propagationFrame(&Request{Name: "LPOP", Args: [][]byte{clone(request.Args[0])}})
-			result.Durability = []protocol.Value{frame}
-			if request.origin.Propagates() {
-				result.Propagation = []protocol.Value{frame}
+			// restart, or a replica, would still have the element. It is recorded
+			// before its stripe is released; inside a transaction EXEC records it.
+			request.write.Add(propagationFrame(&Request{Name: "LPOP", Args: [][]byte{clone(request.Args[0])}}), record.ToBoth)
+			if inTransaction {
+				return result, nil
 			}
-			return result, nil
+			result, err := e.record(request, result)
+			release()
+			return result, err
 		}
 		release()
 

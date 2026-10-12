@@ -129,17 +129,13 @@ func setCommand(key, value string) []byte {
 // background goroutine runs once a second. When it returns, every policy has
 // tried to write payload to the file.
 func appendAndWrite(writer *Writer, payload []byte) error {
-	switch writer.policy {
-	case PolicyAlways:
-		return writer.AppendSync(payload)
-	case PolicyEverysec:
-		if err := writer.Append(payload); err != nil {
-			return err
-		}
-		return writer.sync()
-	default:
-		return writer.Append(payload)
+	if _, err := writer.Append(payload); err != nil {
+		return err
 	}
+	if writer.policy == PolicyEverysec {
+		return writer.Sync()
+	}
+	return nil
 }
 
 func mustAppend(t *testing.T, writer *Writer, payloads ...[]byte) {
@@ -211,10 +207,9 @@ func wantReplay(t *testing.T, writer *Writer, path string, want ...string) {
 	}
 }
 
-// keptUnder returns commands without the failed ones under always. There the
-// server appends with AppendSync, which leaves a command it could not make
-// durable out of the file, as the client got an error and the replicas never
-// got the command. The other policies keep it and write it later.
+// keptUnder returns commands without the failed ones under always. There
+// Append leaves a command it could not make durable out of the file, as the
+// client got an error and the replicas never got the command. The other policies keep it and write it later.
 func keptUnder(policy Policy, commands []string, failed ...string) []string {
 	if policy != PolicyAlways {
 		return commands
@@ -287,8 +282,9 @@ func TestWriterCutsAPartlyWrittenCommandBeforeRetrying(t *testing.T) {
 			if err := appendAndWrite(writer, setCommand("b", "2")); !errors.Is(err, errDiskFull) {
 				t.Fatalf("append on a full disk: error = %v, want it to wrap %v", err, errDiskFull)
 			}
-			// The failed write leaves part of b in the file, which AppendSync cuts
-			// back at once and the other policies cut before their next write.
+			// The failed write leaves part of b in the file, which Append under
+			// always cuts back at once and the other policies cut before their next
+			// write.
 			if size := fileSize(t, path); (size == before) != (policy == PolicyAlways) {
 				t.Fatalf("file is %d bytes after the failed write, %d before it: want part of a command there, except under always", size, before)
 			}
@@ -351,7 +347,7 @@ func TestWriterKeepsFailingWhileItCannotCutAPartlyWrittenCommand(t *testing.T) {
 // whole. The status went back to ok with the next successful fsync. Under no
 // the writer fsyncs only on Close, so the policies here are the two that fsync;
 // under always the command after the failure is refused, as
-// TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite covers.
+// TestAppendUnderAlwaysRefusesPayloadsAfterAFailedFsyncUntilARewrite covers.
 func TestFailedFsyncKeepsTheStatusFailedUntilARewrite(t *testing.T) {
 	for _, policy := range []Policy{PolicyAlways, PolicyEverysec} {
 		t.Run(policy.String(), func(t *testing.T) {
@@ -698,14 +694,14 @@ func TestEverysecWritesCommandsOnceTheyFillTheFlushSize(t *testing.T) {
 	command := setCommand("key", strings.Repeat("v", 100))
 	below := (pendingFlushSize - 1) / len(command)
 	for i := 0; i < below; i++ {
-		if err := writer.Append(command); err != nil {
+		if _, err := writer.Append(command); err != nil {
 			t.Fatalf("Append() error = %v", err)
 		}
 	}
 	if size := fileSize(t, path); size != 0 {
 		t.Fatalf("file is %d bytes with %d bytes collected, want 0 below %d", size, below*len(command), pendingFlushSize)
 	}
-	if err := writer.Append(command); err != nil {
+	if _, err := writer.Append(command); err != nil {
 		t.Fatalf("Append() error = %v", err)
 	}
 	if size, want := fileSize(t, path), int64((below+1)*len(command)); size != want {
@@ -751,8 +747,7 @@ func TestWriterReleasesAPendingBufferGrownPastItsIdleCap(t *testing.T) {
 // larger than one write can take. A failed write cut the file back to the last
 // command written before it, even past the commands it had written in full, so
 // every retry wrote the same commands, failed at the same place and made no
-// progress. Under always nothing piles up: AppendSync leaves a failed command
-// out.
+// progress. Under always nothing piles up: Append leaves a failed command out.
 func TestWriterKeepsTheWholeCommandsAFailedWriteGotIntoTheFile(t *testing.T) {
 	for _, policy := range []Policy{PolicyEverysec, PolicyNo} {
 		t.Run(policy.String(), func(t *testing.T) {
@@ -791,12 +786,12 @@ func TestWriterKeepsTheWholeCommandsAFailedWriteGotIntoTheFile(t *testing.T) {
 	}
 }
 
-// TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite covers always
-// after an fsync failure, or a failed close of the old file in a swap whose
-// rename then failed. A later AppendSync whose own fsync succeeded returned nil,
-// so the client got OK although earlier commands may have been lost from the
-// file.
-func TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite(t *testing.T) {
+// TestAppendUnderAlwaysRefusesPayloadsAfterAFailedFsyncUntilARewrite covers
+// always after an fsync failure, or a failed close of the old file in a swap
+// whose rename then failed. A later append whose own fsync succeeded returned
+// nil, so the client got OK although earlier commands may have been lost from
+// the file.
+func TestAppendUnderAlwaysRefusesPayloadsAfterAFailedFsyncUntilARewrite(t *testing.T) {
 	tests := []struct {
 		name string
 		fail func(t *testing.T, writer *Writer, faulty *faultyFile, path string)
@@ -805,8 +800,8 @@ func TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite(t *testing.T) {
 			name: "an fsync fails",
 			fail: func(t *testing.T, writer *Writer, faulty *faultyFile, _ string) {
 				setFaults(writer, func() { faulty.failSync = true })
-				if err := writer.AppendSync(setCommand("b", "2")); !errors.Is(err, errSyncFails) {
-					t.Fatalf("AppendSync() whose fsync fails: error = %v, want it to wrap %v", err, errSyncFails)
+				if _, err := writer.Append(setCommand("b", "2")); !errors.Is(err, errSyncFails) {
+					t.Fatalf("Append() whose fsync fails: error = %v, want it to wrap %v", err, errSyncFails)
 				}
 				setFaults(writer, func() { faulty.failSync = false })
 			},
@@ -832,8 +827,8 @@ func TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite(t *testing.T) {
 			mustAppend(t, writer, setCommand("a", "1"))
 			tt.fail(t, writer, faulty, path)
 
-			if err := writer.AppendSync(setCommand("c", "3")); !errors.Is(err, errEarlierSyncFailed) {
-				t.Fatalf("AppendSync() after the failure: error = %v, want it to wrap %v", err, errEarlierSyncFailed)
+			if _, err := writer.Append(setCommand("c", "3")); !errors.Is(err, errEarlierSyncFailed) {
+				t.Fatalf("Append() after the failure: error = %v, want it to wrap %v", err, errEarlierSyncFailed)
 			}
 			if got, _ := loadCommands(t, path); !reflect.DeepEqual(got, []string{"SET a 1"}) {
 				t.Fatalf("the file replays %q, want only the command before the failure", got)
@@ -843,25 +838,25 @@ func TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite(t *testing.T) {
 			if completed, err := writer.finalizeRewrite(tempFile, tempFile.Name()); !completed || err != nil {
 				t.Fatalf("finalizeRewrite() = (%v, %v), want (true, nil)", completed, err)
 			}
-			if err := writer.AppendSync(setCommand("d", "4")); err != nil {
-				t.Fatalf("AppendSync() after a rewrite replaced the file: %v", err)
+			if _, err := writer.Append(setCommand("d", "4")); err != nil {
+				t.Fatalf("Append() after a rewrite replaced the file: %v", err)
 			}
 			wantReplay(t, writer, path, "SET a 1", "SET c 3", "SET d 4")
 		})
 	}
 }
 
-// TestAppendSyncLeavesACommandItCouldNotMakeDurableOutOfTheFile covers always,
+// TestAppendUnderAlwaysLeavesACommandItCouldNotMakeDurableOutOfTheFile covers always,
 // where the client gets ERR for such a command and the replicas never get it.
 // The writer kept the command and wrote it with the next one, so the file held
 // a write the replicas lacked: SET k 1 answered ERR, then APPEND k x, left "1x"
 // in the file and "x" on the replicas. The rewrite buffer must not carry it into
 // a rewritten file either.
-func TestAppendSyncLeavesACommandItCouldNotMakeDurableOutOfTheFile(t *testing.T) {
+func TestAppendUnderAlwaysLeavesACommandItCouldNotMakeDurableOutOfTheFile(t *testing.T) {
 	tests := []struct {
 		name string
-		// refusesAfter is set when the failure also makes AppendSync refuse what
-		// follows (TestAppendSyncRefusesPayloadsAfterAFailedFsyncUntilARewrite).
+		// refusesAfter is set when the failure also makes Append refuse what
+		// follows (TestAppendUnderAlwaysRefusesPayloadsAfterAFailedFsyncUntilARewrite).
 		refusesAfter bool
 		fault        func(faulty *faultyFile, on bool)
 	}{
@@ -878,8 +873,8 @@ func TestAppendSyncLeavesACommandItCouldNotMakeDurableOutOfTheFile(t *testing.T)
 				writer.rewriteActive = true
 				tt.fault(faulty, true)
 			})
-			if err := writer.AppendSync(setCommand("b", "2")); err == nil {
-				t.Fatal("AppendSync() error = nil, want the failure")
+			if _, err := writer.Append(setCommand("b", "2")); err == nil {
+				t.Fatal("Append() error = nil, want the failure")
 			}
 			setFaults(writer, func() { tt.fault(faulty, false) })
 
@@ -895,8 +890,8 @@ func TestAppendSyncLeavesACommandItCouldNotMakeDurableOutOfTheFile(t *testing.T)
 
 			want := []string{"SET a 1"}
 			if !tt.refusesAfter {
-				if err := writer.AppendSync(setCommand("c", "3")); err != nil {
-					t.Fatalf("AppendSync() after the failure: %v", err)
+				if _, err := writer.Append(setCommand("c", "3")); err != nil {
+					t.Fatalf("Append() after the failure: %v", err)
 				}
 				want = append(want, "SET c 3")
 				setFaults(writer, func() { rewriteBuffer = writer.rewriteBuffer.String() })
@@ -909,19 +904,19 @@ func TestAppendSyncLeavesACommandItCouldNotMakeDurableOutOfTheFile(t *testing.T)
 	}
 }
 
-// TestAppendSyncRetriesCuttingATakenBackCommandWhileItRefuses covers always
+// TestAppendUnderAlwaysRetriesCuttingATakenBackCommandWhileItRefuses covers always
 // when the fsync of a command fails and so does cutting it back out, as when
 // no file handle is free for the cut. The command got ERR and never reached the
-// replicas, but every later AppendSync was refused before the cut was tried
-// again, so it stayed in the file and a crash would replay it.
-func TestAppendSyncRetriesCuttingATakenBackCommandWhileItRefuses(t *testing.T) {
+// replicas, but every later append was refused before the cut was tried again,
+// so it stayed in the file and a crash would replay it.
+func TestAppendUnderAlwaysRetriesCuttingATakenBackCommandWhileItRefuses(t *testing.T) {
 	writer, faulty, path := openFaultyWriter(t, PolicyAlways)
 	mustAppend(t, writer, setCommand("a", "1"))
 
 	restore := fakeSeam(writer, &cutFile, func(string, int64) error { return errTruncateFails })
 	setFaults(writer, func() { faulty.failSync = true })
-	if err := writer.AppendSync(setCommand("b", "2")); !errors.Is(err, errSyncFails) {
-		t.Fatalf("AppendSync() whose fsync fails: error = %v, want it to wrap %v", err, errSyncFails)
+	if _, err := writer.Append(setCommand("b", "2")); !errors.Is(err, errSyncFails) {
+		t.Fatalf("Append() whose fsync fails: error = %v, want it to wrap %v", err, errSyncFails)
 	}
 	if got, _ := loadCommands(t, path); !reflect.DeepEqual(got, []string{"SET a 1", "SET b 2"}) {
 		t.Fatalf("the file replays %q, want the command the failed cut left there", got)
@@ -929,12 +924,12 @@ func TestAppendSyncRetriesCuttingATakenBackCommandWhileItRefuses(t *testing.T) {
 
 	restore()
 	setFaults(writer, func() { faulty.failSync = false })
-	if err := writer.AppendSync(setCommand("c", "3")); !errors.Is(err, errEarlierSyncFailed) {
-		t.Fatalf("AppendSync() after the failed fsync: error = %v, want it to wrap %v", err, errEarlierSyncFailed)
+	if _, err := writer.Append(setCommand("c", "3")); !errors.Is(err, errEarlierSyncFailed) {
+		t.Fatalf("Append() after the failed fsync: error = %v, want it to wrap %v", err, errEarlierSyncFailed)
 	}
 	got, stats := loadCommands(t, path)
 	if want := []string{"SET a 1"}; !reflect.DeepEqual(got, want) || stats.TornTail {
-		t.Fatalf("the file replays %q (torn tail %v), want %q: the refused AppendSync cuts the taken-back command out", got, stats.TornTail, want)
+		t.Fatalf("the file replays %q (torn tail %v), want %q: the refused Append cuts the taken-back command out", got, stats.TornTail, want)
 	}
 }
 
@@ -958,7 +953,7 @@ func TestSyncFsyncsTheCommandsAFailedFlushWrote(t *testing.T) {
 			writer, faulty, _ := openFaultyWriter(t, PolicyEverysec)
 			size := len(setCommand("k00", "v"))
 			for i := 0; i < 20; i++ {
-				if err := writer.Append(setCommand(fmt.Sprintf("k%02d", i), "v")); err != nil {
+				if _, err := writer.Append(setCommand(fmt.Sprintf("k%02d", i), "v")); err != nil {
 					t.Fatalf("Append() error = %v", err)
 				}
 			}
@@ -971,25 +966,64 @@ func TestSyncFsyncsTheCommandsAFailedFlushWrote(t *testing.T) {
 				faulty.writeLimit, faulty.failSync = size+size/2, tt.failSync
 				before = faulty.syncs
 			})
-			err := writer.sync()
+			err := writer.Sync()
 			if !errors.Is(err, errDiskFull) {
-				t.Fatalf("sync() of a backlog larger than one write: error = %v, want it to wrap %v", err, errDiskFull)
+				t.Fatalf("Sync() of a backlog larger than one write: error = %v, want it to wrap %v", err, errDiskFull)
 			}
 			if errors.Is(err, errSyncFails) != tt.failSync {
-				t.Fatalf("sync() error = %v, want it to wrap the fsync failure exactly when the fsync fails", err)
+				t.Fatalf("Sync() error = %v, want it to wrap the fsync failure exactly when the fsync fails", err)
 			}
 			var after int
 			setFaults(writer, func() { after = faulty.syncs })
 			if after <= before {
-				t.Fatal("sync() wrote whole commands and did not fsync them")
+				t.Fatal("Sync() wrote whole commands and did not fsync them")
 			}
 
 			setFaults(writer, func() { faulty.writeLimit, faulty.failSync = 0, false })
-			if err := writer.sync(); err != nil {
-				t.Fatalf("sync() once writes work: %v", err)
+			if err := writer.Sync(); err != nil {
+				t.Fatalf("Sync() once writes work: %v", err)
 			}
 			if writer.LastWriteOK() != tt.wantOKLate {
 				t.Fatalf("LastWriteOK() = %v after the backlog was written, want %v", writer.LastWriteOK(), tt.wantOKLate)
+			}
+		})
+	}
+}
+
+func TestAppendUnderAlwaysWithholdsWhenTheFsyncFails(t *testing.T) {
+	// Only always promises a command is on disk before it is acknowledged, so
+	// only there does a failed append withhold the command. everysec defers the
+	// failure to its next flush, and no fails at the write it does at once.
+	tests := []struct {
+		policy       Policy
+		wantWithhold bool
+		wantErr      bool
+	}{
+		{policy: PolicyAlways, wantWithhold: true, wantErr: true},
+		{policy: PolicyEverysec},
+		{policy: PolicyNo, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.policy.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "appendonly.aof")
+			writer, err := OpenWriter(context.Background(), path, tt.policy, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatalf("OpenWriter() error = %v", err)
+			}
+			defer func() { _ = writer.Close() }()
+			mustAppend(t, writer, setCommand("a", "1"))
+
+			// Close the file underneath the writer: every write and fsync now fails.
+			setFaults(writer, func() {
+				if err := writer.file.Close(); err != nil {
+					t.Errorf("closing the file underneath the writer: %v", err)
+				}
+			})
+
+			withhold, err := writer.Append(setCommand("b", "2"))
+			if withhold != tt.wantWithhold || (err != nil) != tt.wantErr {
+				t.Fatalf("Append() = (withhold %v, error %v), want withhold %v and an error %v", withhold, err, tt.wantWithhold, tt.wantErr)
 			}
 		})
 	}

@@ -174,8 +174,6 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 	// may wait for another request (see Request.inTransaction).
 	queued := state.DrainTransaction()
 	responses := make([]protocol.Value, 0, len(queued))
-	propagation := make([]protocol.Value, 0, len(queued))
-	durability := make([]protocol.Value, 0, len(queued))
 	for _, queuedCommand := range queued {
 		queuedRequest := &Request{
 			Name:          queuedCommand.Name,
@@ -198,14 +196,10 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 			continue
 		}
 		responses = append(responses, result.Responses[0])
-		propagation = append(propagation, result.Propagation...)
-		durability = append(durability, result.Durability...)
+		request.write.Extend(&queuedRequest.write)
 	}
 
-	result := server.SingleResponse(protocol.Array{Elements: responses})
-	result.Propagation = propagation
-	result.Durability = durability
-	return result, nil
+	return server.SingleResponse(protocol.Array{Elements: responses}), nil
 }
 
 func (e *Executor) handleBGRewriteAOF(ctx context.Context, request *Request) (protocol.Value, error) {

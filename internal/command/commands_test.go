@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/record/recordtest"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -720,7 +722,7 @@ func TestExecutorExecute(t *testing.T) {
 }
 
 func TestExecutorDetailedPropagation(t *testing.T) {
-	t.Run("SET returns propagation frame", func(t *testing.T) {
+	t.Run("SET returns its command frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
 		result, err := handle(clientContext(executor), executor, requestValue("SET", "name", "Stash"), false)
@@ -732,10 +734,10 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
-		assertPropagationFrames(t, result.Propagation, requestValue("SET", "name", "Stash"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("SET", "name", "Stash"))
 	})
 
-	t.Run("INCR returns propagation frame", func(t *testing.T) {
+	t.Run("INCR returns its command frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
 		result, err := handle(clientContext(executor), executor, requestValue("INCR", "counter"), false)
@@ -747,10 +749,10 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 1})
-		assertPropagationFrames(t, result.Propagation, requestValue("INCR", "counter"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("INCR", "counter"))
 	})
 
-	t.Run("SETBIT returns propagation frame", func(t *testing.T) {
+	t.Run("SETBIT returns its command frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
 		result, err := handle(clientContext(executor), executor, requestValue("SETBIT", "bitmap", "0", "1"), false)
@@ -762,11 +764,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
-		assertPropagationFrames(t, result.Propagation, requestValue("SETBIT", "bitmap", "0", "1"))
-		assertPropagationFrames(t, result.Durability, requestValue("SETBIT", "bitmap", "0", "1"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("SETBIT", "bitmap", "0", "1"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("SETBIT", "bitmap", "0", "1"))
 	})
 
-	t.Run("PFADD returns propagation frame", func(t *testing.T) {
+	t.Run("PFADD returns its command frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
 		result, err := handle(clientContext(executor), executor, requestValue("PFADD", "visitors", "alice"), false)
@@ -778,11 +780,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 1})
-		assertPropagationFrames(t, result.Propagation, requestValue("PFADD", "visitors", "alice"))
-		assertPropagationFrames(t, result.Durability, requestValue("PFADD", "visitors", "alice"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("PFADD", "visitors", "alice"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("PFADD", "visitors", "alice"))
 	})
 
-	t.Run("PUBLISH returns propagation frame", func(t *testing.T) {
+	t.Run("PUBLISH returns its command frame", func(t *testing.T) {
 		executor := newTestExecutor()
 
 		result, err := handle(clientContext(executor), executor, requestValue("PUBLISH", "news", "hello"), false)
@@ -794,7 +796,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
-		assertPropagationFrames(t, result.Propagation, requestValue("PUBLISH", "news", "hello"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("PUBLISH", "news", "hello"))
 	})
 
 	t.Run("DEL propagates even when it removes no keys", func(t *testing.T) {
@@ -809,18 +811,18 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
-		assertPropagationFrames(t, result.Propagation, requestValue("DEL", "missing"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("DEL", "missing"))
 	})
 
-	t.Run("a command from the Master's stream is not propagated again", func(t *testing.T) {
+	t.Run("a command from the Master's stream carries its Origin, which the Recorder never propagates", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := handle(withOrigin(context.Background(), server.OriginMaster), executor, requestValue("PUBLISH", "news", "replica"), false)
+		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("PUBLISH", "news", "replica"), false)
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
-		if len(result.Propagation) != 0 {
-			t.Fatalf("len(result.Propagation) = %d, want 0", len(result.Propagation))
+		if result.Write.Origin != record.OriginMaster {
+			t.Fatalf("result.Write.Origin = %d, want OriginMaster (%d)", result.Write.Origin, record.OriginMaster)
 		}
 	})
 
@@ -850,11 +852,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			protocol.SimpleString{Value: "OK"},
 			protocol.Integer{Value: 0},
 		}})
-		assertPropagationFrames(t, result.Propagation,
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas),
 			requestValue("SET", "name", "Stash"),
 			requestValue("DEL", "missing"),
 		)
-		assertPropagationFrames(t, result.Durability,
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF),
 			requestValue("SET", "name", "Stash"),
 			requestValue("DEL", "missing"),
 		)
@@ -877,11 +879,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Array{Elements: []protocol.Value{}})
-		if len(result.Propagation) != 0 {
-			t.Fatalf("len(result.Propagation) = %d, want 0", len(result.Propagation))
+		if len(result.Write.Frames(record.ToReplicas)) != 0 {
+			t.Fatalf("len(result.Write.Frames(record.ToReplicas)) = %d, want 0", len(result.Write.Frames(record.ToReplicas)))
 		}
-		if len(result.Durability) != 0 {
-			t.Fatalf("len(result.Durability) = %d, want 0", len(result.Durability))
+		if len(result.Write.Frames(record.ToAOF)) != 0 {
+			t.Fatalf("len(result.Write.Frames(record.ToAOF)) = %d, want 0", len(result.Write.Frames(record.ToAOF)))
 		}
 	})
 
@@ -915,11 +917,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			protocol.ErrorValue{Message: "ERR value is not an integer or out of range"},
 			protocol.SimpleString{Value: "OK"},
 		}})
-		assertPropagationFrames(t, result.Propagation,
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas),
 			requestValue("SET", "bad", "hello"),
 			requestValue("SET", "good", "1"),
 		)
-		assertPropagationFrames(t, result.Durability,
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF),
 			requestValue("SET", "bad", "hello"),
 			requestValue("SET", "good", "1"),
 		)
@@ -968,11 +970,11 @@ func TestExecutorMaxMemory(t *testing.T) {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
 		}
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
-		assertPropagationFrames(t, result.Propagation,
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas),
 			requestValue("SET", "hot!", payload),
 			requestValue("DEL", "cold"),
 		)
-		assertPropagationFrames(t, result.Durability,
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF),
 			requestValue("SET", "hot!", payload),
 			requestValue("DEL", "cold"),
 		)
@@ -1256,7 +1258,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		replication.AdvanceReplicaOffset(123)
 		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 
-		result, err := handle(withOrigin(context.Background(), server.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
+		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
@@ -1271,10 +1273,10 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	})
 
 	t.Run("only the Master's stream may answer GETACK", func(t *testing.T) {
-		for _, origin := range []server.Origin{server.OriginClient, server.OriginReplay} {
+		for _, origin := range []record.Origin{record.OriginClient, record.OriginReplay} {
 			executor := newTestExecutor()
 			ctx := withOrigin(context.Background(), origin)
-			if origin == server.OriginClient {
+			if origin == record.OriginClient {
 				ctx = clientContext(executor)
 			}
 
@@ -1706,9 +1708,6 @@ func handleSet(t *testing.T, executor *Executor, call server.Call) (protocol.Val
 	t.Helper()
 
 	result, err := executor.Handle(context.Background(), call, requestValue("SET", "name", "Stash"))
-	if result.Release != nil {
-		result.Release()
-	}
 	_, stored, _ := executor.store.Get("name")
 	var reply protocol.Value
 	if len(result.Responses) == 1 {
@@ -1726,7 +1725,7 @@ func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = requirePass })
 
-			reply, stored, err := handleSet(t, executor, server.Call{Origin: server.OriginClient})
+			reply, stored, err := handleSet(t, executor, server.Call{Origin: record.OriginClient})
 			if !errors.Is(err, errNoClientState) || stored {
 				t.Fatalf("SET = (%#v, stored %v, error %v), want errNoClientState and nothing stored", reply, stored, err)
 			}
@@ -1736,15 +1735,20 @@ func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
 
 func TestACallWithoutAnOriginIsRefused(t *testing.T) {
 	// The zero Origin has none of an Origin's rights, NeedsAuth included, so a
-	// Call that forgets to set one must not run as if it needed no AUTH.
+	// Call that forgets to set one must not run as if it needed no AUTH. Nor
+	// may a Call claim the server's own Origin, which no request has.
 	tests := []struct {
 		name string
 		call func(*Executor) server.Call
+		want error
 	}{
-		{name: "the zero Call", call: func(*Executor) server.Call { return server.Call{} }},
+		{name: "the zero Call", call: func(*Executor) server.Call { return server.Call{} }, want: errNoOrigin},
 		{name: "an authenticated client's Call without its Origin", call: func(executor *Executor) server.Call {
 			return server.Call{Client: newTestClientState(executor, 1)}
-		}},
+		}, want: errNoOrigin},
+		{name: "a Call with the server's own Origin", call: func(*Executor) server.Call {
+			return server.Call{Origin: record.OriginServer}
+		}, want: errServerOrigin},
 	}
 
 	for _, tt := range tests {
@@ -1752,8 +1756,8 @@ func TestACallWithoutAnOriginIsRefused(t *testing.T) {
 			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 
 			reply, stored, err := handleSet(t, executor, tt.call(executor))
-			if !errors.Is(err, errNoOrigin) || stored {
-				t.Fatalf("SET = (%#v, stored %v, error %v), want errNoOrigin and nothing stored", reply, stored, err)
+			if !errors.Is(err, tt.want) || stored {
+				t.Fatalf("SET = (%#v, stored %v, error %v), want %v and nothing stored", reply, stored, err, tt.want)
 			}
 		})
 	}
@@ -1767,15 +1771,15 @@ func TestAnUnauthenticatedClientStateNeverRunsACommand(t *testing.T) {
 	// client's is refused if it carries a Client state.
 	tests := []struct {
 		name            string
-		origin          server.Origin
+		origin          record.Origin
 		unauthenticated bool
 		wantErr         error
 	}{
-		{name: "a client that has not authenticated is refused", origin: server.OriginClient, unauthenticated: true, wantErr: ErrNoAuth},
-		{name: "its Client state lent to the Master's stream is refused", origin: server.OriginMaster, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
-		{name: "its Client state lent to AOF replay is refused", origin: server.OriginReplay, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
-		{name: "the Master's stream, which has no Client state, runs", origin: server.OriginMaster},
-		{name: "AOF replay, which has no Client state, runs", origin: server.OriginReplay},
+		{name: "a client that has not authenticated is refused", origin: record.OriginClient, unauthenticated: true, wantErr: ErrNoAuth},
+		{name: "its Client state lent to the Master's stream is refused", origin: record.OriginMaster, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
+		{name: "its Client state lent to AOF replay is refused", origin: record.OriginReplay, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
+		{name: "the Master's stream, which has no Client state, runs", origin: record.OriginMaster},
+		{name: "AOF replay, which has no Client state, runs", origin: record.OriginReplay},
 	}
 
 	for _, tt := range tests {
@@ -2649,8 +2653,8 @@ func BenchmarkExecutorDetailedPropagation(b *testing.B) {
 		if err != nil {
 			b.Fatalf("executeCall() error = %v", err)
 		}
-		if len(result.Propagation) != 1 {
-			b.Fatalf("len(result.Propagation) = %d, want 1", len(result.Propagation))
+		if len(result.Write.Frames(record.ToReplicas)) != 1 {
+			b.Fatalf("len(result.Write.Frames(record.ToReplicas)) = %d, want 1", len(result.Write.Frames(record.ToReplicas)))
 		}
 	}
 }
@@ -2766,7 +2770,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		// not a value re-derived from a later clock read.
 		storedExpiry := storedExpiryMillis(t, executor, "name")
 
-		for name, frames := range map[string][]protocol.Value{"propagation": result.Propagation, "durability": result.Durability} {
+		for name, frames := range map[string][]protocol.Value{"propagation": result.Write.Frames(record.ToReplicas), "durability": result.Write.Frames(record.ToAOF)} {
 			if len(frames) != 1 {
 				t.Fatalf("%s frames = %d, want 1", name, len(frames))
 			}
@@ -2802,8 +2806,8 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
-		assertPropagationFrames(t, result.Propagation, requestValue("SET", "name", "Stash"))
-		assertPropagationFrames(t, result.Durability, requestValue("SET", "name", "Stash"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("SET", "name", "Stash"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("SET", "name", "Stash"))
 	})
 
 	t.Run("rewritten PXAT frame is accepted on replay and preserves the value", func(t *testing.T) {
@@ -2824,9 +2828,9 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 }
 
 func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
-	// The durability frame is replayed at startup. Logging XADD's "*" verbatim
-	// makes replay mint a fresh ID from the clock at that moment, so every
-	// auto-ID entry came back under a different ID after a restart.
+	// The command frame in the AOF is replayed at startup. Logging XADD's "*"
+	// verbatim makes replay mint a fresh ID from the clock at that moment, so
+	// every auto-ID entry came back under a different ID after a restart.
 	t.Run("auto ID is replaced by the ID that was generated", func(t *testing.T) {
 		executor := newTestExecutor()
 		result, err := handle(clientContext(executor), executor, requestValue("XADD", "events", "*", "type", "start"), false)
@@ -2837,15 +2841,15 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok || id.Value == "" || id.Value == "*" {
 			t.Fatalf("XADD * reply = %#v, want the generated ID", result.Responses[0])
 		}
-		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("XADD", "events", id.Value, "type", "start"))
 
 		// Replaying the logged frame recreates the entry under the same ID.
 		replayed := newTestExecutor()
-		frame, ok := result.Durability[0].(protocol.Array)
+		frame, ok := result.Write.Frames(record.ToAOF)[0].(protocol.Array)
 		if !ok {
-			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
+			t.Fatalf("AOF command frame = %#v, want an array", result.Write.Frames(record.ToAOF)[0])
 		}
-		if _, err := handle(withOrigin(context.Background(), server.OriginReplay), replayed, frame, false); err != nil {
+		if _, err := handle(withOrigin(context.Background(), record.OriginReplay), replayed, frame, false); err != nil {
 			t.Fatalf("replaying the logged frame: %v", err)
 		}
 		entries, err := replayed.store.XRead("events", "0-0")
@@ -2877,7 +2881,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok || id.Value == "" || id.Value == "*" {
 			t.Fatalf("queued XADD reply = %#v, want the generated ID", replies.Elements[0])
 		}
-		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("XADD", "events", id.Value, "type", "start"))
 	})
 
 	t.Run("an explicit ID keeps its verbatim frame", func(t *testing.T) {
@@ -2886,7 +2890,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handle(XADD 5-1) error = %v", err)
 		}
-		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", "5-1", "type", "start"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("XADD", "events", "5-1", "type", "start"))
 	})
 }
 
@@ -2909,18 +2913,16 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeCall() error = %v", err)
 	}
-	first, err := executor.executeRequestDetailed(ctx, request, true)
-	if err != nil {
+	if _, err := executor.executeRequestDetailed(ctx, request, true); err != nil {
 		t.Fatalf("first SET error = %v", err)
 	}
-	assertPropagationFrames(t, first.Durability, requestValue("SET", "hot!", payload), requestValue("DEL", "cold"))
+	assertPropagationFrames(t, request.write.Frames(record.ToAOF), requestValue("SET", "hot!", payload), requestValue("DEL", "cold"))
 
-	second, err := executor.executeRequestDetailed(ctx, request, true)
-	if err != nil {
+	if _, err := executor.executeRequestDetailed(ctx, request, true); err != nil {
 		t.Fatalf("second SET error = %v", err)
 	}
-	assertPropagationFrames(t, second.Propagation, requestValue("SET", "hot!", payload))
-	assertPropagationFrames(t, second.Durability, requestValue("SET", "hot!", payload))
+	assertPropagationFrames(t, request.write.Frames(record.ToReplicas), requestValue("SET", "hot!", payload))
+	assertPropagationFrames(t, request.write.Frames(record.ToAOF), requestValue("SET", "hot!", payload))
 }
 
 func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
@@ -2934,11 +2936,8 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	ctx := withClientStateForExecutor(context.Background(), executor, 1)
 	state, _ := clientOfContext(ctx)
 
-	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, client: state, inTransaction: true, origin: server.OriginClient}
-	result, err := executor.executeRequestDetailed(ctx, request, false)
-	if result.Release != nil {
-		result.Release()
-	}
+	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, client: state, inTransaction: true, origin: record.OriginClient}
+	_, err := executor.executeRequestDetailed(ctx, request, false)
 	if !errors.Is(err, ErrNotAllowedInTransaction) {
 		t.Fatalf("PSYNC run by EXEC error = %v, want ErrNotAllowedInTransaction", err)
 	}
@@ -2971,9 +2970,6 @@ func TestAReplicaIsNeitherSubscribedNorMadeAMonitor(t *testing.T) {
 			state.PromoteToReplica()
 
 			result, err := handle(ctx, executor, requestValue(tt.request...), true)
-			if result.Release != nil {
-				result.Release()
-			}
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("%v from a replica error = %v, want %v", tt.request, err, tt.wantErr)
 			}
@@ -3018,9 +3014,6 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 			}
 
 			result, err := handle(ctx, executor, requestValue(append([]string{"PSYNC"}, tt.args...)...), true)
-			if result.Release != nil {
-				result.Release()
-			}
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("PSYNC %v error = %v, want %v", tt.args, err, tt.wantErr)
 			}
@@ -3033,25 +3026,45 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 
 // testServices is a Services whose every collaborator is a working stand-in:
 // a new store and registries, a logger that discards, INFO's view of a lone
-// master, no AOF, a Slowlog that records nothing, and writes always ordered.
+// master, no AOF, a Slowlog that records nothing, and a Recorder whose stand-in
+// append-only file is always open, so writes are always ordered.
 func testServices() server.Services {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	replication, replicas := &server.ReplicationState{}, server.NewReplicaRegistry()
+	recorder := record.New(server.NewReplicaStream(replication, replicas, logger), logger)
+	recorder.SetLog(&recordtest.Log{})
 	return server.Services{
 		Store:            storage.NewStore(),
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:           logger,
 		Watches:          server.NewWatchRegistry(),
 		PubSub:           server.NewPubSubRegistry(),
 		Slowlog:          server.NewSlowlogRegistry(),
 		SlowlogThreshold: -1,
-		Replication:      &server.ReplicationState{},
-		Replicas:         server.NewReplicaRegistry(),
+		Replication:      replication,
+		Replicas:         replicas,
 		Stats: func() server.Stats {
 			return server.Stats{Role: "master", AOFLastWriteOK: true}
 		},
 		RewriteAOF: func(context.Context) error {
 			return errors.New("append only file persistence is not enabled")
 		},
-		RecordsWrites: func() bool { return true },
+		Recorder: recorder,
 	}
+}
+
+// newRecordingTestExecutor builds an executor whose Recorder writes to
+// stand-ins for the append-only file and the replication stream, and returns
+// them, after configure has changed what a test needs.
+func newRecordingTestExecutor(configure func(*server.Services)) (*Executor, *recordtest.Log, *recordtest.Stream) {
+	log, stream := &recordtest.Log{}, &recordtest.Stream{}
+	executor := newTestExecutorWith(func(s *server.Services) {
+		s.Recorder = record.New(stream, s.Logger)
+		s.Recorder.SetLog(log)
+		if configure != nil {
+			configure(s)
+		}
+	})
+	return executor, log, stream
 }
 
 func newTestExecutor() *Executor {
@@ -3104,26 +3117,37 @@ func (e *Executor) Execute(ctx context.Context, value protocol.Value) (protocol.
 	return nil, fmt.Errorf("command: expected single response, got %d", len(result.Responses))
 }
 
-// executeCall runs a parsed RESP frame as call describes it, admitted as Handle
-// admits it but without ordering it against other requests.
-func (e *Executor) executeCall(ctx context.Context, call server.Call, value protocol.Value) (server.ExecuteResult, error) {
-	request, err := decodeCall(call, value)
-	if err != nil {
-		return server.ExecuteResult{}, err
-	}
-	if err := e.admit(request); err != nil {
-		return server.ExecuteResult{}, err
-	}
-
-	return e.executeRequestDetailed(ctx, request, true)
+// testResult is what a test reads of a request it ran: its result and, when
+// the request ran without Handle, the command frames its execution produced,
+// which Handle would have recorded.
+type testResult struct {
+	server.ExecuteResult
+	Write record.Write
 }
 
-// handle runs request with the Call ctx carries: through Handle, ordered as
-// the server orders it (sequenced), or without ordering (not sequenced).
-func handle(ctx context.Context, executor *Executor, request protocol.Value, sequenced bool) (server.ExecuteResult, error) {
+// executeCall runs a parsed RESP frame as call describes it, admitted as Handle
+// admits it but neither ordered against other requests nor recorded.
+func (e *Executor) executeCall(ctx context.Context, call server.Call, value protocol.Value) (testResult, error) {
+	request, err := decodeCall(call, value)
+	if err != nil {
+		return testResult{}, err
+	}
+	if err := e.admit(request); err != nil {
+		return testResult{}, err
+	}
+
+	result, err := e.executeRequestDetailed(ctx, request, true)
+	return testResult{ExecuteResult: result, Write: request.write}, err
+}
+
+// handle runs request with the Call ctx carries: through Handle, ordered and
+// recorded as the server runs it (sequenced), or neither (not sequenced). Only
+// a request that was not sequenced returns its Write.
+func handle(ctx context.Context, executor *Executor, request protocol.Value, sequenced bool) (testResult, error) {
 	call := callFromContext(ctx)
 	if sequenced {
-		return executor.Handle(ctx, call, request)
+		result, err := executor.Handle(ctx, call, request)
+		return testResult{ExecuteResult: result}, err
 	}
 	return executor.executeCall(ctx, call, request)
 }
@@ -3136,12 +3160,12 @@ func withCall(ctx context.Context, call server.Call) context.Context {
 // withClient is the context of a request from the client whose Client state is
 // state.
 func withClient(ctx context.Context, state *server.ClientState) context.Context {
-	return withCall(ctx, server.Call{Client: state, Origin: server.OriginClient})
+	return withCall(ctx, server.Call{Client: state, Origin: record.OriginClient})
 }
 
 // withOrigin is the context of a request from origin, which carries no Client
 // state: the Master's replication stream or AOF replay.
-func withOrigin(ctx context.Context, origin server.Origin) context.Context {
+func withOrigin(ctx context.Context, origin record.Origin) context.Context {
 	return withCall(ctx, server.Call{Origin: origin})
 }
 

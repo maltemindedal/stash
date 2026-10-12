@@ -138,7 +138,7 @@ func TestRewriteSwapFailureKeepsBufferedWrites(t *testing.T) {
 	writer.mu.Unlock()
 
 	payload := []byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
-	if err := writer.Append(payload); err != nil {
+	if _, err := writer.Append(payload); err != nil {
 		t.Fatalf("Append() error = %v", err)
 	}
 
@@ -221,11 +221,7 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 			}
 			defer func() { _ = writer.Close() }()
 
-			appendPayload := writer.Append
-			if policy == PolicyAlways {
-				appendPayload = writer.AppendSync
-			}
-			if err := appendPayload(payload); err != nil {
+			if _, err := writer.Append(payload); err != nil {
 				t.Fatalf("Append() error = %v", err)
 			}
 			if !writer.LastWriteOK() {
@@ -242,12 +238,12 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 
 			// everysec defers the failure to the next flush or fsync, so force one
 			// there; the other policies fail inside the append itself.
-			if err := appendPayload(payload); err != nil && policy == PolicyEverysec {
+			if _, err := writer.Append(payload); err != nil && policy == PolicyEverysec {
 				t.Fatalf("everysec Append() error = %v, want the write buffered", err)
 			}
 			if policy == PolicyEverysec {
-				if err := writer.sync(); err == nil {
-					t.Fatal("sync() on a closed file error = nil")
+				if err := writer.Sync(); err == nil {
+					t.Fatal("Sync() on a closed file error = nil")
 				}
 			}
 			if writer.LastWriteOK() {
@@ -266,8 +262,11 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 			writer.mu.Unlock()
 			t.Cleanup(func() { _ = fresh.Close() })
 
-			if err := writer.AppendSync(payload); err != nil {
-				t.Fatalf("AppendSync() after recovery error = %v", err)
+			if _, err := writer.Append(payload); err != nil {
+				t.Fatalf("Append() after recovery error = %v", err)
+			}
+			if err := writer.Sync(); err != nil {
+				t.Fatalf("Sync() after recovery error = %v", err)
 			}
 			if !writer.LastWriteOK() {
 				t.Fatal("LastWriteOK() = false after the file worked again")

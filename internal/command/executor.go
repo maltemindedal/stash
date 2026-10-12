@@ -49,6 +49,10 @@ var (
 	ErrMonitorModeOnly = errors.New("only PING is allowed in this context")
 	// ErrOutOfMemory reports that write could not fit under maxmemory.
 	ErrOutOfMemory = errors.New("command not allowed when used memory > 'maxmemory'")
+	// ErrPersistenceFailure reports a write that, under appendfsync always,
+	// could not be appended and fsynced: it stays applied in memory, but is in
+	// neither the append-only file nor the replicas.
+	ErrPersistenceFailure = errors.New("persistence failure")
 )
 
 // RESPError exposes the wire error prefix to use when returning a RESP error.
@@ -207,6 +211,11 @@ func ErrMonitorModeOnlyError() error {
 // ErrOutOfMemoryError reports a Redis-style OOM failure.
 func ErrOutOfMemoryError() error {
 	return newRESPError("OOM", "command not allowed when used memory > 'maxmemory'", ErrOutOfMemory)
+}
+
+// ErrPersistenceFailureError reports a write the Recorder withheld.
+func ErrPersistenceFailureError() error {
+	return newRESPWrappedError("ERR", ErrPersistenceFailure)
 }
 
 func wrongNumberOfArgumentsError(command string) error {

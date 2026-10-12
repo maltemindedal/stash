@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -24,6 +25,10 @@ type Request struct {
 	// and propagated frames depend on: the keys it evicted, SET's absolute
 	// expiry, XADD's generated ID. Each execution starts it from zero.
 	effects executionEffects
+	// write is the command frames one execution of the request produced, for
+	// the sequencer to record before it releases the request's locks (see
+	// Executor.record). Each execution starts it from zero.
+	write record.Write
 	// client, origin and inline are the request's Call (see server.Call):
 	// the Client state of the connection it came from, where it came from, and
 	// whether it runs inline on the Event loop. They sit beside inTransaction
@@ -33,7 +38,7 @@ type Request struct {
 	// sequencer exclusively while it does, so such a command must not wait for
 	// anything another request would have to provide.
 	inTransaction bool
-	origin        server.Origin
+	origin        record.Origin
 	inline        bool
 }
 
@@ -70,8 +75,9 @@ type commandSpec struct {
 }
 
 type executionEffects struct {
-	propagation []protocol.Value
-	durability  []protocol.Value
+	// evicted holds the DEL of the keys the execution evicted to make room,
+	// recorded after the command's own frame.
+	evicted record.Write
 	// setExpiryMillis is the absolute Unix-millis deadline the SET handler
 	// computed and stored for this request, carried here so the PXAT rewrite
 	// frame reuses that exact value instead of re-deriving it from a later
@@ -97,6 +103,7 @@ type Executor struct {
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
 	aofRewrite          func(context.Context) error
+	recorder            *record.Recorder
 	seq                 *sequencer
 }
 
@@ -121,10 +128,11 @@ func New(services server.Services) (*Executor, error) {
 		slowlogThreshold:    services.SlowlogThreshold,
 		serverStatsProvider: services.Stats,
 		aofRewrite:          services.RewriteAOF,
+		recorder:            services.Recorder,
 		seq:                 newSequencer(),
 	}
 	// Writes are ordered only while something records them (see sequencer).
-	executor.seq.needsOrder = services.RecordsWrites
+	executor.seq.needsOrder = executor.recorder.Records
 	executor.commands = executor.commandSpecs()
 	return executor, nil
 }
@@ -166,21 +174,26 @@ var (
 	// stream or AOF replay that carries a Client state: only a client has one,
 	// and it must not lend its connection to an Origin that needs no AUTH.
 	errClientStateWithoutClientOrigin = errors.New("command: a request that is not a client's carries a client state")
+	// errServerOrigin refuses a request that claims the server's own Origin,
+	// which is for writes the server makes outside any request.
+	errServerOrigin = errors.New("command: a request with the server's own origin")
 )
 
 // validateCall refuses a request whose Call is not one the server makes: an
-// Origin is required, a client request carries its Client state, and nothing
-// else does.
+// Origin other than the server's own is required, a client request carries its
+// Client state, and nothing else does.
 func validateCall(request *Request) error {
 	switch request.origin {
-	case server.OriginClient:
+	case record.OriginClient:
 		if request.client == nil {
 			return errNoClientState
 		}
-	case server.OriginMaster, server.OriginReplay:
+	case record.OriginMaster, record.OriginReplay:
 		if request.client != nil {
 			return errClientStateWithoutClientOrigin
 		}
+	case record.OriginServer:
+		return errServerOrigin
 	default:
 		return errNoOrigin
 	}
@@ -205,6 +218,7 @@ func (e *Executor) admit(request *Request) error {
 func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request, allowQueue bool) (server.ExecuteResult, error) {
 	request.effects = executionEffects{}
 	effects := &request.effects
+	request.write = record.Write{Origin: request.origin}
 
 	if err := e.validateSubscriptionContext(request); err != nil {
 		return server.ExecuteResult{}, err
@@ -236,8 +250,7 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 			return server.ExecuteResult{}, err
 		}
 		e.recordSlowCommand(request, startedAt, time.Since(startedAt))
-		result.Propagation = append(result.Propagation, effects.propagation...)
-		result.Durability = append(result.Durability, effects.durability...)
+		request.write.Extend(&effects.evicted)
 		return result, nil
 	}
 	if spec.handler == nil {
@@ -250,11 +263,11 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 	}
 	e.recordSlowCommand(request, startedAt, time.Since(startedAt))
 
-	propagation, durability := executionFrames(request, spec)
-	result := server.SingleResponse(response)
-	result.Propagation = append(propagation, effects.propagation...)
-	result.Durability = append(durability, effects.durability...)
-	return result, nil
+	if to := spec.destinations(); to != 0 {
+		request.write.Add(commandFrame(request, spec), to)
+	}
+	request.write.Extend(&effects.evicted)
+	return server.SingleResponse(response), nil
 }
 
 func (e *Executor) validateQueueableRequest(request *Request) error {
@@ -300,38 +313,29 @@ func responseErrorValue(err error) protocol.ErrorValue {
 	return protocol.ErrorValue{Message: prefix + " " + err.Error()}
 }
 
-func executionFrames(request *Request, spec commandSpec) ([]protocol.Value, []protocol.Value) {
-	var (
-		frame     protocol.Array
-		haveFrame bool
-	)
-	ensureFrame := func() protocol.Array {
-		if !haveFrame {
-			if spec.rewriteFrame != nil {
-				if rewritten, ok := spec.rewriteFrame(request); ok {
-					frame = rewritten
-					haveFrame = true
-					return frame
-				}
-			}
-			frame = propagationFrame(request)
-			haveFrame = true
-		}
-
-		return frame
-	}
-
-	var propagation []protocol.Value
-	if spec.propagates && request.origin.Propagates() {
-		propagation = []protocol.Value{ensureFrame()}
-	}
-
-	var durability []protocol.Value
+// destinations returns where the command's frame goes: the AOF for a durable
+// command, the replicas for a propagating one. The Recorder applies the
+// request's Origin.
+func (spec commandSpec) destinations() record.Dest {
+	var to record.Dest
 	if spec.durable {
-		durability = []protocol.Value{ensureFrame()}
+		to |= record.ToAOF
 	}
+	if spec.propagates {
+		to |= record.ToReplicas
+	}
+	return to
+}
 
-	return propagation, durability
+// commandFrame returns the command frame that recreates request's write: the
+// request itself, or the deterministic equivalent spec.rewriteFrame gives.
+func commandFrame(request *Request, spec commandSpec) protocol.Array {
+	if spec.rewriteFrame != nil {
+		if rewritten, ok := spec.rewriteFrame(request); ok {
+			return rewritten
+		}
+	}
+	return propagationFrame(request)
 }
 
 func propagationFrame(request *Request) protocol.Array {
@@ -389,11 +393,7 @@ func (e *Executor) recordEvictedKeys(request *Request, keys []string) {
 	}
 
 	e.touchWatchKeys(keys...)
-	frame := server.DeleteFrame(keys)
-	if request.origin.Propagates() {
-		request.effects.propagation = append(request.effects.propagation, frame)
-	}
-	request.effects.durability = append(request.effects.durability, frame)
+	request.effects.evicted.Add(record.DeleteFrame(keys), record.ToBoth)
 }
 
 // DecodeRequest converts a RESP array into a command request.

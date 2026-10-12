@@ -20,6 +20,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -406,7 +407,7 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 // command package.
 func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
-	frame := []protocol.Value{DeleteFrame([]string{"key"})}
+	frame := []protocol.Value{record.DeleteFrame([]string{"key"})}
 
 	const writers = 8
 	var propagated atomic.Int64
@@ -1030,7 +1031,7 @@ func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.V
 func TestRequestsOnAReplicasLinkGetNoReplies(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), psyncLikeExecutor{})
 	state := &ClientState{ID: 1, Authenticated: true}
-	call := Call{Client: state, Origin: OriginClient}
+	call := Call{Client: state, Origin: record.OriginClient}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	steps := []struct {
@@ -1106,4 +1107,25 @@ func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// propagateToReplicas encodes values and propagates them through the server's
+// replica stream as a client write's command frames are: ordered, so with no
+// replica registered they are only counted.
+func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport {
+	return s.propagateEncoded(values, true)
+}
+
+// propagateUnorderedToReplicas propagates values as the server's own writes
+// are, always under the registry lock.
+func (s *Server) propagateUnorderedToReplicas(values []protocol.Value) propagationReport {
+	return s.propagateEncoded(values, false)
+}
+
+func (s *Server) propagateEncoded(values []protocol.Value, ordered bool) propagationReport {
+	payload, err := protocol.EncodeValues(values)
+	if err != nil {
+		panic(err)
+	}
+	return NewReplicaStream(s.replication, s.replicaPeers, s.logger).propagate(payload, ordered)
 }

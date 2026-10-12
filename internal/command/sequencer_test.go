@@ -3,10 +3,15 @@ package command
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/aof"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 )
 
@@ -165,17 +170,14 @@ func TestUnauthenticatedRequestsAreRefusedBeforeTheyTakeASequencerLock(t *testin
 				executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 				state := newTestClientState(executor, 1)
 				state.SetAuthenticated(false)
-				call := server.Call{Client: state, Origin: server.OriginClient, Inline: inline}
+				call := server.Call{Client: state, Origin: record.OriginClient, Inline: inline}
 
 				executor.seq.gate.Lock()
 				replied := make(chan []error, 1)
 				go func() {
 					errs := make([]error, 0, len(tt.requests))
 					for _, parts := range tt.requests {
-						result, err := executor.Handle(context.Background(), call, requestValue(parts...))
-						if result.Release != nil {
-							result.Release()
-						}
+						_, err := executor.Handle(context.Background(), call, requestValue(parts...))
 						errs = append(errs, err)
 					}
 					replied <- errs
@@ -354,5 +356,77 @@ func TestSequenceModeOfRequests(t *testing.T) {
 		if got := executor.sequenceModeFor(&Request{Name: tt.name}); got != tt.want {
 			t.Errorf("sequenceModeFor(%s) = %d, want %d", tt.name, got, tt.want)
 		}
+	}
+}
+
+// benchStream stands in for one attached replica in BenchmarkSequencedWrite: it
+// counts each payload into an offset and copies it into a buffer it reuses, as a
+// replica's feed copies what it queues. The buffer is allocated up front, so the
+// copies allocate nothing.
+type benchStream struct {
+	mu  sync.Mutex
+	end int64
+	buf []byte
+}
+
+func (s *benchStream) Propagate(payload []byte, _ bool) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.end += int64(len(payload))
+	if len(s.buf)+len(payload) > cap(s.buf) {
+		s.buf = s.buf[:0]
+	}
+	s.buf = append(s.buf, payload...)
+	return s.end
+}
+
+func (s *benchStream) Active() bool { return true }
+
+// BenchmarkSequencedWrite measures one SET as the server runs it with an
+// append-only file under everysec, through Handle: ordered, its command frames
+// recorded to the file and handed to the replicas, and its locks given back.
+// "stream" hands the frames to a stand-in for one attached replica; "no stream"
+// to a replica registry with no replica, which only counts them. Each goroutine
+// writes its own key, so writers spread over the stripes.
+func BenchmarkSequencedWrite(b *testing.B) {
+	for _, withStream := range []bool{false, true} {
+		name := "no_stream"
+		if withStream {
+			name = "stream"
+		}
+		b.Run(name, func(b *testing.B) {
+			writer, err := aof.OpenWriter(context.Background(), filepath.Join(b.TempDir(), "appendonly.aof"), aof.PolicyEverysec, nil)
+			if err != nil {
+				b.Fatalf("OpenWriter() error = %v", err)
+			}
+			defer func() {
+				if err := writer.Close(); err != nil {
+					b.Fatalf("Close() error = %v", err)
+				}
+			}()
+			executor := newTestExecutorWith(func(s *server.Services) {
+				var stream record.Stream = server.NewReplicaStream(s.Replication, s.Replicas, s.Logger)
+				if withStream {
+					stream = &benchStream{buf: make([]byte, 0, 1<<20)}
+				}
+				s.Recorder = record.New(stream, s.Logger)
+				s.Recorder.SetLog(writer)
+			})
+			var writers atomic.Int64
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				ctx := clientContext(executor)
+				call := callFromContext(ctx)
+				request := requestValue("SET", fmt.Sprintf("key:%d", writers.Add(1)), "value")
+				for pb.Next() {
+					if _, err := executor.Handle(ctx, call, request); err != nil {
+						b.Errorf("Handle() error = %v", err)
+						return
+					}
+				}
+			})
+		})
 	}
 }

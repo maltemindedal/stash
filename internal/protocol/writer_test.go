@@ -61,6 +61,39 @@ func TestEncodedValuesLenMatchesEncodeValues(t *testing.T) {
 	}
 }
 
+func TestAppendValueAppendsAfterDst(t *testing.T) {
+	set := Array{Elements: []Value{BulkString{Data: []byte("SET")}, BulkString{Data: []byte("k")}, BulkString{Data: []byte("v")}}}
+	want, err := Encode(set)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+
+	got, err := AppendValue([]byte("prefix"), set)
+	if err != nil {
+		t.Fatalf("AppendValue() error = %v", err)
+	}
+	if string(got) != "prefix"+string(want) {
+		t.Fatalf("AppendValue() = %q, want %q", got, "prefix"+string(want))
+	}
+}
+
+func TestAppendValueLeavesDstsLengthOnError(t *testing.T) {
+	bad := Array{Elements: []Value{BulkString{Data: []byte("SET")}, unsupported{}}}
+
+	got, err := AppendValue([]byte("prefix"), bad)
+	if err == nil {
+		t.Fatal("AppendValue() error = nil, want an unsupported value type")
+	}
+	if string(got) != "prefix" {
+		t.Fatalf("AppendValue() = %q, want %q", got, "prefix")
+	}
+}
+
+// unsupported is a Value the encoder does not know.
+type unsupported struct{}
+
+func (unsupported) value() {}
+
 func BenchmarkEncode(b *testing.B) {
 	benchmarks := []struct {
 		name  string

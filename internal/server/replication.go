@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -27,18 +29,10 @@ import (
 type ExecuteResult struct {
 	Responses       []protocol.Value
 	UpstreamReplies []protocol.Value
-	Propagation     []protocol.Value
-	Durability      []protocol.Value
 	// RegisterReplica is set by PSYNC, which registered the client as a replica
 	// at its attach cut. The connection then starts the replica's feed
 	// (registerReplicaPeer) once Responses are ahead of anything it writes.
 	RegisterReplica bool
-	// Release, when set, must be called by whoever applies Durability and
-	// Propagation, after it has done so. It ends the exclusion that keeps other
-	// writes (and transactions) from running until those frames are in the log
-	// and on their way to replicas. It is set only by an executor's sequenced
-	// entry point.
-	Release func()
 }
 
 // SingleResponse wraps a standard single RESP value as an execution result.
@@ -51,20 +45,6 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 	responses := make([]protocol.Value, len(values))
 	copy(responses, values)
 	return ExecuteResult{Responses: responses}
-}
-
-// DeleteFrame builds the `DEL` command frame for keys the server removed without
-// a client command. The command executor uses it for memory-pressure evictions.
-// The server uses it for active TTL evictions. Both callers propagate and
-// persist the same frame.
-func DeleteFrame(keys []string) protocol.Array {
-	elements := make([]protocol.Value, 0, len(keys)+1)
-	elements = append(elements, protocol.TextBulkString{Value: "DEL"})
-	for _, key := range keys {
-		elements = append(elements, protocol.BulkString{Data: []byte(key)})
-	}
-
-	return protocol.Array{Elements: elements}
 }
 
 // ReplicationState stores process-wide replication metadata.
@@ -422,7 +402,8 @@ func (r *ReplicaRegistry) Propagate(offsets *ReplicationState, payload []byte) (
 // PropagateOrdered is Propagate for a client write's frames, whose caller the
 // command sequencer orders against PSYNC's attach cut: it holds the sequencer's
 // gate, and the stripes of the write whenever anything records writes, from
-// before the write is applied until this returns (ExecuteResult.Release). While
+// before the write is applied until this returns (the command executor records
+// a write before it releases them). While
 // no replica is registered it only counts payload into the master offset, without
 // the registry lock, and returns 0 for queued and refused.
 //
@@ -709,38 +690,47 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 	)
 }
 
-// propagateToReplicas hands a client write's frames to the replicas. Its caller
-// holds the write's sequencer locks until it returns (finalizeMutationEffects runs
-// before ExecuteResult.Release), so it skips the registry lock while no replica is
-// registered (ReplicaRegistry.PropagateOrdered).
-func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport {
-	return s.propagate(values, true)
+// ReplicaStream is the replication stream the Recorder propagates to: the
+// master offset and the replica registry. Each payload is counted into the
+// offset and queued for every replica (ReplicaRegistry.Propagate).
+type ReplicaStream struct {
+	offsets  *ReplicationState
+	replicas *ReplicaRegistry
+	logger   *slog.Logger
 }
 
-// propagateUnorderedToReplicas hands the replicas frames that the sequencer may
-// not order against PSYNC's attach cut, and so always takes the registry lock
-// (ReplicaRegistry.Propagate): the expiry DELs, which the replica link's full
-// resync publishes while holding no sequencer lock (consumeFullResync).
-func (s *Server) propagateUnorderedToReplicas(values []protocol.Value) propagationReport {
-	return s.propagate(values, false)
+// NewReplicaStream returns the stream that counts into offsets and queues for
+// replicas, logging refusals to logger.
+func NewReplicaStream(offsets *ReplicationState, replicas *ReplicaRegistry, logger *slog.Logger) *ReplicaStream {
+	return &ReplicaStream{offsets: offsets, replicas: replicas, logger: logger}
 }
 
-func (s *Server) propagate(values []protocol.Value, ordered bool) propagationReport {
-	if len(values) == 0 {
-		return propagationReport{}
-	}
+// Active reports whether a replica is attached or attaching.
+func (s *ReplicaStream) Active() bool {
+	return s.replicas.Active()
+}
 
-	payload, err := protocol.EncodeValues(values)
-	if err != nil {
-		s.logger.Warn("failed to encode propagated command", "error", err)
+// Propagate counts payload into the master offset, queues it for every
+// replica, and returns the offset at its end. When ordered, its caller holds
+// the write's sequencer locks until it returns, so it skips the registry lock
+// while no replica is registered (ReplicaRegistry.PropagateOrdered). Otherwise
+// it always takes the lock (ReplicaRegistry.Propagate): the server's own
+// writes, such as the expiry DELs a replica link's full resync publishes while
+// holding no sequencer lock (consumeFullResync).
+func (s *ReplicaStream) Propagate(payload []byte, ordered bool) (end int64) {
+	return s.propagate(payload, ordered).endOffset
+}
+
+func (s *ReplicaStream) propagate(payload []byte, ordered bool) propagationReport {
+	if len(payload) == 0 {
 		return propagationReport{}
 	}
 
 	report := propagationReport{payloadSize: len(payload)}
 	if ordered {
-		report.endOffset, report.succeeded, report.failed = s.replicaPeers.PropagateOrdered(s.replication, payload)
+		report.endOffset, report.succeeded, report.failed = s.replicas.PropagateOrdered(s.offsets, payload)
 	} else {
-		report.endOffset, report.succeeded, report.failed = s.replicaPeers.Propagate(s.replication, payload)
+		report.endOffset, report.succeeded, report.failed = s.replicas.Propagate(s.offsets, payload)
 	}
 	report.attempted = report.succeeded + report.failed
 	if report.attempted > 0 {
@@ -811,14 +801,6 @@ func replicaFellBehind(cause error) bool {
 		errors.Is(cause, errPushLimitExceeded) ||
 		errors.Is(cause, os.ErrDeadlineExceeded) ||
 		errors.Is(cause, errResponseWriterBusy)
-}
-
-func (s *Server) recordClientWriteOffset(client *ClientState, offset int64) {
-	if offset <= 0 || client == nil {
-		return
-	}
-
-	client.SetLastWriteReplicationOffset(offset)
 }
 
 func (s *Server) setUpstreamConn(conn net.Conn) {
@@ -967,7 +949,7 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 	s.logger.Info("replica handshake completed", "master_addr", masterAddr, "listening_port", listeningPort)
 	synchronised = true
 
-	masterCall := Call{Origin: OriginMaster}
+	masterCall := Call{Origin: record.OriginMaster}
 
 	for {
 		value, err := parser.Parse()
@@ -1002,17 +984,14 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 				return
 			}
 
+			if errors.Is(execErr, ErrNotRecorded) {
+				s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", execErr)
+				return
+			}
 			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
 			return
 		}
-		persistErr := s.persistDurabilityFrames(result.Durability)
-		if result.Release != nil {
-			result.Release()
-		}
-		if persistErr != nil {
-			s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", persistErr)
-			return
-		}
+
 		if len(result.UpstreamReplies) > 0 {
 			if err := writeReplicaResponses(writer, result.UpstreamReplies); err != nil {
 				s.logger.Warn("failed to write replication upstream reply", "master_addr", masterAddr, "error", err)

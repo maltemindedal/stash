@@ -15,6 +15,7 @@ import (
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -37,6 +38,7 @@ type Server struct {
 	slowlogRegistry   *SlowlogRegistry
 	replication       *ReplicationState
 	aofWriter         *aof.Writer
+	recorder          *record.Recorder
 	runtimeCtx        context.Context
 	commandsProcessed atomic.Int64
 
@@ -78,6 +80,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		clientStates:    make(map[uint64]*ClientState),
 	}
 	srv.replicaPeers.SetFeedErrorHandler(srv.dropReplica)
+	srv.recorder = record.New(NewReplicaStream(srv.replication, srv.replicaPeers, logger), logger)
 
 	executor, err := newExecutor(Services{
 		Store:            store,
@@ -91,7 +94,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		Replicas:         srv.replicaPeers,
 		Stats:            srv.ServerStats,
 		RewriteAOF:       srv.beginAOFRewrite,
-		RecordsWrites:    srv.recordsWrites,
+		Recorder:         srv.recorder,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: build the command executor: %w", err)

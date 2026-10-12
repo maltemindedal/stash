@@ -12,8 +12,9 @@ flowchart LR
     S -->|frames| P[internal/protocol]
     P -->|Request| X[internal/command]
     X -->|read/write| ST[internal/storage]
-    X -->|durable frames| A[internal/aof]
-    X -->|propagated frames| R[Replicas]
+    X -->|Write| REC[internal/record]
+    REC -->|command frames| A[internal/aof]
+    REC -->|command frames| R[Replicas]
     ST -->|snapshot| D[internal/rdb]
 ```
 
@@ -47,6 +48,18 @@ Current responsibilities:
 - rewrite the current durable state in the background for `BGREWRITEAOF`
 - write a snapshot of the keyspace into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
 
+### `internal/record`
+
+Decides where the command frames of an applied write go, and what a failed append does. It is a leaf: it imports `internal/protocol` and the standard library, and reaches the AOF and the replicas only through two ports, `Log` (`*aof.Writer`) and `Stream` (`server.ReplicaStream`).
+
+Current responsibilities:
+
+- define `Origin` (a client, the Master's stream, AOF replay, or the server itself) and its capabilities
+- collect a write's command frames with where each goes (`Write`, `ToAOF`, `ToReplicas`, `ToBoth`); producers say only that, and `Recorder.Record` applies the Origin: the Master's frames go to the AOF only, and replay records nothing
+- apply one table to a failed append: under `always` a client's write is withheld (answered `ERR persistence failure`, not propagated) and so is the server's own; under `everysec` and `no` the failure is logged and the write still propagated; for the Master's frames it is returned, and the link ends
+- report whether anything records writes (`Records`): an AOF open, or a replica attached or attaching
+- encode each command frame once, into a pooled buffer: when every frame goes to the same places, the AOF and the stream are handed the same bytes, and otherwise each payload is assembled from the frames already encoded. `Log` and `Stream` copy what they keep, so the buffer is reused as soon as `Record` returns
+
 ### `internal/protocol`
 
 Owns RESP parsing and encoding.
@@ -79,9 +92,9 @@ Current responsibilities:
 
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
-`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, and the server's INFO snapshot, AOF rewrite and write-recording check. It refuses a `Services` with a collaborator missing, naming the field.
+`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, the server's INFO snapshot and AOF rewrite, and the `record.Recorder`, whose `Records` tells the sequencer whether anything records writes. It refuses a `Services` with a collaborator missing, naming the field.
 
-The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog, and only the Master's stream may answer `REPLCONF GETACK`. A Call without an Origin, a client request without its Client state, and a Master or replay request that carries one are refused.
+The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (`record.Origin`: a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog, and only the Master's stream may answer `REPLCONF GETACK`. A Call without an Origin or with the server's own (`OriginServer`, for evictions the server makes outside any request), a client request without its Client state, and a Master or replay request that carries one are refused.
 
 Implemented commands cover strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial data, streams, transactions, pub/sub, replication handshakes, `WAIT`, `BGREWRITEAOF`, `INFO`, `SLOWLOG`, and `MONITOR`. The `commandSpecs` table registers each command with its handler, argument validator, and replication and durability flags. The [command reference](../reference/commands.md) documents that table for users.
 
@@ -104,7 +117,7 @@ Current responsibilities:
 - maintain an active connection registry for shutdown
 - load startup persistence (RDB and/or AOF) before accepting TCP connections, and write the keys an RDB snapshot loaded into a missing or empty AOF before opening it, since every later start loads the AOF and skips the RDB snapshot
 - append a `DEL` of the keys the startup `--maxmemory` pass evicts to the AOF, fsynced, before accepting TCP connections, and refuse to start if that append fails
-- append durable command frames and fan out replication writes after successful execution
+- build the `record.Recorder`, give it the AOF writer once the file is open and a `ReplicaStream` over the replica registry, and pass it to the executor, which records each write through it; the expiry listener and the startup eviction record their `DEL`s through it as the server's own writes
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
 - stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck
@@ -144,7 +157,7 @@ Commands execute inline on the loop goroutine. In event-loop mode, a command tha
 
 The sharded store makes each operation atomic, but two clients' operations can still interleave. Two things depend on their order: `EXEC`, which must see its watched keys unchanged and its queued commands run without others in between, and the AOF and replicas, which must see two writes to one key in the order they were applied.
 
-The command executor therefore has a sequencer. Every request holds a read-write lock shared while it executes; `EXEC` holds it exclusive. A request refused for its Call, or because its client has not authenticated, is refused before it takes any sequencer lock, so it neither waits for nor holds up another request. A request that writes also holds the lock for the stripe (one of 64) of each key it writes, from before it executes until its frames have been appended to the AOF and handed to the replicas. Writers to different keys still run in parallel; writers to the same key, and any write whose keys the command table does not declare, are ordered. The expiry sweep and the snapshot an AOF rewrite takes hold every stripe for a moment, so that an expiry and a later write of the same key, or a snapshot and a command halfway to the log, cannot be reordered. When there is no AOF and no replica, attached or attaching, there is nothing to order, and the stripes are skipped.
+The command executor therefore has a sequencer. Every request holds a read-write lock shared while it executes; `EXEC` holds it exclusive. A request refused for its Call, or because its client has not authenticated, is refused before it takes any sequencer lock, so it neither waits for nor holds up another request. A request that writes also holds the lock for the stripe (one of 64) of each key it writes, from before it executes until its command frames have been appended to the AOF and handed to the replicas. `Handle` records them itself (`record.Recorder`) before it releases the locks, so a write's locks never leave the executor, and `BLPOP` records its pop inside the attempt that holds its stripe. Writes on different stripes commute, so the AOF and the replicas may receive them in different orders; the Recorder takes no lock of its own. Writers to different keys still run in parallel; writers to the same key, and any write whose keys the command table does not declare, are ordered. The expiry sweep and the snapshot an AOF rewrite takes hold every stripe for a moment, so that an expiry and a later write of the same key, or a snapshot and a command halfway to the log, cannot be reordered. When there is no AOF and no replica, attached or attaching, there is nothing to order, and the stripes are skipped.
 
 `PSYNC` attaches a replica at one moment, its attach cut, so that every write is in exactly one of the snapshot the replica is sent and the stream that follows it. It switches ordering on while holding the read-write lock exclusive for a moment, which waits for any write that skipped its stripes, and then holds the lock shared and every stripe while it copies the snapshot and registers the replica. Writers wait for the copy, as they already waited for the store's shard locks it takes, and readers keep running; encoding the RDB happens after. The new replica's queue collects every write from then on, but its connection starts sending them only once the full resync reply is ahead of them. Because `EXEC` holds the lock exclusive, which the cut would wait for, `PSYNC` is refused inside `MULTI`. After `PSYNC`, the connection carries the stream alone: the request pipeline both networking modes share runs what the replica sends, such as its acknowledgements, and drops the replies, and a frame that cannot be parsed closes the connection without an error reply, so that no reply can land among the stream's frames. No push can either: `MONITOR` from a replica is ignored, and `SUBSCRIBE` from one makes the executor return `server.ErrCloseConnection`, on which both networking modes close the connection.
 
@@ -159,4 +172,4 @@ Replication and AOF both reuse RESP-encoded command frames, but they serve diffe
 - replication forwards commands to live replicas
 - AOF records only durable state mutations for crash recovery
 
-Keeping those paths separate lets the server replicate transient commands like `PUBLISH` without persisting them, while still logging durable commands such as `XADD` even when they are not part of the replication handshake flow.
+So each command frame of a write says where it goes (`record.ToAOF`, `ToReplicas` or both), and one `record.Write` carries all of them. That lets the server replicate transient commands like `PUBLISH` without persisting them, and log `XADD` without replicating it, while the `DEL` of a key `XADD` evicted under `maxmemory` goes to both. The Recorder then applies the write's Origin (the Master's frames go to the AOF only) and decides what a failed append does to the reply and to propagation, in one table (see `record.Recorder`).

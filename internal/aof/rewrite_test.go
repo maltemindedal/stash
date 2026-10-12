@@ -20,6 +20,7 @@ import (
 	"github.com/maltemindedal/stash/internal/aof"
 	"github.com/maltemindedal/stash/internal/command"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -69,11 +70,7 @@ func TestGenerateRewriteRoundTripsState(t *testing.T) {
 			t.Fatalf("Parse() error = %v", parseErr)
 		}
 		// Replayed as the server replays its AOF at startup.
-		result, execErr := executor.Handle(context.Background(), server.Call{Origin: server.OriginReplay}, value)
-		if result.Release != nil {
-			result.Release()
-		}
-		if execErr != nil {
+		if _, execErr := executor.Handle(context.Background(), server.Call{Origin: record.OriginReplay}, value); execErr != nil {
 			t.Fatalf("Handle() error = %v", execErr)
 		}
 	}
@@ -382,10 +379,7 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 			replayedStore := storage.NewStore()
 			executor := replayExecutor(t, replayedStore)
 			loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
-				result, execErr := executor.Handle(ctx, server.Call{Origin: server.OriginReplay}, value)
-				if result.Release != nil {
-					result.Release()
-				}
+				_, execErr := executor.Handle(ctx, server.Call{Origin: record.OriginReplay}, value)
 				return execErr
 			})
 			if err != nil {
@@ -548,18 +542,20 @@ func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
 func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
 	t.Helper()
 
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	replication, replicas := &server.ReplicationState{}, server.NewReplicaRegistry()
 	executor, err := command.New(server.Services{
 		Store:            store,
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:           logger,
 		Watches:          server.NewWatchRegistry(),
 		PubSub:           server.NewPubSubRegistry(),
 		Slowlog:          server.NewSlowlogRegistry(),
 		SlowlogThreshold: -1,
-		Replication:      &server.ReplicationState{},
-		Replicas:         server.NewReplicaRegistry(),
+		Replication:      replication,
+		Replicas:         replicas,
 		Stats:            func() server.Stats { return server.Stats{Role: "master", AOFLastWriteOK: true} },
 		RewriteAOF:       func(context.Context) error { return errors.New("append only file persistence is not enabled") },
-		RecordsWrites:    func() bool { return false },
+		Recorder:         record.New(server.NewReplicaStream(replication, replicas, logger), logger),
 	})
 	if err != nil {
 		t.Fatalf("command.New() error = %v", err)

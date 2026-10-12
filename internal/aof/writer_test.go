@@ -24,7 +24,7 @@ func TestWriterPolicyNoFlushesOnAppend(t *testing.T) {
 	}()
 
 	payload := []byte("*1\r\n$4\r\nPING\r\n")
-	if err := writer.Append(payload); err != nil {
+	if _, err := writer.Append(payload); err != nil {
 		t.Fatalf("Append() error = %v", err)
 	}
 
@@ -34,6 +34,33 @@ func TestWriterPolicyNoFlushesOnAppend(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("file contents = %q, want %q", got, payload)
+	}
+}
+
+func TestAppendCopiesThePayload(t *testing.T) {
+	// The Recorder hands Append a buffer it reuses for the next write as soon
+	// as Append returns. Under everysec the bytes may still be buffered then.
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	writer, err := aof.OpenWriter(context.Background(), path, aof.PolicyEverysec, nil)
+	if err != nil {
+		t.Fatalf("OpenWriter() error = %v", err)
+	}
+	payload := []byte("*1\r\n$4\r\nPING\r\n")
+	want := bytes.Clone(payload)
+	if _, err := writer.Append(payload); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	copy(payload, bytes.Repeat([]byte("X"), len(payload)))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("file contents = %q, want %q", got, want)
 	}
 }
 
