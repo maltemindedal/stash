@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 )
 
@@ -91,10 +92,10 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 		got.result.Release()
 	}
 	if !errors.Is(got.err, server.ErrClientDisconnected) {
-		t.Fatalf("BLPOP = (%v, durability %v), error %v; want error %v", got.result.Responses, got.result.Durability, got.err, server.ErrClientDisconnected)
+		t.Fatalf("BLPOP = (%v, durability %v), error %v; want error %v", got.result.Responses, got.result.Write.Frames(record.ToAOF), got.err, server.ErrClientDisconnected)
 	}
-	if len(got.result.Durability) != 0 || len(got.result.Propagation) != 0 {
-		t.Fatalf("BLPOP durability %v, propagation %v; want none", got.result.Durability, got.result.Propagation)
+	if len(got.result.Write.Frames(record.ToAOF)) != 0 || len(got.result.Write.Frames(record.ToReplicas)) != 0 {
+		t.Fatalf("BLPOP durability %v, propagation %v; want none", got.result.Write.Frames(record.ToAOF), got.result.Write.Frames(record.ToReplicas))
 	}
 	values, err := executor.store.ListRange("jobs", 0, -1)
 	if err != nil || len(values) != 1 || string(values[0]) != "job-1" {

@@ -71,8 +71,9 @@ type commandSpec struct {
 }
 
 type executionEffects struct {
-	propagation []protocol.Value
-	durability  []protocol.Value
+	// evicted holds the DEL of the keys the execution evicted to make room,
+	// recorded after the command's own frame.
+	evicted record.Write
 	// setExpiryMillis is the absolute Unix-millis deadline the SET handler
 	// computed and stored for this request, carried here so the PXAT rewrite
 	// frame reuses that exact value instead of re-deriving it from a later
@@ -242,8 +243,8 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 			return server.ExecuteResult{}, err
 		}
 		e.recordSlowCommand(request, startedAt, time.Since(startedAt))
-		result.Propagation = append(result.Propagation, effects.propagation...)
-		result.Durability = append(result.Durability, effects.durability...)
+		result.Write.Extend(&effects.evicted)
+		result.Write.Origin = request.origin
 		return result, nil
 	}
 	if spec.handler == nil {
@@ -256,10 +257,12 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 	}
 	e.recordSlowCommand(request, startedAt, time.Since(startedAt))
 
-	propagation, durability := executionFrames(request, spec)
 	result := server.SingleResponse(response)
-	result.Propagation = append(propagation, effects.propagation...)
-	result.Durability = append(durability, effects.durability...)
+	if to := spec.destinations(); to != 0 {
+		result.Write.Add(commandFrame(request, spec), to)
+	}
+	result.Write.Extend(&effects.evicted)
+	result.Write.Origin = request.origin
 	return result, nil
 }
 
@@ -306,38 +309,29 @@ func responseErrorValue(err error) protocol.ErrorValue {
 	return protocol.ErrorValue{Message: prefix + " " + err.Error()}
 }
 
-func executionFrames(request *Request, spec commandSpec) ([]protocol.Value, []protocol.Value) {
-	var (
-		frame     protocol.Array
-		haveFrame bool
-	)
-	ensureFrame := func() protocol.Array {
-		if !haveFrame {
-			if spec.rewriteFrame != nil {
-				if rewritten, ok := spec.rewriteFrame(request); ok {
-					frame = rewritten
-					haveFrame = true
-					return frame
-				}
-			}
-			frame = propagationFrame(request)
-			haveFrame = true
-		}
-
-		return frame
-	}
-
-	var propagation []protocol.Value
-	if spec.propagates && request.origin.Propagates() {
-		propagation = []protocol.Value{ensureFrame()}
-	}
-
-	var durability []protocol.Value
+// destinations returns where the command's frame goes: the AOF for a durable
+// command, the replicas for a propagating one. The Recorder applies the
+// request's Origin.
+func (spec commandSpec) destinations() record.Dest {
+	var to record.Dest
 	if spec.durable {
-		durability = []protocol.Value{ensureFrame()}
+		to |= record.ToAOF
 	}
+	if spec.propagates {
+		to |= record.ToReplicas
+	}
+	return to
+}
 
-	return propagation, durability
+// commandFrame returns the command frame that recreates request's write: the
+// request itself, or the deterministic equivalent spec.rewriteFrame gives.
+func commandFrame(request *Request, spec commandSpec) protocol.Array {
+	if spec.rewriteFrame != nil {
+		if rewritten, ok := spec.rewriteFrame(request); ok {
+			return rewritten
+		}
+	}
+	return propagationFrame(request)
 }
 
 func propagationFrame(request *Request) protocol.Array {
@@ -395,11 +389,7 @@ func (e *Executor) recordEvictedKeys(request *Request, keys []string) {
 	}
 
 	e.touchWatchKeys(keys...)
-	frame := record.DeleteFrame(keys)
-	if request.origin.Propagates() {
-		request.effects.propagation = append(request.effects.propagation, frame)
-	}
-	request.effects.durability = append(request.effects.durability, frame)
+	request.effects.evicted.Add(record.DeleteFrame(keys), record.ToBoth)
 }
 
 // DecodeRequest converts a RESP array into a command request.

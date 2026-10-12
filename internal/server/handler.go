@@ -212,7 +212,7 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 		result = SingleResponse(responseError(execErr))
 	}
 
-	outcome := s.recordResult(call, result)
+	outcome := s.recordResult(&result)
 	if outcome.Withheld {
 		result = SingleResponse(persistenceFailureResponse())
 	}

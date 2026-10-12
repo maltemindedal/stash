@@ -446,14 +446,7 @@ func sequencedWrite(ctx context.Context, executor *Executor, recorder *record.Re
 		return fmt.Errorf("Handle() error = %w", err)
 	}
 	defer result.Release()
-	w := record.Write{Origin: call.Origin}
-	for _, frame := range result.Durability {
-		w.Add(frame.(protocol.Array), record.ToAOF)
-	}
-	for _, frame := range result.Propagation {
-		w.Add(frame.(protocol.Array), record.ToReplicas)
-	}
-	outcome := recorder.Record(&w)
+	outcome := recorder.Record(&result.Write)
 	if outcome.Err != nil {
 		return fmt.Errorf("Record() error = %w", outcome.Err)
 	}

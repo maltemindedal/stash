@@ -167,23 +167,10 @@ func (s *Server) closeAOFWriter() error {
 	return nil
 }
 
-// recordResult records the command frames of result, which a request with
-// call's Origin produced, through the Recorder: its durability frames go to the
-// AOF and its propagation frames to the replicas. The caller holds the
-// request's sequencer locks (ExecuteResult.Release).
-func (s *Server) recordResult(call Call, result ExecuteResult) record.Outcome {
-	w := record.Write{Origin: call.Origin}
-	addCommandFrames(&w, result.Durability, record.ToAOF)
-	addCommandFrames(&w, result.Propagation, record.ToReplicas)
-	return s.recorder.Record(&w)
-}
-
-func addCommandFrames(w *record.Write, frames []protocol.Value, to record.Dest) {
-	for _, frame := range frames {
-		if cmd, ok := frame.(protocol.Array); ok {
-			w.Add(cmd, to)
-		}
-	}
+// recordResult records the command frames of result through the Recorder.
+// The caller holds the request's sequencer locks (ExecuteResult.Release).
+func (s *Server) recordResult(result *ExecuteResult) record.Outcome {
+	return s.recorder.Record(&result.Write)
 }
 
 // recordExpiredKeys gives an active TTL eviction the same effects a

@@ -734,7 +734,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
-		assertPropagationFrames(t, result.Propagation, requestValue("SET", "name", "Stash"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("SET", "name", "Stash"))
 	})
 
 	t.Run("INCR returns propagation frame", func(t *testing.T) {
@@ -749,7 +749,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 1})
-		assertPropagationFrames(t, result.Propagation, requestValue("INCR", "counter"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("INCR", "counter"))
 	})
 
 	t.Run("SETBIT returns propagation frame", func(t *testing.T) {
@@ -764,8 +764,8 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
-		assertPropagationFrames(t, result.Propagation, requestValue("SETBIT", "bitmap", "0", "1"))
-		assertPropagationFrames(t, result.Durability, requestValue("SETBIT", "bitmap", "0", "1"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("SETBIT", "bitmap", "0", "1"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("SETBIT", "bitmap", "0", "1"))
 	})
 
 	t.Run("PFADD returns propagation frame", func(t *testing.T) {
@@ -780,8 +780,8 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 1})
-		assertPropagationFrames(t, result.Propagation, requestValue("PFADD", "visitors", "alice"))
-		assertPropagationFrames(t, result.Durability, requestValue("PFADD", "visitors", "alice"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("PFADD", "visitors", "alice"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("PFADD", "visitors", "alice"))
 	})
 
 	t.Run("PUBLISH returns propagation frame", func(t *testing.T) {
@@ -796,7 +796,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
-		assertPropagationFrames(t, result.Propagation, requestValue("PUBLISH", "news", "hello"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("PUBLISH", "news", "hello"))
 	})
 
 	t.Run("DEL propagates even when it removes no keys", func(t *testing.T) {
@@ -811,18 +811,18 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Integer{Value: 0})
-		assertPropagationFrames(t, result.Propagation, requestValue("DEL", "missing"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("DEL", "missing"))
 	})
 
-	t.Run("a command from the Master's stream is not propagated again", func(t *testing.T) {
+	t.Run("a command from the Master's stream carries its Origin, which the Recorder never propagates", func(t *testing.T) {
 		executor := newTestExecutor()
 
 		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("PUBLISH", "news", "replica"), false)
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
-		if len(result.Propagation) != 0 {
-			t.Fatalf("len(result.Propagation) = %d, want 0", len(result.Propagation))
+		if result.Write.Origin != record.OriginMaster {
+			t.Fatalf("result.Write.Origin = %d, want OriginMaster (%d)", result.Write.Origin, record.OriginMaster)
 		}
 	})
 
@@ -852,11 +852,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			protocol.SimpleString{Value: "OK"},
 			protocol.Integer{Value: 0},
 		}})
-		assertPropagationFrames(t, result.Propagation,
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas),
 			requestValue("SET", "name", "Stash"),
 			requestValue("DEL", "missing"),
 		)
-		assertPropagationFrames(t, result.Durability,
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF),
 			requestValue("SET", "name", "Stash"),
 			requestValue("DEL", "missing"),
 		)
@@ -879,11 +879,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 		}
 
 		assertValueEqual(t, result.Responses[0], protocol.Array{Elements: []protocol.Value{}})
-		if len(result.Propagation) != 0 {
-			t.Fatalf("len(result.Propagation) = %d, want 0", len(result.Propagation))
+		if len(result.Write.Frames(record.ToReplicas)) != 0 {
+			t.Fatalf("len(result.Write.Frames(record.ToReplicas)) = %d, want 0", len(result.Write.Frames(record.ToReplicas)))
 		}
-		if len(result.Durability) != 0 {
-			t.Fatalf("len(result.Durability) = %d, want 0", len(result.Durability))
+		if len(result.Write.Frames(record.ToAOF)) != 0 {
+			t.Fatalf("len(result.Write.Frames(record.ToAOF)) = %d, want 0", len(result.Write.Frames(record.ToAOF)))
 		}
 	})
 
@@ -917,11 +917,11 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 			protocol.ErrorValue{Message: "ERR value is not an integer or out of range"},
 			protocol.SimpleString{Value: "OK"},
 		}})
-		assertPropagationFrames(t, result.Propagation,
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas),
 			requestValue("SET", "bad", "hello"),
 			requestValue("SET", "good", "1"),
 		)
-		assertPropagationFrames(t, result.Durability,
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF),
 			requestValue("SET", "bad", "hello"),
 			requestValue("SET", "good", "1"),
 		)
@@ -970,11 +970,11 @@ func TestExecutorMaxMemory(t *testing.T) {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
 		}
 		assertValueEqual(t, result.Responses[0], protocol.SimpleString{Value: "OK"})
-		assertPropagationFrames(t, result.Propagation,
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas),
 			requestValue("SET", "hot!", payload),
 			requestValue("DEL", "cold"),
 		)
-		assertPropagationFrames(t, result.Durability,
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF),
 			requestValue("SET", "hot!", payload),
 			requestValue("DEL", "cold"),
 		)
@@ -2656,8 +2656,8 @@ func BenchmarkExecutorDetailedPropagation(b *testing.B) {
 		if err != nil {
 			b.Fatalf("executeCall() error = %v", err)
 		}
-		if len(result.Propagation) != 1 {
-			b.Fatalf("len(result.Propagation) = %d, want 1", len(result.Propagation))
+		if len(result.Write.Frames(record.ToReplicas)) != 1 {
+			b.Fatalf("len(result.Write.Frames(record.ToReplicas)) = %d, want 1", len(result.Write.Frames(record.ToReplicas)))
 		}
 	}
 }
@@ -2773,7 +2773,7 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		// not a value re-derived from a later clock read.
 		storedExpiry := storedExpiryMillis(t, executor, "name")
 
-		for name, frames := range map[string][]protocol.Value{"propagation": result.Propagation, "durability": result.Durability} {
+		for name, frames := range map[string][]protocol.Value{"propagation": result.Write.Frames(record.ToReplicas), "durability": result.Write.Frames(record.ToAOF)} {
 			if len(frames) != 1 {
 				t.Fatalf("%s frames = %d, want 1", name, len(frames))
 			}
@@ -2809,8 +2809,8 @@ func TestSetRelativeExpiryPropagatesAsPXAT(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
-		assertPropagationFrames(t, result.Propagation, requestValue("SET", "name", "Stash"))
-		assertPropagationFrames(t, result.Durability, requestValue("SET", "name", "Stash"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToReplicas), requestValue("SET", "name", "Stash"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("SET", "name", "Stash"))
 	})
 
 	t.Run("rewritten PXAT frame is accepted on replay and preserves the value", func(t *testing.T) {
@@ -2844,13 +2844,13 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok || id.Value == "" || id.Value == "*" {
 			t.Fatalf("XADD * reply = %#v, want the generated ID", result.Responses[0])
 		}
-		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("XADD", "events", id.Value, "type", "start"))
 
 		// Replaying the logged frame recreates the entry under the same ID.
 		replayed := newTestExecutor()
-		frame, ok := result.Durability[0].(protocol.Array)
+		frame, ok := result.Write.Frames(record.ToAOF)[0].(protocol.Array)
 		if !ok {
-			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
+			t.Fatalf("durability frame = %#v, want an array", result.Write.Frames(record.ToAOF)[0])
 		}
 		if _, err := handle(withOrigin(context.Background(), record.OriginReplay), replayed, frame, false); err != nil {
 			t.Fatalf("replaying the logged frame: %v", err)
@@ -2884,7 +2884,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok || id.Value == "" || id.Value == "*" {
 			t.Fatalf("queued XADD reply = %#v, want the generated ID", replies.Elements[0])
 		}
-		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", id.Value, "type", "start"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("XADD", "events", id.Value, "type", "start"))
 	})
 
 	t.Run("an explicit ID keeps its verbatim frame", func(t *testing.T) {
@@ -2893,7 +2893,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handle(XADD 5-1) error = %v", err)
 		}
-		assertPropagationFrames(t, result.Durability, requestValue("XADD", "events", "5-1", "type", "start"))
+		assertPropagationFrames(t, result.Write.Frames(record.ToAOF), requestValue("XADD", "events", "5-1", "type", "start"))
 	})
 }
 
@@ -2920,14 +2920,14 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first SET error = %v", err)
 	}
-	assertPropagationFrames(t, first.Durability, requestValue("SET", "hot!", payload), requestValue("DEL", "cold"))
+	assertPropagationFrames(t, first.Write.Frames(record.ToAOF), requestValue("SET", "hot!", payload), requestValue("DEL", "cold"))
 
 	second, err := executor.executeRequestDetailed(ctx, request, true)
 	if err != nil {
 		t.Fatalf("second SET error = %v", err)
 	}
-	assertPropagationFrames(t, second.Propagation, requestValue("SET", "hot!", payload))
-	assertPropagationFrames(t, second.Durability, requestValue("SET", "hot!", payload))
+	assertPropagationFrames(t, second.Write.Frames(record.ToReplicas), requestValue("SET", "hot!", payload))
+	assertPropagationFrames(t, second.Write.Frames(record.ToAOF), requestValue("SET", "hot!", payload))
 }
 
 func TestPSyncThatEXECRunsIsRefused(t *testing.T) {

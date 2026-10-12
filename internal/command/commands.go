@@ -14,6 +14,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -174,8 +175,7 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 	// may wait for another request (see Request.inTransaction).
 	queued := state.DrainTransaction()
 	responses := make([]protocol.Value, 0, len(queued))
-	propagation := make([]protocol.Value, 0, len(queued))
-	durability := make([]protocol.Value, 0, len(queued))
+	var write record.Write
 	for _, queuedCommand := range queued {
 		queuedRequest := &Request{
 			Name:          queuedCommand.Name,
@@ -198,13 +198,11 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 			continue
 		}
 		responses = append(responses, result.Responses[0])
-		propagation = append(propagation, result.Propagation...)
-		durability = append(durability, result.Durability...)
+		write.Extend(&result.Write)
 	}
 
 	result := server.SingleResponse(protocol.Array{Elements: responses})
-	result.Propagation = propagation
-	result.Durability = durability
+	result.Write = write
 	return result, nil
 }
 

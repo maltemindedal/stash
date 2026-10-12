@@ -18,10 +18,10 @@ import (
 // command frame for the AOF and the replicas, as a SET is.
 type setExecutor struct{}
 
-func (setExecutor) Handle(_ context.Context, _ Call, request protocol.Value) (ExecuteResult, error) {
+func (setExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
 	result := SingleResponse(protocol.SimpleString{Value: "OK"})
-	result.Durability = []protocol.Value{request}
-	result.Propagation = []protocol.Value{request}
+	result.Write = record.Write{Origin: call.Origin}
+	result.Write.Add(request.(protocol.Array), record.ToBoth)
 	return result, nil
 }
 

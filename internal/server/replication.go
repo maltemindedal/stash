@@ -29,16 +29,18 @@ import (
 type ExecuteResult struct {
 	Responses       []protocol.Value
 	UpstreamReplies []protocol.Value
-	Propagation     []protocol.Value
-	Durability      []protocol.Value
+	// Write holds the command frames the request's write produced, with its
+	// Origin, for the caller to record (record.Recorder) before it releases
+	// the request.
+	Write record.Write
 	// RegisterReplica is set by PSYNC, which registered the client as a replica
 	// at its attach cut. The connection then starts the replica's feed
 	// (registerReplicaPeer) once Responses are ahead of anything it writes.
 	RegisterReplica bool
-	// Release, when set, must be called by whoever applies Durability and
-	// Propagation, after it has done so. It ends the exclusion that keeps other
-	// writes (and transactions) from running until those frames are in the log
-	// and on their way to replicas. It is set only by an executor's sequenced
+	// Release, when set, must be called by whoever records Write, after it
+	// has done so. It ends the exclusion that keeps other writes (and
+	// transactions) from running until those frames are in the log and on
+	// their way to replicas. It is set only by an executor's sequenced
 	// entry point.
 	Release func()
 }
@@ -1002,7 +1004,7 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
 			return
 		}
-		outcome := s.recordResult(masterCall, result)
+		outcome := s.recordResult(&result)
 		if result.Release != nil {
 			result.Release()
 		}

@@ -182,8 +182,12 @@ func (r *Recorder) Records() bool {
 }
 
 // Record sends w's command frames where its Origin allows and applies the
-// table on Recorder to a failed append. The caller must hold w's ordering.
+// table on Recorder to a failed append. A Write without frames records
+// nothing, whatever its Origin. The caller must hold w's ordering.
 func (r *Recorder) Record(w *Write) Outcome {
+	if len(w.frames) == 0 {
+		return Outcome{}
+	}
 	switch w.Origin {
 	case OriginClient, OriginServer, OriginMaster:
 	case OriginReplay:
@@ -192,9 +196,6 @@ func (r *Recorder) Record(w *Write) Outcome {
 		return Outcome{Err: ErrZeroOrigin}
 	default:
 		return Outcome{Err: fmt.Errorf("record: unknown origin %d", w.Origin)}
-	}
-	if len(w.frames) == 0 {
-		return Outcome{}
 	}
 
 	var outcome Outcome

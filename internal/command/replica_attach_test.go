@@ -15,6 +15,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -119,7 +120,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 						t.Errorf("SET error = %v", err)
 						return false
 					}
-					payload, err := protocol.EncodeValues(result.Propagation)
+					payload, err := protocol.EncodeValues(result.Write.Frames(record.ToReplicas))
 					if err != nil {
 						result.Release()
 						t.Errorf("EncodeValues() error = %v", err)
