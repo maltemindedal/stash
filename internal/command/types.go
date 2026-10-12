@@ -395,7 +395,7 @@ func (e *Executor) recordEvictedKeys(request *Request, keys []string) {
 	}
 
 	e.touchWatchKeys(keys...)
-	frame := server.DeleteFrame(keys)
+	frame := record.DeleteFrame(keys)
 	if request.origin.Propagates() {
 		request.effects.propagation = append(request.effects.propagation, frame)
 	}

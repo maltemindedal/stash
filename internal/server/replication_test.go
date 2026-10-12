@@ -407,7 +407,7 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 // command package.
 func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
-	frame := []protocol.Value{DeleteFrame([]string{"key"})}
+	frame := []protocol.Value{record.DeleteFrame([]string{"key"})}
 
 	const writers = 8
 	var propagated atomic.Int64

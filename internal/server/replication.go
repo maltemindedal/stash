@@ -54,20 +54,6 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 	return ExecuteResult{Responses: responses}
 }
 
-// DeleteFrame builds the `DEL` command frame for keys the server removed without
-// a client command. The command executor uses it for memory-pressure evictions.
-// The server uses it for active TTL evictions. Both callers propagate and
-// persist the same frame.
-func DeleteFrame(keys []string) protocol.Array {
-	elements := make([]protocol.Value, 0, len(keys)+1)
-	elements = append(elements, protocol.TextBulkString{Value: "DEL"})
-	for _, key := range keys {
-		elements = append(elements, protocol.BulkString{Data: []byte(key)})
-	}
-
-	return protocol.Array{Elements: elements}
-}
-
 // ReplicationState stores process-wide replication metadata.
 type ReplicationState struct {
 	MasterReplicationID string
