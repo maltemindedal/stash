@@ -25,7 +25,7 @@ Each step prints `PASS`/`FAIL`/`SKIP` lines and ends with `RESULT: PASS`, `RESUL
 
 - `test` runs `go test ./...` and requires exit 0 with no `FAIL` lines.
 - `gate` runs `scripts/gate.sh`, the repo's PR gate: gofmt, build, vet, test, lint, race and cross-OS vet on `GOTOOLCHAIN=go1.21.13`. It SKIPs if `golangci-lint` v2.13.2 is not on `PATH` or in `GOLANGCI_LINT`. It downloads the floor toolchain the first time.
-- `drive` sends `PING`, `SET verify:greeting hello`, `GET verify:greeting`, `INCR verify:counter` and an unknown command over real TCP through `scripts/resp.py <host:port> <args...>`. It asserts the replies `PONG`, `OK`, `"hello"`, `(integer) 1` and `(error) ERR unknown command...`.
+- `drive` sends `PING`, `SET verify:greeting hello`, `GET verify:greeting`, `DEL verify:counter` then `INCR verify:counter`, and an unknown command over real TCP through `scripts/resp.py <host:port> <args...>`. It asserts the replies `PONG`, `OK`, `"hello"`, `(integer) 1` (the DEL makes this hold on a rerun against the same AOF) and `(error) ERR unknown command...`.
 - `persist` writes a key, stops the server, checks that the AOF file on disk contains the key, restarts on the same AOF, and requires `GET` to return the value.
 - `all` runs doctor, test, gate, launch, drive, stop, persist and cleanup. It stops after doctor if doctor fails.
 

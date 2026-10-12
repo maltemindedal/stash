@@ -24,4 +24,4 @@ Preconditions:
 
 ## Gotchas
 
-- `drive` reuses the run's server. INCR returns 1 only on a fresh AOF, so run it once per run, or `stop` and use a new `STASH_VERIFY_RUN`.
+- `drive` DELs `verify:counter` before INCR, so reruns on the same server or AOF still expect 1.

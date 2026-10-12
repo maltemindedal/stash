@@ -43,7 +43,11 @@ doctor() {
   local floor; floor="$(sed -n 's/^go //p' go.mod)"
   echo "go.mod floor: $floor (CI builds on it; scripts/gate.sh pins GOTOOLCHAIN=go1.21.13)"
   command -v python3 >/dev/null && echo "  PASS python3 present (RESP client)" || { echo "  FAIL python3 missing: drive needs it"; return 1; }
-  command -v golangci-lint >/dev/null || [ -n "${GOLANGCI_LINT:-}" ] && echo "  PASS golangci-lint available for gate" || echo "  WARN golangci-lint missing: gate will SKIP"
+  if command -v golangci-lint >/dev/null || [ -n "${GOLANGCI_LINT:-}" ]; then
+    echo "  PASS golangci-lint available for gate"
+  else
+    echo "  WARN golangci-lint missing: gate will SKIP"
+  fi
   if [ -s "$ART/server.pid" ] && kill -0 "$(cat "$ART/server.pid")" 2>/dev/null; then
     echo "  PASS server from this run is up: pid $(cat "$ART/server.pid") at $(addr)"
   else
@@ -104,7 +108,8 @@ drive() {
   cmd ping PING; expect "PING replies PONG" "$ART/ping.stdout" "^PONG$"
   cmd set SET verify:greeting hello; expect "SET replies OK" "$ART/set.stdout" "^OK$"
   cmd get GET verify:greeting; expect "GET returns the stored value" "$ART/get.stdout" '^"hello"$'
-  cmd incr INCR verify:counter; expect "INCR on a new key returns 1" "$ART/incr.stdout" '^\(integer\) 1$'
+  cmd incr-reset DEL verify:counter; expect "DEL of the counter replies with an integer" "$ART/incr-reset.stdout" '^\(integer\) [01]$'
+  cmd incr INCR verify:counter; expect "INCR on a just-deleted key returns 1" "$ART/incr.stdout" '^\(integer\) 1$'
   cmd unknown NOSUCHCOMMAND; expect "unknown command is an explicit error" "$ART/unknown.stdout" "^\(error\) ERR unknown command"
 }
 
