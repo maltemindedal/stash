@@ -448,7 +448,7 @@ func sequencedWrite(ctx context.Context, executor *Executor, call server.Call, r
 	if err != nil {
 		return fmt.Errorf("EncodeValues(durability) error = %w", err)
 	}
-	if err := writer.Append(payload); err != nil {
+	if _, err := writer.Append(payload); err != nil {
 		return fmt.Errorf("Append() error = %w", err)
 	}
 	payload, err = protocol.EncodeValues(result.Propagation)

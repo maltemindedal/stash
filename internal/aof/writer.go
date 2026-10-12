@@ -55,8 +55,8 @@ const (
 	maxIdlePendingCap = 1 << 20
 )
 
-// errEarlierSyncFailed is AppendSync's error from a failed fsync until a
-// rewrite replaces the file.
+// errEarlierSyncFailed is the error of Append under always from a failed fsync
+// until a rewrite replaces the file.
 var errEarlierSyncFailed = errors.New("an earlier fsync failed, so no later one shows the file whole; BGREWRITEAOF replaces it")
 
 // appendFile is what the writer needs of its append-only file: an *os.File, or
@@ -105,8 +105,8 @@ type Writer struct {
 	// during a rewrite swap whose rename then fails, and cleared only when a
 	// rewrite replaces the file. After such a failure the kernel may have dropped
 	// data it could not write, and a later fsync can succeed without it, so no
-	// later success proves the file whole. AppendSync refuses payloads while it
-	// is set.
+	// later success proves the file whole. Append under always refuses payloads
+	// while it is set.
 	syncFailed bool
 	// dirUnsynced is set when a rewrite was renamed into place but its directory
 	// could not be synced. The next sync retries it before it reports success.
@@ -219,21 +219,22 @@ func (w *Writer) LastWriteOK() bool {
 	return w == nil || !w.writeFailed.Load()
 }
 
-// Append writes a payload without forcing an immediate fsync. A payload whose
-// write fails is kept, and the next append, everysec fsync or Close writes it
-// ahead of anything appended after it.
-func (w *Writer) Append(payload []byte) error {
-	return w.append(payload, false)
-}
-
-// AppendSync writes a payload and fsyncs it before returning, or returns an
-// error and leaves the payload out of the file: it is not retried, and any part
-// of it already written is cut back. The server answers such a command with an
-// error and does not send it to replicas, so the file and the replicas agree.
-// After a failed fsync AppendSync refuses every payload until a rewrite
-// replaces the file; see LastWriteOK.
-func (w *Writer) AppendSync(payload []byte) error {
-	return w.append(payload, true)
+// Append writes a payload under the file's fsync policy. Under always it
+// fsyncs the payload before returning, or returns an error with withhold set
+// and leaves the payload out of the file: it is not retried, and any part of it
+// already written is cut back. The caller then neither acknowledges nor
+// propagates the command, so the file and the replicas agree. After a failed
+// fsync, Append under always refuses every payload until a rewrite replaces the
+// file; see LastWriteOK. Under everysec and no, withhold is false: a payload
+// whose write fails is kept, and the next append, everysec fsync, Sync or Close
+// writes it ahead of anything appended after it. Append keeps no reference to
+// payload after it returns.
+func (w *Writer) Append(payload []byte) (withhold bool, err error) {
+	always := w != nil && w.policy == PolicyAlways
+	if err := w.append(payload, always); err != nil {
+		return always, err
+	}
+	return false, nil
 }
 
 // Close flushes, fsyncs, and closes the underlying AOF file.
@@ -317,13 +318,14 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 	if syncNow && w.syncFailed {
 		// A command taken back after the failed fsync may still be in the file
 		// if cutting it failed; nothing else retries the cut while every
-		// AppendSync is refused.
+		// Append under always is refused.
 		w.cutTornTailLocked()
 		return fmt.Errorf("aof: append to %q: %w", w.path, errEarlierSyncFailed)
 	}
 	// Append keeps the command whether or not the file takes it now: in pending
 	// until a write of it succeeds, and in the rewrite buffer for a rewrite that
-	// has taken its snapshot. AppendSync takes it back from both if it fails.
+	// has taken its snapshot. Under always it is taken back from both if it
+	// fails.
 	rewriteLen := w.rewriteBuffer.Len()
 	w.pending = append(w.pending, payload...)
 	w.ends = append(w.ends, len(w.pending))
@@ -352,10 +354,10 @@ func (w *Writer) append(payload []byte, syncNow bool) error {
 	return nil
 }
 
-// withdrawLocked takes back the payload of size bytes that AppendSync added
-// last, after it could not be written and synced, and cuts back any part of it
-// already in the file. Nothing was appended after it, so it is the tail of
-// pending if pending holds anything, and otherwise the last bytes written.
+// withdrawLocked takes back the payload of size bytes that Append under always
+// added last, after it could not be written and synced, and cuts back any part
+// of it already in the file. Nothing was appended after it, so it is the tail
+// of pending if pending holds anything, and otherwise the last bytes written.
 func (w *Writer) withdrawLocked(size int, rewriteLen int) {
 	if len(w.pending) > 0 {
 		w.pending = w.pending[:len(w.pending)-size]
@@ -366,7 +368,8 @@ func (w *Writer) withdrawLocked(size int, rewriteLen int) {
 		w.tornTail = true
 	}
 	w.rewriteBuffer.Truncate(rewriteLen)
-	// If the cut fails here, the next AppendSync or flush tries again first.
+	// If the cut fails here, the next Append under always or flush tries again
+	// first.
 	w.cutTornTailLocked()
 }
 
@@ -391,14 +394,17 @@ func (w *Writer) runEverysec(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.sync(); err != nil && !errors.Is(err, ErrClosed) {
+			if err := w.Sync(); err != nil && !errors.Is(err, ErrClosed) {
 				w.logWarn("failed to sync append-only file", "path", w.path, "error", err)
 			}
 		}
 	}
 }
 
-func (w *Writer) sync() error {
+// Sync writes every payload appended so far to the file and fsyncs it, under
+// every policy: the server calls it for the evictions it appends at startup,
+// which must be durable before it accepts a client.
+func (w *Writer) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -738,8 +744,8 @@ func (w *Writer) reopenLocked() error {
 var cutFile = cutAppendOnlyFile
 
 // cutAppendOnlyFile cuts the append-only file at path back to size bytes, the
-// end of its last complete command, and syncs it, so a command AppendSync took
-// back does not return after a crash. It opens a handle of its own, as
+// end of its last complete command, and syncs it, so a command Append under
+// always took back does not return after a crash. It opens a handle of its own, as
 // TruncateTail does: Go opens an O_APPEND file on Windows without the
 // write-data access truncating needs. It never extends the file. A file shorter
 // than size has lost commands the writer counted as written, and padding it

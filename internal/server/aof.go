@@ -183,13 +183,7 @@ func (s *Server) persistDurabilityFrames(values []protocol.Value) error {
 	if err != nil {
 		return fmt.Errorf("server: encode durability frames: %w", err)
 	}
-	if s.aofWriter.Policy() == aof.PolicyAlways {
-		if err := s.aofWriter.AppendSync(payload); err != nil {
-			return fmt.Errorf("server: append durability frames: %w", err)
-		}
-		return nil
-	}
-	if err := s.aofWriter.Append(payload); err != nil {
+	if _, err := s.aofWriter.Append(payload); err != nil {
 		return fmt.Errorf("server: append durability frames: %w", err)
 	}
 	return nil
@@ -205,7 +199,7 @@ func (s *Server) prepareDurabilityBeforeResponse(values []protocol.Value, logger
 		logger.Error("failed to encode AOF payload", "error", err)
 		return nil, err
 	}
-	if err := s.aofWriter.AppendSync(payload); err != nil {
+	if _, err := s.aofWriter.Append(payload); err != nil {
 		logger.Error("failed to append command to AOF before responding", "error", err)
 		return nil, err
 	}
@@ -229,7 +223,7 @@ func (s *Server) finalizeMutationEffects(client *ClientState, durability []proto
 			}
 		}
 		if len(payload) > 0 {
-			if err := s.aofWriter.Append(payload); err != nil {
+			if _, err := s.aofWriter.Append(payload); err != nil {
 				logger.Warn("failed to append command to AOF", "error", err)
 			}
 		}
@@ -296,8 +290,11 @@ func (s *Server) persistStartupEvictions(keys []string) error {
 	if err != nil {
 		return fmt.Errorf("server: encode a DEL of the %d keys evicted at startup: %w", len(keys), err)
 	}
-	if err := s.aofWriter.AppendSync(payload); err != nil {
+	if _, err := s.aofWriter.Append(payload); err != nil {
 		return fmt.Errorf("server: append a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)
+	}
+	if err := s.aofWriter.Sync(); err != nil {
+		return fmt.Errorf("server: fsync a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)
 	}
 	return nil
 }

@@ -24,7 +24,7 @@ func TestWriterPolicyNoFlushesOnAppend(t *testing.T) {
 	}()
 
 	payload := []byte("*1\r\n$4\r\nPING\r\n")
-	if err := writer.Append(payload); err != nil {
+	if _, err := writer.Append(payload); err != nil {
 		t.Fatalf("Append() error = %v", err)
 	}
 
