@@ -15,7 +15,6 @@ import (
 
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -69,7 +68,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 			}); err != nil {
 				t.Fatalf("server.New() error = %v", err)
 			}
-			registry, offsets := executor.replicaPeers, executor.replication
+			registry := executor.replicaPeers
 
 			// A client write's value -> the end offset counted for its frame, for
 			// the writes made since the current replica attached. It is emptied at
@@ -113,21 +112,15 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				ctx := clientContext(executor)
 				run(func(i int) bool {
 					tag := fmt.Sprintf("%s-%d", key, i)
-					// As the server runs a client write (executeClientRequest): its
-					// frames are handed to the replicas before its locks are released.
-					result, err := handle(ctx, executor, requestValue("SET", key, tag), true)
-					if err != nil {
+					// As the server runs a client write: Handle propagates its frames
+					// before it releases its locks, and stores where they end as the
+					// client's last write offset.
+					if _, err := handle(ctx, executor, requestValue("SET", key, tag), true); err != nil {
 						t.Errorf("SET error = %v", err)
 						return false
 					}
-					payload, err := protocol.EncodeValues(result.Write.Frames(record.ToReplicas))
-					if err != nil {
-						result.Release()
-						t.Errorf("EncodeValues() error = %v", err)
-						return false
-					}
-					end, _, _ := registry.PropagateOrdered(offsets, payload)
-					result.Release()
+					client, _ := clientOfContext(ctx)
+					end := client.LastWriteReplicationOffset()
 					endsMu.Lock()
 					if len(ends) < maxTrackedWrites {
 						ends[tag] = end

@@ -61,14 +61,10 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		startedAt := time.Now()
 		// Replay is ordered like any request. Nothing records writes yet (the
 		// Recorder gets the writer below), so each one takes the sequencer's gate
-		// shared and no stripe, and gives it back here. The Recorder records
-		// nothing for replay's Origin.
+		// shared and no stripe. The Recorder records nothing for replay's Origin.
 		replayCall := Call{Origin: record.OriginReplay}
 		stats, err := aof.LoadFile(ctx, s.cfg.AOFPath, func(replayCtx context.Context, value protocol.Value) error {
-			result, replayErr := s.executor.Handle(replayCtx, replayCall, value)
-			if result.Release != nil {
-				result.Release()
-			}
+			_, replayErr := s.executor.Handle(replayCtx, replayCall, value)
 			return replayErr
 		})
 		if err != nil {
@@ -167,12 +163,6 @@ func (s *Server) closeAOFWriter() error {
 	return nil
 }
 
-// recordResult records the command frames of result through the Recorder.
-// The caller holds the request's sequencer locks (ExecuteResult.Release).
-func (s *Server) recordResult(result *ExecuteResult) record.Outcome {
-	return s.recorder.Record(&result.Write)
-}
-
 // recordExpiredKeys gives an active TTL eviction the same effects a
 // client-issued DEL would have had: it invalidates WATCH on the keys, appends
 // the deletion to the AOF, and forwards it to replicas. The store evicts expired
@@ -227,10 +217,6 @@ func (s *Server) persistStartupEvictions(keys []string) error {
 		return fmt.Errorf("server: fsync a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)
 	}
 	return nil
-}
-
-func persistenceFailureResponse() protocol.ErrorValue {
-	return protocol.ErrorValue{Message: "ERR persistence failure"}
 }
 
 func aofFileState(path string) (bool, int64, error) {

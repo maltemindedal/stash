@@ -2,9 +2,12 @@ package command
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 )
 
@@ -22,9 +25,11 @@ import (
 // nor hold one up.
 //
 // A request that writes also holds the stripe of each key it writes, from before
-// it executes until its frames have reached the AOF and the replicas
-// (ExecuteResult.Release). Two writers to the same key therefore append in the
-// order they were applied. Without it a client could update the store, another
+// it executes until Handle has recorded its command frames (Executor.record,
+// record.Recorder), so a write's locks never leave Handle. Two writers to the
+// same key therefore reach the AOF and the replicas in the order they were
+// applied; writers on different stripes commute, so nothing orders them against
+// each other, and the Recorder takes no lock of its own. Without it a client could update the store, another
 // client could update it and append first, and the log would replay the two in the
 // opposite order to the one live state came from. Writers to different keys run
 // in parallel, except that a write whose keys are not known holds every stripe.
@@ -32,11 +37,13 @@ import (
 // The stripes exist to order what reaches the log and the replicas, so a server
 // with neither has nothing to order and skips them (needsOrder).
 //
-// Lock order is gate, then stripes by ascending index. Nothing takes gate shared
-// while it already holds it, and nothing waits for another request while holding
-// either (a blocking command waits with neither held). Handing a write's frames
-// to the replicas then takes the replica registry's lock and a replica feed's
-// (server.ReplicaRegistry.Propagate), which take neither gate nor stripe.
+// Lock order is gate, then stripes by ascending index, then what recording
+// takes: the AOF writer's lock (aof.Writer.Append), and then the replica
+// registry's lock and a replica feed's (server.ReplicaRegistry.Propagate),
+// which take neither gate nor stripe, and are not held together. Nothing takes
+// gate shared while it already holds it, and nothing waits for another request
+// while holding either (a blocking command waits with neither held). Recording
+// is never done under a shard lock.
 // Counting a frame's replication offset and queueing it for every replica happen
 // under that one lock, so writers on different stripes, and WAIT's GETACK, reach
 // every replica in offset order. While no replica is registered, a client write's
@@ -213,9 +220,9 @@ type sequenceMode int
 const (
 	// sequenceRead: holds gate shared while it executes.
 	sequenceRead sequenceMode = iota
-	// sequenceWrite: gate shared and writes, until the result is released.
+	// sequenceWrite: gate shared and writes, until its write is recorded.
 	sequenceWrite
-	// sequenceExclusive: gate exclusive, until the result is released.
+	// sequenceExclusive: gate exclusive, until its write is recorded.
 	sequenceExclusive
 	// sequenceSelf: the command orders itself, because it waits (BLPOP, WAIT)
 	// or because it needs locks no other mode takes (PSYNC's attach cut).
@@ -248,10 +255,11 @@ func (e *Executor) sequenceModeFor(request *Request) sequenceMode {
 }
 
 // Handle runs one request the server received, as call describes it, ordered
-// against the other requests as described on sequencer. When the result has a
-// Release function the caller must call it once it has applied the result's
-// durability and propagation frames, and not before; nothing else can execute
-// a write, or a transaction, until then.
+// against the other requests as described on sequencer. A write's command
+// frames are recorded before its locks are released, so they never leave this
+// function: nothing else can execute a write to the same keys, or a
+// transaction, until its frames are in the AOF and on their way to the
+// replicas.
 func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.Value) (server.ExecuteResult, error) {
 	request, err := decodeCall(call, value)
 	if err != nil {
@@ -265,29 +273,53 @@ func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.
 	switch e.sequenceModeFor(request) {
 	case sequenceExclusive:
 		q.gate.Lock()
-		result, err := e.executeRequestDetailed(ctx, request, true)
-		if err != nil {
-			q.gate.Unlock()
-			return result, err
-		}
-		result.Release = q.releaseExclusive
-		return result, nil
+		defer q.gate.Unlock()
+		return e.executeAndRecord(ctx, request)
 	case sequenceWrite:
 		release := q.beginWrite(e.keyShapeOf(request.Name), request.Args)
-		result, err := e.executeRequestDetailed(ctx, request, true)
-		if err != nil {
-			release()
-			return result, err
-		}
-		result.Release = release
-		return result, nil
+		defer release()
+		return e.executeAndRecord(ctx, request)
 	case sequenceSelf:
+		// BLPOP records its pop inside the attempt that holds its stripe.
 		return e.executeRequestDetailed(ctx, request, true)
 	default:
 		q.gate.RLock()
 		defer q.gate.RUnlock()
-		return e.executeRequestDetailed(ctx, request, true)
+		return e.executeAndRecord(ctx, request)
 	}
+}
+
+// executeAndRecord executes request and records its write. The caller holds
+// the request's ordering.
+func (e *Executor) executeAndRecord(ctx context.Context, request *Request) (server.ExecuteResult, error) {
+	result, err := e.executeRequestDetailed(ctx, request, true)
+	if err != nil {
+		return result, err
+	}
+	return e.record(request, result)
+}
+
+// record records the command frames request's execution produced, while the
+// caller holds the request's ordering, and turns what the Recorder did into
+// the request's reply. A write the Recorder withheld is answered ERR
+// persistence failure. A failed append of the Master's command frames is
+// returned, so that the link ends. Otherwise the end of the write's frames in
+// the replication stream becomes the client's last write offset, which WAIT
+// waits for.
+func (e *Executor) record(request *Request, result server.ExecuteResult) (server.ExecuteResult, error) {
+	outcome := e.recorder.Record(&request.write)
+	switch {
+	case outcome.Withheld && request.origin != record.OriginMaster:
+		return server.ExecuteResult{}, ErrPersistenceFailureError()
+	case outcome.Err != nil && request.origin == record.OriginMaster:
+		return server.ExecuteResult{}, fmt.Errorf("%w: %w", server.ErrNotRecorded, outcome.Err)
+	case errors.Is(outcome.Err, record.ErrZeroOrigin):
+		return server.ExecuteResult{}, outcome.Err
+	}
+	if outcome.End > 0 && request.client != nil {
+		request.client.SetLastWriteReplicationOffset(outcome.End)
+	}
+	return result, nil
 }
 
 // BeginBackgroundWrite orders work the server does on its own initiative (the

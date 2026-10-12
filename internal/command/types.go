@@ -25,6 +25,10 @@ type Request struct {
 	// and propagated frames depend on: the keys it evicted, SET's absolute
 	// expiry, XADD's generated ID. Each execution starts it from zero.
 	effects executionEffects
+	// write is the command frames one execution of the request produced, for
+	// the sequencer to record before it releases the request's locks (see
+	// Executor.record). Each execution starts it from zero.
+	write record.Write
 	// client, origin and inline are the request's Call (see server.Call):
 	// the Client state of the connection it came from, where it came from, and
 	// whether it runs inline on the Event loop. They sit beside inTransaction
@@ -99,6 +103,7 @@ type Executor struct {
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
 	aofRewrite          func(context.Context) error
+	recorder            *record.Recorder
 	seq                 *sequencer
 }
 
@@ -123,10 +128,11 @@ func New(services server.Services) (*Executor, error) {
 		slowlogThreshold:    services.SlowlogThreshold,
 		serverStatsProvider: services.Stats,
 		aofRewrite:          services.RewriteAOF,
+		recorder:            services.Recorder,
 		seq:                 newSequencer(),
 	}
 	// Writes are ordered only while something records them (see sequencer).
-	executor.seq.needsOrder = services.Recorder.Records
+	executor.seq.needsOrder = executor.recorder.Records
 	executor.commands = executor.commandSpecs()
 	return executor, nil
 }
@@ -212,6 +218,7 @@ func (e *Executor) admit(request *Request) error {
 func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request, allowQueue bool) (server.ExecuteResult, error) {
 	request.effects = executionEffects{}
 	effects := &request.effects
+	request.write = record.Write{Origin: request.origin}
 
 	if err := e.validateSubscriptionContext(request); err != nil {
 		return server.ExecuteResult{}, err
@@ -243,8 +250,7 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 			return server.ExecuteResult{}, err
 		}
 		e.recordSlowCommand(request, startedAt, time.Since(startedAt))
-		result.Write.Extend(&effects.evicted)
-		result.Write.Origin = request.origin
+		request.write.Extend(&effects.evicted)
 		return result, nil
 	}
 	if spec.handler == nil {
@@ -257,13 +263,11 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 	}
 	e.recordSlowCommand(request, startedAt, time.Since(startedAt))
 
-	result := server.SingleResponse(response)
 	if to := spec.destinations(); to != 0 {
-		result.Write.Add(commandFrame(request, spec), to)
+		request.write.Add(commandFrame(request, spec), to)
 	}
-	result.Write.Extend(&effects.evicted)
-	result.Write.Origin = request.origin
-	return result, nil
+	request.write.Extend(&effects.evicted)
+	return server.SingleResponse(response), nil
 }
 
 func (e *Executor) validateQueueableRequest(request *Request) error {

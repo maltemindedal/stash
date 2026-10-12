@@ -17,11 +17,16 @@ import (
 // side is a compile error rather than a feature that silently switches off.
 type CommandExecutor interface {
 	// Handle runs one request, ordered against the others (see the command
-	// package's sequencer), as call describes it. When the result has a
-	// Release function, the caller calls it once it has applied the result's
-	// durability and propagation frames, and not before.
+	// package's sequencer), as call describes it, and records the command
+	// frames of its write (record.Recorder) before it returns.
 	Handle(ctx context.Context, call Call, request protocol.Value) (ExecuteResult, error)
 }
+
+// ErrNotRecorded is what the command executor returns, wrapping the cause, for
+// a request from the Master's stream whose command frames could not be
+// appended to the AOF: the replica link ends, and the Replica synchronises
+// again when it reconnects.
+var ErrNotRecorded = errors.New("server: the command frames could not be recorded")
 
 // ErrCloseConnection is what the command executor returns for a request that
 // its connection may not make in its state, to have the server close the

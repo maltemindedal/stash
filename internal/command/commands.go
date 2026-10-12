@@ -14,7 +14,6 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
-	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -175,7 +174,6 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 	// may wait for another request (see Request.inTransaction).
 	queued := state.DrainTransaction()
 	responses := make([]protocol.Value, 0, len(queued))
-	var write record.Write
 	for _, queuedCommand := range queued {
 		queuedRequest := &Request{
 			Name:          queuedCommand.Name,
@@ -198,12 +196,10 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 			continue
 		}
 		responses = append(responses, result.Responses[0])
-		write.Extend(&result.Write)
+		request.write.Extend(&queuedRequest.write)
 	}
 
-	result := server.SingleResponse(protocol.Array{Elements: responses})
-	result.Write = write
-	return result, nil
+	return server.SingleResponse(protocol.Array{Elements: responses}), nil
 }
 
 func (e *Executor) handleBGRewriteAOF(ctx context.Context, request *Request) (protocol.Value, error) {

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/aof"
-	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 )
@@ -178,10 +177,7 @@ func TestUnauthenticatedRequestsAreRefusedBeforeTheyTakeASequencerLock(t *testin
 				go func() {
 					errs := make([]error, 0, len(tt.requests))
 					for _, parts := range tt.requests {
-						result, err := executor.Handle(context.Background(), call, requestValue(parts...))
-						if result.Release != nil {
-							result.Release()
-						}
+						_, err := executor.Handle(context.Background(), call, requestValue(parts...))
 						errs = append(errs, err)
 					}
 					replied <- errs
@@ -387,7 +383,7 @@ func (s *benchStream) Propagate(payload []byte, _ bool) int64 {
 func (s *benchStream) Active() bool { return true }
 
 // BenchmarkSequencedWrite measures one SET as the server runs it with an
-// append-only file under everysec: ordered by Handle, its command frames
+// append-only file under everysec, through Handle: ordered, its command frames
 // recorded to the file and handed to the replicas, and its locks given back.
 // "stream" hands the frames to a stand-in for one attached replica; "no stream"
 // to a replica registry with no replica, which only counts them. Each goroutine
@@ -408,15 +404,13 @@ func BenchmarkSequencedWrite(b *testing.B) {
 					b.Fatalf("Close() error = %v", err)
 				}
 			}()
-			var recorder *record.Recorder
 			executor := newTestExecutorWith(func(s *server.Services) {
 				var stream record.Stream = server.NewReplicaStream(s.Replication, s.Replicas, s.Logger)
 				if withStream {
 					stream = &benchStream{buf: make([]byte, 0, 1<<20)}
 				}
-				recorder = record.New(stream, s.Logger)
-				recorder.SetLog(writer)
-				s.Recorder = recorder
+				s.Recorder = record.New(stream, s.Logger)
+				s.Recorder.SetLog(writer)
 			})
 			var writers atomic.Int64
 
@@ -427,29 +421,12 @@ func BenchmarkSequencedWrite(b *testing.B) {
 				call := callFromContext(ctx)
 				request := requestValue("SET", fmt.Sprintf("key:%d", writers.Add(1)), "value")
 				for pb.Next() {
-					if err := sequencedWrite(ctx, executor, recorder, call, request); err != nil {
-						b.Error(err)
+					if _, err := executor.Handle(ctx, call, request); err != nil {
+						b.Errorf("Handle() error = %v", err)
 						return
 					}
 				}
 			})
 		})
 	}
-}
-
-// sequencedWrite runs request through Handle and then does what the server does
-// with the result's frames before it gives the write's locks back: it records
-// them and stores the client's last write offset.
-func sequencedWrite(ctx context.Context, executor *Executor, recorder *record.Recorder, call server.Call, request protocol.Value) error {
-	result, err := executor.Handle(ctx, call, request)
-	if err != nil {
-		return fmt.Errorf("Handle() error = %w", err)
-	}
-	defer result.Release()
-	outcome := recorder.Record(&result.Write)
-	if outcome.Err != nil {
-		return fmt.Errorf("Record() error = %w", outcome.Err)
-	}
-	call.Client.SetLastWriteReplicationOffset(outcome.End)
-	return nil
 }

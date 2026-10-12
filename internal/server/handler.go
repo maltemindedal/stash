@@ -181,9 +181,9 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 }
 
 // executeClientRequest runs one parsed request through the command pipeline
-// shared by both networking modes: monitor observation, execution, recording
-// its command frames (and answering a write the Recorder withheld with ERR
-// persistence failure), and the processed-command counter. It returns the RESP
+// shared by both networking modes: monitor observation, execution (which
+// records a write's command frames, and answers one the Recorder withheld with
+// ERR persistence failure), and the processed-command counter. It returns the RESP
 // responses to deliver and whether the caller must start the feed of the
 // replica peer PSYNC registered (registerReplicaPeer) once those responses have
 // been written or buffered. A non-nil error is fatal for the connection.
@@ -199,11 +199,6 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 	// the connection a replica still goes out.
 	attachedReplica := call.Client.IsReplica()
 	result, execErr := s.executor.Handle(ctx, call, request)
-	// Until the result's frames have been logged and sent to the replicas, no
-	// other write may run; see sequencer in the command package.
-	if result.Release != nil {
-		defer result.Release()
-	}
 	if execErr != nil {
 		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) || errors.Is(execErr, ErrClientDisconnected) || errors.Is(execErr, ErrCloseConnection) {
 			return nil, false, execErr
@@ -212,11 +207,6 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 		result = SingleResponse(responseError(execErr))
 	}
 
-	outcome := s.recordResult(&result)
-	if outcome.Withheld {
-		result = SingleResponse(persistenceFailureResponse())
-	}
-	s.recordClientWriteOffset(call.Client, outcome.End)
 	s.commandsProcessed.Add(1)
 
 	if attachedReplica {

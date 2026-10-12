@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 )
 
@@ -21,7 +20,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	// wait, so a client that left during it still had the element popped into
 	// its closed connection, logged and replicated as LPOP, and the client waiting
 	// behind it was never woken.
-	executor := newTestExecutor()
+	executor, log, stream := newRecordingTestExecutor(nil)
 	client, conn := tcpPair(t)
 	state := newTestClientState(executor, 1)
 	state.BindResponseWriter(bufio.NewWriter(conn))
@@ -34,7 +33,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 		t.Fatalf("QueueResponses() error = %v", err)
 	}
 	type outcome struct {
-		result server.ExecuteResult
+		result testResult
 		err    error
 	}
 	done := make(chan outcome, 1)
@@ -88,14 +87,11 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	case <-time.After(2 * time.Second):
 		t.Fatal("BLPOP did not return within 2s of the stripe's release")
 	}
-	if got.result.Release != nil {
-		got.result.Release()
-	}
 	if !errors.Is(got.err, server.ErrClientDisconnected) {
-		t.Fatalf("BLPOP = (%v, durability %v), error %v; want error %v", got.result.Responses, got.result.Write.Frames(record.ToAOF), got.err, server.ErrClientDisconnected)
+		t.Fatalf("BLPOP = %v, error %v; want error %v", got.result.Responses, got.err, server.ErrClientDisconnected)
 	}
-	if len(got.result.Write.Frames(record.ToAOF)) != 0 || len(got.result.Write.Frames(record.ToReplicas)) != 0 {
-		t.Fatalf("BLPOP durability %v, propagation %v; want none", got.result.Write.Frames(record.ToAOF), got.result.Write.Frames(record.ToReplicas))
+	if log.Appends() != 0 || len(stream.Payloads()) != 0 {
+		t.Fatalf("BLPOP recorded %q to the AOF and %q to the replicas; want nothing", log.Payloads(), stream.Payloads())
 	}
 	values, err := executor.store.ListRange("jobs", 0, -1)
 	if err != nil || len(values) != 1 || string(values[0]) != "job-1" {

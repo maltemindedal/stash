@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,39 +21,35 @@ import (
 )
 
 // recordingExecutor answers every request with +OK, and records the Call each
-// one came with and whether the caller released its result.
+// one came with.
 type recordingExecutor struct {
 	mu    sync.Mutex
 	calls []recordedCall
 }
 
 type recordedCall struct {
-	command  string
-	call     Call
-	released *atomic.Bool
+	command string
+	call    Call
 }
 
 func (r *recordingExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
-	released := &atomic.Bool{}
 	r.mu.Lock()
-	r.calls = append(r.calls, recordedCall{command: replicationCommandName(request), call: call, released: released})
+	r.calls = append(r.calls, recordedCall{command: replicationCommandName(request), call: call})
 	r.mu.Unlock()
 
-	result := SingleResponse(protocol.SimpleString{Value: "OK"})
-	result.Release = func() { released.Store(true) }
-	return result, nil
+	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 }
 
-// released waits for the first request named command to be executed and its
-// result released, and returns its Call.
-func (r *recordingExecutor) released(t *testing.T, command string) Call {
+// handled waits for the first request named command to be executed, and
+// returns its Call.
+func (r *recordingExecutor) handled(t *testing.T, command string) Call {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		r.mu.Lock()
 		for _, recorded := range r.calls {
-			if recorded.command == command && recorded.released.Load() {
+			if recorded.command == command {
 				r.mu.Unlock()
 				return recorded.call
 			}
@@ -62,7 +57,7 @@ func (r *recordingExecutor) released(t *testing.T, command string) Call {
 		r.mu.Unlock()
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("no %s was executed and released within 5s", command)
+	t.Fatalf("no %s was executed within 5s", command)
 	return Call{}
 }
 
@@ -211,7 +206,7 @@ func TestEveryExecutionPathPassesItsOrigin(t *testing.T) {
 				tt.drive(t, addr)
 			}
 
-			call := executor.released(t, tt.command)
+			call := executor.handled(t, tt.command)
 			if call.Origin != tt.wantOrigin || (call.Client != nil) != tt.wantClient || call.Inline != tt.wantInline {
 				t.Fatalf("%s ran with Call{Origin: %d, Client set: %v, Inline: %v}, want Origin %d, Client set %v, Inline %v",
 					tt.command, call.Origin, call.Client != nil, call.Inline, tt.wantOrigin, tt.wantClient, tt.wantInline)

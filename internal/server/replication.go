@@ -29,20 +29,10 @@ import (
 type ExecuteResult struct {
 	Responses       []protocol.Value
 	UpstreamReplies []protocol.Value
-	// Write holds the command frames the request's write produced, with its
-	// Origin, for the caller to record (record.Recorder) before it releases
-	// the request.
-	Write record.Write
 	// RegisterReplica is set by PSYNC, which registered the client as a replica
 	// at its attach cut. The connection then starts the replica's feed
 	// (registerReplicaPeer) once Responses are ahead of anything it writes.
 	RegisterReplica bool
-	// Release, when set, must be called by whoever records Write, after it
-	// has done so. It ends the exclusion that keeps other writes (and
-	// transactions) from running until those frames are in the log and on
-	// their way to replicas. It is set only by an executor's sequenced
-	// entry point.
-	Release func()
 }
 
 // SingleResponse wraps a standard single RESP value as an execution result.
@@ -412,7 +402,8 @@ func (r *ReplicaRegistry) Propagate(offsets *ReplicationState, payload []byte) (
 // PropagateOrdered is Propagate for a client write's frames, whose caller the
 // command sequencer orders against PSYNC's attach cut: it holds the sequencer's
 // gate, and the stripes of the write whenever anything records writes, from
-// before the write is applied until this returns (ExecuteResult.Release). While
+// before the write is applied until this returns (the command executor records
+// a write before it releases them). While
 // no replica is registered it only counts payload into the master offset, without
 // the registry lock, and returns 0 for queued and refused.
 //
@@ -812,14 +803,6 @@ func replicaFellBehind(cause error) bool {
 		errors.Is(cause, errResponseWriterBusy)
 }
 
-func (s *Server) recordClientWriteOffset(client *ClientState, offset int64) {
-	if offset <= 0 || client == nil {
-		return
-	}
-
-	client.SetLastWriteReplicationOffset(offset)
-}
-
 func (s *Server) setUpstreamConn(conn net.Conn) {
 	s.upstreamConnMu.Lock()
 	defer s.upstreamConnMu.Unlock()
@@ -1001,17 +984,14 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 				return
 			}
 
+			if errors.Is(execErr, ErrNotRecorded) {
+				s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", execErr)
+				return
+			}
 			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
 			return
 		}
-		outcome := s.recordResult(&result)
-		if result.Release != nil {
-			result.Release()
-		}
-		if outcome.Err != nil {
-			s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", outcome.Err)
-			return
-		}
+
 		if len(result.UpstreamReplies) > 0 {
 			if err := writeReplicaResponses(writer, result.UpstreamReplies); err != nil {
 				s.logger.Warn("failed to write replication upstream reply", "master_addr", masterAddr, "error", err)

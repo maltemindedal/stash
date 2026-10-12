@@ -113,6 +113,18 @@ The background compaction that replaces the **AOF** with a file recreating only 
 **AOF seed**:
 The startup step that writes the keys an **RDB snapshot** loaded into a missing or empty **AOF**, the way an **AOF rewrite** writes its file, because every later start loads the **AOF** and skips the snapshot.
 
+**Command frame**:
+A RESP command array that recreates part of a write when replayed from the **AOF** or applied by a **Replica**.
+_Avoid_: propagation frame, durability frame
+
+**Recording**:
+Appending an applied write's **Command frames** to the **AOF** and propagating them to **Replicas** while the write's ordering is still held.
+_Avoid_: commit, finalize, mutation effects
+
+**Persistence failure**:
+Under `appendfsync always`, a write whose **Command frames** could not be appended and fsynced; it stays applied in memory, is answered `ERR persistence failure`, and is not propagated.
+_Avoid_: AOF error
+
 **RDB snapshot**:
 A Redis database file holding the string keys of database `0`. Stash can load one at startup, writes one at graceful shutdown, and sends one to a **Replica** on full resync.
 

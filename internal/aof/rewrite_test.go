@@ -70,11 +70,7 @@ func TestGenerateRewriteRoundTripsState(t *testing.T) {
 			t.Fatalf("Parse() error = %v", parseErr)
 		}
 		// Replayed as the server replays its AOF at startup.
-		result, execErr := executor.Handle(context.Background(), server.Call{Origin: record.OriginReplay}, value)
-		if result.Release != nil {
-			result.Release()
-		}
-		if execErr != nil {
+		if _, execErr := executor.Handle(context.Background(), server.Call{Origin: record.OriginReplay}, value); execErr != nil {
 			t.Fatalf("Handle() error = %v", execErr)
 		}
 	}
@@ -383,10 +379,7 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 			replayedStore := storage.NewStore()
 			executor := replayExecutor(t, replayedStore)
 			loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
-				result, execErr := executor.Handle(ctx, server.Call{Origin: record.OriginReplay}, value)
-				if result.Release != nil {
-					result.Release()
-				}
+				_, execErr := executor.Handle(ctx, server.Call{Origin: record.OriginReplay}, value)
 				return execErr
 			})
 			if err != nil {
