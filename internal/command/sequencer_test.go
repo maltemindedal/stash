@@ -430,3 +430,46 @@ func BenchmarkSequencedWrite(b *testing.B) {
 		})
 	}
 }
+
+// TestUnderMaxMemoryOnlyShrinkingWritesKeepTheirOwnStripes pins which durable
+// writes keep their own stripes under maxmemory. A Growing write can then evict
+// keys in any stripe, so it is ordered against every write; a Shrinking write
+// evicts nothing. Listing them makes a change to one a decision rather than an
+// accident.
+func TestUnderMaxMemoryOnlyShrinkingWritesKeepTheirOwnStripes(t *testing.T) {
+	shrinking := map[string]bool{"DEL": true, "LPOP": true, "RPOP": true, "HDEL": true, "SREM": true}
+
+	for _, maxMemory := range []int64{0, 1 << 20} {
+		executor := newTestExecutor()
+		executor.store.ConfigureMaxMemory(maxMemory, 0)
+		for name, spec := range executor.commands {
+			if !spec.durable {
+				continue
+			}
+			name, spec := name, spec
+			t.Run(fmt.Sprintf("%s with maxmemory %d", name, maxMemory), func(t *testing.T) {
+				want := spec.keys
+				if maxMemory > 0 && !shrinking[name] {
+					want = keysUnknown
+				}
+				if got := executor.writeShapeOf(name); got != want {
+					t.Errorf("ordered by key shape %d, want %d", got, want)
+				}
+				if spec.shrinks != shrinking[name] {
+					t.Errorf("spec shrinks = %v, want %v", spec.shrinks, shrinking[name])
+				}
+			})
+		}
+	}
+
+	t.Run("BLPOP is marked shrinking though it orders itself", func(t *testing.T) {
+		if !newTestExecutor().commands["BLPOP"].shrinks {
+			t.Error("BLPOP spec shrinks = false, want true")
+		}
+	})
+	for name := range shrinking {
+		if spec, ok := newTestExecutor().commands[name]; !ok || !spec.durable {
+			t.Errorf("%s is listed here as a durable Shrinking write but is not a durable command", name)
+		}
+	}
+}

@@ -61,6 +61,12 @@ type commandSpec struct {
 	// to different keys are not ordered against each other. Left unset, the
 	// command is ordered against every write.
 	keys keyShape
+	// shrinks marks a Shrinking write: DEL, the pops, HDEL and SREM, the
+	// operations storage runs with growth class shrinks (storage/shard.go);
+	// change the two together. Every other durable write is a Growing write,
+	// whose Evictions under maxmemory may remove keys outside its own stripes,
+	// so it is then ordered against every write (see writeShapeOf).
+	shrinks bool
 	// noTransaction refuses the command inside MULTI, when it is queued, and
 	// marks the transaction dirty so that EXEC aborts, as Redis does with its
 	// NO_MULTI commands.
@@ -524,6 +530,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates: true,
 			durable:    true,
 			keys:       keysEveryArg,
+			shrinks:    true,
 		},
 		"INCR": {
 			handler:    e.handleIncr,
@@ -556,6 +563,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates: true,
 			durable:    true,
 			keys:       keysFirstArg,
+			shrinks:    true,
 		},
 		"RPOP": {
 			handler:    e.handleRPop,
@@ -563,10 +571,14 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates: true,
 			durable:    true,
 			keys:       keysFirstArg,
+			shrinks:    true,
 		},
 		"BLPOP": {
 			detailed: e.handleBLPop,
 			validate: exactArgsValidator("BLPOP", 1),
+			// Ordered by its handler as a write of its key, which a pop never
+			// grows.
+			shrinks: true,
 		},
 		"ZADD": {
 			handler:    e.handleZAdd,
@@ -622,6 +634,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates: true,
 			durable:    true,
 			keys:       keysFirstArg,
+			shrinks:    true,
 		},
 		"HGETALL": {
 			handler:  e.handleHGetAll,
@@ -644,6 +657,7 @@ func (e *Executor) commandSpecs() map[string]commandSpec {
 			propagates: true,
 			durable:    true,
 			keys:       keysFirstArg,
+			shrinks:    true,
 		},
 		"SMEMBERS": {
 			handler:  e.handleSMembers,

@@ -29,10 +29,20 @@ import (
 // record.Recorder), so a write's locks never leave Handle. Two writers to the
 // same key therefore reach the AOF and the replicas in the order they were
 // applied; writers on different stripes commute, so nothing orders them against
-// each other, and the Recorder takes no lock of its own. Without it a client could update the store, another
+// each other (except under maxmemory, below), and the Recorder takes no lock of its own. Without it a client could update the store, another
 // client could update it and append first, and the log would replay the two in the
 // opposite order to the one live state came from. Writers to different keys run
 // in parallel, except that a write whose keys are not known holds every stripe.
+//
+// While maxmemory is set, an Accounted write (a Growing write under maxmemory)
+// also holds every stripe (writeShapeOf). Making room for it can cause a
+// Memory-pressure eviction anywhere in the keyspace, and its sweep a TTL
+// eviction, and their DELs are recorded with its own frames or through the
+// expiration listener while it runs. So it no longer commutes with a write of
+// an evicted key: held to its own stripe, such a write could be applied after
+// the Eviction and still be recorded before its DEL, and replay would delete a
+// live key. Shrinking writes (DEL, the pops, HDEL, SREM) never evict or sweep,
+// so they keep their own stripes.
 //
 // The stripes exist to order what reaches the log and the replicas, so a server
 // with neither has nothing to order and skips them (needsOrder).
@@ -276,7 +286,7 @@ func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.
 		defer q.gate.Unlock()
 		return e.executeAndRecord(ctx, request)
 	case sequenceWrite:
-		release := q.beginWrite(e.keyShapeOf(request.Name), request.Args)
+		release := q.beginWrite(e.writeShapeOf(request.Name), request.Args)
 		defer release()
 		return e.executeAndRecord(ctx, request)
 	case sequenceSelf:
@@ -330,8 +340,15 @@ func (e *Executor) BeginBackgroundWrite() (release func()) {
 	return e.seq.beginWrite(keysUnknown, nil)
 }
 
-func (e *Executor) keyShapeOf(name string) keyShape {
+// writeShapeOf is the key shape a write named name is ordered by: the keys its
+// spec declares, or every key for an Accounted write, whose Evictions may
+// remove keys outside its own stripes (see sequencer). Maxmemory is configured before the server serves its first
+// request, so the setting cannot change between this check and the write.
+func (e *Executor) writeShapeOf(name string) keyShape {
 	spec, _ := e.command(name)
+	if spec.durable && !spec.shrinks && e.store.MaxMemory() > 0 {
+		return keysUnknown
+	}
 	return spec.keys
 }
 
