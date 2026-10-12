@@ -1108,3 +1108,24 @@ func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// propagateToReplicas encodes values and propagates them through the server's
+// replica stream as a client write's command frames are: ordered, so with no
+// replica registered they are only counted.
+func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport {
+	return s.propagateEncoded(values, true)
+}
+
+// propagateUnorderedToReplicas propagates values as the server's own writes
+// are, always under the registry lock.
+func (s *Server) propagateUnorderedToReplicas(values []protocol.Value) propagationReport {
+	return s.propagateEncoded(values, false)
+}
+
+func (s *Server) propagateEncoded(values []protocol.Value, ordered bool) propagationReport {
+	payload, err := protocol.EncodeValues(values)
+	if err != nil {
+		panic(err)
+	}
+	return NewReplicaStream(s.replication, s.replicaPeers, s.logger).propagate(payload, ordered)
+}

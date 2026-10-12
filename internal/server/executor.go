@@ -76,7 +76,8 @@ type Services struct {
 	// RewriteAOF starts the background AOF rewrite BGREWRITEAOF asks for, or
 	// reports that there is no AOF.
 	RewriteAOF func(context.Context) error
-	// RecordsWrites reports whether anything records writes at the moment (an
-	// AOF, a Replica attached or attaching), so that writes must be ordered.
-	RecordsWrites func() bool
+	// Recorder records each applied write's command frames. Its Records
+	// reports whether anything records writes at the moment (an AOF, a Replica
+	// attached or attaching), so that writes must be ordered.
+	Recorder *record.Recorder
 }

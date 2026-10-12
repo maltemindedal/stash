@@ -181,9 +181,9 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 }
 
 // executeClientRequest runs one parsed request through the command pipeline
-// shared by both networking modes: monitor observation, execution, durability
-// preparation and its persistence-failure downgrade, mutation-effect
-// finalization, and the processed-command counter. It returns the RESP
+// shared by both networking modes: monitor observation, execution, recording
+// its command frames (and answering a write the Recorder withheld with ERR
+// persistence failure), and the processed-command counter. It returns the RESP
 // responses to deliver and whether the caller must start the feed of the
 // replica peer PSYNC registered (registerReplicaPeer) once those responses have
 // been written or buffered. A non-nil error is fatal for the connection.
@@ -212,15 +212,11 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 		result = SingleResponse(responseError(execErr))
 	}
 
-	durabilityPayload, durableErr := s.prepareDurabilityBeforeResponse(result.Durability, logger)
-	if durableErr != nil {
+	outcome := s.recordResult(call, result)
+	if outcome.Withheld {
 		result = SingleResponse(persistenceFailureResponse())
-		result.Propagation = nil
-		result.Durability = nil
-		durabilityPayload = nil
 	}
-
-	s.finalizeMutationEffects(call.Client, result.Durability, durabilityPayload, result.Propagation, logger)
+	s.recordClientWriteOffset(call.Client, outcome.End)
 	s.commandsProcessed.Add(1)
 
 	if attachedReplica {

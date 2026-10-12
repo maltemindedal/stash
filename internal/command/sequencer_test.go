@@ -373,7 +373,7 @@ type benchStream struct {
 	buf []byte
 }
 
-func (s *benchStream) propagate(payload []byte) int64 {
+func (s *benchStream) Propagate(payload []byte, _ bool) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.end += int64(len(payload))
@@ -384,9 +384,11 @@ func (s *benchStream) propagate(payload []byte) int64 {
 	return s.end
 }
 
+func (s *benchStream) Active() bool { return true }
+
 // BenchmarkSequencedWrite measures one SET as the server runs it with an
 // append-only file under everysec: ordered by Handle, its command frames
-// appended to the file and handed to the replicas, and its locks given back.
+// recorded to the file and handed to the replicas, and its locks given back.
 // "stream" hands the frames to a stand-in for one attached replica; "no stream"
 // to a replica registry with no replica, which only counts them. Each goroutine
 // writes its own key, so writers spread over the stripes.
@@ -406,16 +408,16 @@ func BenchmarkSequencedWrite(b *testing.B) {
 					b.Fatalf("Close() error = %v", err)
 				}
 			}()
-			var services server.Services
-			executor := newTestExecutorWith(func(s *server.Services) { services = *s })
-			stream := &benchStream{buf: make([]byte, 0, 1<<20)}
-			propagate := func(payload []byte) int64 {
-				end, _, _ := services.Replicas.PropagateOrdered(services.Replication, payload)
-				return end
-			}
-			if withStream {
-				propagate = stream.propagate
-			}
+			var recorder *record.Recorder
+			executor := newTestExecutorWith(func(s *server.Services) {
+				var stream record.Stream = server.NewReplicaStream(s.Replication, s.Replicas, s.Logger)
+				if withStream {
+					stream = &benchStream{buf: make([]byte, 0, 1<<20)}
+				}
+				recorder = record.New(stream, s.Logger)
+				recorder.SetLog(writer)
+				s.Recorder = recorder
+			})
 			var writers atomic.Int64
 
 			b.ReportAllocs()
@@ -425,7 +427,7 @@ func BenchmarkSequencedWrite(b *testing.B) {
 				call := callFromContext(ctx)
 				request := requestValue("SET", fmt.Sprintf("key:%d", writers.Add(1)), "value")
 				for pb.Next() {
-					if err := sequencedWrite(ctx, executor, call, request, writer, propagate); err != nil {
+					if err := sequencedWrite(ctx, executor, recorder, call, request); err != nil {
 						b.Error(err)
 						return
 					}
@@ -436,25 +438,25 @@ func BenchmarkSequencedWrite(b *testing.B) {
 }
 
 // sequencedWrite runs request through Handle and then does what the server does
-// with the result's frames before it gives the write's locks back: it appends
-// them to writer under everysec and hands them to propagate.
-func sequencedWrite(ctx context.Context, executor *Executor, call server.Call, request protocol.Value, writer *aof.Writer, propagate func([]byte) int64) error {
+// with the result's frames before it gives the write's locks back: it records
+// them and stores the client's last write offset.
+func sequencedWrite(ctx context.Context, executor *Executor, recorder *record.Recorder, call server.Call, request protocol.Value) error {
 	result, err := executor.Handle(ctx, call, request)
 	if err != nil {
 		return fmt.Errorf("Handle() error = %w", err)
 	}
 	defer result.Release()
-	payload, err := protocol.EncodeValues(result.Durability)
-	if err != nil {
-		return fmt.Errorf("EncodeValues(durability) error = %w", err)
+	w := record.Write{Origin: call.Origin}
+	for _, frame := range result.Durability {
+		w.Add(frame.(protocol.Array), record.ToAOF)
 	}
-	if _, err := writer.Append(payload); err != nil {
-		return fmt.Errorf("Append() error = %w", err)
+	for _, frame := range result.Propagation {
+		w.Add(frame.(protocol.Array), record.ToReplicas)
 	}
-	payload, err = protocol.EncodeValues(result.Propagation)
-	if err != nil {
-		return fmt.Errorf("EncodeValues(propagation) error = %w", err)
+	outcome := recorder.Record(&w)
+	if outcome.Err != nil {
+		return fmt.Errorf("Record() error = %w", outcome.Err)
 	}
-	call.Client.SetLastWriteReplicationOffset(propagate(payload))
+	call.Client.SetLastWriteReplicationOffset(outcome.End)
 	return nil
 }

@@ -47,6 +47,17 @@ Current responsibilities:
 - rewrite the current durable state in the background for `BGREWRITEAOF`
 - write a snapshot of the keyspace into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
 
+### `internal/record`
+
+Decides where the command frames of an applied write go, and what a failed append does. It is a leaf: it imports `internal/protocol` and the standard library, and reaches the AOF and the replicas only through two ports, `Log` (`*aof.Writer`) and `Stream` (`server.ReplicaStream`).
+
+Current responsibilities:
+
+- define `Origin` (a client, the Master's stream, AOF replay, or the server itself) and its capabilities
+- collect a write's command frames with where each goes (`Write`, `ToAOF`, `ToReplicas`, `ToBoth`); producers say only that, and `Recorder.Record` applies the Origin: the Master's frames go to the AOF only, and replay records nothing
+- apply one table to a failed append: under `always` a client's write is withheld (answered `ERR persistence failure`, not propagated) and so is the server's own; under `everysec` and `no` the failure is logged and the write still propagated; for the Master's frames it is returned, and the link ends
+- report whether anything records writes (`Records`): an AOF open, or a replica attached or attaching
+
 ### `internal/protocol`
 
 Owns RESP parsing and encoding.
@@ -79,7 +90,7 @@ Current responsibilities:
 
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
-`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, and the server's INFO snapshot, AOF rewrite and write-recording check. It refuses a `Services` with a collaborator missing, naming the field.
+`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, the server's INFO snapshot and AOF rewrite, and the `record.Recorder`, whose `Records` tells the sequencer whether anything records writes. It refuses a `Services` with a collaborator missing, naming the field.
 
 The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (`record.Origin`: a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog, and only the Master's stream may answer `REPLCONF GETACK`. A Call without an Origin or with the server's own (`OriginServer`, for evictions the server makes outside any request), a client request without its Client state, and a Master or replay request that carries one are refused.
 
@@ -104,7 +115,7 @@ Current responsibilities:
 - maintain an active connection registry for shutdown
 - load startup persistence (RDB and/or AOF) before accepting TCP connections, and write the keys an RDB snapshot loaded into a missing or empty AOF before opening it, since every later start loads the AOF and skips the RDB snapshot
 - append a `DEL` of the keys the startup `--maxmemory` pass evicts to the AOF, fsynced, before accepting TCP connections, and refuse to start if that append fails
-- append durable command frames and fan out replication writes after successful execution
+- build the `record.Recorder`, give it the AOF writer once the file is open and a `ReplicaStream` over the replica registry, and record each request's command frames through it after successful execution, answering a write it withholds with `ERR persistence failure`; the expiry listener and the startup eviction record their `DEL`s through it as the server's own writes
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
 - stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"time"
 
@@ -61,8 +60,9 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		s.logger.Info("AOF detected, skipping RDB startup load", "aof_path", s.cfg.AOFPath, "rdb_path", s.cfg.RDBPath)
 		startedAt := time.Now()
 		// Replay is ordered like any request. Nothing records writes yet (the
-		// writer is assigned below, and recordsWrites checks it), so each one
-		// takes the sequencer's gate shared and no stripe, and gives it back here.
+		// Recorder gets the writer below), so each one takes the sequencer's gate
+		// shared and no stripe, and gives it back here. The Recorder records
+		// nothing for replay's Origin.
 		replayCall := Call{Origin: record.OriginReplay}
 		stats, err := aof.LoadFile(ctx, s.cfg.AOFPath, func(replayCtx context.Context, value protocol.Value) error {
 			result, replayErr := s.executor.Handle(replayCtx, replayCall, value)
@@ -135,14 +135,8 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		writer.SetRewriteGuard(sequencer.BeginBackgroundWrite)
 	}
 	s.aofWriter = writer
+	s.recorder.SetLog(writer)
 	return nil
-}
-
-// recordsWrites reports whether anything is recording the writes clients make, so
-// that their order matters: an append-only file or a replica, attached or
-// attaching.
-func (s *Server) recordsWrites() bool {
-	return s.aofWriter != nil || s.replicaPeers.Active()
 }
 
 func (s *Server) beginAOFRewrite(_ context.Context) error {
@@ -164,6 +158,7 @@ func (s *Server) closeAOFWriter() error {
 	}
 
 	writer := s.aofWriter
+	s.recorder.SetLog(nil)
 	s.aofWriter = nil
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("server: close aof writer: %w", err)
@@ -172,66 +167,22 @@ func (s *Server) closeAOFWriter() error {
 	return nil
 }
 
-// persistDurabilityFrames appends frames the server itself originated, rather
-// than answered a client with, to the AOF under the configured fsync policy.
-func (s *Server) persistDurabilityFrames(values []protocol.Value) error {
-	if s == nil || s.aofWriter == nil || len(values) == 0 {
-		return nil
-	}
-
-	payload, err := protocol.EncodeValues(values)
-	if err != nil {
-		return fmt.Errorf("server: encode durability frames: %w", err)
-	}
-	if _, err := s.aofWriter.Append(payload); err != nil {
-		return fmt.Errorf("server: append durability frames: %w", err)
-	}
-	return nil
+// recordResult records the command frames of result, which a request with
+// call's Origin produced, through the Recorder: its durability frames go to the
+// AOF and its propagation frames to the replicas. The caller holds the
+// request's sequencer locks (ExecuteResult.Release).
+func (s *Server) recordResult(call Call, result ExecuteResult) record.Outcome {
+	w := record.Write{Origin: call.Origin}
+	addCommandFrames(&w, result.Durability, record.ToAOF)
+	addCommandFrames(&w, result.Propagation, record.ToReplicas)
+	return s.recorder.Record(&w)
 }
 
-func (s *Server) prepareDurabilityBeforeResponse(values []protocol.Value, logger *slog.Logger) ([]byte, error) {
-	if s == nil || s.aofWriter == nil || s.aofWriter.Policy() != aof.PolicyAlways || len(values) == 0 {
-		return nil, nil
-	}
-
-	payload, err := protocol.EncodeValues(values)
-	if err != nil {
-		logger.Error("failed to encode AOF payload", "error", err)
-		return nil, err
-	}
-	if _, err := s.aofWriter.Append(payload); err != nil {
-		logger.Error("failed to append command to AOF before responding", "error", err)
-		return nil, err
-	}
-
-	return payload, nil
-}
-
-func (s *Server) finalizeMutationEffects(client *ClientState, durability []protocol.Value, durabilityPayload []byte, propagation []protocol.Value, logger *slog.Logger) {
-	if s == nil {
-		return
-	}
-
-	if len(durability) > 0 && s.aofWriter != nil && s.aofWriter.Policy() != aof.PolicyAlways {
-		payload := durabilityPayload
-		if len(payload) == 0 {
-			encoded, err := protocol.EncodeValues(durability)
-			if err != nil {
-				logger.Warn("failed to encode deferred AOF payload", "error", err)
-			} else {
-				payload = encoded
-			}
+func addCommandFrames(w *record.Write, frames []protocol.Value, to record.Dest) {
+	for _, frame := range frames {
+		if cmd, ok := frame.(protocol.Array); ok {
+			w.Add(cmd, to)
 		}
-		if len(payload) > 0 {
-			if _, err := s.aofWriter.Append(payload); err != nil {
-				logger.Warn("failed to append command to AOF", "error", err)
-			}
-		}
-	}
-
-	if len(propagation) > 0 {
-		report := s.propagateToReplicas(propagation)
-		s.recordClientWriteOffset(client, report.endOffset)
 	}
 }
 
@@ -248,23 +199,19 @@ func (s *Server) recordExpiredKeys(keys []string) {
 
 	s.watchRegistry.Touch(keys...)
 
-	frames := []protocol.Value{record.DeleteFrame(keys)}
-	if err := s.persistDurabilityFrames(frames); err != nil {
-		s.logger.Error("failed to append expired key deletion to AOF", "error", err, "expired_keys", len(keys))
-		// Withhold propagation exactly where the client path withholds it: under
-		// appendfsync always, which promises durability before a mutation is
-		// announced. The deferred policies make no such promise, and a replica
-		// left serving a key this server has already dropped is the worse
-		// outcome, so there the failure is logged and the deletion still goes.
-		if s.aofWriter != nil && s.aofWriter.Policy() == aof.PolicyAlways {
-			return
-		}
-	}
-	// The sweep and an accounted write publish expiries while the sequencer
-	// orders them, but a replica's full resync publishes the ones its new dataset
-	// holds with no sequencer lock (consumeFullResync), and the store hands every
-	// expiry to whichever of them publishes next.
-	s.propagateUnorderedToReplicas(frames)
+	// Under appendfsync always, which promises durability before a mutation is
+	// announced, a DEL that could not be appended is not propagated either,
+	// exactly as a client's write is not. The deferred policies make no such
+	// promise, and a replica left serving a key this server has already
+	// dropped is the worse outcome, so there the failure is logged and the
+	// deletion still goes. The sweep and an accounted write publish expiries
+	// while the sequencer orders them, but a replica's full resync publishes the
+	// ones its new dataset holds with no sequencer lock (consumeFullResync), and
+	// the store hands every expiry to whichever of them publishes next, so the
+	// Recorder propagates the server's own writes as unordered.
+	w := record.Write{Origin: record.OriginServer}
+	w.Add(record.DeleteFrame(keys), record.ToBoth)
+	s.recorder.Record(&w)
 }
 
 // persistStartupEvictions appends a DEL of the keys the startup memory-pressure
@@ -281,17 +228,13 @@ func (s *Server) persistStartupEvictions(keys []string) error {
 		return nil
 	}
 
-	frames := make([]protocol.Value, 0, (len(keys)+aof.ItemsPerCommand-1)/aof.ItemsPerCommand)
+	w := record.Write{Origin: record.OriginServer}
 	for start := 0; start < len(keys); start += aof.ItemsPerCommand {
 		end := min(start+aof.ItemsPerCommand, len(keys))
-		frames = append(frames, record.DeleteFrame(keys[start:end]))
+		w.Add(record.DeleteFrame(keys[start:end]), record.ToAOF)
 	}
-	payload, err := protocol.EncodeValues(frames)
-	if err != nil {
-		return fmt.Errorf("server: encode a DEL of the %d keys evicted at startup: %w", len(keys), err)
-	}
-	if _, err := s.aofWriter.Append(payload); err != nil {
-		return fmt.Errorf("server: append a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)
+	if outcome := s.recorder.Record(&w); outcome.Err != nil {
+		return fmt.Errorf("server: append a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, outcome.Err)
 	}
 	if err := s.aofWriter.Sync(); err != nil {
 		return fmt.Errorf("server: fsync a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)

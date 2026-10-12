@@ -17,6 +17,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/record/recordtest"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -3039,24 +3040,29 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 
 // testServices is a Services whose every collaborator is a working stand-in:
 // a new store and registries, a logger that discards, INFO's view of a lone
-// master, no AOF, a Slowlog that records nothing, and writes always ordered.
+// master, no AOF, a Slowlog that records nothing, and a Recorder whose stand-in
+// append-only file is always open, so writes are always ordered.
 func testServices() server.Services {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	replication, replicas := &server.ReplicationState{}, server.NewReplicaRegistry()
+	recorder := record.New(server.NewReplicaStream(replication, replicas, logger), logger)
+	recorder.SetLog(&recordtest.Log{})
 	return server.Services{
 		Store:            storage.NewStore(),
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:           logger,
 		Watches:          server.NewWatchRegistry(),
 		PubSub:           server.NewPubSubRegistry(),
 		Slowlog:          server.NewSlowlogRegistry(),
 		SlowlogThreshold: -1,
-		Replication:      &server.ReplicationState{},
-		Replicas:         server.NewReplicaRegistry(),
+		Replication:      replication,
+		Replicas:         replicas,
 		Stats: func() server.Stats {
 			return server.Stats{Role: "master", AOFLastWriteOK: true}
 		},
 		RewriteAOF: func(context.Context) error {
 			return errors.New("append only file persistence is not enabled")
 		},
-		RecordsWrites: func() bool { return true },
+		Recorder: recorder,
 	}
 }
 

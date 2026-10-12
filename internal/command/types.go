@@ -125,7 +125,7 @@ func New(services server.Services) (*Executor, error) {
 		seq:                 newSequencer(),
 	}
 	// Writes are ordered only while something records them (see sequencer).
-	executor.seq.needsOrder = services.RecordsWrites
+	executor.seq.needsOrder = services.Recorder.Records
 	executor.commands = executor.commandSpecs()
 	return executor, nil
 }

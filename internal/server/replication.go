@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -696,38 +697,47 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 	)
 }
 
-// propagateToReplicas hands a client write's frames to the replicas. Its caller
-// holds the write's sequencer locks until it returns (finalizeMutationEffects runs
-// before ExecuteResult.Release), so it skips the registry lock while no replica is
-// registered (ReplicaRegistry.PropagateOrdered).
-func (s *Server) propagateToReplicas(values []protocol.Value) propagationReport {
-	return s.propagate(values, true)
+// ReplicaStream is the replication stream the Recorder propagates to: the
+// master offset and the replica registry. Each payload is counted into the
+// offset and queued for every replica (ReplicaRegistry.Propagate).
+type ReplicaStream struct {
+	offsets  *ReplicationState
+	replicas *ReplicaRegistry
+	logger   *slog.Logger
 }
 
-// propagateUnorderedToReplicas hands the replicas frames that the sequencer may
-// not order against PSYNC's attach cut, and so always takes the registry lock
-// (ReplicaRegistry.Propagate): the expiry DELs, which the replica link's full
-// resync publishes while holding no sequencer lock (consumeFullResync).
-func (s *Server) propagateUnorderedToReplicas(values []protocol.Value) propagationReport {
-	return s.propagate(values, false)
+// NewReplicaStream returns the stream that counts into offsets and queues for
+// replicas, logging refusals to logger.
+func NewReplicaStream(offsets *ReplicationState, replicas *ReplicaRegistry, logger *slog.Logger) *ReplicaStream {
+	return &ReplicaStream{offsets: offsets, replicas: replicas, logger: logger}
 }
 
-func (s *Server) propagate(values []protocol.Value, ordered bool) propagationReport {
-	if len(values) == 0 {
-		return propagationReport{}
-	}
+// Active reports whether a replica is attached or attaching.
+func (s *ReplicaStream) Active() bool {
+	return s.replicas.Active()
+}
 
-	payload, err := protocol.EncodeValues(values)
-	if err != nil {
-		s.logger.Warn("failed to encode propagated command", "error", err)
+// Propagate counts payload into the master offset, queues it for every
+// replica, and returns the offset at its end. When ordered, its caller holds
+// the write's sequencer locks until it returns, so it skips the registry lock
+// while no replica is registered (ReplicaRegistry.PropagateOrdered). Otherwise
+// it always takes the lock (ReplicaRegistry.Propagate): the server's own
+// writes, such as the expiry DELs a replica link's full resync publishes while
+// holding no sequencer lock (consumeFullResync).
+func (s *ReplicaStream) Propagate(payload []byte, ordered bool) (end int64) {
+	return s.propagate(payload, ordered).endOffset
+}
+
+func (s *ReplicaStream) propagate(payload []byte, ordered bool) propagationReport {
+	if len(payload) == 0 {
 		return propagationReport{}
 	}
 
 	report := propagationReport{payloadSize: len(payload)}
 	if ordered {
-		report.endOffset, report.succeeded, report.failed = s.replicaPeers.PropagateOrdered(s.replication, payload)
+		report.endOffset, report.succeeded, report.failed = s.replicas.PropagateOrdered(s.offsets, payload)
 	} else {
-		report.endOffset, report.succeeded, report.failed = s.replicaPeers.Propagate(s.replication, payload)
+		report.endOffset, report.succeeded, report.failed = s.replicas.Propagate(s.offsets, payload)
 	}
 	report.attempted = report.succeeded + report.failed
 	if report.attempted > 0 {
@@ -992,12 +1002,12 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
 			return
 		}
-		persistErr := s.persistDurabilityFrames(result.Durability)
+		outcome := s.recordResult(masterCall, result)
 		if result.Release != nil {
 			result.Release()
 		}
-		if persistErr != nil {
-			s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", persistErr)
+		if outcome.Err != nil {
+			s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", outcome.Err)
 			return
 		}
 		if len(result.UpstreamReplies) > 0 {

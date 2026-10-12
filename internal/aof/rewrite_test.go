@@ -549,18 +549,20 @@ func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
 func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
 	t.Helper()
 
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	replication, replicas := &server.ReplicationState{}, server.NewReplicaRegistry()
 	executor, err := command.New(server.Services{
 		Store:            store,
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:           logger,
 		Watches:          server.NewWatchRegistry(),
 		PubSub:           server.NewPubSubRegistry(),
 		Slowlog:          server.NewSlowlogRegistry(),
 		SlowlogThreshold: -1,
-		Replication:      &server.ReplicationState{},
-		Replicas:         server.NewReplicaRegistry(),
+		Replication:      replication,
+		Replicas:         replicas,
 		Stats:            func() server.Stats { return server.Stats{Role: "master", AOFLastWriteOK: true} },
 		RewriteAOF:       func(context.Context) error { return errors.New("append only file persistence is not enabled") },
-		RecordsWrites:    func() bool { return false },
+		Recorder:         record.New(server.NewReplicaStream(replication, replicas, logger), logger),
 	})
 	if err != nil {
 		t.Fatalf("command.New() error = %v", err)
