@@ -217,6 +217,77 @@ func TestEachDestinationGetsOnlyItsCommandFramesInOneCall(t *testing.T) {
 	assertPayloads(t, "stream", stream.Payloads(), encoded(t, del, publish))
 }
 
+func TestAMixedWriteOfManyFramesKeepsEachDestinationsOrder(t *testing.T) {
+	// More frames than Record tracks without allocating, as a long EXEC has.
+	recorder, log, stream := newRecorder()
+	w := &record.Write{Origin: record.OriginClient}
+	var toAOF, toStream []protocol.Array
+	for i := 0; i < 20; i++ {
+		frame := command("SET", fmt.Sprint("k", i), "v")
+		to := []record.Dest{record.ToBoth, record.ToAOF, record.ToReplicas}[i%3]
+		w.Add(frame, to)
+		if to&record.ToAOF != 0 {
+			toAOF = append(toAOF, frame)
+		}
+		if to&record.ToReplicas != 0 {
+			toStream = append(toStream, frame)
+		}
+	}
+
+	recorder.Record(w)
+
+	assertPayloads(t, "AOF", log.Payloads(), encoded(t, toAOF...))
+	assertPayloads(t, "stream", stream.Payloads(), encoded(t, toStream...))
+}
+
+func TestEachWriteIsEncodedOnce(t *testing.T) {
+	// A write whose frames all go to both destinations is encoded once, and
+	// the append-only file and the stream are handed the same bytes.
+	log := &firstByteLog{}
+	stream := &firstByteStream{}
+	recorder := record.New(stream, nil)
+	recorder.SetLog(log)
+
+	recorder.Record(write(record.OriginClient, command("SET", "k", "v"), record.DeleteFrame([]string{"cold"})))
+
+	if log.first == nil || log.first != stream.first {
+		t.Fatalf("the AOF was handed %p and the stream %p, want the same encoded bytes", log.first, stream.first)
+	}
+}
+
+// firstByteLog and firstByteStream keep where the payload they were handed
+// starts.
+type firstByteLog struct{ first *byte }
+
+func (l *firstByteLog) Append(payload []byte) (bool, error) {
+	l.first = &payload[0]
+	return false, nil
+}
+
+type firstByteStream struct{ first *byte }
+
+func (s *firstByteStream) Propagate(payload []byte, _ bool) int64 {
+	s.first = &payload[0]
+	return int64(len(payload))
+}
+
+func (s *firstByteStream) Active() bool { return true }
+
+func TestAWriteThatCannotBeEncodedIsWithheldAndSentNowhere(t *testing.T) {
+	recorder, log, stream := newRecorder()
+	// A nil element is a value the encoder does not know.
+	broken := protocol.Array{Elements: []protocol.Value{protocol.BulkString{Data: []byte("SET")}, nil}}
+
+	outcome := recorder.Record(write(record.OriginClient, command("SET", "k", "v"), broken))
+
+	if outcome.Err == nil || !outcome.Withheld {
+		t.Fatalf("Record() = %+v, want an error and withheld", outcome)
+	}
+	if log.Appends() != 0 || len(stream.Payloads()) != 0 {
+		t.Fatalf("%d appends and %d propagations, want none", log.Appends(), len(stream.Payloads()))
+	}
+}
+
 func TestAWriteForTheReplicasOnlyAppendsNothing(t *testing.T) {
 	recorder, log, stream := newRecorder()
 	w := &record.Write{Origin: record.OriginClient}

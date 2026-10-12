@@ -199,3 +199,26 @@ func TestAReplicaFeedHoldsWhatItQueuesUntilItStarts(t *testing.T) {
 		}
 	})
 }
+
+func TestAReplicaFeedCopiesWhatItQueues(t *testing.T) {
+	// The Recorder hands the stream a buffer it reuses for the next write as
+	// soon as Propagate returns.
+	feed := newReplicaFeed(1 << 20)
+	payload := []byte("one;")
+	if err := feed.enqueue(payload); err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	copy(payload, "XXX;")
+
+	var written bytes.Buffer
+	feed.start(func(chunk []byte) error {
+		written.Write(chunk)
+		return nil
+	}, nil)
+	if !feed.close(2 * time.Second) {
+		t.Fatal("the feed did not finish writing after it was closed")
+	}
+	if got := written.String(); got != "one;" {
+		t.Fatalf("written = %q, want %q", got, "one;")
+	}
+}

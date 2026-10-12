@@ -53,6 +53,16 @@ func AppendValues(dst []byte, values []Value) ([]byte, error) {
 	return dst, nil
 }
 
+// AppendValue appends the wire representation of value to dst and returns the
+// extended slice. On error dst is returned unmodified in length.
+func AppendValue(dst []byte, value Value) ([]byte, error) {
+	next, err := appendEncodedValue(dst, value)
+	if err != nil {
+		return dst, err
+	}
+	return next, nil
+}
+
 // EncodedLen reports how many bytes Encode would emit for value.
 func EncodedLen(value Value) (int, error) {
 	switch typed := value.(type) {

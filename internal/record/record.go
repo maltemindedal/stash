@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"github.com/maltemindedal/stash/internal/protocol"
@@ -184,6 +185,11 @@ func (r *Recorder) Records() bool {
 // Record sends w's command frames where its Origin allows and applies the
 // table on Recorder to a failed append. A Write without frames records
 // nothing, whatever its Origin. The caller must hold w's ordering.
+//
+// Each command frame is encoded once, into a pooled buffer. When every frame
+// goes to the same destinations, the append-only file and the stream are
+// handed the same bytes; otherwise each destination's payload is assembled
+// from the frames already encoded.
 func (r *Recorder) Record(w *Write) Outcome {
 	if len(w.frames) == 0 {
 		return Outcome{}
@@ -198,34 +204,142 @@ func (r *Recorder) Record(w *Write) Outcome {
 		return Outcome{Err: fmt.Errorf("record: unknown origin %d", w.Origin)}
 	}
 
+	log := r.currentLog()
+	var allowed Dest
+	if log != nil {
+		allowed |= ToAOF
+	}
+	if w.Origin.Propagates() {
+		allowed |= ToReplicas
+	}
+
+	buffer := getBuffer()
+	defer putBuffer(buffer)
+	aofPayload, streamPayload, err := encode(buffer, w.frames, allowed)
+	if err != nil {
+		// Only a frame of a type the encoder does not know fails, which is a
+		// bug in the command that built it. Nothing was sent anywhere.
+		err = fmt.Errorf("record: encode command frames: %w", err)
+		r.logger.Error("failed to encode a write's command frames", "error", err)
+		return Outcome{Withheld: true, Err: err}
+	}
+
 	var outcome Outcome
-	if log := r.currentLog(); log != nil {
-		if frames := w.Frames(ToAOF); len(frames) > 0 {
-			withhold, err := appendFrames(log, frames)
-			if err != nil {
-				outcome.Err = err
-				outcome.Withheld = withhold
-				if r.appendFailed(w, withhold, err) {
-					return outcome
-				}
+	if len(aofPayload) > 0 {
+		withhold, err := log.Append(aofPayload)
+		if err != nil {
+			outcome.Err = err
+			outcome.Withheld = withhold
+			if r.appendFailed(w, withhold, err) {
+				return outcome
 			}
 		}
 	}
-
-	if !w.Origin.Propagates() {
-		return outcome
+	if len(streamPayload) > 0 {
+		outcome.End = r.stream.Propagate(streamPayload, w.Origin != OriginServer)
 	}
-	frames := w.Frames(ToReplicas)
-	if len(frames) == 0 {
-		return outcome
-	}
-	payload, err := protocol.EncodeValues(frames)
-	if err != nil {
-		r.logger.Error("failed to encode command frames for the replicas", "error", err)
-		return outcome
-	}
-	outcome.End = r.stream.Propagate(payload, w.Origin != OriginServer)
 	return outcome
+}
+
+// maxPooledBuffer is the largest encoding buffer kept for reuse, so that one
+// huge write does not pin its buffer for good.
+const maxPooledBuffer = 1 << 20
+
+var buffers = sync.Pool{New: func() any {
+	buffer := make([]byte, 0, 512)
+	return &buffer
+}}
+
+func getBuffer() *[]byte { return buffers.Get().(*[]byte) }
+
+func putBuffer(buffer *[]byte) {
+	if cap(*buffer) > maxPooledBuffer {
+		return
+	}
+	*buffer = (*buffer)[:0]
+	buffers.Put(buffer)
+}
+
+// span is where one encoded command frame sits in the buffer, and where it
+// goes.
+type span struct {
+	start, end int
+	to         Dest
+}
+
+// encode encodes each of frames that goes somewhere allowed once into
+// *buffer, and returns the payload for the append-only file and the one for
+// the stream, either of which may be empty. The payloads live in *buffer and
+// are valid until it is reused.
+func encode(buffer *[]byte, frames []commandFrame, allowed Dest) (aof, stream []byte, err error) {
+	buf := (*buffer)[:0]
+	defer func() { *buffer = buf }()
+
+	// The common case: every frame that goes anywhere goes to the same
+	// destinations, so both payloads are the same bytes.
+	var uniform Dest
+	mixed := false
+	for _, frame := range frames {
+		to := frame.to & allowed
+		switch {
+		case to == 0:
+		case uniform == 0:
+			uniform = to
+		case to != uniform:
+			mixed = true
+		}
+	}
+	if uniform == 0 {
+		return nil, nil, nil
+	}
+	if !mixed {
+		for _, frame := range frames {
+			if frame.to&allowed == 0 {
+				continue
+			}
+			if buf, err = protocol.AppendValue(buf, frame.cmd); err != nil {
+				return nil, nil, err
+			}
+		}
+		return payloadFor(buf, uniform, ToAOF), payloadFor(buf, uniform, ToReplicas), nil
+	}
+
+	// Mixed destinations: encode each frame once, then copy the encoded
+	// frames into each destination's payload, in order.
+	var fixed [8]span
+	spans := fixed[:0]
+	for _, frame := range frames {
+		to := frame.to & allowed
+		if to == 0 {
+			continue
+		}
+		start := len(buf)
+		if buf, err = protocol.AppendValue(buf, frame.cmd); err != nil {
+			return nil, nil, err
+		}
+		spans = append(spans, span{start: start, end: len(buf), to: to})
+	}
+	aofStart := len(buf)
+	buf = appendSpans(buf, spans, ToAOF)
+	streamStart := len(buf)
+	buf = appendSpans(buf, spans, ToReplicas)
+	return buf[aofStart:streamStart], buf[streamStart:], nil
+}
+
+func payloadFor(encoded []byte, to, dest Dest) []byte {
+	if to&dest == 0 {
+		return nil
+	}
+	return encoded
+}
+
+func appendSpans(buf []byte, spans []span, dest Dest) []byte {
+	for _, s := range spans {
+		if s.to&dest != 0 {
+			buf = append(buf, buf[s.start:s.end]...)
+		}
+	}
+	return buf
 }
 
 // appendFailed logs a failed append as its Origin requires, and reports
@@ -245,12 +359,4 @@ func (r *Recorder) appendFailed(w *Write, withhold bool, err error) (stop bool) 
 		}
 	}
 	return withhold
-}
-
-func appendFrames(log Log, frames []protocol.Value) (withhold bool, err error) {
-	payload, err := protocol.EncodeValues(frames)
-	if err != nil {
-		return true, fmt.Errorf("record: encode command frames: %w", err)
-	}
-	return log.Append(payload)
 }

@@ -58,6 +58,7 @@ Current responsibilities:
 - collect a write's command frames with where each goes (`Write`, `ToAOF`, `ToReplicas`, `ToBoth`); producers say only that, and `Recorder.Record` applies the Origin: the Master's frames go to the AOF only, and replay records nothing
 - apply one table to a failed append: under `always` a client's write is withheld (answered `ERR persistence failure`, not propagated) and so is the server's own; under `everysec` and `no` the failure is logged and the write still propagated; for the Master's frames it is returned, and the link ends
 - report whether anything records writes (`Records`): an AOF open, or a replica attached or attaching
+- encode each command frame once, into a pooled buffer: when every frame goes to the same places, the AOF and the stream are handed the same bytes, and otherwise each payload is assembled from the frames already encoded. `Log` and `Stream` copy what they keep, so the buffer is reused as soon as `Record` returns
 
 ### `internal/protocol`
 
