@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -29,31 +30,15 @@ type CommandExecutor interface {
 // whose command produces a reply.
 var ErrCloseConnection = errors.New("server: connection closed for a request it may not make")
 
-// Origin is where a request came from, which decides what it may do. The zero
-// Origin is none of them, so the executor refuses a Call that does not set one.
-type Origin uint8
+// Origin is where a request came from; see record.Origin. It is an alias
+// while its users move to the record package.
+type Origin = record.Origin
 
 const (
-	// OriginClient is a client connection.
-	OriginClient Origin = iota + 1
-	// OriginMaster is the Master's replication stream, applied on a Replica.
-	OriginMaster
-	// OriginReplay is AOF replay at startup.
-	OriginReplay
+	OriginClient = record.OriginClient
+	OriginMaster = record.OriginMaster
+	OriginReplay = record.OriginReplay
 )
-
-// Propagates reports whether the request's writes are forwarded to Replicas.
-func (o Origin) Propagates() bool { return o == OriginClient }
-
-// RecordsSlowlog reports whether the request can be recorded in the Slowlog.
-func (o Origin) RecordsSlowlog() bool { return o == OriginClient }
-
-// NeedsAuth reports whether the request runs only for a client that has
-// authenticated, on a server that requires a password.
-func (o Origin) NeedsAuth() bool { return o == OriginClient }
-
-// AnswersGetAck reports whether the request may answer REPLCONF GETACK.
-func (o Origin) AnswersGetAck() bool { return o == OriginMaster }
 
 // Call is what the command executor is told about one request besides its
 // arguments.
