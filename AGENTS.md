@@ -38,7 +38,7 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 
 ### Adding a command
 
-1. Register it in `commandSpecs` in `internal/command/types.go`. Set `validate` (a test requires it; handlers then skip their own arity checks). For a write, set `propagates`/`durable` and `keys`: left unset, the write is ordered against every other write. Set `rewriteFrame` when the logged frame must be deterministic (SET's relative EX becomes PXAT, XADD `*` becomes the generated ID).
+1. Register it in `commandSpecs` in `internal/command/types.go`. Set `validate` (a test requires it; handlers then skip their own arity checks). For a write, set `propagates`/`durable` and `keys`: left unset, the write is ordered against every other write. Set `shrinks` on a write that can only remove bytes (a pop, `DEL`): left unset, the write is ordered against every other write while maxmemory is set, because it may evict keys in any stripe. Set `rewriteFrame` when the logged frame must be deterministic (SET's relative EX becomes PXAT, XADD `*` becomes the generated ID).
 2. Put the handler in its family file (`list.go`, `geo.go`, `hashset.go`, ..., otherwise `commands.go`) and the storage operation in `internal/storage/<kind>.go`.
 3. A blocking command is classified by name in `sequenceModeFor` (`sequencer.go`) and returns `blockingNotSupportedError` in event-loop mode, as BLPOP and WAIT do.
 4. A new value kind also needs a case in `internal/aof/rewrite.go` (the default case errors), `approximateValueObjectSize` in `storage/memory.go`, `snapshotAllLocked` in `storage/store.go`, `storage/stats.go`, and `command/info.go`.
