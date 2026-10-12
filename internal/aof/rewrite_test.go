@@ -20,6 +20,7 @@ import (
 	"github.com/maltemindedal/stash/internal/aof"
 	"github.com/maltemindedal/stash/internal/command"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -69,7 +70,7 @@ func TestGenerateRewriteRoundTripsState(t *testing.T) {
 			t.Fatalf("Parse() error = %v", parseErr)
 		}
 		// Replayed as the server replays its AOF at startup.
-		result, execErr := executor.Handle(context.Background(), server.Call{Origin: server.OriginReplay}, value)
+		result, execErr := executor.Handle(context.Background(), server.Call{Origin: record.OriginReplay}, value)
 		if result.Release != nil {
 			result.Release()
 		}
@@ -382,7 +383,7 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 			replayedStore := storage.NewStore()
 			executor := replayExecutor(t, replayedStore)
 			loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
-				result, execErr := executor.Handle(ctx, server.Call{Origin: server.OriginReplay}, value)
+				result, execErr := executor.Handle(ctx, server.Call{Origin: record.OriginReplay}, value)
 				if result.Release != nil {
 					result.Release()
 				}

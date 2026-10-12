@@ -13,7 +13,7 @@ The Redis Serialization Protocol. It carries client requests and replies, and th
 The component that validates each request against its **Call**, runs it, and returns its RESP reply.
 
 **Origin**:
-Where a request came from: a client connection, the **Master**'s replication stream, or **AOF** replay at startup. It decides whether the request needs `AUTH`, is propagated to **Replicas**, is recorded in the **Slowlog**, and may answer `REPLCONF GETACK`.
+Who caused a request or a write: a client connection, the **Master**'s replication stream, **AOF** replay at startup, or the server itself (an **Eviction** it makes outside any request). It decides whether the request needs `AUTH`, is propagated to **Replicas**, is recorded in the **Slowlog**, and may answer `REPLCONF GETACK`. The zero value is refused, and no request has the server's Origin.
 _Avoid_: replication origin (for all of them), source
 
 **Call**:

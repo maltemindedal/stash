@@ -20,6 +20,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -1030,7 +1031,7 @@ func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.V
 func TestRequestsOnAReplicasLinkGetNoReplies(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), psyncLikeExecutor{})
 	state := &ClientState{ID: 1, Authenticated: true}
-	call := Call{Client: state, Origin: OriginClient}
+	call := Call{Client: state, Origin: record.OriginClient}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	steps := []struct {

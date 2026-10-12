@@ -17,6 +17,7 @@ import (
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -130,7 +131,7 @@ func TestEveryExecutionPathPassesItsOrigin(t *testing.T) {
 		configure  func(t *testing.T, cfg *config.Config)
 		drive      func(t *testing.T, addr string)
 		command    string
-		wantOrigin Origin
+		wantOrigin record.Origin
 		wantClient bool
 		wantInline bool
 	}{
@@ -138,7 +139,7 @@ func TestEveryExecutionPathPassesItsOrigin(t *testing.T) {
 			name:       "a client connection",
 			drive:      sendPing,
 			command:    "PING",
-			wantOrigin: OriginClient,
+			wantOrigin: record.OriginClient,
 			wantClient: true,
 		},
 		{
@@ -146,7 +147,7 @@ func TestEveryExecutionPathPassesItsOrigin(t *testing.T) {
 			eventLoop:  true,
 			drive:      sendPing,
 			command:    "PING",
-			wantOrigin: OriginClient,
+			wantOrigin: record.OriginClient,
 			wantClient: true,
 			wantInline: true,
 		},
@@ -163,7 +164,7 @@ func TestEveryExecutionPathPassesItsOrigin(t *testing.T) {
 				}
 			},
 			command:    "SET",
-			wantOrigin: OriginReplay,
+			wantOrigin: record.OriginReplay,
 		},
 		{
 			name: "the Master's replication stream",
@@ -171,7 +172,7 @@ func TestEveryExecutionPathPassesItsOrigin(t *testing.T) {
 				cfg.ReplicaOf = fakeMaster(t, setFrame())
 			},
 			command:    "SET",
-			wantOrigin: OriginMaster,
+			wantOrigin: record.OriginMaster,
 		},
 	}
 

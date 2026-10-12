@@ -12,6 +12,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/aof"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 )
 
@@ -170,7 +171,7 @@ func TestUnauthenticatedRequestsAreRefusedBeforeTheyTakeASequencerLock(t *testin
 				executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 				state := newTestClientState(executor, 1)
 				state.SetAuthenticated(false)
-				call := server.Call{Client: state, Origin: server.OriginClient, Inline: inline}
+				call := server.Call{Client: state, Origin: record.OriginClient, Inline: inline}
 
 				executor.seq.gate.Lock()
 				replied := make(chan []error, 1)

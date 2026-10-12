@@ -20,6 +20,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -967,7 +968,7 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 	s.logger.Info("replica handshake completed", "master_addr", masterAddr, "listening_port", listeningPort)
 	synchronised = true
 
-	masterCall := Call{Origin: OriginMaster}
+	masterCall := Call{Origin: record.OriginMaster}
 
 	for {
 		value, err := parser.Parse()

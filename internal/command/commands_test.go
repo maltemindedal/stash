@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -815,7 +816,7 @@ func TestExecutorDetailedPropagation(t *testing.T) {
 	t.Run("a command from the Master's stream is not propagated again", func(t *testing.T) {
 		executor := newTestExecutor()
 
-		result, err := handle(withOrigin(context.Background(), server.OriginMaster), executor, requestValue("PUBLISH", "news", "replica"), false)
+		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("PUBLISH", "news", "replica"), false)
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
@@ -1256,7 +1257,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		replication.AdvanceReplicaOffset(123)
 		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
 
-		result, err := handle(withOrigin(context.Background(), server.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
+		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
 		if err != nil {
 			t.Fatalf("handle() error = %v", err)
 		}
@@ -1271,10 +1272,10 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 	})
 
 	t.Run("only the Master's stream may answer GETACK", func(t *testing.T) {
-		for _, origin := range []server.Origin{server.OriginClient, server.OriginReplay} {
+		for _, origin := range []record.Origin{record.OriginClient, record.OriginReplay} {
 			executor := newTestExecutor()
 			ctx := withOrigin(context.Background(), origin)
-			if origin == server.OriginClient {
+			if origin == record.OriginClient {
 				ctx = clientContext(executor)
 			}
 
@@ -1726,7 +1727,7 @@ func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = requirePass })
 
-			reply, stored, err := handleSet(t, executor, server.Call{Origin: server.OriginClient})
+			reply, stored, err := handleSet(t, executor, server.Call{Origin: record.OriginClient})
 			if !errors.Is(err, errNoClientState) || stored {
 				t.Fatalf("SET = (%#v, stored %v, error %v), want errNoClientState and nothing stored", reply, stored, err)
 			}
@@ -1736,15 +1737,20 @@ func TestAClientRequestWithoutClientStateIsRefused(t *testing.T) {
 
 func TestACallWithoutAnOriginIsRefused(t *testing.T) {
 	// The zero Origin has none of an Origin's rights, NeedsAuth included, so a
-	// Call that forgets to set one must not run as if it needed no AUTH.
+	// Call that forgets to set one must not run as if it needed no AUTH. Nor
+	// may a Call claim the server's own Origin, which no request has.
 	tests := []struct {
 		name string
 		call func(*Executor) server.Call
+		want error
 	}{
-		{name: "the zero Call", call: func(*Executor) server.Call { return server.Call{} }},
+		{name: "the zero Call", call: func(*Executor) server.Call { return server.Call{} }, want: errNoOrigin},
 		{name: "an authenticated client's Call without its Origin", call: func(executor *Executor) server.Call {
 			return server.Call{Client: newTestClientState(executor, 1)}
-		}},
+		}, want: errNoOrigin},
+		{name: "a Call with the server's own Origin", call: func(*Executor) server.Call {
+			return server.Call{Origin: record.OriginServer}
+		}, want: errServerOrigin},
 	}
 
 	for _, tt := range tests {
@@ -1752,8 +1758,8 @@ func TestACallWithoutAnOriginIsRefused(t *testing.T) {
 			executor := newTestExecutorWith(func(s *server.Services) { s.RequirePass = "secret" })
 
 			reply, stored, err := handleSet(t, executor, tt.call(executor))
-			if !errors.Is(err, errNoOrigin) || stored {
-				t.Fatalf("SET = (%#v, stored %v, error %v), want errNoOrigin and nothing stored", reply, stored, err)
+			if !errors.Is(err, tt.want) || stored {
+				t.Fatalf("SET = (%#v, stored %v, error %v), want %v and nothing stored", reply, stored, err, tt.want)
 			}
 		})
 	}
@@ -1767,15 +1773,15 @@ func TestAnUnauthenticatedClientStateNeverRunsACommand(t *testing.T) {
 	// client's is refused if it carries a Client state.
 	tests := []struct {
 		name            string
-		origin          server.Origin
+		origin          record.Origin
 		unauthenticated bool
 		wantErr         error
 	}{
-		{name: "a client that has not authenticated is refused", origin: server.OriginClient, unauthenticated: true, wantErr: ErrNoAuth},
-		{name: "its Client state lent to the Master's stream is refused", origin: server.OriginMaster, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
-		{name: "its Client state lent to AOF replay is refused", origin: server.OriginReplay, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
-		{name: "the Master's stream, which has no Client state, runs", origin: server.OriginMaster},
-		{name: "AOF replay, which has no Client state, runs", origin: server.OriginReplay},
+		{name: "a client that has not authenticated is refused", origin: record.OriginClient, unauthenticated: true, wantErr: ErrNoAuth},
+		{name: "its Client state lent to the Master's stream is refused", origin: record.OriginMaster, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
+		{name: "its Client state lent to AOF replay is refused", origin: record.OriginReplay, unauthenticated: true, wantErr: errClientStateWithoutClientOrigin},
+		{name: "the Master's stream, which has no Client state, runs", origin: record.OriginMaster},
+		{name: "AOF replay, which has no Client state, runs", origin: record.OriginReplay},
 	}
 
 	for _, tt := range tests {
@@ -2845,7 +2851,7 @@ func TestXAddAutoIDIsLoggedAsTheGeneratedID(t *testing.T) {
 		if !ok {
 			t.Fatalf("durability frame = %#v, want an array", result.Durability[0])
 		}
-		if _, err := handle(withOrigin(context.Background(), server.OriginReplay), replayed, frame, false); err != nil {
+		if _, err := handle(withOrigin(context.Background(), record.OriginReplay), replayed, frame, false); err != nil {
 			t.Fatalf("replaying the logged frame: %v", err)
 		}
 		entries, err := replayed.store.XRead("events", "0-0")
@@ -2934,7 +2940,7 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	ctx := withClientStateForExecutor(context.Background(), executor, 1)
 	state, _ := clientOfContext(ctx)
 
-	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, client: state, inTransaction: true, origin: server.OriginClient}
+	request := &Request{Name: "PSYNC", Args: [][]byte{[]byte("?"), []byte("-1")}, client: state, inTransaction: true, origin: record.OriginClient}
 	result, err := executor.executeRequestDetailed(ctx, request, false)
 	if result.Release != nil {
 		result.Release()
@@ -3136,12 +3142,12 @@ func withCall(ctx context.Context, call server.Call) context.Context {
 // withClient is the context of a request from the client whose Client state is
 // state.
 func withClient(ctx context.Context, state *server.ClientState) context.Context {
-	return withCall(ctx, server.Call{Client: state, Origin: server.OriginClient})
+	return withCall(ctx, server.Call{Client: state, Origin: record.OriginClient})
 }
 
 // withOrigin is the context of a request from origin, which carries no Client
 // state: the Master's replication stream or AOF replay.
-func withOrigin(ctx context.Context, origin server.Origin) context.Context {
+func withOrigin(ctx context.Context, origin record.Origin) context.Context {
 	return withCall(ctx, server.Call{Origin: origin})
 }
 

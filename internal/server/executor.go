@@ -30,23 +30,13 @@ type CommandExecutor interface {
 // whose command produces a reply.
 var ErrCloseConnection = errors.New("server: connection closed for a request it may not make")
 
-// Origin is where a request came from; see record.Origin. It is an alias
-// while its users move to the record package.
-type Origin = record.Origin
-
-const (
-	OriginClient = record.OriginClient
-	OriginMaster = record.OriginMaster
-	OriginReplay = record.OriginReplay
-)
-
 // Call is what the command executor is told about one request besides its
 // arguments.
 type Call struct {
 	// Client is the Client state of the connection the request came from. It
 	// is required for OriginClient and must be nil for every other Origin.
 	Client *ClientState
-	Origin Origin
+	Origin record.Origin
 	// Inline marks a request run on the Event loop's goroutine, where whatever
 	// would block returns an error instead.
 	Inline bool

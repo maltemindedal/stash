@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 )
 
 // pollerEventBatch bounds how many readiness events one Wait call returns.
@@ -564,7 +565,7 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
 	// Requests run inline on the loop goroutine, where whatever would block
 	// returns an error instead.
-	conn.run = l.srv.connCommandRunner(Call{Client: state, Origin: OriginClient, Inline: true}, clientID, handle, conn.logger)
+	conn.run = l.srv.connCommandRunner(Call{Client: state, Origin: record.OriginClient, Inline: true}, clientID, handle, conn.logger)
 
 	if err := l.poller.Add(fd); err != nil {
 		conn.logger.Warn("failed to register accepted connection with poller", "error", err)

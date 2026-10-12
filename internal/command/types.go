@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -33,7 +34,7 @@ type Request struct {
 	// sequencer exclusively while it does, so such a command must not wait for
 	// anything another request would have to provide.
 	inTransaction bool
-	origin        server.Origin
+	origin        record.Origin
 	inline        bool
 }
 
@@ -166,21 +167,26 @@ var (
 	// stream or AOF replay that carries a Client state: only a client has one,
 	// and it must not lend its connection to an Origin that needs no AUTH.
 	errClientStateWithoutClientOrigin = errors.New("command: a request that is not a client's carries a client state")
+	// errServerOrigin refuses a request that claims the server's own Origin,
+	// which is for writes the server makes outside any request.
+	errServerOrigin = errors.New("command: a request with the server's own origin")
 )
 
 // validateCall refuses a request whose Call is not one the server makes: an
-// Origin is required, a client request carries its Client state, and nothing
-// else does.
+// Origin other than the server's own is required, a client request carries its
+// Client state, and nothing else does.
 func validateCall(request *Request) error {
 	switch request.origin {
-	case server.OriginClient:
+	case record.OriginClient:
 		if request.client == nil {
 			return errNoClientState
 		}
-	case server.OriginMaster, server.OriginReplay:
+	case record.OriginMaster, record.OriginReplay:
 		if request.client != nil {
 			return errClientStateWithoutClientOrigin
 		}
+	case record.OriginServer:
+		return errServerOrigin
 	default:
 		return errNoOrigin
 	}

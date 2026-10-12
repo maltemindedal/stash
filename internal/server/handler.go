@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/record"
 )
 
 func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net.Conn) {
@@ -27,7 +28,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	state := s.getClientState(clientID)
 	// Built once for the connection. A connection whose Client state shutdown
 	// has already cleared gets a Call without one, which the executor refuses.
-	call := Call{Client: state, Origin: OriginClient}
+	call := Call{Client: state, Origin: record.OriginClient}
 	var input io.Reader = conn
 	if state != nil {
 		// Replies are queued while requests keep arriving and are sent when the

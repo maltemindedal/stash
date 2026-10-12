@@ -11,6 +11,7 @@ import (
 	"github.com/maltemindedal/stash/internal/aof"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
+	"github.com/maltemindedal/stash/internal/record"
 )
 
 func (s *Server) initializePersistence(ctx context.Context) error {
@@ -62,7 +63,7 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 		// Replay is ordered like any request. Nothing records writes yet (the
 		// writer is assigned below, and recordsWrites checks it), so each one
 		// takes the sequencer's gate shared and no stripe, and gives it back here.
-		replayCall := Call{Origin: OriginReplay}
+		replayCall := Call{Origin: record.OriginReplay}
 		stats, err := aof.LoadFile(ctx, s.cfg.AOFPath, func(replayCtx context.Context, value protocol.Value) error {
 			result, replayErr := s.executor.Handle(replayCtx, replayCall, value)
 			if result.Release != nil {
