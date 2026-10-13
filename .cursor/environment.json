@@ -1,0 +1,4 @@
+{
+  "name": "stash",
+  "install": "bash .cursor/install.sh"
+}
