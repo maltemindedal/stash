@@ -46,4 +46,4 @@ The "why" behind the design. For contributors and anyone reading the source.
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Dev setup, the verification commands CI runs, test layout, and project conventions. |
 | [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | Expected behavior in the project and how to report a violation. |
 | [`AGENTS.md`](../AGENTS.md) | Commands, conventions and gotchas for LLM coding agents working in this repo. |
-| [Agent support docs](agents/) | Issue tracker conventions, triage label vocabulary, and domain-doc consumption rules. |
+| [Agent support docs](agents/) | Issue tracker conventions and triage label vocabulary. |
