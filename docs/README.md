@@ -38,7 +38,6 @@ The "why" behind the design. For contributors and anyone reading the source.
 | Document | What it covers |
 | --- | --- |
 | [Architecture overview](architecture/overview.md) | Package responsibilities, request flow, and the rationale behind sharding, the opt-in event loop, and the persistence/replication split. |
-| [`GLOSSARY.md`](../GLOSSARY.md) | Domain glossary: the project's vocabulary. Lives at the repo root because agent tooling requires it there. |
 
 ## Contributing
 
