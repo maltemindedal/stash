@@ -14,6 +14,9 @@ set -euo pipefail
 floor=go1.21.13
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# shellcheck source=scripts/pins.sh
+. scripts/pins.sh
+pins_prefix=gate
 
 current=preflight
 finish() {
@@ -52,23 +55,6 @@ check_floor() {
     go"$declared".*) ;;
     *)
       say "go.mod declares go $declared but gate.sh pins $floor; update floor in scripts/gate.sh"
-      return 1
-      ;;
-  esac
-}
-
-# The golangci-lint version ci.yml pins, so ci.yml stays the one place that says it.
-pinned_lint_version() {
-  local want
-  want="$(sed -n '/golangci\/golangci-lint-action/,/^ *- /s/^ *version: *\(v[0-9][0-9.]*\).*$/\1/p' .github/workflows/ci.yml)"
-  case "$want" in
-    *$'\n'*)
-      say "more than one golangci-lint version in .github/workflows/ci.yml: $want"
-      return 1
-      ;;
-    v[0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$want" ;;
-    *)
-      say "no golangci-lint version found under golangci-lint-action in .github/workflows/ci.yml"
       return 1
       ;;
   esac
@@ -115,7 +101,8 @@ check_lint_version() {
 }
 
 lint_install_hint() {
-  printf '  install: curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b "$(go env GOPATH)/bin" %s\n' "$1" >&2
+  # shellcheck disable=SC2016 # $(go env GOPATH) is for the reader to run
+  printf '  install: curl -sSfL %s | sh -s -- -b "$(go env GOPATH)/bin" %s\n' "$(lint_installer_url "$1")" "$1" >&2
   printf '  or set GOLANGCI_LINT to a %s binary\n' "$1" >&2
 }
 

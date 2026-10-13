@@ -40,6 +40,10 @@ doctor() {
   echo "repo: $ROOT @ $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
   command -v go >/dev/null || { echo "  FAIL go not on PATH"; return 1; }
   echo "go: $(go version)"
+  if ! (cd "$ROOT" && . scripts/pins.sh && pins_prefix=doctor go_honours_gotoolchain); then
+    echo "  FAIL go on PATH is older than 1.21: GOTOOLCHAIN would be ignored"; return 1
+  fi
+  echo "  PASS go >= 1.21 (honours GOTOOLCHAIN)"
   local floor; floor="$(sed -n 's/^go //p' go.mod)"
   echo "go.mod floor: $floor (CI builds on it; scripts/gate.sh pins GOTOOLCHAIN=go1.21.13)"
   command -v python3 >/dev/null && echo "  PASS python3 present (RESP client)" || { echo "  FAIL python3 missing: drive needs it"; return 1; }
