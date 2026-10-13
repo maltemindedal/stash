@@ -2,8 +2,6 @@
 
 This repository implements a Redis-compatible TCP server in Go one phase at a time. It now includes the TCP server, RESP parsing and encoding, sharded in-memory storage, transactions, pub/sub, replication, RDB snapshots, append-only-file durability, memory-pressure eviction, and basic operational metrics. Each package keeps a distinct responsibility so later phases can extend the server without mixing those concerns.
 
-For domain vocabulary, see [`GLOSSARY.md`](../../GLOSSARY.md) at the repository root.
-
 ## Request flow
 
 ```mermaid
