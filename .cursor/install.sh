@@ -15,23 +15,12 @@ for cmd in go python3 gcc curl git; do
   fi
 done
 
-lint_version="$(sed -n '/golangci\/golangci-lint-action/,/^ *- /s/^ *version: *\(v[0-9][0-9.]*\).*$/\1/p' .github/workflows/ci.yml)"
-case "$lint_version" in
-  v[0-9]*.[0-9]*.[0-9]*) ;;
-  *)
-    echo "install: no single golangci-lint version under golangci-lint-action in .github/workflows/ci.yml" >&2
-    exit 1
-    ;;
-esac
-
-floor="$(sed -n 's/^floor=//p' scripts/gate.sh)"
-case "$floor" in
-  go[0-9]*.[0-9]*.[0-9]*) ;;
-  *)
-    echo "install: no Go floor assignment in scripts/gate.sh" >&2
-    exit 1
-    ;;
-esac
+# shellcheck source=scripts/pins.sh
+. scripts/pins.sh
+pins_prefix=install
+go_honours_gotoolchain
+lint_version="$(pinned_lint_version)"
+floor="$(pinned_floor)"
 
 want="${lint_version#v}"
 have=""
@@ -40,7 +29,7 @@ if command -v golangci-lint >/dev/null 2>&1; then
 fi
 if [ "$have" != "$want" ]; then
   dest="$(mktemp -d)"
-  curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b "$dest" "$lint_version"
+  curl -sSfL "$(lint_installer_url "$lint_version")" | sh -s -- -b "$dest" "$lint_version"
   sudo install -m 0755 "$dest/golangci-lint" /usr/local/bin/golangci-lint
   rm -rf "$dest"
   hash -r
@@ -53,7 +42,13 @@ if [ "$have" != "$want" ]; then
   exit 1
 fi
 
-GOTOOLCHAIN="$floor" go version
+# GOTOOLCHAIN downloads the floor into the module cache on first use. Check that the
+# floor actually ran, not the go on PATH.
+got="$(GOTOOLCHAIN="$floor" go env GOVERSION)"
+if [ "$got" != "$floor" ]; then
+  echo "install: GOTOOLCHAIN=$floor go env GOVERSION reported '$got'; the floor toolchain is not cached" >&2
+  exit 1
+fi
 
 echo "install: golangci-lint $have at $resolved"
 echo "install: floor toolchain $floor cached"

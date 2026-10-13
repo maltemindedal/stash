@@ -78,6 +78,15 @@ The code is the source of truth: when docs and behavior disagree, fix the docs. 
 - Durability, performance or security work: PR #36's body (`gh pr view 36`) records decisions D1 to D20, the deferred list, and "Measured and rejected (do not redo)".
 - Adding a doc: give it a row in `docs/README.md`.
 
+## Cursor Cloud specific instructions
+
+`.cursor/environment.json` runs `.cursor/install.sh` when a Cloud Agent starts.
+
+- The image must provide Go >= 1.21 (older go ignores `GOTOOLCHAIN`), `gcc` (for `go test -race`), `python3` (the verify skill's RESP client), `curl` and `git`. `install.sh` stops if any is missing.
+- `install.sh` installs golangci-lint into `/usr/local/bin` at the version `.github/workflows/ci.yml` pins, through the installer at that tag on raw.githubusercontent.com. It downloads the floor toolchain named by `floor=` in `scripts/gate.sh` through `GOTOOLCHAIN`, into the module cache under `$HOME/go`, and checks that `go env GOVERSION` reports it. `scripts/pins.sh` reads both pins, for `install.sh` and `gate.sh` alike; do not copy the versions anywhere else.
+- No services are needed: the verify skill starts and stops its own server.
+- `.agents/skills/verify-stash/scripts/verify.sh all` is the gate. Read its exit status.
+
 ## Agent skills
 
 ### Verification
