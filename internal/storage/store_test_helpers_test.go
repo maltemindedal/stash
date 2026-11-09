@@ -171,6 +171,8 @@ func (s *Store) encodingForTest(key string) string {
 	switch data := v.data.(type) {
 	case *zsetValue:
 		compact = data.compact != nil
+	case *setValue:
+		compact = data.ints != nil
 	default:
 		return string(v.Kind)
 	}

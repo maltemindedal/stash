@@ -31,7 +31,6 @@ type imageEntry struct {
 	str       []byte
 	list      [][]byte
 	hash      []HashFieldValue
-	set       [][]byte
 	// data is the image of a kind that has moved out of the fields above.
 	data kindImage
 }
@@ -151,11 +150,6 @@ func (e *imageEntry) recreate(emit func(args [][]byte) error) error {
 		sort.Slice(e.hash, func(i, j int) bool { return e.hash[i].Field < e.hash[j].Field })
 		return emitChunked(emit, "HSET", e.key, len(e.hash), 2, func(args [][]byte, i int) [][]byte {
 			return append(args, []byte(e.hash[i].Field), e.hash[i].Value)
-		})
-	case ValueKindSet:
-		sort.Slice(e.set, func(i, j int) bool { return string(e.set[i]) < string(e.set[j]) })
-		return emitChunked(emit, "SADD", e.key, len(e.set), 1, func(args [][]byte, i int) [][]byte {
-			return append(args, e.set[i])
 		})
 	default:
 		return fmt.Errorf("storage: cannot recreate value kind %q of key %q", e.kind, e.key)

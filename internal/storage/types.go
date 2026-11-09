@@ -113,9 +113,6 @@ type ValueObject struct {
 	Hash           map[string][]byte
 	CompactHash    *CompactHash
 	HashEncoding   ValueEncoding
-	Set            map[string]struct{}
-	IntSet         *IntSet
-	SetEncoding    ValueEncoding
 	ExpiresAt      int64
 	LastAccessedAt int64
 	Kind           ValueKind
@@ -258,9 +255,6 @@ func (v *ValueObject) emptiedCollection() bool {
 	case ValueKindHash:
 		n, err := v.hashLen()
 		return err == nil && n == 0
-	case ValueKindSet:
-		n, err := v.setLen()
-		return err == nil && n == 0
 	}
 	return false
 }
@@ -286,9 +280,6 @@ func (v *ValueObject) containerCopy() *ValueObject {
 	case ValueKindHash:
 		c.Hash = maps.Clone(v.Hash)
 		c.CompactHash = cloneCompactHash(v.CompactHash)
-	case ValueKindSet:
-		c.Set = maps.Clone(v.Set)
-		c.IntSet = cloneIntSet(v.IntSet)
 	}
 	return &c
 }
@@ -350,28 +341,6 @@ func (v *ValueObject) HashValue() (map[string][]byte, error) {
 	return v.Hash, nil
 }
 
-// SetValue returns the general set payload for a set value. Integer sets are
-// materialized as detached general set maps.
-func (v *ValueObject) SetValue() (map[string]struct{}, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindSet {
-		return nil, ErrWrongType
-	}
-	if v.SetEncoding == ValueEncodingCompact {
-		if v.IntSet == nil {
-			return nil, errInvalidValueObjectState
-		}
-		return v.IntSet.generalSet(), nil
-	}
-	if v.Set == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.Set, nil
-}
-
 func newHashValue(fields map[string][]byte, expiresAt int64) *ValueObject {
 	return &ValueObject{
 		Hash:      fields,
@@ -386,22 +355,5 @@ func newCompactHashValue(hash *CompactHash, expiresAt int64) *ValueObject {
 		HashEncoding: ValueEncodingCompact,
 		ExpiresAt:    expiresAt,
 		Kind:         ValueKindHash,
-	}
-}
-
-func newSetValue(members map[string]struct{}, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		Set:       members,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindSet,
-	}
-}
-
-func newIntSetValue(members *IntSet, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		IntSet:      members,
-		SetEncoding: ValueEncodingCompact,
-		ExpiresAt:   expiresAt,
-		Kind:        ValueKindSet,
 	}
 }

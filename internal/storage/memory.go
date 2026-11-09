@@ -112,20 +112,6 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 			size += int64(len(field) + len(raw))
 		}
 		return size
-	case ValueKindSet:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.SetEncoding == ValueEncodingCompact {
-			if value.IntSet != nil {
-				size += int64(value.IntSet.len()) * 8
-			}
-			return size
-		}
-		size += int64(len(value.Set)) * approxSetEntryOverhead
-		for member := range value.Set {
-			size += int64(len(member))
-		}
-		return size
 	}
 
 	return approximateBaseValueObjectSize(key, value.ExpiresAt)

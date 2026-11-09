@@ -494,9 +494,8 @@ func TestStoreSet(t *testing.T) {
 		if added != 3 {
 			t.Fatalf("SAdd() added = %d, want 3", added)
 		}
-		stored := store.valueObjectForTest("s")
-		if stored == nil || stored.Kind != ValueKindSet || stored.SetEncoding != ValueEncodingCompact || stored.IntSet == nil {
-			t.Fatalf("stored set = %#v, want compact intset", stored)
+		if got := store.encodingForTest("s"); got != "set:compact" {
+			t.Fatalf("encodingForTest(s) = %q, want set:compact", got)
 		}
 
 		exists, err := store.SIsMember("s", []byte("1"))
@@ -541,9 +540,8 @@ func TestStoreSet(t *testing.T) {
 		}
 
 		for _, key := range []string{"strings", "mixed", "noncanonical"} {
-			stored := store.valueObjectForTest(key)
-			if stored == nil || stored.SetEncoding != ValueEncodingGeneral || stored.Set == nil {
-				t.Fatalf("stored set %q = %#v, want general set", key, stored)
+			if got := store.encodingForTest(key); got != "set:general" {
+				t.Fatalf("encodingForTest(%s) = %q, want set:general", key, got)
 			}
 		}
 	})
@@ -576,12 +574,11 @@ func TestStoreSet(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("SAdd() mixed update = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("s")
-		if stored == nil || stored.Kind != ValueKindSet || stored.SetEncoding != ValueEncodingGeneral || stored.Set == nil {
-			t.Fatalf("stored set = %#v, want upgraded general set", stored)
+		if got := store.encodingForTest("s"); got != "set:general" {
+			t.Fatalf("encodingForTest(s) = %q, want set:general", got)
 		}
-		if stored.ExpiresAt != expiresAt {
-			t.Fatalf("upgraded set ExpiresAt = %d, want %d", stored.ExpiresAt, expiresAt)
+		if got := store.expiresAtForTest("s"); got != expiresAt {
+			t.Fatalf("upgraded set expires at %d, want %d", got, expiresAt)
 		}
 		for _, member := range []string{"1", "2", "three"} {
 			exists, err := store.SIsMember("s", []byte(member))

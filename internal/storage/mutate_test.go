@@ -253,13 +253,14 @@ func describeValueForTest(store *Store, key string) string {
 		sort.Strings(pairs)
 		fmt.Fprintf(&b, "encoding %d %q", v.HashEncoding, pairs)
 	case ValueKindSet:
-		members, _ := v.setMembers()
+		set, _ := setOf(v)
+		members := set.members()
 		names := make([]string, 0, len(members))
 		for _, member := range members {
 			names = append(names, string(member))
 		}
 		sort.Strings(names)
-		fmt.Fprintf(&b, "encoding %d %q", v.SetEncoding, names)
+		fmt.Fprintf(&b, "integers %v %q", set.ints != nil, names)
 	case ValueKindZSet:
 		zset, _ := zsetOf(v)
 		fmt.Fprintf(&b, "compact %v %v", zset.compact != nil, zset.rangeByRank(0, zset.len()-1))

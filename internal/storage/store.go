@@ -662,26 +662,6 @@ func (s *Store) imageLocked(now int64) *Image {
 					clonedValue := a.bytes(hashEntry.Value)
 					entry.hash = append(entry.hash, HashFieldValue{Field: hashEntry.Field, Value: clonedValue})
 				}
-			case ValueKindSet:
-				if value.SetEncoding == ValueEncodingCompact {
-					setMembers, err := value.setMembers()
-					if err != nil {
-						continue
-					}
-					entry.set = make([][]byte, len(setMembers))
-					for j, member := range setMembers {
-						entry.set[j] = a.bytes(member)
-					}
-					break
-				}
-				if value.Set == nil {
-					continue
-				}
-				entry.set = make([][]byte, 0, len(value.Set))
-				for member := range value.Set {
-					clonedMember := a.string(member)
-					entry.set = append(entry.set, clonedMember)
-				}
 			}
 
 			entries = append(entries, entry)

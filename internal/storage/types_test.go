@@ -71,23 +71,6 @@ func TestValueObjectAccessorsMaterializeCompactValues(t *testing.T) {
 			t.Fatalf("compact hash after materialized mutation = (%q, %v, %v), want (v, true, nil)", string(got), ok, err)
 		}
 	})
-
-	t.Run("intset", func(t *testing.T) {
-		setValue := newIntSetValue(&IntSet{values: []int64{1}}, 0)
-		set, err := setValue.SetValue()
-		if err != nil {
-			t.Fatalf("SetValue() error = %v", err)
-		}
-		if _, ok := set["1"]; !ok {
-			t.Fatalf("SetValue()[1] missing")
-		}
-
-		set["2"] = struct{}{}
-		contains, err := setValue.setContains([]byte("2"))
-		if err != nil || contains {
-			t.Fatalf("compact set after materialized mutation = (%v, %v), want (false, nil)", contains, err)
-		}
-	})
 }
 
 // TestAWriteStampsTheValueItCreatesWithTheStoreClock pins where a new value's
@@ -131,8 +114,8 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 		{name: "RPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.RightPush(key, bulk("a")); return err }},
 		{name: "HSET of a short value (newCompactHashValue)", write: hset("f", "v")},
 		{name: "HSET of a long value (newHashValue)", write: hset("f", long)},
-		{name: "SADD of an integer (newIntSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("1")); return err }},
-		{name: "SADD of a string (newSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("a")); return err }},
+		{name: "SADD of an integer (an integer set)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("1")); return err }},
+		{name: "SADD of a string (a table set)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("a")); return err }},
 		{name: "ZADD of a short member (a compact sorted set)", write: zadd("m")},
 		{name: "ZADD of a long member (a general sorted set)", write: zadd(long)},
 		{name: "XADD (a new stream)", write: func(s *Store) error { _, _, err := s.XAdd(key, "*", bulk("f", "v")); return err }},
