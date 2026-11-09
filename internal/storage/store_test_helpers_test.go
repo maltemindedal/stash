@@ -167,6 +167,7 @@ func (s *Store) encodingForTest(key string) string {
 	if v == nil {
 		return ""
 	}
+	kind := string(kindNames[v.kind()])
 	var compact bool
 	switch data := v.data.(type) {
 	case *zsetValue:
@@ -176,12 +177,12 @@ func (s *Store) encodingForTest(key string) string {
 	case *hashValue:
 		compact = data.compact != nil
 	default:
-		return string(v.Kind)
+		return kind
 	}
 	if compact {
-		return string(v.Kind) + ":compact"
+		return kind + ":compact"
 	}
-	return string(v.Kind) + ":general"
+	return kind + ":general"
 }
 
 // expiresAtForTest returns the TTL deadline stored for key: 0 when the key has

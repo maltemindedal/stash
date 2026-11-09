@@ -238,8 +238,9 @@ func describeValueForTest(store *Store, key string) string {
 		return "absent"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s, expires at %d: ", v.Kind, v.ExpiresAt)
-	switch v.Kind {
+	kind := kindNames[v.kind()]
+	fmt.Fprintf(&b, "%s, expires at %d: ", kind, v.ExpiresAt)
+	switch kind {
 	case ValueKindString:
 		fmt.Fprintf(&b, "%q", v.String)
 	case ValueKindList:
@@ -492,13 +493,13 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 				s.setValueObjectForTest(key, newKindValue(newZSetValueForEntries(nil)))
 				return nil
 			},
-			write: func(s *Store) error { _, _, err := mutateKey(s, key, ValueKindZSet, shrinks, unchanged); return err },
+			write: func(s *Store) error { _, _, err := mutateKey(s, key, kindZSet, shrinks, unchanged); return err },
 		},
 		{
 			name:  "a mutation that empties a string",
 			setup: func(s *Store) error { _, err := s.Set(key, []byte("text"), 0); return err },
 			write: func(s *Store) error {
-				_, _, err := mutateKey(s, key, ValueKindString, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, struct{}, error) {
+				_, _, err := mutateKey(s, key, kindString, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, struct{}, error) {
 					cur.String = cur.String[:0]
 					return cur, struct{}{}, nil
 				})

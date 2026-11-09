@@ -298,7 +298,7 @@ func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
 	// carrying them was copied on every return and made a pop over 10% slower.
 	var item []byte
 	remaining := 0
-	ok, _, err := mutateKey(s, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, _, err := mutateKey(s, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil {
 			return nil, false, nil
 		}
@@ -342,7 +342,7 @@ func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
 	// As in popOne, the values and the count left come back through variables.
 	var values [][]byte
 	remaining := 0
-	ok, _, err := mutateKey(s, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, _, err := mutateKey(s, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil {
 			return nil, false, nil
 		}
@@ -391,7 +391,7 @@ func (s *Store) ZAdd(key string, entries []ZSetEntry) (int64, []string, error) {
 		return 0, nil, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, key, kindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newZSetValueForEntries(entries)
 			return newKindValue(created), int64(created.len()), nil
@@ -484,7 +484,7 @@ func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, erro
 		return "", nil, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
+	return mutateKey(s, key, kindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
 		if cur == nil {
 			cur = newKindValue(newStream())
 		}
@@ -585,7 +585,7 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 				stats.SkippedExpiredKeys++
 				continue
 			}
-			if value.Kind != ValueKindString {
+			if value.data != nil {
 				stats.SkippedUnsupportedKeys++
 				continue
 			}
@@ -633,34 +633,6 @@ func (s *Store) ReplaceWith(other *Store) {
 	}
 	s.writeUnlockAllShards()
 	s.publishExpiredKeys()
-}
-
-func (s *Store) imageLocked(now int64) *Image {
-	stats := SnapshotStats{}
-	entries := make([]imageEntry, 0, s.totalKeyCountLocked())
-	var a arena
-	for i := range s.shards {
-		shard := &s.shards[i]
-		stats.TotalKeys += len(shard.data)
-		for key, value := range shard.data {
-			if isExpired(value, now) {
-				stats.SkippedExpiredKeys++
-				continue
-			}
-
-			entry := imageEntry{key: key, kind: value.Kind, expiresAt: value.ExpiresAt}
-			if value.data != nil {
-				entry.data = value.data.image(&a)
-			} else {
-				entry.str = a.bytes(value.String)
-			}
-
-			entries = append(entries, entry)
-			stats.ExportedKeys++
-		}
-	}
-
-	return &Image{entries: entries, stats: stats}
 }
 
 func (s *Store) totalKeyCountLocked() int {
@@ -849,7 +821,7 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 		return 0, nil, ErrSyntax
 	}
 
-	length, evicted, err := mutateKey(s, key, ValueKindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	length, evicted, err := mutateKey(s, key, kindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			cur = newKindValue(&listValue{})
 		}

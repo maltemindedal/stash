@@ -171,7 +171,7 @@ func (s *Store) SAdd(key string, members [][]byte) (int64, []string, error) {
 		return 0, nil, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, key, kindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newSetValueForMembers(members)
 			return newKindValue(created), int64(created.len()), nil
@@ -203,7 +203,7 @@ func (s *Store) SRem(key string, members [][]byte) (int64, error) {
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, key, ValueKindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, _, err := mutateKey(s, key, kindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			return nil, 0, nil
 		}

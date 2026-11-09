@@ -1,24 +1,11 @@
 package storage
 
 import (
-	"errors"
 	"sync/atomic"
 )
 
-var errInvalidValueObjectState = errors.New("storage: invalid value object state")
-
 // ValueKind identifies the logical data shape of a stored value.
 type ValueKind string
-
-// ValueEncoding identifies the internal physical representation of a stored value.
-type ValueEncoding uint8
-
-const (
-	// ValueEncodingGeneral stores a value in its general-purpose representation.
-	ValueEncodingGeneral ValueEncoding = iota
-	// ValueEncodingCompact stores a small collection in a contiguous compact representation.
-	ValueEncodingCompact
-)
 
 const (
 	// ValueKindString is the Phase 1 string storage type used by SET/GET.
@@ -94,21 +81,33 @@ type StringSnapshotStats struct {
 	SkippedUnsupportedKeys int
 }
 
-// ValueObject is the internal representation of an item stored in Stash.
+// ValueObject is the internal representation of an item stored in Stash: its
+// TTL, its access stamp and its value.
 //
-// The type is a tagged union: Kind selects which payload field is valid.
-// ExpiresAt is stored as a Unix timestamp in milliseconds; 0 means no TTL.
-// LastAccessedAt stores the last observed successful access in Unix
-// milliseconds. Reads refresh it with atomic stores so shard read paths can
-// keep their RLock fast path while still providing data for approximate LRU
-// eviction.
+// The value is a string when data is nil, and then String holds its bytes.
+// Otherwise data is the payload of a collection kind and String is unused. A
+// string therefore costs one allocation beside its bytes, and GET and SET make
+// no interface call.
+//
+// ExpiresAt is a Unix timestamp in milliseconds; 0 means no TTL.
+// LastAccessedAt is the last successful access in Unix milliseconds. Reads
+// refresh it with atomic stores, so shard read paths keep their RLock fast path
+// while still providing data for approximate LRU eviction. The two int64 fields
+// come first, which keeps them 8-byte aligned for those atomic stores on every
+// platform.
 type ValueObject struct {
-	String         []byte
 	ExpiresAt      int64
 	LastAccessedAt int64
-	Kind           ValueKind
-	// data is the payload of a kind that has moved out of the union above.
-	data kindValue
+	String         []byte
+	data           kindValue
+}
+
+// kind returns the kind of the value v holds.
+func (v *ValueObject) kind() kindID {
+	if v.data == nil {
+		return kindString
+	}
+	return v.data.kind()
 }
 
 func (v *ValueObject) touch(now int64) {
@@ -129,10 +128,7 @@ func (v *ValueObject) lastAccessed() int64 {
 
 // StringValue returns the string payload for a string value.
 func (v *ValueObject) StringValue() ([]byte, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindString {
+	if v.data != nil {
 		return nil, ErrWrongType
 	}
 
@@ -169,12 +165,11 @@ func newOwnedStringValue(data []byte, expiresAt int64) *ValueObject {
 	return &ValueObject{
 		String:    data,
 		ExpiresAt: expiresAt,
-		Kind:      ValueKindString,
 	}
 }
 
 // newKindValue wraps the payload of a collection kind in a value without a
 // TTL. The write that stores it stamps it.
 func newKindValue(data kindValue) *ValueObject {
-	return &ValueObject{data: data, Kind: kindNames[data.kind()]}
+	return &ValueObject{data: data}
 }

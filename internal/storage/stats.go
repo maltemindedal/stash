@@ -37,7 +37,7 @@ func (s *Store) setKeyLocked(shard *Shard, key string, value *ValueObject) {
 	}
 
 	previous := shard.data[key]
-	if previous == nil || previous.Kind != value.Kind {
+	if previous == nil || previous.kind() != value.kind() {
 		s.adjustKeyKindCount(previous, -1)
 		s.adjustKeyKindCount(value, 1)
 	}
@@ -61,18 +61,14 @@ func (s *Store) adjustKeyKindCount(value *ValueObject, delta int64) {
 	if s == nil || value == nil || delta == 0 {
 		return
 	}
-	if index, ok := keyStatsKindIndex(value.Kind); ok {
-		s.keyKindCounts[index].Add(delta)
-	}
+	s.keyKindCounts[value.kind()].Add(delta)
 }
 
 func (s *Store) recalculateKeyStatsLocked() {
 	var counts [kindCount]int64
 	for i := range s.shards {
 		for _, value := range s.shards[i].data {
-			if index, ok := keyStatsKindIndex(value.Kind); ok {
-				counts[index]++
-			}
+			counts[value.kind()]++
 		}
 	}
 	for i := range counts {

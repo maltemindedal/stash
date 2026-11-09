@@ -153,6 +153,47 @@ func TestEveryValueKindKeepsItsContract(t *testing.T) {
 				}
 			})
 
+			t.Run("a clone and the value it was taken from change independently", func(t *testing.T) {
+				// Without a memory limit a write edits the stored value in place,
+				// so each write below reaches the very payload that was cloned.
+				store, _ := newStoreWithManualClock()
+				if err := fixture.build(store); err != nil {
+					t.Fatalf("build error = %v", err)
+				}
+				data := store.valueObjectForTest(kindFixtureKey).data
+				if data == nil {
+					t.Skip("a string has no payload to clone: a write replaces its bytes")
+				}
+				if data.empty() {
+					t.Fatal("empty() = true for a value that holds items")
+				}
+				before := recreationCommands(t, store)
+
+				cloned, _ := newStoreWithManualClock()
+				cloned.setValueObjectForTest(kindFixtureKey, newKindValue(data.clone()))
+				if got := recreationCommands(t, cloned); !reflect.DeepEqual(got, before) {
+					t.Fatalf("the clone recreates as %.200q, want %.200q", got, before)
+				}
+
+				if err := fixture.write(cloned); err != nil {
+					t.Fatalf("write to the clone error = %v", err)
+				}
+				if got := recreationCommands(t, store); !reflect.DeepEqual(got, before) {
+					t.Fatalf("after a write to its clone the value recreates as %.200q, want %.200q", got, before)
+				}
+				after := recreationCommands(t, cloned)
+				if reflect.DeepEqual(after, before) {
+					t.Fatal("the write left the clone as it was, so it tests nothing")
+				}
+
+				if err := fixture.write(store); err != nil {
+					t.Fatalf("write error = %v", err)
+				}
+				if got := recreationCommands(t, cloned); !reflect.DeepEqual(got, after) {
+					t.Fatalf("after writes to the value its clone recreates as %.200q, want %.200q", got, after)
+				}
+			})
+
 			t.Run("its recreation commands are the same every time and carry at most 1,024 items", func(t *testing.T) {
 				store := built(t)
 				first := recreationCommands(t, store)
@@ -174,5 +215,64 @@ func TestEveryValueKindKeepsItsContract(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestTheKindFixturesCoverEveryValueKind fails when a kind is added to
+// kindNames without a row in kindFixtures, which is what holds it to the
+// contract above.
+func TestTheKindFixturesCoverEveryValueKind(t *testing.T) {
+	covered := make(map[ValueKind]bool)
+	for _, fixture := range kindFixtures() {
+		store := NewStore()
+		if err := fixture.build(store); err != nil {
+			t.Fatalf("%s: build error = %v", fixture.name, err)
+		}
+		covered[kindNames[store.valueObjectForTest(kindFixtureKey).kind()]] = true
+	}
+	for _, kind := range ValueKinds() {
+		if !covered[kind] {
+			t.Errorf("no kind fixture builds a %s", kind)
+		}
+	}
+}
+
+// TestAnEmptiedValueIsDeletedUnlessItIsAStream pins empty for each kind and
+// encoding with nothing in it. A write that leaves a value like this deletes its
+// key, except that a stream key stays.
+func TestAnEmptiedValueIsDeletedUnlessItIsAStream(t *testing.T) {
+	tests := []struct {
+		name  string
+		value kindValue
+		want  bool
+	}{
+		{name: "list", value: &listValue{}, want: true},
+		{name: "list of dead slots only", value: &listValue{items: make([][]byte, 3), head: 3}, want: true},
+		{name: "compact hash", value: &hashValue{compact: &CompactHash{}}, want: true},
+		{name: "table hash", value: &hashValue{table: map[string][]byte{}}, want: true},
+		{name: "integer set", value: &setValue{ints: &IntSet{}}, want: true},
+		{name: "table set", value: &setValue{table: map[string]struct{}{}}, want: true},
+		{name: "compact sorted set", value: &zsetValue{compact: &CompactZSet{}}, want: true},
+		{name: "skip-list sorted set", value: &zsetValue{general: newSortedSet()}, want: true},
+		{name: "stream", value: newStream(), want: false},
+	}
+
+	seen := make(map[kindID]bool)
+	for _, tt := range tests {
+		tt := tt
+		seen[tt.value.kind()] = true
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.value.empty(); got != tt.want {
+				t.Fatalf("empty() = %v, want %v", got, tt.want)
+			}
+			if got := newKindValue(tt.value).emptied(); got != tt.want {
+				t.Fatalf("emptied() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	for id := kindString + 1; id < kindCount; id++ {
+		if !seen[id] {
+			t.Errorf("no row holds an emptied %s", kindNames[id])
+		}
 	}
 }

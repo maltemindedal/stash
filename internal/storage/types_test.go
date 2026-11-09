@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestValueObjectAccessorsRejectWrongKinds(t *testing.T) {
+func TestEachKindAccessorRejectsAValueOfAnotherKind(t *testing.T) {
 	tests := []struct {
 		name   string
 		access func(*ValueObject) error
@@ -26,28 +26,6 @@ func TestValueObjectAccessorsRejectWrongKinds(t *testing.T) {
 
 			if err := tt.access(value); !errors.Is(err, ErrWrongType) {
 				t.Fatalf("%s() on a string value error = %v, want ErrWrongType", tt.name, err)
-			}
-		})
-	}
-}
-
-func TestValueObjectAccessorsRejectInvalidTaggedUnionState(t *testing.T) {
-	tests := []struct {
-		name   string
-		value  *ValueObject
-		access func(*ValueObject) error
-	}{
-		{
-			name:   "nil value object",
-			value:  nil,
-			access: func(v *ValueObject) error { _, err := v.StringValue(); return err },
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.access(tt.value); !errors.Is(err, errInvalidValueObjectState) {
-				t.Fatalf("accessor error = %v, want errInvalidValueObjectState", err)
 			}
 		})
 	}

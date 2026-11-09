@@ -198,7 +198,7 @@ func (s *Store) HSet(key string, pairs []HashFieldValue) (int64, []string, error
 		return 0, nil, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, key, kindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newHashValueForPairs(pairs)
 			return newKindValue(created), int64(created.len()), nil
@@ -245,7 +245,7 @@ func (s *Store) HDel(key string, fields []string) (int64, error) {
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, key, ValueKindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, _, err := mutateKey(s, key, kindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			return nil, 0, nil
 		}

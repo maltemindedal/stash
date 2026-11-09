@@ -26,7 +26,6 @@ type SnapshotStats struct {
 // and nil for a string, whose bytes are str.
 type imageEntry struct {
 	key       string
-	kind      ValueKind
 	expiresAt int64
 	str       []byte
 	data      kindImage
@@ -66,6 +65,36 @@ func (s *Store) Image(barrier func()) *Image {
 		barrier()
 	}
 	return img
+}
+
+// imageLocked copies every key that is live at now. The caller holds every
+// shard lock.
+func (s *Store) imageLocked(now int64) *Image {
+	stats := SnapshotStats{}
+	entries := make([]imageEntry, 0, s.totalKeyCountLocked())
+	var a arena
+	for i := range s.shards {
+		shard := &s.shards[i]
+		stats.TotalKeys += len(shard.data)
+		for key, value := range shard.data {
+			if isExpired(value, now) {
+				stats.SkippedExpiredKeys++
+				continue
+			}
+
+			entry := imageEntry{key: key, expiresAt: value.ExpiresAt}
+			if value.data != nil {
+				entry.data = value.data.image(&a)
+			} else {
+				entry.str = a.bytes(value.String)
+			}
+
+			entries = append(entries, entry)
+			stats.ExportedKeys++
+		}
+	}
+
+	return &Image{entries: entries, stats: stats}
 }
 
 // Stats reports how many keys the image was taken from and how many it holds.
@@ -127,7 +156,7 @@ func (e *imageEntry) recreate(emit func(args [][]byte) error) error {
 		// today, but refusing it keeps a future TTL from being dropped without a
 		// word.
 		if e.expiresAt > 0 {
-			return fmt.Errorf("storage: cannot recreate the TTL of %s key %q", e.kind, e.key)
+			return fmt.Errorf("storage: cannot recreate the TTL of key %q, which holds a collection", e.key)
 		}
 		return e.data.recreate(e.key, emit)
 	}
