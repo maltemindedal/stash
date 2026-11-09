@@ -11,6 +11,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -42,7 +43,7 @@ type replicaMarker interface {
 }
 
 // registerReplicaPeer starts the feed of the replica that PSYNC registered at its
-// attach cut (Master.Start), once the full resync reply is ahead of
+// attach cut (replication.Master.Start), once the full resync reply is ahead of
 // anything the feed writes on conn. The feed has queued every write since the
 // snapshot. When the replica was dropped while its reply was sent (its feed
 // refused a frame, past the backlog limit), it closes conn instead.
@@ -102,18 +103,18 @@ func (s *Server) dropReplica(id uint64, cause error) {
 }
 
 // replicaFellBehind reports whether a replica's feed stopped because the replica
-// did not keep up: its queue passed its limit (ErrReplicaBacklog, or the event
+// did not keep up: its queue passed its limit (replication.ErrReplicaBacklog, or the event
 // loop's push limit), or a write to it, or the wait for its connection's writer,
 // took longer than the replica feed allows. Anything else means its connection
 // ended.
 func replicaFellBehind(cause error) bool {
-	return errors.Is(cause, ErrReplicaBacklog) ||
+	return errors.Is(cause, replication.ErrReplicaBacklog) ||
 		errors.Is(cause, errPushLimitExceeded) ||
 		errors.Is(cause, os.ErrDeadlineExceeded) ||
 		errors.Is(cause, errResponseWriterBusy)
 }
 
-// startReplicaLink keeps the replica attached to its master (Follow) until ctx
+// startReplicaLink keeps the replica attached to its master (replication.Follow) until ctx
 // is cancelled, which shutdown does. Only an unusable configuration ends it
 // before that.
 func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
@@ -137,7 +138,7 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, "tcp", masterAddr)
 	}
-	Follow(ctx, dial, s.link, nil)
+	replication.Follow(ctx, dial, s.link, nil)
 }
 
 // replicaStore is the Store as the Replica's Link changes it: a full resync

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -226,7 +227,7 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 		return server.SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 	case "GETACK":
 		// A Replica's Link answers its Master's GETACK itself
-		// (server.Link.Run), so none reaches the executor from the stream, and
+		// (replication.Link.Run), so none reaches the executor from the stream, and
 		// nobody else may ask.
 		return server.ExecuteResult{}, ErrSyntaxError()
 	case "ACK":
@@ -278,7 +279,7 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	// The Master copies the snapshot and registers the replica at one attach
 	// cut, and the replica's feed holds every write made since; the connection
 	// starts the feed once this reply is ahead of it.
-	attachment := e.master.Attach(server.Candidate{
+	attachment := e.master.Attach(replication.Candidate{
 		ID: state.ID, ListeningPort: state.ReplicaListeningPort(), Out: state,
 	}, e.seq.attachCut)
 	state.PromoteToReplica()

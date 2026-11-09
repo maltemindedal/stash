@@ -12,6 +12,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -103,7 +104,7 @@ type Executor struct {
 	pubSubRegistry      *server.PubSubRegistry
 	requirePass         string
 	commands            map[string]commandSpec
-	master              *server.Master
+	master              *replication.Master
 	slowlogRegistry     *server.SlowlogRegistry
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats

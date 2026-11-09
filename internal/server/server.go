@@ -16,6 +16,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -31,7 +32,7 @@ type Server struct {
 	store             *storage.Store
 	executor          CommandExecutor
 	registry          *ClientRegistry
-	master            *Master
+	master            *replication.Master
 	watchRegistry     *WatchRegistry
 	pubSubRegistry    *PubSubRegistry
 	monitorRegistry   *MonitorRegistry
@@ -46,7 +47,7 @@ type Server struct {
 
 	// link is the Replica's link to its Master. Only a Replica runs it
 	// (startReplicaLink); on a Master its offset stays 0.
-	link *Link
+	link *replication.Link
 
 	// stopLink ends a Replica's link to its Master. ListenAndServe sets it before
 	// the link or anything that can call shutdown starts, and shutdown calls it,
@@ -77,8 +78,8 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		slowlogRegistry: NewSlowlogRegistry(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
-	srv.link = &Link{MasterAuth: cfg.MasterAuth, Store: replicaStore{server: srv}, Logger: logger}
-	srv.master = NewMaster(store, srv.dropReplica, logger)
+	srv.link = &replication.Link{MasterAuth: cfg.MasterAuth, Store: replicaStore{server: srv}, Logger: logger}
+	srv.master = replication.NewMaster(store, srv.dropReplica, logger)
 	srv.recorder = record.New(srv.master, logger)
 
 	executor, err := newExecutor(Services{

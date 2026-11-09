@@ -49,7 +49,7 @@ import (
 //
 // Lock order is gate, then stripes by ascending index, then what recording
 // takes: the AOF writer's lock (aof.Writer.Append), and then the Master's
-// lock and a replica feed's (server.Master.Propagate),
+// lock and a replica feed's (replication.Master.Propagate),
 // which take neither gate nor stripe, and are not held together. Nothing takes
 // gate shared while it already holds it, and nothing waits for another request
 // while holding either (a blocking command waits with neither held). Recording
@@ -58,7 +58,7 @@ import (
 // under that one lock, so writers on different stripes, and WAIT's GETACK, reach
 // every replica in offset order. While no replica is registered, a client write's
 // frames are only counted, without the Master's lock
-// (server.Master.Propagate, ordered): the attach cut below registers a
+// (replication.Master.Propagate, ordered): the attach cut below registers a
 // replica only when no write sits between being applied and having its frames
 // counted, so a write is counted either below the new replica's base, and is in
 // its snapshot, or after the replica is registered. WAIT's GETACK, which holds

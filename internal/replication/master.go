@@ -1,4 +1,4 @@
-package server
+package replication
 
 import (
 	"context"
@@ -532,10 +532,10 @@ func (m *Master) StopFeeds(grace time.Duration) (unfinished int) {
 	return unfinished
 }
 
-// streamEnder is a Replica's connection whose write side can be shut on its
+// StreamEnder is a Replica's connection whose write side can be shut on its
 // own: a TCP connection in the default networking mode, the event loop's
 // handle in the other.
-type streamEnder interface {
+type StreamEnder interface {
 	CloseWrite() error
 }
 
@@ -547,9 +547,9 @@ type streamEnder interface {
 // acknowledgement draw a reset that discards it.
 func (m *Master) EndStreams(deadline time.Time) (remaining int) {
 	m.mu.RLock()
-	enders := make(map[uint64]streamEnder, len(m.replicas))
+	enders := make(map[uint64]StreamEnder, len(m.replicas))
 	for id, replica := range m.replicas {
-		if ender, ok := replica.Conn.(streamEnder); ok {
+		if ender, ok := replica.Conn.(StreamEnder); ok {
 			enders[id] = ender
 		}
 	}
@@ -773,7 +773,7 @@ func randomReplicationID() string {
 		// crypto/rand only fails when the OS entropy source is broken. A
 		// replication ID must be unpredictable, so fail loudly at startup rather
 		// than fall back to a guessable time-derived value.
-		panic(fmt.Sprintf("server: read crypto/rand for replication ID: %v", err))
+		panic(fmt.Sprintf("replication: read crypto/rand for replication ID: %v", err))
 	}
 
 	return hex.EncodeToString(raw[:])

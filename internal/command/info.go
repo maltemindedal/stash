@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -104,7 +105,7 @@ func (e *Executor) appendInfoReplication(buf *bytes.Buffer) {
 	appendInfoField(buf, "slave_repl_offset", stats.ReplicaOffset)
 	appendInfoField(buf, "connected_slaves", len(stats.Replicas))
 
-	replicas := append([]server.ReplicaInfo(nil), stats.Replicas...)
+	replicas := append([]replication.ReplicaInfo(nil), stats.Replicas...)
 	sort.Slice(replicas, func(i, j int) bool { return replicas[i].ID < replicas[j].ID })
 	for i, replica := range replicas {
 		appendInfoField(buf, fmt.Sprintf("slave%d", i), fmt.Sprintf("id=%d,port=%d,offset=%d", replica.ID, replica.ListeningPort, replica.AckedMasterOffset))

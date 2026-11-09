@@ -8,6 +8,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -76,7 +77,7 @@ type Services struct {
 	SlowlogThreshold time.Duration
 	// Master serves the Replicas: PSYNC attaches one through it, REPLCONF ACK
 	// and WAIT read and wait for their acknowledgements.
-	Master *Master
+	Master *replication.Master
 	// Stats is the snapshot of the server that INFO reports.
 	Stats func() Stats
 	// RewriteAOF starts the background AOF rewrite BGREWRITEAOF asks for, or

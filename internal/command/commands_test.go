@@ -18,6 +18,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/record/recordtest"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -1277,7 +1278,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		defer func() { _ = replicaConn.Close() }()
 
 		state := newReplicaPeerStateForExecutor(executor, 7, serverConn)
-		executor.master.Add(server.Candidate{ID: 7, ListeningPort: 6380, Out: state}, serverConn)
+		executor.master.Add(replication.Candidate{ID: 7, ListeningPort: 6380, Out: state}, serverConn)
 
 		ctx := withClient(context.Background(), state)
 
@@ -1308,7 +1309,7 @@ func TestExecutorWait(t *testing.T) {
 		// The client wrote 50 bytes before the replica attached, so they are in
 		// its snapshot: the replica counts for them once it acknowledges anything.
 		executor.master.Propagate(make([]byte, 50), true)
-		executor.master.Add(server.Candidate{ID: 11, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 11, serverConn)}, serverConn)
+		executor.master.Add(replication.Candidate{ID: 11, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 11, serverConn)}, serverConn)
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(50)
 		// This WAIT ends when the replica acknowledges, not when a clock says so: the
@@ -1414,7 +1415,7 @@ func TestExecutorWait(t *testing.T) {
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		executor.master.Add(server.Candidate{ID: 12, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 12, serverConn)}, serverConn)
+		executor.master.Add(replication.Candidate{ID: 12, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 12, serverConn)}, serverConn)
 
 		state := &server.ClientState{ID: 99, Authenticated: true}
 		state.SetLastWriteReplicationOffset(0)
@@ -2990,7 +2991,7 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 func testServices() server.Services {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	store := storage.NewStore()
-	master := server.NewMaster(store, nil, logger)
+	master := replication.NewMaster(store, nil, logger)
 	recorder := record.New(master, logger)
 	recorder.SetLog(&recordtest.Log{})
 	return server.Services{
@@ -3162,7 +3163,7 @@ func newReplicaPeerStateForExecutor(executor *Executor, id uint64, conn net.Conn
 // request, requires it to be REPLCONF GETACK *, and acknowledges offset for
 // replica id in registry as soon as it has, which is what a replica does with
 // GETACK.
-func acknowledgeGetAck(conn net.Conn, registry *server.Master, id uint64, offset int64) error {
+func acknowledgeGetAck(conn net.Conn, registry *replication.Master, id uint64, offset int64) error {
 	value, err := protocol.NewParser(conn).Parse()
 	if err != nil {
 		return fmt.Errorf("read GETACK: %w", err)

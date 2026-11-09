@@ -1,4 +1,4 @@
-package server
+package replication
 
 import (
 	"errors"
@@ -25,7 +25,7 @@ const replicaFeedWriteTimeout = 30 * time.Second
 // ErrReplicaBacklog reports that a replica has fallen further behind than
 // replicaFeedLimit allows, counting the writes made while its full resync
 // reply was being sent.
-var ErrReplicaBacklog = errors.New("server: replica is too far behind the propagated stream")
+var ErrReplicaBacklog = errors.New("replication: replica is too far behind the propagated stream")
 
 // replicaFeed carries the propagated command stream to one replica. A writer that
 // propagates a command only appends its bytes to the feed, which never blocks on

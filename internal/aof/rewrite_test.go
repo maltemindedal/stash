@@ -21,6 +21,7 @@ import (
 	"github.com/maltemindedal/stash/internal/command"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -543,7 +544,7 @@ func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	master := server.NewMaster(store, nil, logger)
+	master := replication.NewMaster(store, nil, logger)
 	executor, err := command.New(server.Services{
 		Store:            store,
 		Logger:           logger,

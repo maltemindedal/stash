@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/replication"
 )
 
 const monitorWriteTimeout = 100 * time.Millisecond
@@ -19,7 +20,7 @@ type Stats struct {
 	MasterReplicationID string
 	MasterOffset        int64
 	ReplicaOffset       int64
-	Replicas            []ReplicaInfo
+	Replicas            []replication.ReplicaInfo
 	// AOFEnabled reports whether an append-only file is being written, and
 	// AOFLastWriteOK whether its most recent write and fsync succeeded (true when
 	// there is no AOF).

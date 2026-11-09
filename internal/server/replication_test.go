@@ -19,6 +19,7 @@ import (
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -27,9 +28,9 @@ func TestServerPropagateToReplicasRemovesFailingReplica(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, logger, storage.NewStore(), nil)
 
 	serverConn := &recordingConn{}
-	srv.master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, serverConn)}, serverConn)
+	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, serverConn)}, serverConn)
 	failingConn := &stubConn{writeErr: errors.New("write boom")}
-	srv.master.Add(Candidate{ID: 2, ListeningPort: 6381, Out: newReplicaPeerStateForTest(2, failingConn)}, failingConn)
+	srv.master.Add(replication.Candidate{ID: 2, ListeningPort: 6381, Out: newReplicaPeerStateForTest(2, failingConn)}, failingConn)
 
 	// Propagating only queues the command for each replica; the replica whose
 	// socket fails is found out, and dropped, by its feed.
@@ -70,7 +71,7 @@ func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
 		{name: "the connection was closed", cause: net.ErrClosed, wantLog: "replica disconnected"},
 		{name: "the replica reset the connection", cause: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrClosedPipe}, wantLog: "replica disconnected"},
 		{name: "the client state was disconnected", cause: errors.New("client response writer unavailable"), wantLog: "replica disconnected"},
-		{name: "its queue passed the limit", cause: ErrReplicaBacklog, wantLog: "dropping a replica"},
+		{name: "its queue passed the limit", cause: replication.ErrReplicaBacklog, wantLog: "dropping a replica"},
 		{name: "the event loop's push limit", cause: fmt.Errorf("%w: more than its 268435456 byte limit waiting", errPushLimitExceeded), wantLog: "dropping a replica"},
 		{name: "a write stalled", cause: &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}, wantLog: "dropping a replica"},
 		{name: "the writer stayed busy", cause: fmt.Errorf("%w for 30s", errResponseWriterBusy), wantLog: "dropping a replica"},
@@ -82,7 +83,7 @@ func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
 			var logs bytes.Buffer
 			srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(&logs, nil)), storage.NewStore(), nil)
 			conn := &stubConn{}
-			srv.master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, &recordingConn{})}, conn)
+			srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, &recordingConn{})}, conn)
 
 			srv.dropReplica(1, tt.cause)
 
@@ -109,7 +110,7 @@ func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
 func TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 	out := &markOrderOutput{written: make(chan struct{})}
-	attachWithoutCut(srv.master, Candidate{ID: 1, ListeningPort: 6380, Out: out})
+	attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	defer srv.master.StopFeeds(time.Second)
 	srv.master.Propagate([]byte("*1\r\n$4\r\nPING\r\n"), true)
 
@@ -143,7 +144,7 @@ func TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts(t *testing.T) {
 // sent, when the feed will not start.
 func TestAReplicaDroppedWhileItsFullResyncIsSentHasItsConnectionClosed(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
-	attachWithoutCut(srv.master, Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, &recordingConn{})})
+	attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, &recordingConn{})})
 	srv.master.Detach(1)
 
 	conn := &stubConn{}
@@ -155,7 +156,7 @@ func TestAReplicaDroppedWhileItsFullResyncIsSentHasItsConnectionClosed(t *testin
 
 // attachWithoutCut attaches c as PSYNC does, but with no sequencer to cut
 // against, for tests that propagate nothing while it runs.
-func attachWithoutCut(master *Master, c Candidate) *Attachment {
+func attachWithoutCut(master *replication.Master, c replication.Candidate) *replication.Attachment {
 	return master.Attach(c, func(startRecording func()) (release func()) {
 		startRecording()
 		return func() {}
@@ -307,7 +308,7 @@ func newReplicaPeerStateForTest(id uint64, conn net.Conn) *ClientState {
 // race detector reports that, so this test is meaningful under -race.
 func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
-	srv.master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: nil}, &stubConn{})
+	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: nil}, &stubConn{})
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
