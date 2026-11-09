@@ -43,8 +43,8 @@ Current responsibilities:
 - replay RESP command streams on startup before the listener opens
 - append successful mutating commands in RESP form
 - apply `appendfsync` policies (`always`, `everysec`, `no`)
-- rewrite the current durable state in the background for `BGREWRITEAOF`
-- write a snapshot of the keyspace into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
+- rewrite the current durable state in the background for `BGREWRITEAOF`: it takes a keyspace image from the store (`storage.Image`) and writes the image's recreation commands as RESP, without knowing a value kind, how a collection is split into commands, or how a TTL is written
+- write a keyspace image into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
 
 ### `internal/record`
 
@@ -82,6 +82,7 @@ Current responsibilities:
 - store TTLs in Unix milliseconds
 - perform passive eviction when a read or write touches an expired key
 - perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed), reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
+- copy every live key into a keyspace image (`Image`) under every shard write lock, and emit the image's recreation commands (`Recreate`) with no lock held: in key order, at most 1,024 items per command, each TTL as the absolute deadline it had, and an error for a collection with a TTL, which no command recreates. The store names the commands and their argument order (`SET`, `RPUSH`, `HSET`, `SADD`, `ZADD`, `XADD`); parsing and validating them stays in `internal/command`
 - track approximate keyspace memory when `maxmemory` is enabled
 - evict sampled least-recently-used candidates under memory pressure
 - scan several sorted-set score ranges under one lock acquisition, so `GEORADIUS` reads only the geohash cells that cover its radius, plus two guard ranges for scores outside every cell, instead of the whole set

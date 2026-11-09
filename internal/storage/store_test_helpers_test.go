@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"strings"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -118,4 +120,42 @@ func scoresOfEntries(entries []ZSetEntry) []float64 {
 		scores = append(scores, entry.Score)
 	}
 	return scores
+}
+
+// recreationCommands returns the recreation commands of the store's keyspace
+// image, each as its arguments joined by spaces.
+func recreationCommands(t testing.TB, store *Store) []string {
+	t.Helper()
+	return recreationCommandsOf(t, store.Image(nil))
+}
+
+// recreationCommandsOf returns the recreation commands of img, each as its
+// arguments joined by spaces.
+func recreationCommandsOf(t testing.TB, img *Image) []string {
+	t.Helper()
+
+	var commands []string
+	_, err := img.Recreate(func(args [][]byte) error {
+		parts := make([]string, len(args))
+		for i, arg := range args {
+			parts[i] = string(arg)
+		}
+		commands = append(commands, strings.Join(parts, " "))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Recreate() error = %v", err)
+	}
+	return commands
+}
+
+// assertRecreationCommands fails unless the store's keyspace image recreates
+// with exactly the commands in want.
+func assertRecreationCommands(t testing.TB, store *Store, want ...string) {
+	t.Helper()
+
+	got := recreationCommands(t, store)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("recreation commands = %q, want %q", got, want)
+	}
 }

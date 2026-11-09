@@ -12,7 +12,6 @@ import (
 	"sync"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -279,20 +278,14 @@ func TestLastWriteOKTracksFailuresAndRecovery(t *testing.T) {
 // that fails before its rename. The path must still be missing or empty, so the
 // next start loads the RDB snapshot again, and the temp file must be gone.
 func TestSeedFileLeavesTheFileAsItWasWhenAStepBeforeTheRenameFails(t *testing.T) {
-	keys := []storage.SnapshotEntry{{Key: "k", Kind: storage.ValueKindString, String: []byte("v")}}
-	// No command recreates the TTL of a collection, so the rewrite refuses this.
-	unwritable := []storage.SnapshotEntry{{Key: "letters", Kind: storage.ValueKindList, List: [][]byte{[]byte("a")}, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}}
 	renameErr := errors.New("rename failed")
 
 	tests := []struct {
-		name       string
-		existing   bool
-		entries    []storage.SnapshotEntry
-		failRename bool
+		name     string
+		existing bool
 	}{
-		{name: "the rename fails over a missing file", entries: keys, failRename: true},
-		{name: "the rename fails over an empty file", existing: true, entries: keys, failRename: true},
-		{name: "the commands cannot be generated", existing: true, entries: unwritable},
+		{name: "the rename fails over a missing file"},
+		{name: "the rename fails over an empty file", existing: true},
 	}
 
 	for _, tt := range tests {
@@ -304,15 +297,13 @@ func TestSeedFileLeavesTheFileAsItWasWhenAStepBeforeTheRenameFails(t *testing.T)
 					t.Fatalf("WriteFile() error = %v", err)
 				}
 			}
-			if tt.failRename {
-				original := renameFile
-				renameFile = func(string, string) error { return renameErr }
-				defer func() { renameFile = original }()
-			}
+			original := renameFile
+			renameFile = func(string, string) error { return renameErr }
+			defer func() { renameFile = original }()
 
-			_, err := SeedFile(path, tt.entries)
-			if err == nil || (tt.failRename && !errors.Is(err, renameErr)) {
-				t.Fatalf("SeedFile() error = %v, want the failure", err)
+			_, err := SeedFile(path, stringImage(t, "k", "v"))
+			if !errors.Is(err, renameErr) {
+				t.Fatalf("SeedFile() error = %v, want the rename failure", err)
 			}
 			files, err := os.ReadDir(dir)
 			if err != nil {
@@ -338,12 +329,9 @@ func TestSeedFileLeavesTheFileAsItWasWhenAStepBeforeTheRenameFails(t *testing.T)
 // and the error must still reach the caller, which refuses to start rather than
 // append to a file whose name may not survive a crash.
 func TestSeedFileReportsARenameWhoseDirectoryCouldNotBeSynced(t *testing.T) {
-	entries := []storage.SnapshotEntry{
-		{Key: "a", Kind: storage.ValueKindString, String: []byte("1")},
-		{Key: "b", Kind: storage.ValueKindString, String: []byte("2")},
-	}
+	img := stringImage(t, "a", "1", "b", "2")
 	var want bytes.Buffer
-	if _, err := GenerateRewrite(entries, &want); err != nil {
+	if _, err := GenerateRewrite(img, &want); err != nil {
 		t.Fatalf("GenerateRewrite() error = %v", err)
 	}
 	dir := t.TempDir()
@@ -354,7 +342,7 @@ func TestSeedFileReportsARenameWhoseDirectoryCouldNotBeSynced(t *testing.T) {
 	syncDir = func(string) error { return sentinel }
 	defer func() { syncDir = original }()
 
-	_, err := SeedFile(path, entries)
+	_, err := SeedFile(path, img)
 	var unsynced *unsyncedReplaceError
 	if !errors.As(err, &unsynced) || !errors.Is(err, sentinel) {
 		t.Fatalf("SeedFile() error = %v, want the directory sync failure", err)
@@ -372,4 +360,18 @@ func TestLastWriteOKOnNilWriter(t *testing.T) {
 	if !writer.LastWriteOK() {
 		t.Fatal("(*Writer)(nil).LastWriteOK() = false, want true: no AOF is not a failing AOF")
 	}
+}
+
+// stringImage returns the keyspace image of a store holding the given string
+// keys and values.
+func stringImage(t *testing.T, keysAndValues ...string) *storage.Image {
+	t.Helper()
+
+	store := storage.NewStore()
+	for i := 0; i < len(keysAndValues); i += 2 {
+		if _, err := store.Set(keysAndValues[i], []byte(keysAndValues[i+1]), 0); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+	}
+	return store.Image(nil)
 }

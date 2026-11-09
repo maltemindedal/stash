@@ -276,16 +276,10 @@ func TestStoreHash(t *testing.T) {
 			t.Fatalf("HGetAll() = %#v, want a/one", entries)
 		}
 
-		snapshot, stats := store.SnapshotAll()
-		if stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
-			t.Fatalf("SnapshotAll() stats = %+v, want total/exported 1", stats)
+		if stats := store.Image(nil).Stats(); stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
+			t.Fatalf("Image().Stats() = %+v, want total/exported 1", stats)
 		}
-		if len(snapshot) != 1 || snapshot[0].Kind != ValueKindHash || len(snapshot[0].Hash) != 1 {
-			t.Fatalf("SnapshotAll() = %#v, want one logical hash", snapshot)
-		}
-		if snapshot[0].Hash[0].Field != "a" || string(snapshot[0].Hash[0].Value) != "one" {
-			t.Fatalf("SnapshotAll() hash = %#v, want a/one", snapshot[0].Hash)
-		}
+		assertRecreationCommands(t, store, "HSET h a one")
 	})
 
 	t.Run("Hash creation chooses compact encoding by distinct fields", func(t *testing.T) {
@@ -528,17 +522,10 @@ func TestStoreSet(t *testing.T) {
 			t.Fatalf("SMembers() = %v, want %v", got, want)
 		}
 
-		snapshot, stats := store.SnapshotAll()
-		if stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
-			t.Fatalf("SnapshotAll() stats = %+v, want total/exported 1", stats)
+		if stats := store.Image(nil).Stats(); stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
+			t.Fatalf("Image().Stats() = %+v, want total/exported 1", stats)
 		}
-		if len(snapshot) != 1 || snapshot[0].Kind != ValueKindSet {
-			t.Fatalf("SnapshotAll() = %#v, want one logical set", snapshot)
-		}
-		got = sortedStrings(snapshot[0].Set)
-		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-			t.Fatalf("SnapshotAll().Set = %v, want %v", got, want)
-		}
+		assertRecreationCommands(t, store, "SADD s -5 1")
 	})
 
 	t.Run("Non-integer and mixed sets use general encoding", func(t *testing.T) {

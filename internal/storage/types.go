@@ -96,26 +96,6 @@ type StringSnapshotStats struct {
 	SkippedUnsupportedKeys int
 }
 
-// SnapshotEntry is a defensive copy of a stored value used for AOF rewrite generation.
-type SnapshotEntry struct {
-	Key       string
-	Kind      ValueKind
-	ExpiresAt int64
-	String    []byte
-	List      [][]byte
-	ZSet      []ZSetRangeEntry
-	Stream    []StreamEntry
-	Hash      []HashFieldValue
-	Set       [][]byte
-}
-
-// SnapshotStats summarizes a full-value snapshot export.
-type SnapshotStats struct {
-	TotalKeys          int
-	ExportedKeys       int
-	SkippedExpiredKeys int
-}
-
 // ValueObject is the internal representation of an item stored in Stash.
 //
 // The type is a tagged union: Kind selects which payload field is valid.

@@ -187,12 +187,8 @@ func BenchmarkStore(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			entries, stats := store.SnapshotAll()
-			if len(entries) != len(snapshotKeys) {
-				b.Fatalf("len(SnapshotAll()) = %d, want %d", len(entries), len(snapshotKeys))
-			}
-			if stats.TotalKeys != len(snapshotKeys) || stats.ExportedKeys != len(snapshotKeys) {
-				b.Fatalf("SnapshotAll() stats = %+v, want total/exported %d", stats, len(snapshotKeys))
+			if stats := store.Image(nil).Stats(); stats.TotalKeys != len(snapshotKeys) || stats.ExportedKeys != len(snapshotKeys) {
+				b.Fatalf("Image().Stats() = %+v, want total/exported %d", stats, len(snapshotKeys))
 			}
 		}
 	})
@@ -264,26 +260,119 @@ func BenchmarkStoreMaxMemory(b *testing.B) {
 	}
 }
 
-func BenchmarkStoreSnapshotAll(b *testing.B) {
-	value := []byte("value-of-about-thirty-two-bytes!")
+// imageBenchmarkStores are the keyspaces BenchmarkStoreSnapshotAll images and
+// BenchmarkRecreate recreates: 100,000 strings, large enough for the value arena
+// to grow many times (the 1,024-key case is BenchmarkStore's), and 10,000 keys of
+// each collection kind with 16 items each.
+func imageBenchmarkStores(b *testing.B) []struct {
+	name  string
+	keys  int
+	store *Store
+} {
+	b.Helper()
 
-	// The 1,024-key case is BenchmarkStore's; this one is large enough for the
-	// value arena to grow many times.
-	for _, n := range []int{100_000} {
-		b.Run(fmt.Sprintf("%d strings", n), func(b *testing.B) {
-			store := NewStore()
-			for i := 0; i < n; i++ {
-				if _, err := store.Set(fmt.Sprintf("key-%d", i), value, 0); err != nil {
-					b.Fatal(err)
+	value := []byte("value-of-about-thirty-two-bytes!")
+	items := make([][]byte, 16)
+	for i := range items {
+		items[i] = []byte(fmt.Sprintf("item-%02d", i))
+	}
+	kinds := []struct {
+		name  string
+		keys  int
+		write func(s *Store, key string) error
+	}{
+		{name: "100000 strings", keys: 100_000, write: func(s *Store, key string) error {
+			_, err := s.Set(key, value, 0)
+			return err
+		}},
+		{name: "10000 lists of 16", keys: 10_000, write: func(s *Store, key string) error {
+			_, _, err := s.RightPush(key, items)
+			return err
+		}},
+		{name: "10000 hashes of 16", keys: 10_000, write: func(s *Store, key string) error {
+			pairs := make([]HashFieldValue, len(items))
+			for i, item := range items {
+				pairs[i] = HashFieldValue{Field: string(item), Value: value}
+			}
+			_, _, err := s.HSet(key, pairs)
+			return err
+		}},
+		{name: "10000 sets of 16", keys: 10_000, write: func(s *Store, key string) error {
+			_, _, err := s.SAdd(key, items)
+			return err
+		}},
+		{name: "10000 sorted sets of 16", keys: 10_000, write: func(s *Store, key string) error {
+			entries := make([]ZSetEntry, len(items))
+			for i, item := range items {
+				entries[i] = ZSetEntry{Member: item, Score: float64(i)}
+			}
+			_, _, err := s.ZAdd(key, entries)
+			return err
+		}},
+		{name: "10000 streams of 16", keys: 10_000, write: func(s *Store, key string) error {
+			for i := range items {
+				if _, _, err := s.XAdd(key, fmt.Sprintf("1-%d", i+1), [][]byte{[]byte("field"), value}); err != nil {
+					return err
 				}
+			}
+			return nil
+		}},
+	}
+
+	stores := make([]struct {
+		name  string
+		keys  int
+		store *Store
+	}, len(kinds))
+	for i, kind := range kinds {
+		store := NewStore()
+		for j := 0; j < kind.keys; j++ {
+			if err := kind.write(store, fmt.Sprintf("key-%d", j)); err != nil {
+				b.Fatal(err)
+			}
+		}
+		stores[i].name, stores[i].keys, stores[i].store = kind.name, kind.keys, store
+	}
+	return stores
+}
+
+// BenchmarkStoreSnapshotAll takes a keyspace image, which is the part of an AOF
+// rewrite that holds every shard lock.
+func BenchmarkStoreSnapshotAll(b *testing.B) {
+	for _, tt := range imageBenchmarkStores(b) {
+		tt := tt
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				if stats := tt.store.Image(nil).Stats(); stats.ExportedKeys != tt.keys {
+					b.Fatalf("the image has %d keys, want %d", stats.ExportedKeys, tt.keys)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkRecreate emits the recreation commands of a keyspace image that is
+// already taken and sorted, which is the part of an AOF rewrite that holds no
+// lock.
+func BenchmarkRecreate(b *testing.B) {
+	for _, tt := range imageBenchmarkStores(b) {
+		tt := tt
+		b.Run(tt.name, func(b *testing.B) {
+			img := tt.store.Image(nil)
+			discard := func([][]byte) error { return nil }
+			if _, err := img.Recreate(discard); err != nil {
+				b.Fatal(err)
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				entries, _ := store.SnapshotAll()
-				if len(entries) != n {
-					b.Fatalf("snapshot has %d entries, want %d", len(entries), n)
+				keys, err := img.Recreate(discard)
+				if err != nil || keys != tt.keys {
+					b.Fatalf("Recreate() = (%d, %v), want %d keys", keys, err, tt.keys)
 				}
 			}
 		})

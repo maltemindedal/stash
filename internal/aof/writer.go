@@ -551,7 +551,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 
 	activated := false
 	releaseGuard := w.acquireRewriteGuard()
-	entries, snapshotStats := store.SnapshotAllWithWriteBarrier(func() {
+	image := store.Image(func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		if w.closed {
@@ -582,7 +582,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 	default:
 	}
 
-	rewriteStats, err := GenerateRewrite(entries, tempFile)
+	rewriteStats, err := GenerateRewrite(image, tempFile)
 	if err != nil {
 		w.clearRewriteState(true)
 		_ = tempFile.Close()
@@ -604,7 +604,7 @@ func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
 	w.logInfo(
 		"completed append-only file rewrite",
 		"path", w.path,
-		"snapshot_keys", snapshotStats.ExportedKeys,
+		"snapshot_keys", image.Stats().ExportedKeys,
 		"rewrite_keys", rewriteStats.Keys,
 		"rewrite_commands", rewriteStats.Commands,
 		"duration", time.Since(startedAt),

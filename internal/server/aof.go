@@ -104,8 +104,7 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			// startup loads it and skips the RDB snapshot, so the keys the snapshot
 			// loaded go into the file first.
 			startedAt := time.Now()
-			entries, _ := s.store.SnapshotAll()
-			stats, err := aof.SeedFile(s.cfg.AOFPath, entries)
+			stats, err := aof.SeedFile(s.cfg.AOFPath, s.store.Image(nil))
 			if err != nil {
 				return fmt.Errorf("server: write the keys loaded from rdb %q into aof %q: %w", s.cfg.RDBPath, s.cfg.AOFPath, err)
 			}

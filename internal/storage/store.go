@@ -70,8 +70,9 @@ type Store struct {
 // read no clock: they leave a new value unstamped, and the write that stores it
 // stamps it with its own reading. Code outside the store takes its own
 // reading of the system clock to judge TTLs: SET for its relative EX or PX
-// (ParseExpiryMillis is handed it), RDB loading and snapshot building, and the
-// AOF rewrite.
+// (ParseExpiryMillis is handed it), and RDB loading and snapshot building. An
+// AOF rewrite reads none: the keyspace image it is generated from was judged by
+// the store's reading, and its deadlines are written as they are.
 func (s *Store) now() int64 {
 	if s.clock != nil {
 		return s.clock()
@@ -594,28 +595,6 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 	return entries, stats
 }
 
-// SnapshotAll returns defensive copies of every currently supported non-expired value.
-func (s *Store) SnapshotAll() ([]SnapshotEntry, SnapshotStats) {
-	s.readLockAllShards()
-	defer s.readUnlockAllShards()
-
-	return s.snapshotAllLocked(s.now())
-}
-
-// SnapshotAllWithWriteBarrier snapshots the full keyspace while holding the store's
-// write locks, invoking barrier immediately before write traffic resumes.
-func (s *Store) SnapshotAllWithWriteBarrier(barrier func()) ([]SnapshotEntry, SnapshotStats) {
-	s.writeLockAllShards()
-	defer s.writeUnlockAllShards()
-
-	entries, stats := s.snapshotAllLocked(s.now())
-	if barrier != nil {
-		barrier()
-	}
-
-	return entries, stats
-}
-
 // ReplaceWith swaps the store contents with a snapshot from another store.
 //
 // The replacement is applied only after the source snapshot has already been
@@ -646,9 +625,9 @@ func (s *Store) ReplaceWith(other *Store) {
 	s.publishExpiredKeys()
 }
 
-func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
+func (s *Store) imageLocked(now int64) *Image {
 	stats := SnapshotStats{}
-	entries := make([]SnapshotEntry, 0, s.totalKeyCountLocked())
+	entries := make([]imageEntry, 0, s.totalKeyCountLocked())
 	valueArena := make([]byte, 0)
 	for i := range s.shards {
 		shard := &s.shards[i]
@@ -659,15 +638,15 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 				continue
 			}
 
-			entry := SnapshotEntry{Key: key, Kind: value.Kind, ExpiresAt: value.ExpiresAt}
+			entry := imageEntry{key: key, kind: value.Kind, expiresAt: value.ExpiresAt}
 			switch value.Kind {
 			case ValueKindString:
-				valueArena, entry.String = appendClonedBytesArena(valueArena, value.String)
+				valueArena, entry.str = appendClonedBytesArena(valueArena, value.String)
 			case ValueKindList:
 				list := value.liveList()
-				entry.List = make([][]byte, len(list))
+				entry.list = make([][]byte, len(list))
 				for j, item := range list {
-					valueArena, entry.List[j] = appendClonedBytesArena(valueArena, item)
+					valueArena, entry.list[j] = appendClonedBytesArena(valueArena, item)
 				}
 			case ValueKindZSet:
 				setLen, err := value.zsetLen()
@@ -675,20 +654,20 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 					continue
 				}
 				if setLen > 0 {
-					entry.ZSet, err = value.zsetRangeByRank(0, setLen-1)
+					entry.zset, err = value.zsetRangeByRank(0, setLen-1)
 					if err != nil {
 						continue
 					}
 				}
 			case ValueKindStream:
 				if value.Stream != nil {
-					entry.Stream = make([]StreamEntry, 0, len(value.Stream.entries))
+					entry.stream = make([]StreamEntry, 0, len(value.Stream.entries))
 					for _, record := range value.Stream.entries {
 						clonedValues := make([][]byte, len(record.values))
 						for j, item := range record.values {
 							valueArena, clonedValues[j] = appendClonedBytesArena(valueArena, item)
 						}
-						entry.Stream = append(entry.Stream, StreamEntry{ID: record.idText, Values: clonedValues})
+						entry.stream = append(entry.stream, StreamEntry{ID: record.idText, Values: clonedValues})
 					}
 				}
 			case ValueKindHash:
@@ -696,11 +675,11 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 				if err != nil {
 					continue
 				}
-				entry.Hash = make([]HashFieldValue, 0, len(hashEntries))
+				entry.hash = make([]HashFieldValue, 0, len(hashEntries))
 				for _, hashEntry := range hashEntries {
 					var clonedValue []byte
 					valueArena, clonedValue = appendClonedBytesArena(valueArena, hashEntry.Value)
-					entry.Hash = append(entry.Hash, HashFieldValue{Field: hashEntry.Field, Value: clonedValue})
+					entry.hash = append(entry.hash, HashFieldValue{Field: hashEntry.Field, Value: clonedValue})
 				}
 			case ValueKindSet:
 				if value.SetEncoding == ValueEncodingCompact {
@@ -708,20 +687,20 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 					if err != nil {
 						continue
 					}
-					entry.Set = make([][]byte, len(setMembers))
+					entry.set = make([][]byte, len(setMembers))
 					for j, member := range setMembers {
-						valueArena, entry.Set[j] = appendClonedBytesArena(valueArena, member)
+						valueArena, entry.set[j] = appendClonedBytesArena(valueArena, member)
 					}
 					break
 				}
 				if value.Set == nil {
 					continue
 				}
-				entry.Set = make([][]byte, 0, len(value.Set))
+				entry.set = make([][]byte, 0, len(value.Set))
 				for member := range value.Set {
 					var clonedMember []byte
 					valueArena, clonedMember = appendClonedStringBytesArena(valueArena, member)
-					entry.Set = append(entry.Set, clonedMember)
+					entry.set = append(entry.set, clonedMember)
 				}
 			}
 
@@ -730,7 +709,7 @@ func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
 		}
 	}
 
-	return entries, stats
+	return &Image{entries: entries, stats: stats}
 }
 
 func (s *Store) totalKeyCountLocked() int {

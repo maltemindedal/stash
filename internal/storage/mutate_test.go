@@ -729,11 +729,14 @@ func TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas(t *testing.T) {
 				fromStrings = entry.Value
 			}
 		}
-		all, _ := store.SnapshotAll()
-		for _, entry := range all {
-			if entry.Key == key {
-				fromAll = entry.String
+		_, err := store.Image(nil).Recreate(func(args [][]byte) error {
+			if string(args[1]) == key {
+				fromAll = args[2]
 			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Recreate() error = %v", err)
 		}
 		return fromStrings, fromAll
 	}
