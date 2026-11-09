@@ -181,11 +181,12 @@ func (s *Server) recordExpiredKeys(keys []string) {
 	// exactly as a client's write is not. The deferred policies make no such
 	// promise, and a replica left serving a key this server has already
 	// dropped is the worse outcome, so there the failure is logged and the
-	// deletion still goes. The sweep and an accounted write publish expiries
-	// while the sequencer orders them, but a replica's full resync publishes the
-	// ones its new dataset holds with no sequencer lock (replicaStore.Replace), and
-	// the store hands every expiry to whichever of them publishes next, so the
-	// Recorder propagates the server's own writes as unordered.
+	// deletion still goes. The sweep, an accounted write and a replica's full
+	// resync (replicaStore.Replace) each publish expiries while the sequencer
+	// orders them, and the store hands every expiry to whichever of them
+	// publishes next. The Recorder still propagates the server's own writes as
+	// unordered, so the Master counts them under its lock and nothing here
+	// depends on every publisher holding that ordering.
 	w := record.Write{Origin: record.OriginServer}
 	w.Add(record.DeleteFrame(keys), record.ToBoth)
 	s.recorder.Record(&w)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -146,6 +147,16 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 // the command executor with the Master's Origin.
 type replicaStore struct{ server *Server }
 
+// Replace loads the RDB snapshot of a full resync and swaps it in for the
+// whole keyspace, and has the append-only file follow: the file holds the
+// history of the keyspace the Replica had before, so it is rewritten from the
+// new one. Until that rewrite has replaced the file, a restart still replays
+// the old history.
+//
+// The swap runs as a background write, ordered against client requests and
+// against the copy an AOF rewrite takes, so a rewrite copies the keyspace from
+// before the swap or from after it, never half of each, and RequestRewrite
+// runs another after one that copied the old keyspace.
 func (r replicaStore) Replace(snapshot []byte) error {
 	s := r.server
 	snapshotStore := storage.NewStore()
@@ -153,13 +164,30 @@ func (r replicaStore) Replace(snapshot []byte) error {
 	if err != nil {
 		return err
 	}
+
+	release := func() {}
+	if sequencer, ok := s.executor.(backgroundWriteSequencer); ok {
+		release = sequencer.BeginBackgroundWrite()
+	}
 	s.store.ReplaceWith(snapshotStore)
+	release()
+
 	s.logger.Info(
 		"applied full resync snapshot",
 		"snapshot_size_bytes", len(snapshot),
 		"loaded_keys", stats.LoadedKeys,
 		"skipped_expired_keys", stats.SkippedExpiredKeys,
 	)
+
+	if s.aofWriter != nil {
+		runtimeCtx := s.runtimeCtx
+		if runtimeCtx == nil {
+			runtimeCtx = context.Background()
+		}
+		if err := s.aofWriter.RequestRewrite(runtimeCtx, s.store); err != nil {
+			return fmt.Errorf("rewrite the append-only file from the full resync: %w", err)
+		}
+	}
 
 	return nil
 }

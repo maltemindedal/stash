@@ -23,8 +23,8 @@ import (
 // replicas one at a time through PSYNC's attach cut while frames are handed to
 // the replicas from the paths that do so: client writes, which the sequencer
 // orders and which count their frames without the Master's lock while no
-// replica is registered; WAIT's GETACK, which nothing orders; and the expiry
-// DELs that a replica's own full resync publishes, which nothing orders either.
+// replica is registered; WAIT's GETACK, which nothing orders; and expiry DELs
+// published with no sequencer lock held, which the Recorder allows for.
 // Each replica acknowledges what it was sent up to a client write's frame, and
 // must then count at exactly that frame's end offset, as WAIT counts it. A frame
 // counted above the replica's base but not sent to it leaves the replica short;
@@ -37,13 +37,13 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 		name string
 		// getAcks runs WAIT's GETACK alongside the client writes.
 		getAcks bool
-		// fullResyncs replaces the dataset as a replica's full resync does, with
-		// one that holds an expired key, which the store removes and publishes.
+		// fullResyncs replaces the dataset with one that holds an expired key,
+		// which the store removes and publishes, here with no sequencer lock.
 		fullResyncs bool
 	}{
 		{name: "client writes"},
 		{name: "client writes and WAIT's GETACK", getAcks: true},
-		{name: "client writes and the expiry DELs of a replica's full resync", fullResyncs: true},
+		{name: "client writes and expiry DELs published with no sequencer lock", fullResyncs: true},
 	}
 
 	for _, tt := range tests {
@@ -145,7 +145,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 					t.Fatalf("Set() error = %v", err)
 				}
 				run(func(int) bool {
-					store.ReplaceWith(snapshot) // as a full resync does, holding no sequencer lock
+					store.ReplaceWith(snapshot) // holding no sequencer lock
 					return true
 				})
 			}

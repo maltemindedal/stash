@@ -62,8 +62,8 @@ import (
 // replica only when no write sits between being applied and having its frames
 // counted, so a write is counted either below the new replica's base, and is in
 // its snapshot, or after the replica is registered. WAIT's GETACK, which holds
-// neither gate nor stripe, and the expiry DELs, which a replica's full resync
-// publishes holding neither, always take the lock.
+// neither gate nor stripe, always takes the lock, and so do the server's own
+// writes, the expiry DELs: the Recorder does not vouch for who publishes them.
 //
 // PSYNC attaches a replica at an attach cut (attachCut): it copies the snapshot
 // it sends the replica and registers the replica while it holds gate shared and

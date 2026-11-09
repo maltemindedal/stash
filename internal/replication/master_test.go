@@ -453,8 +453,8 @@ func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *test
 // propagates a frame with no Replica registered. An ordered frame, a client
 // write's, is counted without waiting: the sequencer orders it against the
 // attach cut instead. An unordered one, such as an expiry DEL, must wait for the
-// lock: a Replica's full resync publishes expiries holding no sequencer lock, so
-// nothing else orders the DEL against the registration, and counted without the
+// lock: the Recorder passes the server's own writes as unordered, so nothing
+// else is known to order the DEL against the registration, and counted without the
 // lock it could lie above the new Replica's base without being sent to it.
 func TestWithNoReplicaRegisteredOnlyOrderedFramesSkipTheMastersLock(t *testing.T) {
 	tests := []struct {

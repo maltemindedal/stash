@@ -70,7 +70,13 @@ Once a replica is attached, its connection carries the replication stream and no
 
 ## When the link to the master drops
 
-A replica that loses its master, or cannot reach it at startup, waits one second and tries again, doubling the wait up to 30 seconds after each failure and starting over once a link has completed its handshake. Every attempt begins with a full resynchronisation, which replaces the replica's dataset with the master's snapshot, so a reconnected replica never keeps data from before the drop. Only an invalid `--replicaof` address or the server stopping stops the retries, including when the server stops because it can no longer accept connections.
+A replica that loses its master, or cannot reach it at startup, waits one second and tries again, doubling the wait up to 30 seconds after each failure and starting over once a link has completed its handshake. Every attempt begins with a full resynchronisation, which replaces the replica's dataset with the master's snapshot, so a reconnected replica never keeps data from before the drop.
+
+## A replica with an append-only file
+
+A replica started with `--aof` appends the commands of the stream to its file, so it can restart without its master. A full resync replaces the replica's dataset, and the file still holds the history of the dataset it replaced, so after every full resync the replica rewrites the file in the background from the dataset it now has, as `BGREWRITEAOF` does. If a rewrite is already running when the resync arrives, another runs when it ends, because the first one may have copied the old dataset.
+
+Until that rewrite has replaced the file, the file is the old history followed by the stream's commands. A replica that stops in that window, cleanly or not, replays both when it next starts, and holds keys its master does not until it attaches again. Only an invalid `--replicaof` address or the server stopping stops the retries, including when the server stops because it can no longer accept connections.
 
 ## Replicate against a protected master
 

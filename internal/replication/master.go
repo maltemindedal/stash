@@ -410,8 +410,9 @@ func (m *Master) WaitFeeds() {
 // taking the lock.
 //
 // A frame the sequencer does not order that way takes the lock even when no
-// Replica is registered: Await's REPLCONF GETACK, or an expiry DEL that a
-// Replica's full resync publishes. Counted without it, such a frame could lie
+// Replica is registered: Await's REPLCONF GETACK, or a write the server makes
+// on its own, such as an expiry DEL, which the Recorder passes as unordered
+// whoever publishes it. Counted without it, such a frame could lie
 // above the base of a Replica registering at that moment and never be queued
 // for it.
 //

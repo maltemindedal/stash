@@ -44,6 +44,8 @@ Background append only file rewriting started
 
 The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite. A list, set, hash, or sorted set with more than 1,024 values is written as several commands, so the rewritten file stays loadable however large the collection grows.
 
+A replica rewrites its file on its own after every full resync, because the resync replaces the dataset the file describes. See [A replica with an append-only file](replication.md#a-replica-with-an-append-only-file).
+
 ## Understand the AOF/RDB precedence
 
 When both `--aof` and `--rdb` are set and the AOF file exists and is non-empty, the AOF wins and RDB loading is skipped. The server logs this decision:
