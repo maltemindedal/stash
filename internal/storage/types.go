@@ -113,7 +113,6 @@ type ValueObject struct {
 	CompactZSet    *CompactZSet
 	ZSetEncoding   ValueEncoding
 	ListHead       int32
-	Stream         *StreamValue
 	Hash           map[string][]byte
 	CompactHash    *CompactHash
 	HashEncoding   ValueEncoding
@@ -123,6 +122,8 @@ type ValueObject struct {
 	ExpiresAt      int64
 	LastAccessedAt int64
 	Kind           ValueKind
+	// data is the payload of a kind that has moved out of the union above.
+	data kindValue
 }
 
 func (v *ValueObject) touch(now int64) {
@@ -253,6 +254,9 @@ func (v *ValueObject) emptied() bool {
 
 // emptiedCollection is emptied for a value that is not a list.
 func (v *ValueObject) emptiedCollection() bool {
+	if v.data != nil {
+		return v.data.empty()
+	}
 	switch v.Kind {
 	case ValueKindHash:
 		n, err := v.hashLen()
@@ -277,6 +281,10 @@ func (v *ValueObject) emptiedCollection() bool {
 // edits a string's bytes in place must not be handed this copy.
 func (v *ValueObject) containerCopy() *ValueObject {
 	c := *v
+	if v.data != nil {
+		c.data = v.data.clone()
+		return &c
+	}
 	switch v.Kind {
 	case ValueKindList:
 		c.List = append([][]byte(nil), v.liveList()...)
@@ -290,8 +298,6 @@ func (v *ValueObject) containerCopy() *ValueObject {
 	case ValueKindZSet:
 		c.ZSet = cloneSortedSet(v.ZSet)
 		c.CompactZSet = cloneCompactZSet(v.CompactZSet)
-	case ValueKindStream:
-		c.Stream = v.Stream.containerCopy()
 	}
 	return &c
 }
@@ -320,21 +326,6 @@ func (v *ValueObject) ZSetValue() (*SortedSet, error) {
 	}
 
 	return v.ZSet, nil
-}
-
-// StreamValue returns the stream payload for a stream value.
-func (v *ValueObject) StreamValue() (*StreamValue, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindStream {
-		return nil, ErrWrongType
-	}
-	if v.Stream == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.Stream, nil
 }
 
 func newStringValue(data []byte, expiresAt int64) *ValueObject {
@@ -379,12 +370,10 @@ func newCompactZSetValue(set *CompactZSet, expiresAt int64) *ValueObject {
 	}
 }
 
-func newStreamValue(stream *StreamValue, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		Stream:    stream,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindStream,
-	}
+// newKindValue wraps the payload of a collection kind in a value without a
+// TTL. The write that stores it stamps it.
+func newKindValue(data kindValue) *ValueObject {
+	return &ValueObject{data: data, Kind: kindNames[data.kind()]}
 }
 
 // HashValue returns the general hash payload for a hash value. Compact hashes

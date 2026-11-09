@@ -265,8 +265,9 @@ func describeValueForTest(store *Store, key string) string {
 		entries, _ := v.zsetRangeByRank(0, n-1)
 		fmt.Fprintf(&b, "encoding %d %v", v.ZSetEncoding, entries)
 	case ValueKindStream:
-		fmt.Fprintf(&b, "last ID %s", v.Stream.lastID)
-		for _, record := range v.Stream.entries {
+		stream, _ := streamOf(v)
+		fmt.Fprintf(&b, "last ID %s", stream.lastID)
+		for _, record := range stream.entries {
 			fmt.Fprintf(&b, ", %s %q", record.idText, record.values)
 		}
 	}

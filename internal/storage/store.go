@@ -476,9 +476,9 @@ func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, erro
 
 	return mutateKey(s, key, ValueKindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
 		if cur == nil {
-			cur = newStreamValue(newStream(), 0)
+			cur = newKindValue(newStream())
 		}
-		stream, err := cur.StreamValue()
+		stream, err := streamOf(cur)
 		if err != nil {
 			return nil, "", err
 		}
@@ -490,7 +490,7 @@ func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, erro
 // XRead returns stream entries whose IDs are greater than the supplied ID.
 func (s *Store) XRead(key, rawID string) ([]StreamEntry, error) {
 	entries, found, err := readKey(s, key, func(value *ValueObject) ([]StreamEntry, error) {
-		stream, err := value.StreamValue()
+		stream, err := streamOf(value)
 		if err != nil {
 			return nil, err
 		}
@@ -628,7 +628,7 @@ func (s *Store) ReplaceWith(other *Store) {
 func (s *Store) imageLocked(now int64) *Image {
 	stats := SnapshotStats{}
 	entries := make([]imageEntry, 0, s.totalKeyCountLocked())
-	valueArena := make([]byte, 0)
+	var a arena
 	for i := range s.shards {
 		shard := &s.shards[i]
 		stats.TotalKeys += len(shard.data)
@@ -639,14 +639,17 @@ func (s *Store) imageLocked(now int64) *Image {
 			}
 
 			entry := imageEntry{key: key, kind: value.Kind, expiresAt: value.ExpiresAt}
+			if value.data != nil {
+				entry.data = value.data.image(&a)
+			}
 			switch value.Kind {
 			case ValueKindString:
-				valueArena, entry.str = appendClonedBytesArena(valueArena, value.String)
+				entry.str = a.bytes(value.String)
 			case ValueKindList:
 				list := value.liveList()
 				entry.list = make([][]byte, len(list))
 				for j, item := range list {
-					valueArena, entry.list[j] = appendClonedBytesArena(valueArena, item)
+					entry.list[j] = a.bytes(item)
 				}
 			case ValueKindZSet:
 				setLen, err := value.zsetLen()
@@ -659,17 +662,6 @@ func (s *Store) imageLocked(now int64) *Image {
 						continue
 					}
 				}
-			case ValueKindStream:
-				if value.Stream != nil {
-					entry.stream = make([]StreamEntry, 0, len(value.Stream.entries))
-					for _, record := range value.Stream.entries {
-						clonedValues := make([][]byte, len(record.values))
-						for j, item := range record.values {
-							valueArena, clonedValues[j] = appendClonedBytesArena(valueArena, item)
-						}
-						entry.stream = append(entry.stream, StreamEntry{ID: record.idText, Values: clonedValues})
-					}
-				}
 			case ValueKindHash:
 				hashEntries, err := value.hashEntries()
 				if err != nil {
@@ -677,8 +669,7 @@ func (s *Store) imageLocked(now int64) *Image {
 				}
 				entry.hash = make([]HashFieldValue, 0, len(hashEntries))
 				for _, hashEntry := range hashEntries {
-					var clonedValue []byte
-					valueArena, clonedValue = appendClonedBytesArena(valueArena, hashEntry.Value)
+					clonedValue := a.bytes(hashEntry.Value)
 					entry.hash = append(entry.hash, HashFieldValue{Field: hashEntry.Field, Value: clonedValue})
 				}
 			case ValueKindSet:
@@ -689,7 +680,7 @@ func (s *Store) imageLocked(now int64) *Image {
 					}
 					entry.set = make([][]byte, len(setMembers))
 					for j, member := range setMembers {
-						valueArena, entry.set[j] = appendClonedBytesArena(valueArena, member)
+						entry.set[j] = a.bytes(member)
 					}
 					break
 				}
@@ -698,8 +689,7 @@ func (s *Store) imageLocked(now int64) *Image {
 				}
 				entry.set = make([][]byte, 0, len(value.Set))
 				for member := range value.Set {
-					var clonedMember []byte
-					valueArena, clonedMember = appendClonedStringBytesArena(valueArena, member)
+					clonedMember := a.string(member)
 					entry.set = append(entry.set, clonedMember)
 				}
 			}

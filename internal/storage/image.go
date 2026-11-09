@@ -31,9 +31,31 @@ type imageEntry struct {
 	str       []byte
 	list      [][]byte
 	zset      []ZSetRangeEntry
-	stream    []StreamEntry
 	hash      []HashFieldValue
 	set       [][]byte
+	// data is the image of a kind that has moved out of the fields above.
+	data kindImage
+}
+
+// arena hands out the copies an image holds of the bytes it is taken from. It
+// packs them into large chunks, so that an image of many small values is a few
+// allocations.
+type arena struct {
+	chunk []byte
+}
+
+// bytes returns a copy of src that shares no room to grow with its neighbours.
+func (a *arena) bytes(src []byte) []byte {
+	var cloned []byte
+	a.chunk, cloned = appendClonedBytesArena(a.chunk, src)
+	return cloned
+}
+
+// string is bytes for a string.
+func (a *arena) string(src string) []byte {
+	var cloned []byte
+	a.chunk, cloned = appendClonedStringBytesArena(a.chunk, src)
+	return cloned
 }
 
 // Image copies every live key under every shard write lock, and runs barrier
@@ -111,6 +133,10 @@ func (e *imageEntry) recreate(emit func(args [][]byte) error) error {
 		return fmt.Errorf("storage: cannot recreate the TTL of %s key %q", e.kind, e.key)
 	}
 
+	if e.data != nil {
+		return e.data.recreate(e.key, emit)
+	}
+
 	switch e.kind {
 	case ValueKindString:
 		args := [][]byte{[]byte("SET"), []byte(e.key), e.str}
@@ -136,16 +162,6 @@ func (e *imageEntry) recreate(emit func(args [][]byte) error) error {
 		return emitChunked(emit, "ZADD", e.key, len(e.zset), 2, func(args [][]byte, i int) [][]byte {
 			return append(args, strconv.AppendFloat(nil, e.zset[i].Score, 'g', -1, 64), []byte(e.zset[i].Member))
 		})
-	case ValueKindStream:
-		for _, entry := range e.stream {
-			args := make([][]byte, 0, len(entry.Values)+3)
-			args = append(args, []byte("XADD"), []byte(e.key), []byte(entry.ID))
-			args = append(args, entry.Values...)
-			if err := emit(args); err != nil {
-				return err
-			}
-		}
-		return nil
 	default:
 		return fmt.Errorf("storage: cannot recreate value kind %q of key %q", e.kind, e.key)
 	}

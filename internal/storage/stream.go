@@ -30,18 +30,68 @@ func newStream() *StreamValue {
 	return &StreamValue{}
 }
 
-// containerCopy returns a copy of s that XADD can append to while s stays
-// stored: a new slice of the same records. A record is never edited once it is
-// added, so the copies share them.
-func (s *StreamValue) containerCopy() *StreamValue {
-	if s == nil {
-		return nil
+// streamOf returns the stream v holds, or ErrWrongType when v holds a value of
+// another kind.
+func streamOf(v *ValueObject) (*StreamValue, error) {
+	if stream, ok := v.data.(*StreamValue); ok {
+		return stream, nil
 	}
+	return nil, ErrWrongType
+}
+
+func (s *StreamValue) kind() kindID { return kindStream }
+
+func (s *StreamValue) approxSize() int64 {
+	size := approxCollectionOverhead + int64(len(s.entries))*approxStreamEntryOverhead
+	for _, record := range s.entries {
+		size += int64(len(record.idText))
+		for _, item := range record.values {
+			size += int64(len(item))
+		}
+	}
+	return size
+}
+
+// clone returns a copy that XADD can append to while s stays stored: a new
+// slice of the same records. A record is never edited once it is added, so the
+// copies share them.
+func (s *StreamValue) clone() kindValue {
 	return &StreamValue{
 		entries:    append([]streamRecord(nil), s.entries...),
 		lastID:     s.lastID,
 		hasEntries: s.hasEntries,
 	}
+}
+
+// empty is false for every stream: a stream key stays however short it is.
+func (s *StreamValue) empty() bool { return false }
+
+func (s *StreamValue) image(a *arena) kindImage {
+	entries := make(streamImage, len(s.entries))
+	for i, record := range s.entries {
+		values := make([][]byte, len(record.values))
+		for j, item := range record.values {
+			values[j] = a.bytes(item)
+		}
+		entries[i] = StreamEntry{ID: record.idText, Values: values}
+	}
+	return entries
+}
+
+// streamImage is a stream in a keyspace image: its entries in ID order.
+type streamImage []StreamEntry
+
+// recreate emits one XADD per entry, with the entry's own ID.
+func (entries streamImage) recreate(key string, emit func(args [][]byte) error) error {
+	var args [][]byte
+	for _, entry := range entries {
+		args = append(args[:0], []byte("XADD"), []byte(key), []byte(entry.ID))
+		args = append(args, entry.Values...)
+		if err := emit(args); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ValidateXAddID reports whether raw is a syntactically valid XADD ID.

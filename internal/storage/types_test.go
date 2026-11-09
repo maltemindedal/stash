@@ -15,7 +15,7 @@ func TestValueObjectAccessorsRejectWrongKinds(t *testing.T) {
 	}{
 		{name: "ListValue", access: func(v *ValueObject) error { _, err := v.ListValue(); return err }},
 		{name: "ZSetValue", access: func(v *ValueObject) error { _, err := v.ZSetValue(); return err }},
-		{name: "StreamValue", access: func(v *ValueObject) error { _, err := v.StreamValue(); return err }},
+		{name: "streamOf", access: func(v *ValueObject) error { _, err := streamOf(v); return err }},
 	}
 
 	for _, tt := range tests {
@@ -39,11 +39,6 @@ func TestValueObjectAccessorsRejectInvalidTaggedUnionState(t *testing.T) {
 			name:   "zset kind without a zset payload",
 			value:  &ValueObject{Kind: ValueKindZSet},
 			access: func(v *ValueObject) error { _, err := v.ZSetValue(); return err },
-		},
-		{
-			name:   "stream kind without a stream payload",
-			value:  &ValueObject{Kind: ValueKindStream},
-			access: func(v *ValueObject) error { _, err := v.StreamValue(); return err },
 		},
 		{
 			name:   "nil value object",
@@ -126,12 +121,6 @@ func TestStoreRejectsInvalidTaggedUnionState(t *testing.T) {
 			value: &ValueObject{Kind: ValueKindZSet},
 			read:  func(s *Store, key string) error { _, err := s.ZRange(key, 0, -1); return err },
 		},
-		{
-			name:  "XRead over a stream kind without a payload",
-			key:   "events",
-			value: &ValueObject{Kind: ValueKindStream},
-			read:  func(s *Store, key string) error { _, err := s.XRead(key, "0-0"); return err },
-		},
 	}
 
 	for _, tt := range tests {
@@ -191,7 +180,7 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 		{name: "SADD of a string (newSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("a")); return err }},
 		{name: "ZADD of a short member (newCompactZSetValue)", write: zadd("m")},
 		{name: "ZADD of a long member (newZSetValue)", write: zadd(long)},
-		{name: "XADD (newStreamValue)", write: func(s *Store) error { _, _, err := s.XAdd(key, "*", bulk("f", "v")); return err }},
+		{name: "XADD (a new stream)", write: func(s *Store) error { _, _, err := s.XAdd(key, "*", bulk("f", "v")); return err }},
 	}
 
 	for _, tt := range tests {

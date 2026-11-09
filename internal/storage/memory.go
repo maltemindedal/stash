@@ -83,6 +83,10 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 		return 0
 	}
 
+	if value.data != nil {
+		return approximateBaseValueObjectSize(key, value.ExpiresAt) + value.data.approxSize()
+	}
+
 	switch value.Kind {
 	case ValueKindString:
 		return s.approximateStringValueObjectSize(key, len(value.String), value.ExpiresAt)
@@ -135,19 +139,6 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 			size += int64(len(value.ZSet.index)) * approxZSetEntryOverhead
 			for member := range value.ZSet.index {
 				size += int64(len(member))
-			}
-		}
-		return size
-	case ValueKindStream:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.Stream != nil {
-			size += int64(len(value.Stream.entries)) * approxStreamEntryOverhead
-			for _, record := range value.Stream.entries {
-				size += int64(len(record.idText))
-				for _, item := range record.values {
-					size += int64(len(item))
-				}
 			}
 		}
 		return size
