@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -25,54 +24,48 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		}
 	}()
 
-	state := s.getClientState(clientID)
-	// Built once for the connection. A connection whose Client state shutdown
-	// has already cleared gets a Call without one, which the executor refuses.
-	call := Call{Client: state, Origin: record.OriginClient}
-	var input io.Reader = conn
-	if state != nil {
-		// Replies are queued while requests keep arriving and are sent when the
-		// handler is about to wait for more input.
-		input = flushBeforeRead{conn: conn, state: state}
-	}
-	parser := protocol.NewParser(input)
-	writer := bufio.NewWriter(conn)
-
 	remoteAddr := ""
 	if addr := conn.RemoteAddr(); addr != nil {
 		remoteAddr = addr.String()
 	}
+	logger := s.logger.With("client_id", clientID, "remote_addr", remoteAddr)
 
+	// Every byte the connection is sent goes through its Output: its Replies,
+	// written by this goroutine, and what other connections push to it.
+	out := newOutput(s.outputs, &goroutineOutputDriver{wire: conn}, logger)
+	state := s.getClientState(clientID)
 	if state != nil {
-		state.BindResponseWriter(writer)
-		state.BindResponseConn(conn)
+		state.BindOutput(out)
 		state.SetRemoteAddr(remoteAddr)
 	}
+	// Built once for the connection. A connection whose Client state shutdown
+	// has already cleared gets a Call without one, which the executor refuses.
+	call := Call{Client: state, Origin: record.OriginClient}
+	// Replies are queued while requests keep arriving and are sent when the
+	// handler is about to wait for more input.
+	parser := protocol.NewParser(flushBeforeRead{conn: conn, out: out})
+	// What the registries are given as the connection: closing it or ending its
+	// stream goes through the Output, which owns the socket's write side.
+	client := &outputConn{Conn: conn, out: out}
 
-	logger := s.logger.With("client_id", clientID, "remote_addr", remoteAddr)
 	logger.Debug("client connected")
 	defer s.teardownClient(clientID, logger)
-	defer func() {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			logger.Debug("failed to close connection", "error", err)
-		}
-	}()
+	// Closes the connection, after the last flush below.
+	defer out.Close(nil)
 
 	stopClose := context.AfterFunc(ctx, func() {
-		// A replica's connection stays open while shutdown sends it what its
-		// feed holds (ReplicaRegistry.StopFeeds), and shutdown closes it after
-		// that (ClientRegistry.CloseAll).
+		// A replica's connection stays open while shutdown sends it what is
+		// queued for it (ReplicaRegistry.StopFeeds, EndStreams), and shutdown
+		// closes it after that (ClientRegistry.CloseAll).
 		if state.IsReplica() {
 			return
 		}
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			logger.Debug("failed to close connection after cancellation", "error", err)
-		}
+		out.Close(nil)
 	})
 	defer stopClose()
 	// Runs before the connection is closed (deferred after it): whatever replies
 	// are still queued when the handler leaves go out first, if the socket allows.
-	defer func() { _ = state.TryFlushResponses() }()
+	defer func() { _ = out.Flush() }()
 
 	// On a server that requires a password, a connection gets a limited time to
 	// authenticate. The deadline covers reads, including one that is half way
@@ -111,13 +104,13 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			if state.IsReplica() {
 				return
 			}
-			if writeErr := s.writeClientResponses(state, writer, []protocol.Value{protocol.ErrorValue{Message: "ERR " + err.Error()}}); writeErr != nil {
+			if writeErr := out.Reply(protocol.ErrorValue{Message: "ERR " + err.Error()}); writeErr != nil {
 				logger.Warn("failed to write parser error", "parse_error", err, "write_error", writeErr)
 			}
 			return
 		}
 
-		responses, registerReplica, execErr := s.executeClientRequest(ctx, call, clientID, conn, logger, value)
+		responses, execErr := s.executeClientRequest(ctx, call, clientID, client, logger, value)
 		if execErr != nil {
 			return
 		}
@@ -127,24 +120,37 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			authDeadlineSet = false
 		}
 
-		if err := s.writeClientResponses(state, writer, responses); err != nil {
-			logger.Warn("failed to write response", "error", err)
+		if err := out.Reply(responses...); err != nil {
+			logger.Debug("failed to queue response", "error", err)
 			return
 		}
-		// PSYNC registered the replica at its attach cut, and its feed has
-		// been holding every write since. Start the feed only once the
-		// handshake response has reached the socket, so a propagated command
-		// cannot precede the FULLRESYNC frames in the replica's stream.
-		// Replies are queued, so send them first.
-		if registerReplica {
-			if err := state.FlushResponses(); err != nil {
-				logger.Warn("failed to write handshake response", "error", err)
+		// Replies leave together when the handler next waits for input, unless
+		// enough of them are waiting already.
+		if out.Backlog() >= outputWriteThrough {
+			if err := out.Flush(); err != nil {
+				logger.Debug("failed to write response", "error", err)
 				return
 			}
-			s.registerReplicaPeer(clientID, conn)
 		}
 	}
 }
+
+// outputConn is a goroutine-mode connection as the registries see it: closing
+// it and ending its stream go through its Output, so that neither cuts off
+// output that is still queued for another goroutine to write.
+type outputConn struct {
+	net.Conn
+	out *Output
+}
+
+// CloseWrite ends the stream to a replica once everything queued for it has
+// been written (ReplicaRegistry.EndStreams).
+func (c *outputConn) CloseWrite() error {
+	c.out.EndStream()
+	return nil
+}
+
+var _ streamEnder = (*outputConn)(nil)
 
 // authTimeoutApplies reports whether a new connection must authenticate within
 // the configured time: only where a password is required and a timeout is set.
@@ -169,12 +175,12 @@ func (s *Server) requestLimits(state *ClientState) protocol.Limits {
 // waits for its reply would deadlock with us. A read that finds the parser's
 // buffer empty is the only time the handler can block on input.
 type flushBeforeRead struct {
-	conn  net.Conn
-	state *ClientState
+	conn net.Conn
+	out  *Output
 }
 
 func (r flushBeforeRead) Read(p []byte) (int, error) {
-	if err := r.state.TryFlushResponses(); err != nil {
+	if err := r.out.Flush(); err != nil {
 		return 0, err
 	}
 	return r.conn.Read(p)
@@ -184,13 +190,17 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 // shared by both networking modes: monitor observation, execution (which
 // records a write's command frames, and answers one the Recorder withheld with
 // ERR persistence failure), and the processed-command counter. It returns the RESP
-// responses to deliver and whether the caller must start the feed of the
-// replica peer PSYNC registered (registerReplicaPeer) once those responses have
-// been written or buffered. A non-nil error is fatal for the connection.
+// responses to deliver, which the caller hands to the connection's Output even
+// when there are none. A non-nil error is fatal for the connection.
+//
+// A PSYNC that registered the connection as a replica has its feed started
+// here (registerReplicaPeer). The feed pushes to the connection's Output from
+// its own goroutine, so the Output holds what it pushes until the caller has
+// replied: the stream follows the FULLRESYNC reply.
 //
 // A request from a connection that is already an attached replica gets no
 // responses.
-func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID uint64, conn ClientConn, logger *slog.Logger, request protocol.Value) ([]protocol.Value, bool, error) {
+func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID uint64, conn ClientConn, logger *slog.Logger, request protocol.Value) ([]protocol.Value, error) {
 	if s.monitorRegistry.HasSubscribers() {
 		s.broadcastMonitorEvent(observeCommand(request, clientID, conn))
 	}
@@ -201,13 +211,18 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 	result, execErr := s.executor.Handle(ctx, call, request)
 	if execErr != nil {
 		if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) || errors.Is(execErr, ErrClientDisconnected) || errors.Is(execErr, ErrCloseConnection) {
-			return nil, false, execErr
+			return nil, execErr
 		}
 		logger.Debug("command execution failed", "error", execErr)
 		result = SingleResponse(responseError(execErr))
 	}
 
 	s.commandsProcessed.Add(1)
+
+	if result.RegisterReplica {
+		call.Client.Output().HoldPushes()
+		s.registerReplicaPeer(clientID, conn)
+	}
 
 	if attachedReplica {
 		// A replica's connection carries the replication stream and nothing
@@ -220,35 +235,9 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 		if len(result.Responses) > 0 {
 			logger.Debug("not answering a request on a replica's replication link", "replies", len(result.Responses))
 		}
-		return nil, result.RegisterReplica, nil
+		return nil, nil
 	}
-	return result.Responses, result.RegisterReplica, nil
-}
-
-func (s *Server) writeClientResponses(state *ClientState, writer *bufio.Writer, values []protocol.Value) error {
-	if state != nil {
-		return state.QueueResponses(values)
-	}
-
-	return s.writeResponses(writer, values)
-}
-
-func (s *Server) writeResponses(writer *bufio.Writer, values []protocol.Value) error {
-	if len(values) == 1 {
-		if err := protocol.WriteValue(writer, values[0]); err != nil {
-			return err
-		}
-		return writer.Flush()
-	}
-
-	payload, err := protocol.EncodeValues(values)
-	if err != nil {
-		return err
-	}
-	if _, err := writer.Write(payload); err != nil {
-		return err
-	}
-	return writer.Flush()
+	return result.Responses, nil
 }
 
 func responseError(err error) protocol.ErrorValue {

@@ -1,7 +1,6 @@
 package command
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"net"
@@ -23,14 +22,13 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	executor, log, stream := newRecordingTestExecutor(nil)
 	client, conn := tcpPair(t)
 	state := newTestClientState(executor, 1)
-	state.BindResponseWriter(bufio.NewWriter(conn))
-	state.BindResponseConn(conn)
+	state.BindOutput(server.NewOutput(conn))
 	ctx, cancel := context.WithCancel(withClient(context.Background(), state))
 	defer cancel()
 
 	// BLPOP flushes the replies queued ahead of it only once it is waiting.
-	if err := state.QueueResponses([]protocol.Value{protocol.SimpleString{Value: "PONG"}}); err != nil {
-		t.Fatalf("QueueResponses() error = %v", err)
+	if err := state.Output().Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
 	}
 	type outcome struct {
 		result testResult

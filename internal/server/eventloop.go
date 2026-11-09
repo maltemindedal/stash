@@ -3,7 +3,6 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -32,9 +31,8 @@ const eventLoopReadBudget = 1 << 20
 
 // eventLoopOutputHighWater is the pending-output level above which the loop
 // stops reading and executing further requests for a connection until its
-// buffered responses drain, so a pipelining client that reads slowly cannot
-// amplify small requests into unbounded response memory.
-const eventLoopOutputHighWater = 1 << 20
+// output drains, as the goroutine mode stops in Output.Flush.
+const eventLoopOutputHighWater = outputHighWater
 
 // eventLoopAcceptRetryDelay is how long accepting pauses after the process
 // runs out of file descriptors, preventing a level-triggered busy loop on a
@@ -45,25 +43,6 @@ const eventLoopAcceptRetryDelay = 100 * time.Millisecond
 // probe and the interval between probes, the values the net package uses for the
 // connections the default networking path accepts.
 const eventLoopKeepaliveSeconds = 15
-
-// eventLoopPushLimit is how much output may be waiting for a client that
-// receives asynchronous pushes (pub/sub messages, MONITOR events) before the
-// loop closes it. It is Redis's pub/sub hard limit: a subscriber that has not
-// drained 32 MiB is not keeping up. Replies to a client's own requests are not
-// subject to it, since those can be as large as a stored value.
-const eventLoopPushLimit = 32 << 20
-
-// eventLoopReplicaPushLimit is the same limit for a replica, which is expected
-// to fall further behind during a burst of writes; it is Redis's replica hard
-// limit.
-const eventLoopReplicaPushLimit = 256 << 20
-
-// eventLoopPushBudget bounds the output waiting for all push-receiving clients
-// together (replicas excluded, they have their own limit). Every message
-// published is copied once per subscriber, so many slow subscribers each below
-// their own limit could otherwise hold many times the memory of one. When the
-// budget is exceeded the loop closes the client with the most output waiting.
-const eventLoopPushBudget = 128 << 20
 
 // pollEvent is one readiness notification translated from the OS poller.
 type pollEvent struct {
@@ -144,32 +123,20 @@ func (s *Server) serveEventLoop(ctx context.Context, listener net.Listener) erro
 
 // connCommandRunner returns a ConnCommandRunner that executes one parsed
 // request through the command pipeline shared with the goroutine path.
-// Responses are returned for the ConnMachine to buffer rather than written
-// directly. A replica's feed is started (PSYNC registered the replica at its
-// attach cut, and registerReplicaPeer marks the connection a replica first)
-// before the handshake responses are buffered. That is safe because
-// the feed writes through the connection's push queue, which the loop moves
-// into the write buffer only after the request that queued it, so the stream
-// follows the responses.
+// Responses are returned for the ConnMachine to hand to the connection's
+// Output rather than written directly.
 func (s *Server) connCommandRunner(call Call, clientID uint64, conn ClientConn, logger *slog.Logger) ConnCommandRunner {
 	return func(ctx context.Context, request protocol.Value) ([]protocol.Value, error) {
-		responses, registerReplica, err := s.executeClientRequest(ctx, call, clientID, conn, logger, request)
-		if err != nil {
-			return nil, err
-		}
-		if registerReplica {
-			// Marks the connection a replica (markReplica) before starting the feed.
-			s.registerReplicaPeer(clientID, conn)
-		}
-		return responses, nil
+		return s.executeClientRequest(ctx, call, clientID, conn, logger, request)
 	}
 }
 
 // eventLoop drives all client connections from one goroutine. Connection state
 // (ConnMachine, interest flags) is owned exclusively by that goroutine; the
 // mutex only guards the queues that other goroutines use to hand work to the
-// loop (async push frames, close requests, and accept resumption), which are
-// paired with a poller wakeup.
+// loop (connections with output to write, close requests, and accept
+// resumption). Whoever adds to a queue wakes the poller, but only while the
+// loop is waiting in it (wakeIfWaiting).
 type eventLoop struct {
 	srv          *Server
 	poller       poller
@@ -181,9 +148,6 @@ type eventLoop struct {
 	events       []pollEvent
 	readBuf      []byte
 	acceptPaused bool
-	// pushOutput is the output waiting for the push-receiving connections that
-	// are not replicas, as last accounted by accountPushOutput.
-	pushOutput int
 	// draining is set once the server shuts down or accepting fails
 	// (beginDrain). The loop then serves only the replicas, to send them what is
 	// queued for them, and returns drainErr once shutdown has stopped their feeds
@@ -193,20 +157,29 @@ type eventLoop struct {
 	drainErr     error
 	drainExpired atomic.Bool
 
-	mu           sync.Mutex
-	pushed       []*eventConn
+	// waiting is set from just before the loop looks at its queues for the last
+	// time ahead of a Wait until that Wait returns.
+	waiting atomic.Bool
+
+	mu sync.Mutex
+	// dirty are the connections whose Output was given bytes the loop has not
+	// been asked to write yet, each listed once (eventConn.dirty).
+	dirty        []*eventConn
+	spareDirty   []*eventConn
 	closeReqs    []*eventConn
 	resumeAccept bool
 }
 
 // eventConn tracks one accepted connection inside the event loop. All fields
-// are owned by the loop goroutine except pushBuf, pushQueued, closeRequested,
-// and detached, which are guarded by eventLoop.mu.
+// are owned by the loop goroutine except out and dirty, which are safe for
+// concurrent use, and closeRequested and detached, which are guarded by
+// eventLoop.mu.
 type eventConn struct {
 	fd         int
 	clientID   uint64
 	remoteAddr net.Addr
 	machine    *ConnMachine
+	out        *Output
 	ctx        context.Context
 	run        ConnCommandRunner
 	logger     *slog.Logger
@@ -216,13 +189,10 @@ type eventConn struct {
 	// authTimer closes the connection if it has not authenticated in time; nil
 	// where no password is required.
 	authTimer *time.Timer
-	// receivesPushes is set once a push frame has been buffered for the
-	// connection; pushAccounted is its share of eventLoop.pushOutput.
-	receivesPushes bool
-	pushAccounted  int
-	// replica is set once the connection has become a replica peer. It is read
-	// from other goroutines (queuePush), hence atomic.
+	// replica is set once the connection has become a replica peer.
 	replica atomic.Bool
+	// dirty is set while the connection is on eventLoop.dirty.
+	dirty atomic.Bool
 	// endStream is set when shutdown asks for a replica's connection to be
 	// closed while the loop drains: once its output has reached the kernel, the
 	// loop shuts the write side (writeShut) and closes the connection when the
@@ -230,8 +200,6 @@ type eventConn struct {
 	endStream bool
 	writeShut bool
 
-	pushBuf        []byte
-	pushQueued     bool
 	closeRequested bool
 	detached       bool
 }
@@ -246,15 +214,25 @@ func (l *eventLoop) run(ctx context.Context) error {
 	defer stopWake()
 
 	for {
+		// What the events below queued for other connections on this goroutine,
+		// such as the messages of a PUBLISH, is written here without a wakeup.
+		l.applyQueuedWork()
 		if l.draining && (len(l.conns) == 0 || l.drainExpired.Load()) {
 			return l.drainErr
 		}
+
+		// Another goroutine wakes the poller only if it sees waiting set after it
+		// queued its work. Work queued before that is seen here instead, after
+		// waiting is set, so no wakeup is lost between the two.
+		l.waiting.Store(true)
+		if l.hasQueuedWork() {
+			_ = l.poller.Wake()
+		}
 		n, err := l.poller.Wait(l.events)
+		l.waiting.Store(false)
 		if err != nil {
 			return fmt.Errorf("server: event loop wait: %w", err)
 		}
-
-		l.applyQueuedWork()
 
 		for _, event := range l.events[:n] {
 			if event.fd == l.listenFD {
@@ -284,27 +262,41 @@ func (l *eventLoop) run(ctx context.Context) error {
 	}
 }
 
-// applyQueuedWork moves cross-goroutine push frames into connection write
-// buffers, applies queued close requests, and resumes accepting after a
+// hasQueuedWork reports whether another goroutine has handed the loop work it
+// has not taken yet.
+func (l *eventLoop) hasQueuedWork() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.dirty) > 0 || len(l.closeReqs) > 0 || l.resumeAccept
+}
+
+// wakeIfWaiting wakes the poller if the loop is waiting in it, or about to. A
+// loop that is running takes the queues before it waits again.
+func (l *eventLoop) wakeIfWaiting() {
+	if l.waiting.Load() {
+		_ = l.poller.Wake()
+	}
+}
+
+// markDirty lists conn as having output the loop has not been asked to write.
+// Safe for concurrent use; it is called with the connection's Output locked.
+func (l *eventLoop) markDirty(conn *eventConn) {
+	if !conn.dirty.CompareAndSwap(false, true) {
+		return
+	}
+	l.mu.Lock()
+	l.dirty = append(l.dirty, conn)
+	l.mu.Unlock()
+	l.wakeIfWaiting()
+}
+
+// applyQueuedWork writes the output other connections and goroutines queued,
+// applies queued close requests, and resumes accepting after a
 // descriptor-exhaustion pause.
 func (l *eventLoop) applyQueuedWork() {
-	type pushWork struct {
-		conn *eventConn
-		data []byte
-	}
-
 	l.mu.Lock()
-	pushes := make([]pushWork, 0, len(l.pushed))
-	for _, conn := range l.pushed {
-		if conn.detached || len(conn.pushBuf) == 0 {
-			conn.pushQueued = false
-			continue
-		}
-		pushes = append(pushes, pushWork{conn: conn, data: conn.pushBuf})
-		conn.pushBuf = nil
-		conn.pushQueued = false
-	}
-	l.pushed = l.pushed[:0]
+	dirty := l.dirty
+	l.dirty = l.spareDirty[:0]
 	closes := append([]*eventConn(nil), l.closeReqs...)
 	l.closeReqs = l.closeReqs[:0]
 	resumeAccept := l.resumeAccept
@@ -318,16 +310,16 @@ func (l *eventLoop) applyQueuedWork() {
 		l.beginDrain(nil)
 	}
 
-	for _, push := range pushes {
-		if l.conns[push.conn.fd] != push.conn {
-			continue
+	for i, conn := range dirty {
+		dirty[i] = nil
+		// Cleared before the write, so that output queued during it lists the
+		// connection again.
+		conn.dirty.Store(false)
+		if l.conns[conn.fd] == conn {
+			l.finishConnEvent(conn)
 		}
-		if !l.bufferPushes(push.conn, push.data) {
-			continue
-		}
-		l.finishConnEvent(push.conn)
-		l.enforcePushBudget()
 	}
+	l.spareDirty = dirty[:0]
 
 	for _, conn := range closes {
 		if l.conns[conn.fd] != conn {
@@ -384,77 +376,6 @@ func (l *eventLoop) beginDrain(cause error) {
 	}
 }
 
-// takePushes moves the pushes waiting in conn's push queue into its write
-// buffer ahead of the reply to the request about to run, and reports whether
-// conn is still open. A push queued while that request runs stays queued, so it
-// follows the reply. pushQueued stays set because conn stays on the pushed list
-// until applyQueuedWork, which skips an empty pushBuf.
-func (l *eventLoop) takePushes(conn *eventConn) bool {
-	l.mu.Lock()
-	data := conn.pushBuf
-	conn.pushBuf = nil
-	l.mu.Unlock()
-
-	if len(data) > 0 && l.bufferPushes(conn, data) {
-		l.accountPushOutput(conn)
-		l.enforcePushBudget()
-	}
-	return l.conns[conn.fd] == conn
-}
-
-// bufferPushes appends push frames taken from conn's push queue to its write
-// buffer, closing conn if they pass its push limit, and reports whether conn is
-// still open.
-func (l *eventLoop) bufferPushes(conn *eventConn, data []byte) bool {
-	conn.machine.SetPushLimit(conn.pushLimit())
-	if err := conn.machine.BufferEncoded(data); err != nil {
-		l.closeConn(conn, err)
-		return false
-	}
-	conn.receivesPushes = true
-	return true
-}
-
-// pushLimit is how much output may wait for the connection before it is closed:
-// the replica limit once it has become a replica, the subscriber limit before.
-func (c *eventConn) pushLimit() int {
-	if c.replica.Load() {
-		return eventLoopReplicaPushLimit
-	}
-	return eventLoopPushLimit
-}
-
-// queuePush appends an async push frame (pub/sub message, monitor event, or
-// replication payload) for delivery by the loop goroutine. Safe for concurrent
-// use; the per-client responseMu already serializes whole frames. A
-// connection whose push queue exceeds the write-buffer limit is closed, so a
-// consumer that stopped draining its socket cannot grow server memory without
-// bound.
-func (l *eventLoop) queuePush(conn *eventConn, payload []byte) (int, error) {
-	l.mu.Lock()
-	if conn.detached {
-		l.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	if limit := conn.pushLimit(); len(conn.pushBuf)+len(payload) > limit {
-		l.mu.Unlock()
-		l.requestClose(conn)
-		return 0, fmt.Errorf("%w: more than its %d byte limit waiting", errPushLimitExceeded, limit)
-	}
-	conn.pushBuf = append(conn.pushBuf, payload...)
-	alreadyQueued := conn.pushQueued
-	conn.pushQueued = true
-	if !alreadyQueued {
-		l.pushed = append(l.pushed, conn)
-	}
-	l.mu.Unlock()
-
-	if err := l.poller.Wake(); err != nil {
-		return 0, err
-	}
-	return len(payload), nil
-}
-
 // requestClose asks the loop goroutine to close conn. Safe for concurrent use.
 func (l *eventLoop) requestClose(conn *eventConn) {
 	l.mu.Lock()
@@ -466,7 +387,7 @@ func (l *eventLoop) requestClose(conn *eventConn) {
 	l.closeReqs = append(l.closeReqs, conn)
 	l.mu.Unlock()
 
-	_ = l.poller.Wake()
+	l.wakeIfWaiting()
 }
 
 // acceptReady accepts queued connections until the listener would block. A
@@ -540,7 +461,7 @@ func (l *eventLoop) pauseAccepting() {
 		l.mu.Lock()
 		l.resumeAccept = true
 		l.mu.Unlock()
-		_ = l.poller.Wake()
+		l.wakeIfWaiting()
 	})
 }
 
@@ -550,7 +471,6 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 
 	clientID, state := l.srv.registerClient(handle)
 	conn.clientID = clientID
-	state.BindResponseWriter(bufio.NewWriter(&eventConnPushWriter{loop: l, conn: conn}))
 
 	remoteAddrText := ""
 	if remoteAddr != nil {
@@ -558,11 +478,12 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	}
 	state.SetRemoteAddr(remoteAddrText)
 
-	conn.machine = NewConnMachine(state)
-	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
-	conn.machine.SetPushLimit(eventLoopPushLimit)
 	conn.ctx = l.ctx
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
+	conn.out = newOutput(l.srv.outputs, &loopOutputDriver{loop: l, conn: conn}, conn.logger)
+	state.BindOutput(conn.out)
+	conn.machine = NewConnMachine(state)
+	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
 	// Requests run inline on the loop goroutine, where whatever would block
 	// returns an error instead.
 	conn.run = l.srv.connCommandRunner(Call{Client: state, Origin: record.OriginClient, Inline: true}, clientID, handle, conn.logger)
@@ -661,12 +582,6 @@ func (l *eventLoop) processConn(conn *eventConn) {
 			}
 		}
 
-		// Pushes queued before this request, such as a message another
-		// client published earlier in this iteration, go out ahead of its
-		// reply, as Redis orders them.
-		if !l.takePushes(conn) {
-			return
-		}
 		more, err := conn.machine.ProcessNext(conn.ctx, conn.run)
 		if err != nil {
 			l.closeConn(conn, err)
@@ -702,7 +617,6 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 	if !l.flushOnce(conn) {
 		return
 	}
-	l.accountPushOutput(conn)
 	if conn.machine.State() == ConnStateClosed {
 		l.closeConn(conn, conn.machine.Err())
 		return
@@ -751,12 +665,9 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 	if conn.authTimer != nil {
 		conn.authTimer.Stop()
 	}
-	l.pushOutput -= conn.pushAccounted
-	conn.pushAccounted = 0
 
 	l.mu.Lock()
 	conn.detached = true
-	conn.pushBuf = nil
 	l.mu.Unlock()
 
 	conn.machine.Close(cause)
@@ -766,40 +677,6 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 	closeIgnoringError(conn.fd)
 
 	l.srv.teardownClient(conn.clientID, conn.logger)
-}
-
-// accountPushOutput brings the loop's total of push-receiving output up to date
-// with what is waiting for conn now. Replicas are left out: they have their own
-// limit, and a replica catching up should not push subscribers out.
-func (l *eventLoop) accountPushOutput(conn *eventConn) {
-	if !conn.receivesPushes || conn.replica.Load() {
-		return
-	}
-	pending := conn.machine.PendingOutputBytes()
-	l.pushOutput += pending - conn.pushAccounted
-	conn.pushAccounted = pending
-}
-
-// enforcePushBudget closes push-receiving clients, the one with the most output
-// waiting first, until the total is back within eventLoopPushBudget.
-func (l *eventLoop) enforcePushBudget() {
-	for l.pushOutput > eventLoopPushBudget {
-		var victim *eventConn
-		for _, conn := range l.conns {
-			if conn.pushAccounted > 0 && (victim == nil || conn.pushAccounted > victim.pushAccounted) {
-				victim = conn
-			}
-		}
-		if victim == nil {
-			return
-		}
-		victim.logger.Warn(
-			"closing a client that is not keeping up with pushed messages: the event loop's total output budget for such clients is exhausted",
-			"pending_bytes", victim.pushAccounted,
-			"budget_bytes", eventLoopPushBudget,
-		)
-		l.closeConn(victim, fmt.Errorf("server: closed to stay within the %d byte budget for pushed output", eventLoopPushBudget))
-	}
 }
 
 func (l *eventLoop) cleanup() {
@@ -849,20 +726,26 @@ func (w fdWriter) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// eventConnPushWriter is the io.Writer bound (through a bufio.Writer) as the
-// connection's ClientState response writer. Async deliveries from other
-// goroutines land here and are handed to the loop goroutine for ordered
-// flushing.
-type eventConnPushWriter struct {
+// loopOutputDriver is the Event loop's side of a connection's Output: the loop
+// writes every connection itself (ConnMachine.Flush), so the driver only tells
+// it which connections were given output from elsewhere, and asks it to close
+// one.
+type loopOutputDriver struct {
 	loop *eventLoop
 	conn *eventConn
 }
 
-// Write queues p for the loop goroutine to flush. It is safe to call from any
-// goroutine; the bytes are not on the wire when it returns.
-func (w *eventConnPushWriter) Write(p []byte) (int, error) {
-	return w.loop.queuePush(w.conn, p)
-}
+func (d *loopOutputDriver) schedule(*Output) { d.loop.markDirty(d.conn) }
+
+func (d *loopOutputDriver) flush(*Output) error { return nil }
+
+func (d *loopOutputDriver) shut() { d.loop.requestClose(d.conn) }
+
+// closeWrite does nothing: the loop ends a Replica's stream itself
+// (eventConnHandle.CloseWrite).
+func (d *loopOutputDriver) closeWrite() {}
+
+func (d *loopOutputDriver) peerClosed() bool { return false }
 
 // eventConnHandle implements the ClientConn operations registered with the client
 // registry so shutdown, INFO connected-client counts, and replica bookkeeping
@@ -892,12 +775,13 @@ func (h *eventConnHandle) CloseWrite() error {
 	return nil
 }
 
-// markReplica holds the connection's waiting output to the replica limit from
-// now on. registerReplicaPeer calls it before the replica's feed starts pushing.
+// markReplica tells the loop the connection is a replica's, which shutdown
+// drains instead of closing. registerReplicaPeer calls it before the replica's
+// feed starts pushing.
 func (h *eventConnHandle) markReplica() { h.conn.replica.Store(true) }
 
 // Asserted, since registerReplicaPeer finds markReplica by type assertion: a
-// renamed method would compile and leave replicas under the subscriber limit.
+// renamed method would compile, and shutdown would close replicas undrained.
 var _ replicaMarker = (*eventConnHandle)(nil)
 
 // Asserted, since ReplicaRegistry.EndStreams finds CloseWrite by type assertion:

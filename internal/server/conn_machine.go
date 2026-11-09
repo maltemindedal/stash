@@ -51,20 +51,6 @@ const defaultMaxWriteBuffer = 512 * 1024 * 1024
 // it, so four chunks leaves room above that.
 const retainedReadBufferCap = 256 * 1024
 
-// retainedWriteBufferCap is the capacity above which Flush releases the write
-// buffer once it has written everything. The buffer grows to hold one large reply
-// and would otherwise keep that capacity until the connection closes, which a GET
-// of a large value would leave on every connection that asked for one.
-//
-// The bound sits above what a client that pipelines ordinary requests needs,
-// because releasing that buffer after every pipeline costs an allocation and a
-// copy per pipeline. The event loop stops executing a connection's requests once
-// eventLoopOutputHighWater (1 MiB) of output is pending, so such a client's
-// buffer fills to that mark and a reply past it, and append rounds the capacity
-// up from there (to about 1.2 MiB for 64 KiB replies). Twice the mark leaves
-// room above that.
-const retainedWriteBufferCap = 2 << 20
-
 // ConnCommandRunner executes one parsed request with connection-scoped state
 // and returns the RESP responses to buffer for the client. A non-nil error is
 // fatal for the connection.
@@ -96,10 +82,11 @@ type connEvent struct {
 // as Redis does: the byte stream can no longer be resynchronized.
 //
 // A ConnMachine is not safe for concurrent use; a single driving loop must own
-// it. Cross-goroutine async deliveries continue to flow through ClientState,
-// which carries its own locking.
+// it. Its output is the connection's Output, which other goroutines push to
+// under its own lock.
 type ConnMachine struct {
 	client *ClientState
+	out    *Output
 
 	state          ConnMachineState
 	err            error
@@ -109,8 +96,6 @@ type ConnMachine struct {
 	maxReadBuffer  int
 	maxWriteBuffer int
 	pending        []connEvent
-	writeBuf       []byte
-	writeOff       int
 
 	// requestLimits, when set, is asked before each frame is decoded what that
 	// frame may declare. decodePaused is set after a frame was decoded under
@@ -118,30 +103,25 @@ type ConnMachine struct {
 	// request may be the AUTH that lifts them.
 	requestLimits func() protocol.Limits
 	decodePaused  bool
-
-	// maxPushBuffer bounds pending output when an asynchronous push frame is
-	// added, which can be a tighter limit than maxWriteBuffer: a reply the client
-	// asked for can legitimately be as large as a stored value, but only a client
-	// that is not draining its socket lets pushes pile up.
-	maxPushBuffer int
 }
 
 // NewConnMachine constructs an active connection state machine bound to the
-// connection-scoped client state.
+// connection-scoped client state, writing through the Output bound to it. A
+// client with none is given one that is written only by Flush.
 func NewConnMachine(client *ClientState) *ConnMachine {
+	out := client.Output()
+	if out == nil {
+		out = newOutput(newOutputs(), unscheduledOutputDriver{}, discardLogger)
+		if client != nil {
+			client.BindOutput(out)
+		}
+	}
 	return &ConnMachine{
 		client:         client,
+		out:            out,
 		maxReadBuffer:  defaultMaxReadBuffer,
 		maxWriteBuffer: defaultMaxWriteBuffer,
-		maxPushBuffer:  defaultMaxWriteBuffer,
 	}
-}
-
-// SetPushLimit changes how much output may be pending when an asynchronous push
-// frame is buffered (BufferEncoded). Replies to the client's own requests keep
-// the write-buffer limit.
-func (m *ConnMachine) SetPushLimit(limit int) {
-	m.maxPushBuffer = limit
 }
 
 // State returns the current lifecycle phase.
@@ -172,7 +152,7 @@ func (m *ConnMachine) HasPendingOutput() bool {
 
 // PendingOutputBytes reports how many buffered response bytes await flushing.
 func (m *ConnMachine) PendingOutputBytes() int {
-	return len(m.writeBuf) - m.writeOff
+	return m.out.Backlog()
 }
 
 // Feed appends readable bytes to the read buffer and parses every complete
@@ -358,31 +338,18 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	return len(m.pending) > 0, nil
 }
 
-// Flush writes pending output to w and consumes whatever w accepts, so partial
-// writes leave the remainder buffered for a later call. The unwritten remainder
-// is tracked by an offset rather than recompacted, so draining a large reply to
-// a slow reader stays linear. When the output has drained completely, a buffer
-// that grew past retainedWriteBufferCap is released rather than kept for the next
-// reply. Once a closing machine has drained its parsed requests and pending
-// output, Flush completes the transition to the closed state.
+// Flush writes the connection's pending output to w and consumes whatever w
+// accepts, so a partial write leaves the remainder for a later call
+// (Output.writeTo). Once a closing machine has drained its parsed requests and
+// pending output, Flush completes the transition to the closed state.
 func (m *ConnMachine) Flush(w io.Writer) error {
 	if m.state == ConnStateClosed {
 		return ErrConnMachineClosed
 	}
 
-	if m.writeOff < len(m.writeBuf) {
-		n, err := w.Write(m.writeBuf[m.writeOff:])
-		m.writeOff += n
-		if m.writeOff >= len(m.writeBuf) {
-			m.writeBuf = m.writeBuf[:0]
-			if cap(m.writeBuf) > retainedWriteBufferCap {
-				m.writeBuf = nil
-			}
-			m.writeOff = 0
-		}
-		if err != nil {
-			return err
-		}
+	// A writer that took only part of the output is not a failed one.
+	if err := m.out.writeTo(w); err != nil && !errors.Is(err, io.ErrShortWrite) {
+		return err
 	}
 
 	if m.state == ConnStateClosing && !m.HasPendingOutput() && len(m.pending) == 0 {
@@ -392,32 +359,8 @@ func (m *ConnMachine) Flush(w io.Writer) error {
 	return nil
 }
 
-// BufferEncoded appends a pre-encoded RESP payload to the pending output
-// buffer. The event loop uses it to deliver asynchronous push frames (pub/sub
-// messages, monitor events, replication payloads) produced by other
-// connections, keeping every byte written to the socket ordered through the
-// machine's single write buffer. A closing machine still accepts payloads so
-// they drain with the remaining output; a closed machine rejects them, and a
-// payload that would grow pending output past the write-buffer limit fails so
-// the caller disconnects the stalled consumer.
-func (m *ConnMachine) BufferEncoded(payload []byte) error {
-	if m.state == ConnStateClosed {
-		return ErrConnMachineClosed
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	if limit := min(m.maxPushBuffer, m.maxWriteBuffer); m.PendingOutputBytes()+len(payload) > limit {
-		return fmt.Errorf("server: pending output exceeds %d byte limit for pushed frames", limit)
-	}
-
-	m.compactWriteBuf()
-	m.writeBuf = append(m.writeBuf, payload...)
-	return nil
-}
-
-// Close transitions to the closed state, discards buffered input and output,
-// and detaches the connection-scoped client state from shared registries.
+// Close transitions to the closed state, discards buffered input, closes the
+// connection's Output, and abandons the connection-scoped client state.
 func (m *ConnMachine) Close(err error) {
 	if m.state == ConnStateClosed {
 		return
@@ -431,39 +374,19 @@ func (m *ConnMachine) Close(err error) {
 	m.resumeAt = 0
 	m.decodePaused = false
 	m.pending = nil
-	m.writeBuf = nil
-	m.writeOff = 0
-	m.client.Disconnect()
+	m.out.Close(err)
+	m.client.Abandon()
 }
 
+// bufferResponses queues the Replies to the request that just ran, which may
+// be none: the Output releases the Pushed messages that request held either
+// way.
 func (m *ConnMachine) bufferResponses(values []protocol.Value) error {
-	if len(values) == 0 {
-		return nil
-	}
-
-	m.compactWriteBuf()
-
-	encoded, err := protocol.AppendValues(m.writeBuf, values)
-	if err != nil {
+	if err := m.out.Reply(values...); err != nil {
 		return err
 	}
-
-	m.writeBuf = encoded
 	if m.PendingOutputBytes() > m.maxWriteBuffer {
 		return fmt.Errorf("server: pending output exceeds %d byte write-buffer limit", m.maxWriteBuffer)
 	}
 	return nil
-}
-
-// compactWriteBuf reclaims the flushed prefix of the write buffer before an
-// append. Compaction is amortized: it runs only once the flushed prefix
-// dominates the buffer, so repeated appends against a partially drained buffer
-// stay linear instead of moving the whole unwritten tail on every call.
-func (m *ConnMachine) compactWriteBuf() {
-	if m.writeOff == 0 || m.writeOff < len(m.writeBuf)/2 {
-		return
-	}
-
-	m.writeBuf = append(m.writeBuf[:0], m.writeBuf[m.writeOff:]...)
-	m.writeOff = 0
 }

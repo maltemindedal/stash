@@ -115,8 +115,9 @@ The connection switches into monitoring mode and receives every request that cli
 
 Two operational notes:
 
-- Monitor delivery uses a short write deadline. A monitor that stops draining its socket is disconnected rather than allowed to consume server memory.
-- In `--event-loop` mode, buffered output is capped per connection and slow consumers are disconnected on that cap instead of on a per-write deadline.
+- Delivering an event never waits for a monitor: events are queued for it and written as its socket takes them, so a slow monitor does not slow the clients it watches.
+- A monitor that stops draining its socket is disconnected once 32 MiB of output is waiting for it, or earlier if it has the most waiting when monitors and pub/sub subscribers together hold more than 128 MiB. The server logs `closing a connection that is not keeping up with what is pushed to it`. This is the same in both networking modes.
+- The `+OK` reply to `MONITOR` always precedes the first event.
 
 `MONITOR` shows every command argument except `AUTH` passwords, which it redacts, so treat its output as sensitive.
 

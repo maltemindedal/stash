@@ -160,6 +160,10 @@ Subscriptions match exact channel names; there is no pattern subscription (`PSUB
 
 `PUBLISH` is forwarded to replicas but never written to the AOF, since it mutates no durable state.
 
+`PUBLISH` returns the number of subscribers the message was queued for, whether or not they are reading, as in Redis. It never waits for a subscriber. A subscriber's acknowledgements and messages arrive in the order the server processed them: no message precedes the `SUBSCRIBE` acknowledgement, and a message `PUBLISH` counted the subscriber for precedes the reply to that subscriber's next request.
+
+A subscriber that does not read is closed once 32 MiB of output is waiting for it. Subscribers and `MONITOR` clients together may have 128 MiB waiting; past that, the one with the most waiting is closed, even if it is under its own limit. This is the same in both networking modes; the default mode no longer closes a subscriber for one write that took longer than 100 ms.
+
 ## Replication
 
 | Command | Replicated | Durable |
