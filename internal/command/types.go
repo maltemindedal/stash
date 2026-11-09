@@ -22,8 +22,9 @@ type Request struct {
 	Args [][]byte
 
 	// effects records what one execution of the request did that its logged
-	// and propagated frames depend on: the keys it evicted, SET's absolute
-	// expiry, XADD's generated ID. Each execution starts it from zero.
+	// and propagated frames depend on: the keys its Evictions removed, SET's
+	// absolute expiry, XADD's generated ID. It is the storage.Changes the
+	// request's handler passes to the Store. Each execution starts it afresh.
 	effects executionEffects
 	// write is the command frames one execution of the request produced, for
 	// the sequencer to record before it releases the request's locks (see
@@ -81,9 +82,12 @@ type commandSpec struct {
 }
 
 type executionEffects struct {
-	// evicted holds the DEL of the keys the execution evicted to make room,
-	// recorded after the command's own frame.
-	evicted record.Write
+	// watches is the registry of the WATCHes a keyspace change invalidates.
+	watches *server.WatchRegistry
+	// removed is the keys the execution removed without being asked to: the
+	// ones its sweep found expired and the ones it evicted to make room. Their
+	// DEL is recorded after the command's own frame (Request.recordRemovals).
+	removed []string
 	// setExpiryMillis is the absolute Unix-millis deadline the SET handler
 	// computed and stored for this request, carried here so the PXAT rewrite
 	// frame reuses that exact value instead of re-deriving it from a later
@@ -93,6 +97,29 @@ type executionEffects struct {
 	// frame can carry it in place of an auto-ID request ("*"). Empty when the
 	// command did not add a stream entry.
 	streamID string
+}
+
+// KeyChanged makes a request's effects the storage.Changes of its writes: the
+// Store calls it, with no shard lock held, for every key the execution changed.
+// Whatever the cause, the change invalidates WATCH on the key, while the
+// request still holds its ordering, so an EXEC that follows sees it. A key the
+// execution removed on its own is also kept for the DEL that tells the
+// append-only file and the Replicas.
+func (x *executionEffects) KeyChanged(key string, cause storage.Cause) {
+	x.watches.Touch(key)
+	if cause != storage.Written {
+		x.removed = append(x.removed, key)
+	}
+}
+
+// recordRemovals adds the DEL of the keys the execution removed on its own
+// after the command frames the request's write holds so far.
+func (r *Request) recordRemovals() {
+	if len(r.effects.removed) == 0 {
+		return
+	}
+	r.write.AddDeletes(r.effects.removed, record.ToBoth)
+	r.effects.removed = nil
 }
 
 // Executor routes protocol frames to concrete command handlers.
@@ -221,10 +248,14 @@ func (e *Executor) admit(request *Request) error {
 // executeRequestDetailed runs a request that has been admitted: one Handle
 // admitted, or a command queued by the client of an EXEC that Handle admitted,
 // which runs with the EXEC's Call.
+//
+// Whether the command succeeds or fails, the request's write ends with the DEL
+// of the keys the execution removed on its own: a write refused for memory has
+// already swept the expired keys out of the keyspace.
 func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request, allowQueue bool) (server.ExecuteResult, error) {
-	request.effects = executionEffects{}
-	effects := &request.effects
+	request.effects = executionEffects{watches: e.watchRegistry}
 	request.write = record.Write{Origin: request.origin}
+	defer request.recordRemovals()
 
 	if err := e.validateSubscriptionContext(request); err != nil {
 		return server.ExecuteResult{}, err
@@ -256,7 +287,6 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 			return server.ExecuteResult{}, err
 		}
 		e.recordSlowCommand(request, startedAt, time.Since(startedAt))
-		request.write.Extend(&effects.evicted)
 		return result, nil
 	}
 	if spec.handler == nil {
@@ -272,7 +302,6 @@ func (e *Executor) executeRequestDetailed(ctx context.Context, request *Request,
 	if to := spec.destinations(); to != 0 {
 		request.write.Add(commandFrame(request, spec), to)
 	}
-	request.write.Extend(&effects.evicted)
 	return server.SingleResponse(response), nil
 }
 
@@ -391,15 +420,6 @@ func rewriteXAddFrame(request *Request) (protocol.Array, bool) {
 	frame := propagationFrame(request)
 	frame.Elements[2] = protocol.TextBulkString{Value: effects.streamID}
 	return frame, true
-}
-
-func (e *Executor) recordEvictedKeys(request *Request, keys []string) {
-	if len(keys) == 0 {
-		return
-	}
-
-	e.touchWatchKeys(keys...)
-	request.effects.evicted.Add(record.DeleteFrame(keys), record.ToBoth)
 }
 
 // DecodeRequest converts a RESP array into a command request.

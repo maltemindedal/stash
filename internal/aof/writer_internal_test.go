@@ -394,7 +394,7 @@ func TestRewriteKeepsTheCommandsAppendedWhileTheFileFails(t *testing.T) {
 			writer, faulty, path := openFaultyWriter(t, policy)
 			store := storage.NewStore()
 
-			if _, err := store.Set("a", []byte("1"), 0); err != nil {
+			if err := store.Set(nil, "a", []byte("1"), 0); err != nil {
 				t.Fatalf("Set(a) error = %v", err)
 			}
 			mustAppend(t, writer, setCommand("a", "1"))
@@ -421,7 +421,7 @@ func TestRewriteKeepsTheCommandsAppendedWhileTheFileFails(t *testing.T) {
 			}
 
 			setFaults(writer, func() { faulty.failing = true })
-			if _, err := store.Set("b", []byte("2"), 0); err != nil {
+			if err := store.Set(nil, "b", []byte("2"), 0); err != nil {
 				t.Fatalf("Set(b) error = %v", err)
 			}
 			if err := appendAndWrite(writer, setCommand("b", "2")); !errors.Is(err, errDiskFull) {

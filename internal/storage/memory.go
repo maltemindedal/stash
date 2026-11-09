@@ -17,7 +17,9 @@ const (
 
 // ConfigureMaxMemory enables approximate keyspace accounting and probabilistic
 // LRU eviction for subsequent writes. A limit of 0 disables the feature.
-func (s *Store) ConfigureMaxMemory(limit int64, sampleSize int) {
+// Enabling it measures the keyspace, and changes hears which expired keys that
+// swept out.
+func (s *Store) ConfigureMaxMemory(changes Changes, limit int64, sampleSize int) {
 	if s == nil {
 		return
 	}
@@ -36,8 +38,7 @@ func (s *Store) ConfigureMaxMemory(limit int64, sampleSize int) {
 	} else {
 		s.usedMemory.Store(0)
 	}
-	s.writeUnlockAllShards()
-	s.publishExpiredKeys()
+	s.writeUnlockAllShardsAndReport(changes)
 }
 
 // MaxMemory returns the configured approximate keyspace memory limit in bytes.
@@ -59,20 +60,19 @@ func (s *Store) UsedMemory() int64 {
 }
 
 // EnforceMaxMemory evicts least-recently-used candidates until the keyspace is
-// at or below the configured maxmemory limit.
-func (s *Store) EnforceMaxMemory() ([]string, error) {
+// at or below the configured maxmemory limit, and tells changes which.
+func (s *Store) EnforceMaxMemory(changes Changes) error {
 	if !s.maxMemoryEnabled() {
-		return nil, nil
+		return nil
 	}
 
-	defer s.publishExpiredKeys()
 	s.writeLockAllShards()
-	defer s.writeUnlockAllShards()
+	defer s.writeUnlockAllShardsAndReport(changes)
 
 	limit := s.maxMemory.Load()
 	s.recalculateUsedMemoryLocked(s.now())
 	if s.usedMemory.Load() <= limit {
-		return nil, nil
+		return nil
 	}
 
 	return s.evictUntilMemoryAtOrBelowLocked(limit, nil)
@@ -170,8 +170,8 @@ func approximateBaseValueObjectSize(key string, expiresAt int64) int64 {
 
 // recalculateUsedMemoryLocked re-measures the whole keyspace, dropping the
 // expired keys it passes on the way. Those drops are a sweep rather than the
-// caller's own mutation, so they are queued for the expiration listener instead
-// of being folded into whatever the caller is returning.
+// caller's own write, so they are noted for the caller's Changes to hear as
+// Expired. The caller holds every shard write lock.
 func (s *Store) recalculateUsedMemoryLocked(now int64) int64 {
 	used := int64(0)
 	next := maxInt64Value
@@ -192,7 +192,7 @@ func (s *Store) recalculateUsedMemoryLocked(now int64) int64 {
 	}
 	s.usedMemory.Store(used)
 	s.nextExpiry.Store(next)
-	s.noteExpiredKeysLocked(expired)
+	s.noteExpiredLocked(expired)
 	return used
 }
 
@@ -218,17 +218,18 @@ func (s *Store) mayHaveExpired(now int64) bool {
 }
 
 // ensureMemoryAvailableLocked makes room for a write that grows the keyspace by
-// delta bytes, evicting keys other than the protected ones, and reports the keys
-// it evicted.
+// delta bytes, evicting keys other than the protected ones. The caller holds
+// every shard write lock, and hears of the evicted keys as it releases them
+// (writeUnlockAllShardsAndReport).
 //
 // now is the clock reading of the write being sized. A sweep of expired keys
 // judges expiry by it, not by a fresh reading: the write found its key live at
 // now, and a later reading past the key's TTL deadline would sweep the key being
 // written, report it as an eviction ahead of the write, and leave the caller
 // subtracting its size twice.
-func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]struct{}, now int64) ([]string, error) {
+func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]struct{}, now int64) error {
 	if !s.maxMemoryEnabled() || delta <= 0 {
-		return nil, nil
+		return nil
 	}
 
 	// Sweep expired keys and re-measure the keyspace, but only when a TTL deadline
@@ -241,22 +242,24 @@ func (s *Store) ensureMemoryAvailableLocked(delta int64, protected map[string]st
 	limit := s.maxMemory.Load()
 	targetUsed := limit - delta
 	if targetUsed < 0 {
-		return nil, ErrMemoryLimitExceeded
+		return ErrMemoryLimitExceeded
 	}
 	if current <= targetUsed {
-		return nil, nil
+		return nil
 	}
 	// What cannot be evicted is the protected keys; if they alone are over the
 	// target, no amount of eviction makes room.
 	if s.protectedMemoryLocked(protected) > targetUsed {
-		return nil, ErrMemoryLimitExceeded
+		return ErrMemoryLimitExceeded
 	}
 
 	return s.evictUntilMemoryAtOrBelowLocked(targetUsed, protected)
 }
 
-func (s *Store) evictUntilMemoryAtOrBelowLocked(targetUsed int64, protected map[string]struct{}) ([]string, error) {
-	evicted := make([]string, 0)
+// evictUntilMemoryAtOrBelowLocked evicts the stalest keys other than the
+// protected ones until the keyspace uses at most targetUsed bytes. The caller
+// holds every shard write lock.
+func (s *Store) evictUntilMemoryAtOrBelowLocked(targetUsed int64, protected map[string]struct{}) error {
 	for s.usedMemory.Load() > targetUsed {
 		candidate := s.findStalestCandidateLocked(protected)
 		if candidate == "" {
@@ -264,15 +267,15 @@ func (s *Store) evictUntilMemoryAtOrBelowLocked(targetUsed int64, protected map[
 		}
 
 		if s.deleteKeyLocked(s.shardForKey(candidate), candidate) {
-			evicted = append(evicted, candidate)
+			s.removed.evicted = append(s.removed.evicted, candidate)
 		}
 	}
 
 	if s.usedMemory.Load() > targetUsed {
-		return nil, ErrMemoryLimitExceeded
+		return ErrMemoryLimitExceeded
 	}
 
-	return evicted, nil
+	return nil
 }
 
 func (s *Store) findStalestCandidateLocked(protected map[string]struct{}) string {

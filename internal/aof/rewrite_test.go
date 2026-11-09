@@ -27,21 +27,21 @@ import (
 
 func TestGenerateRewriteRoundTripsState(t *testing.T) {
 	store := storage.NewStore()
-	_, _ = store.Set("name", []byte("Stash"), 0)
-	_, _ = store.Set("expiring", []byte("soon"), time.Now().Add(time.Minute).UnixMilli())
-	if _, _, err := store.RightPush("letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+	_ = store.Set(nil, "name", []byte("Stash"), 0)
+	_ = store.Set(nil, "expiring", []byte("soon"), time.Now().Add(time.Minute).UnixMilli())
+	if _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
-	if _, _, err := store.HSet("profile", []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}, {Field: "tier", Value: []byte("senior")}}); err != nil {
+	if _, err := store.HSet(nil, "profile", []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}, {Field: "tier", Value: []byte("senior")}}); err != nil {
 		t.Fatalf("HSet() error = %v", err)
 	}
-	if _, _, err := store.SAdd("tags", [][]byte{[]byte("fast"), []byte("durable")}); err != nil {
+	if _, err := store.SAdd(nil, "tags", [][]byte{[]byte("fast"), []byte("durable")}); err != nil {
 		t.Fatalf("SAdd() error = %v", err)
 	}
-	if _, _, err := store.ZAdd("leaders", []storage.ZSetEntry{{Member: []byte("alpha"), Score: 1}, {Member: []byte("beta"), Score: 2}}); err != nil {
+	if _, err := store.ZAdd(nil, "leaders", []storage.ZSetEntry{{Member: []byte("alpha"), Score: 1}, {Member: []byte("beta"), Score: 2}}); err != nil {
 		t.Fatalf("ZAdd() error = %v", err)
 	}
-	if _, _, err := store.XAdd("events", "1-0", [][]byte{[]byte("type"), []byte("start")}); err != nil {
+	if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("type"), []byte("start")}); err != nil {
 		t.Fatalf("XAdd() error = %v", err)
 	}
 
@@ -337,9 +337,9 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 	// snapshot. So it has to replay to exactly those keys, deadlines included,
 	// and leave no temp file behind.
 	store := storage.NewStore()
-	_, _ = store.Set("name", []byte("Stash"), 0)
-	_, _ = store.Set("session", []byte("alice"), time.Now().Add(time.Hour).UnixMilli())
-	if _, _, err := store.RightPush("letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+	_ = store.Set(nil, "name", []byte("Stash"), 0)
+	_ = store.Set(nil, "session", []byte("alice"), time.Now().Add(time.Hour).UnixMilli())
+	if _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 	entries, _ := store.SnapshotAll()

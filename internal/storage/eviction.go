@@ -9,11 +9,12 @@ import (
 
 const defaultSampleSize = 20
 
-// StartEviction launches the background TTL eviction loop, reporting the keys
-// each pass removed through the store's expiration listener.
+// StartEviction launches the background TTL eviction loop, which runs each
+// sample through the store's background runner and tells its Changes which
+// keys the sample removed.
 //
 // It returns a channel closed once the loop has exited, so a caller whose
-// listener writes to resources it later tears down can order that teardown after
+// runner writes to resources it later tears down can order that teardown after
 // the loop. Cancelling ctx stops the loop.
 func (s *Store) StartEviction(ctx context.Context, interval time.Duration, sampleSize int) <-chan struct{} {
 	done := make(chan struct{})
@@ -62,7 +63,7 @@ const expiredSampleRepeatDenominator = 4
 // budget is spent. Without the repetition a fixed sample per interval clears only
 // sampleSize keys per interval however many have expired.
 //
-// A panic in it, most likely from the expiration listener, which reaches
+// A panic in it, most likely from the background runner, which reaches
 // replication and durability sinks, is logged and ends only this pass:
 // recovering around the whole loop instead would let one bug stop active expiry
 // for the life of the process.
@@ -84,24 +85,28 @@ func (s *Store) evictionPass(sampleSize int, budget time.Duration) (samples int)
 	}
 }
 
-// sweepSample takes one sample, removes its expired keys, and publishes the
-// removals, all inside the eviction guard so that they reach the listener in
-// order with the writes the guard's owner is logging. It returns how many keys
-// it sampled and how many it removed.
+// sweepSample takes one sample and removes its expired keys, as one piece of
+// work for the background runner, so that the removals are heard in order with
+// the writes the runner's owner is recording. It returns how many keys it
+// sampled and how many it removed.
 func (s *Store) sweepSample(sampleSize int) (sampled, removed int) {
-	release := s.acquireEvictionGuard()
-	defer release()
-
-	sampled, expired := s.evictExpiredSample(s.now(), sampleSize)
-	if len(expired) > 0 {
-		s.logDebug("background eviction removed expired keys", "removed", len(expired), "sample_size", sampleSize)
-		// Published once evictExpiredSample has released every shard lock
-		// it took: the listener reaches sinks outside the store, which
-		// must never be entered while holding one.
-		s.publishExpiredKeys()
-	}
-
-	return sampled, len(expired)
+	s.runInBackground(func(changes Changes) {
+		var expired []string
+		sampled, expired = s.evictExpiredSample(s.now(), sampleSize)
+		removed = len(expired)
+		if removed == 0 {
+			return
+		}
+		s.logDebug("background eviction removed expired keys", "removed", removed, "sample_size", sampleSize)
+		if changes == nil {
+			return
+		}
+		// evictExpiredSample has released every shard lock it took.
+		for _, key := range expired {
+			changes.KeyChanged(key, Expired)
+		}
+	})
+	return sampled, removed
 }
 
 // evictExpiredSample removes the expired keys in one sample of the keyspace and
@@ -119,7 +124,6 @@ func (s *Store) evictExpiredSample(now int64, sampleSize int) (sampled int, expi
 		value, ok := shard.data[keys[0]]
 		if ok && isExpired(value, now) {
 			s.deleteKeyLocked(shard, keys[0])
-			s.noteExpiredKeysLocked(keys)
 			return 1, keys
 		}
 
@@ -146,6 +150,5 @@ func (s *Store) evictExpiredSample(now int64, sampleSize int) (sampled int, expi
 		}
 	}
 
-	s.noteExpiredKeysLocked(expired)
 	return len(keys), expired
 }

@@ -106,10 +106,11 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 
 	if store != nil {
 		store.SetLogger(logger)
-		store.SetExpirationListener(srv.recordExpiredKeys)
-		if sequencer, ok := executor.(backgroundWriteSequencer); ok {
-			store.SetEvictionGuard(sequencer.BeginBackgroundWrite)
-		}
+		store.SetBackgroundRunner(func(work func(changes storage.Changes)) {
+			// The Recorder has logged an append that failed, and a sample of
+			// the expiry loop has nobody to answer.
+			_ = executor.RunBackgroundUnit(work)
+		})
 	}
 
 	return srv, nil
@@ -131,17 +132,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 	if s.store != nil {
-		s.store.ConfigureMaxMemory(s.cfg.MaxMemory, s.cfg.EvictionSampleSize)
-		if evicted, err := s.store.EnforceMaxMemory(); err != nil {
-			return fmt.Errorf("server: enforce maxmemory: %w", err)
-		} else if len(evicted) > 0 {
-			s.logger.Info("applied startup maxmemory eviction", "evicted_keys", len(evicted), "used_memory", s.store.UsedMemory(), "maxmemory", s.cfg.MaxMemory)
-			if err := s.persistStartupEvictions(evicted); err != nil {
-				if closeErr := s.closeAOFWriter(); closeErr != nil {
-					s.logger.Warn("failed to close AOF writer after the startup eviction append failed", "error", closeErr)
-				}
-				return err
-			}
+		if err := s.enforceMaxMemoryAtStartup(); err != nil {
+			return err
 		}
 	}
 
