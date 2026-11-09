@@ -194,3 +194,9 @@ func (s *Store) expiresAtForTest(key string) int64 {
 	}
 	return v.ExpiresAt
 }
+
+// holdsKeyForTest reports whether key is in its shard's map, whether or not
+// its TTL has passed, without the reclaiming a read would do.
+func (s *Store) holdsKeyForTest(key string) bool {
+	return s.valueObjectForTest(key) != nil
+}

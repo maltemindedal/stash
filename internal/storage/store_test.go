@@ -202,7 +202,7 @@ func TestStoreValueBehavior(t *testing.T) {
 					if got, _, err := store.Get("bitmap"); err != nil || !bytes.Equal(got, []byte{'a', 'b', 0, 1}) {
 						t.Fatalf("Get() with maxmemory %d = %q, %v, want %q", maxMemory, got, err, []byte{'a', 'b', 0, 1})
 					}
-					if got := store.valueObjectForTest("bitmap").ExpiresAt; got != deadline {
+					if got := store.expiresAtForTest("bitmap"); got != deadline {
 						t.Fatalf("SetBit() with maxmemory %d left the TTL deadline at %d, want %d", maxMemory, got, deadline)
 					}
 				}

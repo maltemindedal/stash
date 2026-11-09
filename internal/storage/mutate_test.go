@@ -312,7 +312,7 @@ func TestAWriteToAnExpiredKeySeesNoValue(t *testing.T) {
 				if found {
 					t.Fatalf("%s found a value under a key whose TTL had passed", w.name)
 				}
-				if store.valueObjectForTest(key) != nil {
+				if store.holdsKeyForTest(key) {
 					t.Fatalf("%s left the expired key stored", w.name)
 				}
 				requireExactUsedMemory(t, store)
@@ -685,7 +685,7 @@ func TestGrowingWritesEvictTheStalestKeyToMakeRoom(t *testing.T) {
 			if len(evicted) != 1 || evicted[0] != victim {
 				t.Fatalf("%s at the limit evicted %v, want [%s]", w.name, evicted, victim)
 			}
-			if store.valueObjectForTest(victim) != nil {
+			if store.holdsKeyForTest(victim) {
 				t.Fatalf("%s reported evicting %s but left it stored", w.name, victim)
 			}
 			if used := store.UsedMemory(); used > limit {
@@ -842,7 +842,7 @@ func TestShrinkingWritesLockOnlyTheirOwnShardAndNeverEvict(t *testing.T) {
 			if len(heard) != 0 {
 				t.Fatalf("%s swept %v; a shrinking write sweeps nothing", w.name, heard)
 			}
-			if store.valueObjectForTest(stale) == nil {
+			if !store.holdsKeyForTest(stale) {
 				t.Fatalf("%s removed %s from another shard", w.name, stale)
 			}
 			requireExactUsedMemory(t, store)

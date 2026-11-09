@@ -116,7 +116,7 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 		t.Fatalf("a write before any deadline swept %v", keys)
 	default:
 	}
-	if store.valueObjectForTest("soon") == nil {
+	if !store.holdsKeyForTest("soon") {
 		t.Fatal("the key was swept before its deadline")
 	}
 
@@ -132,7 +132,7 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("the first write after the deadline did not sweep the expired key")
 	}
-	if store.valueObjectForTest("later") == nil {
+	if !store.holdsKeyForTest("later") {
 		t.Fatal("the swept keyspace lost a key whose deadline had not passed")
 	}
 	if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
