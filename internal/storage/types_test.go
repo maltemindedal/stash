@@ -51,28 +51,6 @@ func TestValueObjectAccessorsRejectInvalidTaggedUnionState(t *testing.T) {
 	}
 }
 
-// TestValueObjectAccessorsMaterializeCompactValues checks that materializing a
-// compact encoding hands back a copy: mutating what the accessor returned must
-// not write through to the stored compact representation.
-func TestValueObjectAccessorsMaterializeCompactValues(t *testing.T) {
-	t.Run("hash", func(t *testing.T) {
-		hashValue := newCompactHashValue(newCompactHash([]HashFieldValue{{Field: "f", Value: []byte("v")}}), 0)
-		hash, err := hashValue.HashValue()
-		if err != nil {
-			t.Fatalf("HashValue() error = %v", err)
-		}
-		if string(hash["f"]) != "v" {
-			t.Fatalf("HashValue()[f] = %q, want v", string(hash["f"]))
-		}
-
-		hash["f"][0] = 'V'
-		got, ok, err := hashValue.hashGet("f")
-		if err != nil || !ok || string(got) != "v" {
-			t.Fatalf("compact hash after materialized mutation = (%q, %v, %v), want (v, true, nil)", string(got), ok, err)
-		}
-	})
-}
-
 // TestAWriteStampsTheValueItCreatesWithTheStoreClock pins where a new value's
 // access stamp comes from. The constructors leave a value unstamped, and the
 // write that stores it stamps it with its clock reading: a value stored with no
@@ -112,8 +90,8 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 		{name: "PFADD (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.PFAdd(key, bulk("a")); return err }},
 		{name: "LPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.LeftPush(key, bulk("a")); return err }},
 		{name: "RPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.RightPush(key, bulk("a")); return err }},
-		{name: "HSET of a short value (newCompactHashValue)", write: hset("f", "v")},
-		{name: "HSET of a long value (newHashValue)", write: hset("f", long)},
+		{name: "HSET of a short value (a compact hash)", write: hset("f", "v")},
+		{name: "HSET of a long value (a table hash)", write: hset("f", long)},
 		{name: "SADD of an integer (an integer set)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("1")); return err }},
 		{name: "SADD of a string (a table set)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("a")); return err }},
 		{name: "ZADD of a short member (a compact sorted set)", write: zadd("m")},

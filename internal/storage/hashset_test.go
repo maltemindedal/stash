@@ -251,9 +251,8 @@ func TestStoreHash(t *testing.T) {
 		if added != 2 {
 			t.Fatalf("HSet() added = %d, want 2", added)
 		}
-		stored := store.valueObjectForTest("h")
-		if stored == nil || stored.Kind != ValueKindHash || stored.HashEncoding != ValueEncodingCompact || stored.CompactHash == nil {
-			t.Fatalf("stored hash = %#v, want compact hash", stored)
+		if got := store.encodingForTest("h"); got != "hash:compact" {
+			t.Fatalf("encodingForTest(h) = %q, want hash:compact", got)
 		}
 
 		added, _, err = store.HSet("h", []HashFieldValue{{Field: "a", Value: []byte("one")}})
@@ -292,9 +291,8 @@ func TestStoreHash(t *testing.T) {
 		if _, _, err := store.HSet("h", pairs); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
-		stored := store.valueObjectForTest("h")
-		if stored == nil || stored.HashEncoding != ValueEncodingCompact {
-			t.Fatalf("stored hash = %#v, want compact hash for one distinct field", stored)
+		if got := store.encodingForTest("h"); got != "hash:compact" {
+			t.Fatalf("encodingForTest(h) = %q, want hash:compact", got)
 		}
 	})
 
@@ -314,12 +312,11 @@ func TestStoreHash(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("HSet() overflow = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("h")
-		if stored == nil || stored.Kind != ValueKindHash || stored.HashEncoding != ValueEncodingGeneral || stored.Hash == nil {
-			t.Fatalf("stored hash = %#v, want upgraded general hash", stored)
+		if got := store.encodingForTest("h"); got != "hash:general" {
+			t.Fatalf("encodingForTest(h) = %q, want hash:general", got)
 		}
-		if stored.ExpiresAt != expiresAt {
-			t.Fatalf("upgraded hash ExpiresAt = %d, want %d", stored.ExpiresAt, expiresAt)
+		if got := store.expiresAtForTest("h"); got != expiresAt {
+			t.Fatalf("upgraded hash expires at %d, want %d", got, expiresAt)
 		}
 		got, ok, err := store.HGet("h", "a")
 		if err != nil || !ok || string(got) != "v" {
@@ -374,9 +371,8 @@ func TestStoreHash(t *testing.T) {
 				if err != nil || added != tt.wantAdded {
 					t.Fatalf("HSet() long update = (%d, %v), want (%d, nil)", added, err, tt.wantAdded)
 				}
-				stored := store.valueObjectForTest("h")
-				if stored == nil || stored.HashEncoding != ValueEncodingGeneral || stored.Hash == nil {
-					t.Fatalf("stored hash = %#v, want upgraded general hash", stored)
+				if got := store.encodingForTest("h"); got != "hash:general" {
+					t.Fatalf("encodingForTest(h) = %q, want hash:general", got)
 				}
 				got, ok, err := store.HGet("h", tt.wantField)
 				if err != nil || !ok || len(got) != tt.wantLen {

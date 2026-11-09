@@ -2,7 +2,6 @@ package storage
 
 import (
 	"errors"
-	"maps"
 	"math"
 	"sync/atomic"
 )
@@ -110,9 +109,6 @@ type ValueObject struct {
 	String         []byte
 	List           [][]byte
 	ListHead       int32
-	Hash           map[string][]byte
-	CompactHash    *CompactHash
-	HashEncoding   ValueEncoding
 	ExpiresAt      int64
 	LastAccessedAt int64
 	Kind           ValueKind
@@ -252,9 +248,6 @@ func (v *ValueObject) emptiedCollection() bool {
 		return v.data.empty()
 	}
 	switch v.Kind {
-	case ValueKindHash:
-		n, err := v.hashLen()
-		return err == nil && n == 0
 	}
 	return false
 }
@@ -277,9 +270,6 @@ func (v *ValueObject) containerCopy() *ValueObject {
 	case ValueKindList:
 		c.List = append([][]byte(nil), v.liveList()...)
 		c.ListHead = 0
-	case ValueKindHash:
-		c.Hash = maps.Clone(v.Hash)
-		c.CompactHash = cloneCompactHash(v.CompactHash)
 	}
 	return &c
 }
@@ -313,47 +303,4 @@ func newListValue(items [][]byte, expiresAt int64) *ValueObject {
 // TTL. The write that stores it stamps it.
 func newKindValue(data kindValue) *ValueObject {
 	return &ValueObject{data: data, Kind: kindNames[data.kind()]}
-}
-
-// HashValue returns the general hash payload for a hash value. Compact hashes
-// are materialized as detached general hash maps.
-func (v *ValueObject) HashValue() (map[string][]byte, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindHash {
-		return nil, ErrWrongType
-	}
-	if v.HashEncoding == ValueEncodingCompact {
-		if v.CompactHash == nil {
-			return nil, errInvalidValueObjectState
-		}
-		fields := make(map[string][]byte, v.CompactHash.len())
-		for _, entry := range v.CompactHash.all() {
-			fields[entry.Field] = cloneBytes(entry.Value)
-		}
-		return fields, nil
-	}
-	if v.Hash == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.Hash, nil
-}
-
-func newHashValue(fields map[string][]byte, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		Hash:      fields,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindHash,
-	}
-}
-
-func newCompactHashValue(hash *CompactHash, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		CompactHash:  hash,
-		HashEncoding: ValueEncodingCompact,
-		ExpiresAt:    expiresAt,
-		Kind:         ValueKindHash,
-	}
 }

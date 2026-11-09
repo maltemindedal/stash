@@ -245,13 +245,14 @@ func describeValueForTest(store *Store, key string) string {
 	case ValueKindList:
 		fmt.Fprintf(&b, "%q", v.liveList())
 	case ValueKindHash:
-		entries, _ := v.hashEntries()
+		hash, _ := hashOf(v)
+		entries := hash.entries()
 		pairs := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			pairs = append(pairs, entry.Field+"="+string(entry.Value))
 		}
 		sort.Strings(pairs)
-		fmt.Fprintf(&b, "encoding %d %q", v.HashEncoding, pairs)
+		fmt.Fprintf(&b, "compact %v %q", hash.compact != nil, pairs)
 	case ValueKindSet:
 		set, _ := setOf(v)
 		members := set.members()

@@ -98,20 +98,6 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 			size += int64(len(item))
 		}
 		return size
-	case ValueKindHash:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.HashEncoding == ValueEncodingCompact {
-			if value.CompactHash != nil {
-				size += int64(len(value.CompactHash.entries))*approxHashEntryOverhead + int64(len(value.CompactHash.arena))
-			}
-			return size
-		}
-		size += int64(len(value.Hash)) * approxHashEntryOverhead
-		for field, raw := range value.Hash {
-			size += int64(len(field) + len(raw))
-		}
-		return size
 	}
 
 	return approximateBaseValueObjectSize(key, value.ExpiresAt)

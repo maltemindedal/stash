@@ -173,6 +173,8 @@ func (s *Store) encodingForTest(key string) string {
 		compact = data.compact != nil
 	case *setValue:
 		compact = data.ints != nil
+	case *hashValue:
+		compact = data.compact != nil
 	default:
 		return string(v.Kind)
 	}
