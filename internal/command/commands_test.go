@@ -1012,6 +1012,10 @@ func TestExecutorInfo(t *testing.T) {
 			t.Fatalf("INFO memory = %q, missing %q", text, want)
 		}
 	}
+	// The per-kind counts close the section, in this order.
+	if want := "key_count:2\r\nkey_count_string:1\r\nkey_count_list:1\r\nkey_count_hash:0\r\nkey_count_set:0\r\nkey_count_zset:0\r\nkey_count_stream:0\r\n"; !strings.HasSuffix(text, want) {
+		t.Fatalf("INFO memory = %q, want it to end with %q", text, want)
+	}
 
 	value, err = executor.Execute(clientContext(executor), requestValue("INFO"))
 	if err != nil {

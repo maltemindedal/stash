@@ -43,7 +43,7 @@ type Store struct {
 	pendingExpired           []string
 	evictionGuard            func() (release func())
 	usedMemory               atomic.Int64
-	keyKindCounts            [keyStatsKindCount]atomic.Int64
+	keyKindCounts            [kindCount]atomic.Int64
 	maxMemory                atomic.Int64
 	memoryEvictionSampleSize int
 	// nextExpiry is a lower bound on the earliest TTL deadline in the store, kept

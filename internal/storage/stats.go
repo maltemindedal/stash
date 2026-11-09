@@ -1,34 +1,31 @@
 package storage
 
-const keyStatsKindCount = 6
-
-var keyStatsKinds = [...]ValueKind{
-	ValueKindString,
-	ValueKindList,
-	ValueKindHash,
-	ValueKindSet,
-	ValueKindZSet,
-	ValueKindStream,
-}
-
 // KeyStats is an approximate snapshot of key counts by value kind.
 type KeyStats struct {
 	TotalKeys int
-	ByKind    map[ValueKind]int
+	byKind    [kindCount]int
+}
+
+// Count returns the number of keys that hold a value of kind.
+func (k KeyStats) Count(kind ValueKind) int {
+	if index, ok := keyStatsKindIndex(kind); ok {
+		return k.byKind[index]
+	}
+	return 0
 }
 
 // KeyStats returns an approximate snapshot of resident key counts by value kind.
 // Expired keys are reflected once passive or active expiry removes them.
 func (s *Store) KeyStats() KeyStats {
-	stats := KeyStats{ByKind: make(map[ValueKind]int)}
+	stats := KeyStats{}
 	if s == nil {
 		return stats
 	}
 
-	for i, kind := range keyStatsKinds {
+	for i := range s.keyKindCounts {
 		count := int(s.keyKindCounts[i].Load())
 		stats.TotalKeys += count
-		stats.ByKind[kind] = count
+		stats.byKind[i] = count
 	}
 
 	return stats
@@ -70,7 +67,7 @@ func (s *Store) adjustKeyKindCount(value *ValueObject, delta int64) {
 }
 
 func (s *Store) recalculateKeyStatsLocked() {
-	var counts [keyStatsKindCount]int64
+	var counts [kindCount]int64
 	for i := range s.shards {
 		for _, value := range s.shards[i].data {
 			if index, ok := keyStatsKindIndex(value.Kind); ok {
@@ -84,7 +81,7 @@ func (s *Store) recalculateKeyStatsLocked() {
 }
 
 func keyStatsKindIndex(kind ValueKind) (int, bool) {
-	for i, candidate := range keyStatsKinds {
+	for i, candidate := range kindNames {
 		if kind == candidate {
 			return i, true
 		}

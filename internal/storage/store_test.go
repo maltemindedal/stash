@@ -1383,9 +1383,9 @@ func assertKeyStats(t *testing.T, store *Store, total int, byKind map[ValueKind]
 	if stats.TotalKeys != total {
 		t.Fatalf("KeyStats().TotalKeys = %d, want %d", stats.TotalKeys, total)
 	}
-	for _, kind := range keyStatsKinds {
-		if stats.ByKind[kind] != byKind[kind] {
-			t.Fatalf("KeyStats().ByKind[%s] = %d, want %d (all stats: %+v)", kind, stats.ByKind[kind], byKind[kind], stats.ByKind)
+	for _, kind := range ValueKinds() {
+		if stats.Count(kind) != byKind[kind] {
+			t.Fatalf("KeyStats().Count(%s) = %d, want %d (all stats: %+v)", kind, stats.Count(kind), byKind[kind], stats)
 		}
 	}
 }
