@@ -33,14 +33,18 @@ var (
 
 // Store is a thread-safe in-memory key/value store.
 type Store struct {
-	shards                   []Shard
-	seed                     maphash.Seed
-	waiters                  *listWaiters
-	loggerMu                 sync.RWMutex
-	logger                   *slog.Logger
-	expirationMu             sync.Mutex
-	expirationListener       func(keys []string)
-	pendingExpired           []string
+	shards             []Shard
+	seed               maphash.Seed
+	waiters            *listWaiters
+	loggerMu           sync.RWMutex
+	logger             *slog.Logger
+	expirationMu       sync.Mutex
+	expirationListener func(keys []string)
+	// removed is the keys the holder of every shard write lock has removed on
+	// its own initiative during that hold. Those locks guard it, and the holder
+	// empties it as it releases them (writeUnlockAllShardsAndPublish), so one
+	// call never hands on what another removed.
+	removed                  removals
 	evictionGuard            func() (release func())
 	usedMemory               atomic.Int64
 	keyKindCounts            [keyStatsKindCount]atomic.Int64
@@ -143,38 +147,43 @@ func (s *Store) acquireEvictionGuard() func() {
 	return guard()
 }
 
-// noteExpiredKeysLocked queues keys removed for expiry while shard locks are
-// held, for publishExpiredKeys to hand on once they are released.
-func (s *Store) noteExpiredKeysLocked(keys []string) {
-	if s == nil || len(keys) == 0 {
-		return
-	}
-
-	s.expirationMu.Lock()
-	defer s.expirationMu.Unlock()
-	s.pendingExpired = append(s.pendingExpired, keys...)
+// removals is the keys one call removed that its caller did not ask it to
+// remove.
+type removals struct {
+	// expired are active TTL evictions: keys a sweep found past their deadline.
+	expired []string
 }
 
-// publishExpiredKeys hands every queued expiry to the listener. Callers must
-// hold no shard lock: the listener reaches replication and durability sinks,
-// which must never be entered under a store lock. It always drains the queue,
-// so an unconfigured listener cannot let it grow.
-func (s *Store) publishExpiredKeys() {
-	if s == nil {
+// noteExpiredLocked adds keys a sweep removed to what the caller's hold of
+// every shard write lock has removed.
+func (s *Store) noteExpiredLocked(keys []string) {
+	s.removed.expired = append(s.removed.expired, keys...)
+}
+
+// writeUnlockAllShardsAndPublish releases every shard write lock and then hands
+// the keys the hold swept to the expiration listener.
+func (s *Store) writeUnlockAllShardsAndPublish() {
+	removed := s.removed
+	s.removed = removals{}
+	s.writeUnlockAllShards()
+	s.publishExpired(removed.expired)
+}
+
+// publishExpired hands keys removed by an active TTL eviction to the listener.
+// Callers must hold no shard lock: the listener reaches replication and
+// durability sinks, which must never be entered under a store lock.
+func (s *Store) publishExpired(keys []string) {
+	if len(keys) == 0 {
 		return
 	}
 
 	s.expirationMu.Lock()
-	pending := s.pendingExpired
-	s.pendingExpired = nil
 	listener := s.expirationListener
 	s.expirationMu.Unlock()
 
-	if len(pending) == 0 || listener == nil {
-		return
+	if listener != nil {
+		listener(keys)
 	}
-
-	listener(pending)
 }
 
 // Set stores a byte slice under the provided key. When maxmemory is configured
@@ -642,8 +651,7 @@ func (s *Store) ReplaceWith(other *Store) {
 	if s.maxMemoryEnabled() {
 		s.recalculateUsedMemoryLocked(s.now())
 	}
-	s.writeUnlockAllShards()
-	s.publishExpiredKeys()
+	s.writeUnlockAllShardsAndPublish()
 }
 
 func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {

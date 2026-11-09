@@ -251,12 +251,11 @@ func mutateGrowing[T any](s *Store, key string, want ValueKind, fn func(cur *Val
 func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
 	var zero T
 
-	// Registered before the unlock below so it runs after it: an accounted write
-	// recalculates the keyspace and sweeps expired keys out of it, and the
-	// listener that hears about them must not be entered under a lock.
-	defer s.publishExpiredKeys()
+	// An accounted write recalculates the keyspace and sweeps expired keys out
+	// of it, and the listener that hears about them must not be entered under a
+	// lock.
 	s.writeLockAllShards()
-	defer s.writeUnlockAllShards()
+	defer s.writeUnlockAllShardsAndPublish()
 
 	shard, stored := s.prepareExistingValueLocked(key, now)
 	if stored != nil && want != anyKind && stored.Kind != want {
@@ -308,11 +307,8 @@ func replaceKey(s *Store, key string, value *ValueObject) ([]string, error) {
 	value.touch(now)
 	// One read of the maxmemory setting decides the locks, as in mutateGrowing.
 	if s.maxMemoryEnabled() {
-		// Registered before the unlock below so it runs after it, as in
-		// mutateGrowingAccounted.
-		defer s.publishExpiredKeys()
 		s.writeLockAllShards()
-		defer s.writeUnlockAllShards()
+		defer s.writeUnlockAllShardsAndPublish()
 
 		shard, stored := s.prepareExistingValueLocked(key, now)
 		oldSize := s.approximateValueObjectSize(key, stored)
@@ -355,11 +351,8 @@ func mutateString[T any](s *Store, key string, fn func(w stringWrite) (T, []stri
 	// One read of the maxmemory setting decides the locks, as in mutateGrowing.
 	accounting := s.maxMemoryEnabled()
 	if accounting {
-		// Registered before the unlock below so it runs after it, as in
-		// mutateGrowingAccounted.
-		defer s.publishExpiredKeys()
 		s.writeLockAllShards()
-		defer s.writeUnlockAllShards()
+		defer s.writeUnlockAllShardsAndPublish()
 	} else {
 		shard := s.shardForKey(key)
 		shard.mu.Lock()

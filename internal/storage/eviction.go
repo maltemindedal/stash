@@ -98,7 +98,7 @@ func (s *Store) sweepSample(sampleSize int) (sampled, removed int) {
 		// Published once evictExpiredSample has released every shard lock
 		// it took: the listener reaches sinks outside the store, which
 		// must never be entered while holding one.
-		s.publishExpiredKeys()
+		s.publishExpired(expired)
 	}
 
 	return sampled, len(expired)
@@ -119,7 +119,6 @@ func (s *Store) evictExpiredSample(now int64, sampleSize int) (sampled int, expi
 		value, ok := shard.data[keys[0]]
 		if ok && isExpired(value, now) {
 			s.deleteKeyLocked(shard, keys[0])
-			s.noteExpiredKeysLocked(keys)
 			return 1, keys
 		}
 
@@ -146,6 +145,5 @@ func (s *Store) evictExpiredSample(now int64, sampleSize int) (sampled int, expi
 		}
 	}
 
-	s.noteExpiredKeysLocked(expired)
 	return len(keys), expired
 }
