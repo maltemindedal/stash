@@ -65,7 +65,7 @@ func writeDuringFullResync(t *testing.T, cfg config.Config, wait bool) {
 	store := storage.NewStore()
 	value := bytes.Repeat([]byte("v"), 200)
 	for i := 0; i < fullResyncKeys; i++ {
-		if _, err := store.Set(fmt.Sprintf("bulk-%06d", i), value, 0); err != nil {
+		if _, err := store.Set(nil, fmt.Sprintf("bulk-%06d", i), value, 0); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 	}

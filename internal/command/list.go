@@ -17,7 +17,7 @@ func (e *Executor) handleLPush(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
-	length, evicted, err := e.store.LeftPush(key, request.Args[1:])
+	length, evicted, err := e.store.LeftPush(nil, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -32,7 +32,7 @@ func (e *Executor) handleRPush(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
-	length, evicted, err := e.store.RightPush(key, request.Args[1:])
+	length, evicted, err := e.store.RightPush(nil, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -99,7 +99,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 			return server.ExecuteResult{}, server.ErrClientDisconnected
 		}
 
-		value, ok, err := e.store.LeftPop(key)
+		value, ok, err := e.store.LeftPop(nil, key)
 		if err != nil {
 			release()
 			e.store.UnsubscribeListPush(key, waiter)
@@ -192,9 +192,9 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 			err   error
 		)
 		if left {
-			value, ok, err = e.store.LeftPop(key)
+			value, ok, err = e.store.LeftPop(nil, key)
 		} else {
-			value, ok, err = e.store.RightPop(key)
+			value, ok, err = e.store.RightPop(nil, key)
 		}
 		if err != nil {
 			if errors.Is(err, storage.ErrWrongType) {
@@ -225,9 +225,9 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 		ok     bool
 	)
 	if left {
-		values, ok, err = e.store.LeftPopN(key, count)
+		values, ok, err = e.store.LeftPopN(nil, key, count)
 	} else {
-		values, ok, err = e.store.RightPopN(key, count)
+		values, ok, err = e.store.RightPopN(nil, key, count)
 	}
 	if err != nil {
 		if errors.Is(err, storage.ErrWrongType) {

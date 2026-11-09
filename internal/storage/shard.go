@@ -90,7 +90,9 @@ const (
 )
 
 // mutateKey applies fn to the value stored at key, and returns fn's result with
-// the keys evicted to make room for it.
+// the keys evicted to make room for it. It tells changes that the key was
+// written, unless fn failed or returned errUnchanged with its result, and which
+// keys its sweep removed.
 //
 // mutateKey takes one clock reading, locks for g, reclaims the key when its TTL
 // has passed, and answers ErrWrongType, without calling fn, for a live value of
@@ -112,11 +114,11 @@ const (
 //
 // fn runs under the locks and must not retain cur, or memory borrowed from it,
 // after it returns. mutateKey releases the locks on every path and calls nothing
-// outside the store while it holds them, so a caller that wakes a list waiter
-// does so after it returns.
-func mutateKey[T any](s *Store, key string, want ValueKind, g growth, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
+// outside the store while it holds them: changes hears of the write once they
+// are released, and a caller that wakes a list waiter does so after it returns.
+func mutateKey[T any](s *Store, changes Changes, key string, want ValueKind, g growth, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
 	if g == mayGrow {
-		return mutateGrowing(s, key, want, fn)
+		return mutateGrowing(s, changes, key, want, fn)
 	}
 
 	// The rest is the shrinking path, written out here rather than in a function
@@ -127,6 +129,8 @@ func mutateKey[T any](s *Store, key string, want ValueKind, g growth, fn func(cu
 
 	now := s.now()
 	shard := s.shardForKey(key)
+	written := false
+	defer reportWritten(changes, key, &written)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -139,13 +143,15 @@ func mutateKey[T any](s *Store, key string, want ValueKind, g growth, fn func(cu
 		return zero, nil, ErrWrongType
 	}
 	if s.maxMemoryEnabled() {
-		result, err := mutateShrinkingAccounted(s, shard, key, cur, now, fn)
+		result, changed, err := mutateShrinkingAccounted(s, shard, key, cur, now, fn)
+		written = changed
 		return result, nil, err
 	}
 
 	// Without a memory limit there is nothing to size, and this path does no
 	// more than the hand-written ones it replaced.
 	next, result, err := fn(cur, now)
+	written, err = changedBy(err)
 	if err != nil {
 		return zero, nil, err
 	}
@@ -170,8 +176,9 @@ var errNotAShrinkingWrite = errors.New("storage: a shrinking write returned a va
 // mutateShrinkingAccounted is mutateKey's path for a shrinking write while the
 // store accounts for memory: it sizes the value before and after fn and moves
 // the counter by the difference. The caller holds the key's shard lock and has
-// already reclaimed an expired key and checked the kind.
-func mutateShrinkingAccounted[T any](s *Store, shard *Shard, key string, cur *ValueObject, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
+// already reclaimed an expired key and checked the kind. It also reports whether
+// fn changed the key.
+func mutateShrinkingAccounted[T any](s *Store, shard *Shard, key string, cur *ValueObject, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, bool, error) {
 	var zero T
 	var oldSize int64
 	if cur != nil {
@@ -179,26 +186,27 @@ func mutateShrinkingAccounted[T any](s *Store, shard *Shard, key string, cur *Va
 	}
 
 	next, result, err := fn(cur, now)
+	changed, err := changedBy(err)
 	if err != nil {
-		return zero, err
+		return zero, false, err
 	}
 	if next != nil && next != cur {
 		panic(errNotAShrinkingWrite)
 	}
 	if cur == nil {
-		return result, nil
+		return result, changed, nil
 	}
 	if next == nil || cur.emptied() {
 		s.deleteKeyWithSizeLocked(shard, key, oldSize)
-		return result, nil
+		return result, changed, nil
 	}
 	cur.touch(now)
 	s.usedMemory.Add(s.approximateValueObjectSize(key, cur) - oldSize)
-	return result, nil
+	return result, changed, nil
 }
 
 // mutateGrowing is mutateKey for a growing write.
-func mutateGrowing[T any](s *Store, key string, want ValueKind, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
+func mutateGrowing[T any](s *Store, changes Changes, key string, want ValueKind, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
 	var zero T
 
 	now := s.now()
@@ -208,10 +216,12 @@ func mutateGrowing[T any](s *Store, key string, want ValueKind, fn func(cur *Val
 	// lock yet enter the cross-shard eviction path and touch other shards' maps
 	// without holding their locks.
 	if s.maxMemoryEnabled() {
-		return mutateGrowingAccounted(s, key, want, now, fn)
+		return mutateGrowingAccounted(s, changes, key, want, now, fn)
 	}
 
 	shard := s.shardForKey(key)
+	written := false
+	defer reportWritten(changes, key, &written)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -225,6 +235,7 @@ func mutateGrowing[T any](s *Store, key string, want ValueKind, fn func(cur *Val
 	}
 
 	next, result, err := fn(cur, now)
+	written, err = changedBy(err)
 	if err != nil {
 		return zero, nil, err
 	}
@@ -248,14 +259,15 @@ func mutateGrowing[T any](s *Store, key string, want ValueKind, fn func(cur *Val
 // before it stores it. The one clock reading decides every expiry the write
 // sees: its own key's and those in the sweep that makes room for it, so the
 // sweep cannot remove a key fn was handed as live.
-func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
+func mutateGrowingAccounted[T any](s *Store, changes Changes, key string, want ValueKind, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, []string, error) {
 	var zero T
 
 	// An accounted write recalculates the keyspace and sweeps expired keys out
-	// of it, and the listener that hears about them must not be entered under a
-	// lock.
+	// of it. Changes hears of them, and of the write, with no lock held.
+	written := false
+	defer reportWritten(changes, key, &written)
 	s.writeLockAllShards()
-	defer s.writeUnlockAllShardsAndPublish()
+	defer s.writeUnlockAllShardsAndReport(changes)
 
 	shard, stored := s.prepareExistingValueLocked(key, now)
 	if stored != nil && want != anyKind && stored.Kind != want {
@@ -271,6 +283,7 @@ func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int
 	}
 
 	next, result, err := fn(cur, now)
+	changed, err := changedBy(err)
 	if err != nil {
 		return zero, nil, err
 	}
@@ -278,6 +291,7 @@ func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int
 		if stored != nil {
 			s.deleteKeyWithSizeLocked(shard, key, oldSize)
 		}
+		written = changed
 		return result, nil, nil
 	}
 
@@ -289,11 +303,13 @@ func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int
 	next.touch(now)
 	s.setKeyLocked(shard, key, next)
 	s.usedMemory.Add(newSize - oldSize)
+	written = changed
 	return result, evicted, nil
 }
 
 // replaceKey stores value under key in place of whatever the key held, and
-// reports the keys evicted to make room for it.
+// reports the keys evicted to make room for it. It tells changes that the key
+// was written, and which keys its sweep removed.
 //
 // It serves SET, which writes a whole value: what the key held does not shape
 // the new value, so replaceKey never copies it, and only sizes it while the
@@ -302,13 +318,15 @@ func mutateGrowingAccounted[T any](s *Store, key string, want ValueKind, now int
 // sweep that makes room removes. Under maxmemory it locks every shard, because
 // making room can evict a key from any of them, and a write refused with
 // ErrMemoryLimitExceeded stores nothing.
-func replaceKey(s *Store, key string, value *ValueObject) ([]string, error) {
+func replaceKey(s *Store, changes Changes, key string, value *ValueObject) ([]string, error) {
 	now := s.now()
 	value.touch(now)
 	// One read of the maxmemory setting decides the locks, as in mutateGrowing.
 	if s.maxMemoryEnabled() {
+		written := false
+		defer reportWritten(changes, key, &written)
 		s.writeLockAllShards()
-		defer s.writeUnlockAllShardsAndPublish()
+		defer s.writeUnlockAllShardsAndReport(changes)
 
 		shard, stored := s.prepareExistingValueLocked(key, now)
 		oldSize := s.approximateValueObjectSize(key, stored)
@@ -319,6 +337,7 @@ func replaceKey(s *Store, key string, value *ValueObject) ([]string, error) {
 		}
 		s.setKeyLocked(shard, key, value)
 		s.usedMemory.Add(newSize - oldSize)
+		written = true
 		return evicted, nil
 	}
 
@@ -326,13 +345,18 @@ func replaceKey(s *Store, key string, value *ValueObject) ([]string, error) {
 	// replaced like a live one.
 	shard := s.shardForKey(key)
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 	s.setKeyLocked(shard, key, value)
+	shard.mu.Unlock()
+	if changes != nil {
+		changes.KeyChanged(key, Written)
+	}
 	return nil, nil
 }
 
 // mutateString applies fn, a write of a string's bytes, to the string stored at
-// key, and returns fn's result with the keys evicted to make room for it.
+// key, and returns fn's result with the keys evicted to make room for it. It
+// tells changes that the key was written, unless fn failed, and which keys its
+// sweep removed.
 //
 // It serves INCR, SETBIT and PFADD. Like mutateKey for a growing write, it takes
 // one clock reading, locks the key's shard, or every shard under maxmemory,
@@ -344,15 +368,17 @@ func replaceKey(s *Store, key string, value *ValueObject) ([]string, error) {
 //
 // fn runs under the locks and must not retain the stringWrite, or memory
 // borrowed from the string, after it returns.
-func mutateString[T any](s *Store, key string, fn func(w stringWrite) (T, []string, error)) (T, []string, error) {
+func mutateString[T any](s *Store, changes Changes, key string, fn func(w stringWrite) (T, []string, error)) (T, []string, error) {
 	var zero T
 
 	now := s.now()
+	written := false
+	defer reportWritten(changes, key, &written)
 	// One read of the maxmemory setting decides the locks, as in mutateGrowing.
 	accounting := s.maxMemoryEnabled()
 	if accounting {
 		s.writeLockAllShards()
-		defer s.writeUnlockAllShardsAndPublish()
+		defer s.writeUnlockAllShardsAndReport(changes)
 	} else {
 		shard := s.shardForKey(key)
 		shard.mu.Lock()
@@ -363,7 +389,9 @@ func mutateString[T any](s *Store, key string, fn func(w stringWrite) (T, []stri
 	if cur != nil && cur.Kind != ValueKindString {
 		return zero, nil, ErrWrongType
 	}
-	return fn(stringWrite{store: s, shard: shard, key: key, cur: cur, now: now, accounting: accounting})
+	result, evicted, err := fn(stringWrite{store: s, shard: shard, key: key, cur: cur, now: now, accounting: accounting})
+	written = err == nil
+	return result, evicted, err
 }
 
 // stringWrite is what a write of a string's bytes runs against: the live string
@@ -447,7 +475,8 @@ func (w *stringWrite) resize(length int) ([]byte, []string, error) {
 }
 
 // deleteKeys removes several keys, as DEL does, and returns the ones that held
-// a live value, in no particular order.
+// a live value, in no particular order. It tells changes that each of those was
+// written, once the locks are released.
 //
 // It is mutateKey's counterpart for a DEL of several keys, which DeleteMany
 // hands it; one key goes through Delete. Deleting is a shrinking write, so even
@@ -455,13 +484,20 @@ func (w *stringWrite) resize(length int) ([]byte, []string, error) {
 // order, and it neither evicts nor sweeps. It takes one clock reading under
 // those locks, by which a key whose TTL has passed is absent: it is reclaimed
 // and not reported.
-func deleteKeys(s *Store, keys []string) []string {
+func deleteKeys(s *Store, changes Changes, keys []string) []string {
+	removed := make([]string, 0, len(keys))
+	if changes != nil {
+		defer func() {
+			for _, key := range removed {
+				changes.KeyChanged(key, Written)
+			}
+		}()
+	}
 	groups := s.groupKeysByShard(keys)
 	groups.lock(s)
 	defer groups.unlock(s)
 
 	now := s.now()
-	removed := make([]string, 0, len(keys))
 	for shardID, count := range groups.counts {
 		if count == 0 {
 			continue

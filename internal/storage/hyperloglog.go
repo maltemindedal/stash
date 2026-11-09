@@ -40,8 +40,8 @@ var hllRankReciprocal = func() [hllMaxRank + 1]float64 {
 // PFAdd registers elements into a HyperLogLog value and reports whether the
 // cardinality estimate changed. When maxmemory is configured it first frees
 // space and reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) PFAdd(key string, elements [][]byte) (int64, []string, error) {
-	return mutateString(s, key, func(w stringWrite) (int64, []string, error) {
+func (s *Store) PFAdd(changes Changes, key string, elements [][]byte) (int64, []string, error) {
+	return mutateString(s, changes, key, func(w stringWrite) (int64, []string, error) {
 		data, exists := w.Current()
 		if exists {
 			if _, err := hyperLogLogRegisters(data); err != nil {

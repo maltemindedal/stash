@@ -164,13 +164,13 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 	}
 	hset := func(field, value string) func(*Store) error {
 		return func(s *Store) error {
-			_, _, err := s.HSet(key, []HashFieldValue{{Field: field, Value: []byte(value)}})
+			_, _, err := s.HSet(nil, key, []HashFieldValue{{Field: field, Value: []byte(value)}})
 			return err
 		}
 	}
 	zadd := func(member string) func(*Store) error {
 		return func(s *Store) error {
-			_, _, err := s.ZAdd(key, []ZSetEntry{{Member: []byte(member), Score: 1}})
+			_, _, err := s.ZAdd(nil, key, []ZSetEntry{{Member: []byte(member), Score: 1}})
 			return err
 		}
 	}
@@ -179,19 +179,19 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 		name  string
 		write func(*Store) error
 	}{
-		{name: "SET (newStringValue)", write: func(s *Store) error { _, err := s.Set(key, []byte("v"), 0); return err }},
-		{name: "INCR (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.Increment(key); return err }},
-		{name: "SETBIT (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.SetBit(key, 9, 1); return err }},
-		{name: "PFADD (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.PFAdd(key, bulk("a")); return err }},
-		{name: "LPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.LeftPush(key, bulk("a")); return err }},
-		{name: "RPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.RightPush(key, bulk("a")); return err }},
+		{name: "SET (newStringValue)", write: func(s *Store) error { _, err := s.Set(nil, key, []byte("v"), 0); return err }},
+		{name: "INCR (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.Increment(nil, key); return err }},
+		{name: "SETBIT (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.SetBit(nil, key, 9, 1); return err }},
+		{name: "PFADD (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.PFAdd(nil, key, bulk("a")); return err }},
+		{name: "LPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.LeftPush(nil, key, bulk("a")); return err }},
+		{name: "RPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.RightPush(nil, key, bulk("a")); return err }},
 		{name: "HSET of a short value (newCompactHashValue)", write: hset("f", "v")},
 		{name: "HSET of a long value (newHashValue)", write: hset("f", long)},
-		{name: "SADD of an integer (newIntSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("1")); return err }},
-		{name: "SADD of a string (newSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("a")); return err }},
+		{name: "SADD of an integer (newIntSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(nil, key, bulk("1")); return err }},
+		{name: "SADD of a string (newSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(nil, key, bulk("a")); return err }},
 		{name: "ZADD of a short member (newCompactZSetValue)", write: zadd("m")},
 		{name: "ZADD of a long member (newZSetValue)", write: zadd(long)},
-		{name: "XADD (newStreamValue)", write: func(s *Store) error { _, _, err := s.XAdd(key, "*", bulk("f", "v")); return err }},
+		{name: "XADD (newStreamValue)", write: func(s *Store) error { _, _, err := s.XAdd(nil, key, "*", bulk("f", "v")); return err }},
 	}
 
 	for _, tt := range tests {
@@ -201,7 +201,7 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 			t.Run(fmt.Sprintf("%s, maxmemory %v", tt.name, maxMemory), func(t *testing.T) {
 				store, clock := newStoreWithManualClock()
 				if maxMemory {
-					store.ConfigureMaxMemory(1<<30, 16)
+					store.ConfigureMaxMemory(nil, 1<<30, 16)
 				}
 				writtenAt := clock.advance(time.Millisecond)
 

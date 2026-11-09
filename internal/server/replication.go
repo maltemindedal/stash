@@ -1031,7 +1031,7 @@ func (s *Server) consumeFullResync(parser *protocol.Parser) error {
 	if err != nil {
 		return fmt.Errorf("load replication snapshot: %w", err)
 	}
-	s.store.ReplaceWith(snapshotStore)
+	s.store.ReplaceWith(nil, snapshotStore)
 	s.logger.Info(
 		"applied full resync snapshot",
 		"snapshot_size_bytes", len(snapshot.Data),

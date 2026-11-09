@@ -138,20 +138,20 @@ func TestEvictionsAreLoggedAfterEveryEarlierWriteOfTheEvictedKey(t *testing.T) {
 			name: "a memory-pressure eviction",
 			evictOnNextWrite: func(t *testing.T, executor *Executor, log *holdingLog) (<-chan struct{}, func()) {
 				store := executor.store
-				store.ConfigureMaxMemory(1<<20, 0)
+				store.ConfigureMaxMemory(nil, 1<<20, 0)
 				if _, err := handle(clientContext(executor), executor, requestValue("SET", string(victim), big), true); err != nil {
 					t.Fatal(err)
 				}
 				usedByVictim := store.UsedMemory()
 
 				scratch := storage.NewStore()
-				scratch.ConfigureMaxMemory(1<<20, 0)
-				if _, err := scratch.Set(string(writer), []byte(small), 0); err != nil {
+				scratch.ConfigureMaxMemory(nil, 1<<20, 0)
+				if _, err := scratch.Set(nil, string(writer), []byte(small), 0); err != nil {
 					t.Fatal(err)
 				}
 				// Room for the writer only once the victim is evicted, and for
 				// a short victim beside the writer after that.
-				store.ConfigureMaxMemory(usedByVictim+scratch.UsedMemory()-1, 0)
+				store.ConfigureMaxMemory(nil, usedByVictim+scratch.UsedMemory()-1, 0)
 
 				// The DEL travels with the evicting write's own frames.
 				log.hold = []byte("DEL")
@@ -180,7 +180,7 @@ func TestEvictionsAreLoggedAfterEveryEarlierWriteOfTheEvictedKey(t *testing.T) {
 					}
 				})
 
-				store.ConfigureMaxMemory(1<<20, 0)
+				store.ConfigureMaxMemory(nil, 1<<20, 0)
 				expiresAt := time.Now().UnixMilli() + 1
 				if _, err := handle(clientContext(executor), executor, requestValue("SET", string(victim), big, "PXAT", strconv.FormatInt(expiresAt, 10)), true); err != nil {
 					t.Fatal(err)

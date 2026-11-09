@@ -11,19 +11,19 @@ func TestAPopThatLeavesElementsWakesTheNextWaiter(t *testing.T) {
 		pop  func(s *Store, key string) error
 	}{
 		{name: "LeftPop", pop: func(s *Store, key string) error {
-			_, _, err := s.LeftPop(key)
+			_, _, err := s.LeftPop(nil, key)
 			return err
 		}},
 		{name: "RightPop", pop: func(s *Store, key string) error {
-			_, _, err := s.RightPop(key)
+			_, _, err := s.RightPop(nil, key)
 			return err
 		}},
 		{name: "LeftPopN", pop: func(s *Store, key string) error {
-			_, _, err := s.LeftPopN(key, 1)
+			_, _, err := s.LeftPopN(nil, key, 1)
 			return err
 		}},
 		{name: "RightPopN", pop: func(s *Store, key string) error {
-			_, _, err := s.RightPopN(key, 1)
+			_, _, err := s.RightPopN(nil, key, 1)
 			return err
 		}},
 	}
@@ -58,7 +58,7 @@ func TestACountedPopWakesTheNextWaiterOnlyWhenItTakesElementsAndLeavesSome(t *te
 	// count that empties the list leaves nothing to hand on.
 	tests := []struct {
 		name      string
-		pop       func(s *Store, key string, count int) ([][]byte, bool, error)
+		pop       func(s *Store, changes Changes, key string, count int) ([][]byte, bool, error)
 		count     int
 		wantWoken bool
 	}{
@@ -76,7 +76,7 @@ func TestACountedPopWakesTheNextWaiterOnlyWhenItTakesElementsAndLeavesSome(t *te
 			rightPush(t, store, "q", "a", "b", "c")
 			waiter := store.SubscribeListPush("q")
 
-			popped, ok, err := tt.pop(store, "q", tt.count)
+			popped, ok, err := tt.pop(store, nil, "q", tt.count)
 			if err != nil || !ok || len(popped) != tt.count {
 				t.Fatalf("pop of %d = (%d values, %v, %v), want (%d values, true, nil)", tt.count, len(popped), ok, err, tt.count)
 			}
@@ -112,7 +112,7 @@ func TestAWakeUpNobodyReceivedPassesToTheNextWaiter(t *testing.T) {
 			rightPush(t, s, "q", "a", "b")
 			first := s.SubscribeListPush("q")
 			next := s.SubscribeListPush("q")
-			if _, _, err := s.LeftPop("q"); err != nil {
+			if _, _, err := s.LeftPop(nil, "q"); err != nil {
 				t.Fatalf("LeftPop() error = %v", err)
 			}
 			return first, next
@@ -174,7 +174,7 @@ func rightPush(t *testing.T, s *Store, key string, values ...string) {
 	for _, value := range values {
 		elements = append(elements, []byte(value))
 	}
-	if _, _, err := s.RightPush(key, elements); err != nil {
+	if _, _, err := s.RightPush(nil, key, elements); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 }

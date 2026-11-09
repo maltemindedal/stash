@@ -10,11 +10,11 @@ import (
 func TestStoreListPopVariants(t *testing.T) {
 	t.Run("RightPop returns tail and deletes empty list", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.RightPush("jobs", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+		if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
-		value, ok, err := store.RightPop("jobs")
+		value, ok, err := store.RightPop(nil, "jobs")
 		if err != nil {
 			t.Fatalf("RightPop() error = %v", err)
 		}
@@ -22,10 +22,10 @@ func TestStoreListPopVariants(t *testing.T) {
 			t.Fatalf("RightPop() = (%q, %v), want (%q, true)", string(value), ok, "b")
 		}
 
-		if _, _, err := store.RightPop("jobs"); err != nil {
+		if _, _, err := store.RightPop(nil, "jobs"); err != nil {
 			t.Fatalf("RightPop() error = %v", err)
 		}
-		_, ok, err = store.RightPop("jobs")
+		_, ok, err = store.RightPop(nil, "jobs")
 		if err != nil || ok {
 			t.Fatalf("RightPop() on empty = (%v, %v), want (false, nil)", ok, err)
 		}
@@ -36,11 +36,11 @@ func TestStoreListPopVariants(t *testing.T) {
 
 	t.Run("LeftPopN returns up to count head items", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.RightPush("jobs", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
+		if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
-		values, ok, err := store.LeftPopN("jobs", 2)
+		values, ok, err := store.LeftPopN(nil, "jobs", 2)
 		if err != nil || !ok {
 			t.Fatalf("LeftPopN() = (%v, %v, %v), want (_, true, nil)", values, ok, err)
 		}
@@ -48,7 +48,7 @@ func TestStoreListPopVariants(t *testing.T) {
 			t.Fatalf("LeftPopN() values = [%q, %q], want [a, b]", string(values[0]), string(values[1]))
 		}
 
-		values, ok, err = store.LeftPopN("jobs", 10)
+		values, ok, err = store.LeftPopN(nil, "jobs", 10)
 		if err != nil || !ok {
 			t.Fatalf("LeftPopN() = (_, %v, %v), want (true, nil)", ok, err)
 		}
@@ -62,11 +62,11 @@ func TestStoreListPopVariants(t *testing.T) {
 
 	t.Run("RightPopN returns tail items in right-to-left order", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.RightPush("jobs", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
+		if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
-		values, ok, err := store.RightPopN("jobs", 2)
+		values, ok, err := store.RightPopN(nil, "jobs", 2)
 		if err != nil || !ok {
 			t.Fatalf("RightPopN() = (_, %v, %v), want (true, nil)", ok, err)
 		}
@@ -77,22 +77,22 @@ func TestStoreListPopVariants(t *testing.T) {
 
 	t.Run("LeftPopN rejects negative count", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.LeftPopN("jobs", -1); !errors.Is(err, ErrSyntax) {
+		if _, _, err := store.LeftPopN(nil, "jobs", -1); !errors.Is(err, ErrSyntax) {
 			t.Fatalf("LeftPopN() error = %v, want ErrSyntax", err)
 		}
 	})
 
 	t.Run("Pop on wrong type returns WRONGTYPE", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set("plain", []byte("x"), 0)
+		_, _ = store.Set(nil, "plain", []byte("x"), 0)
 
-		if _, _, err := store.LeftPop("plain"); !errors.Is(err, ErrWrongType) {
+		if _, _, err := store.LeftPop(nil, "plain"); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("LeftPop() error = %v, want ErrWrongType", err)
 		}
-		if _, _, err := store.RightPop("plain"); !errors.Is(err, ErrWrongType) {
+		if _, _, err := store.RightPop(nil, "plain"); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("RightPop() error = %v, want ErrWrongType", err)
 		}
-		if _, _, err := store.LeftPopN("plain", 1); !errors.Is(err, ErrWrongType) {
+		if _, _, err := store.LeftPopN(nil, "plain", 1); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("LeftPopN() error = %v, want ErrWrongType", err)
 		}
 	})
@@ -102,7 +102,7 @@ func TestStoreHash(t *testing.T) {
 	t.Run("HSet then HGet round trip", func(t *testing.T) {
 		store := NewStore()
 
-		added, _, err := store.HSet("h", []HashFieldValue{
+		added, _, err := store.HSet(nil, "h", []HashFieldValue{
 			{Field: "f1", Value: []byte("v1")},
 			{Field: "f2", Value: []byte("v2")},
 		})
@@ -119,7 +119,7 @@ func TestStoreHash(t *testing.T) {
 		}
 
 		// Update existing
-		added, _, err = store.HSet("h", []HashFieldValue{{Field: "f1", Value: []byte("v1b")}})
+		added, _, err = store.HSet(nil, "h", []HashFieldValue{{Field: "f1", Value: []byte("v1b")}})
 		if err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
@@ -135,7 +135,7 @@ func TestStoreHash(t *testing.T) {
 
 	t.Run("HGet returns defensive copy", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.HSet("h", []HashFieldValue{{Field: "f", Value: []byte("v")}}); err != nil {
+		if _, _, err := store.HSet(nil, "h", []HashFieldValue{{Field: "f", Value: []byte("v")}}); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
 
@@ -153,14 +153,14 @@ func TestStoreHash(t *testing.T) {
 
 	t.Run("HDel removes fields and drops empty hash", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.HSet("h", []HashFieldValue{
+		if _, _, err := store.HSet(nil, "h", []HashFieldValue{
 			{Field: "a", Value: []byte("1")},
 			{Field: "b", Value: []byte("2")},
 		}); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
 
-		removed, err := store.HDel("h", []string{"a", "missing"})
+		removed, err := store.HDel(nil, "h", []string{"a", "missing"})
 		if err != nil {
 			t.Fatalf("HDel() error = %v", err)
 		}
@@ -168,7 +168,7 @@ func TestStoreHash(t *testing.T) {
 			t.Fatalf("HDel() = %d, want 1", removed)
 		}
 
-		removed, err = store.HDel("h", []string{"b"})
+		removed, err = store.HDel(nil, "h", []string{"b"})
 		if err != nil || removed != 1 {
 			t.Fatalf("HDel() = (%d, %v)", removed, err)
 		}
@@ -179,7 +179,7 @@ func TestStoreHash(t *testing.T) {
 
 	t.Run("HGetAll returns all pairs (order-independent)", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.HSet("h", []HashFieldValue{
+		if _, _, err := store.HSet(nil, "h", []HashFieldValue{
 			{Field: "a", Value: []byte("1")},
 			{Field: "b", Value: []byte("2")},
 			{Field: "c", Value: []byte("3")},
@@ -202,15 +202,15 @@ func TestStoreHash(t *testing.T) {
 
 	t.Run("Hash ops on wrong type return WRONGTYPE", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set("plain", []byte("x"), 0)
+		_, _ = store.Set(nil, "plain", []byte("x"), 0)
 
-		if _, _, err := store.HSet("plain", []HashFieldValue{{Field: "f", Value: []byte("v")}}); !errors.Is(err, ErrWrongType) {
+		if _, _, err := store.HSet(nil, "plain", []HashFieldValue{{Field: "f", Value: []byte("v")}}); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("HSet() error = %v, want ErrWrongType", err)
 		}
 		if _, _, err := store.HGet("plain", "f"); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("HGet() error = %v, want ErrWrongType", err)
 		}
-		if _, err := store.HDel("plain", []string{"f"}); !errors.Is(err, ErrWrongType) {
+		if _, err := store.HDel(nil, "plain", []string{"f"}); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("HDel() error = %v, want ErrWrongType", err)
 		}
 		if _, err := store.HGetAll("plain"); !errors.Is(err, ErrWrongType) {
@@ -220,14 +220,14 @@ func TestStoreHash(t *testing.T) {
 
 	t.Run("HSet empty pairs returns ErrSyntax", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.HSet("h", nil); !errors.Is(err, ErrSyntax) {
+		if _, _, err := store.HSet(nil, "h", nil); !errors.Is(err, ErrSyntax) {
 			t.Fatalf("HSet() error = %v, want ErrSyntax", err)
 		}
 	})
 
 	t.Run("Hash passively expires", func(t *testing.T) {
 		store, _ := newStoreWithManualClock()
-		if _, _, err := store.HSet("h", []HashFieldValue{{Field: "f", Value: []byte("v")}}); err != nil {
+		if _, _, err := store.HSet(nil, "h", []HashFieldValue{{Field: "f", Value: []byte("v")}}); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
 		if ok := store.expireKeyForTest("h", store.deadlineAfter(-time.Second)); !ok {
@@ -241,7 +241,7 @@ func TestStoreHash(t *testing.T) {
 
 	t.Run("Small hash uses compact encoding across commands and snapshots", func(t *testing.T) {
 		store := NewStore()
-		added, _, err := store.HSet("h", []HashFieldValue{
+		added, _, err := store.HSet(nil, "h", []HashFieldValue{
 			{Field: "a", Value: []byte("1")},
 			{Field: "b", Value: []byte("2")},
 		})
@@ -256,7 +256,7 @@ func TestStoreHash(t *testing.T) {
 			t.Fatalf("stored hash = %#v, want compact hash", stored)
 		}
 
-		added, _, err = store.HSet("h", []HashFieldValue{{Field: "a", Value: []byte("one")}})
+		added, _, err = store.HSet(nil, "h", []HashFieldValue{{Field: "a", Value: []byte("one")}})
 		if err != nil || added != 0 {
 			t.Fatalf("HSet() update = (%d, %v), want (0, nil)", added, err)
 		}
@@ -264,7 +264,7 @@ func TestStoreHash(t *testing.T) {
 		if err != nil || !ok || string(got) != "one" {
 			t.Fatalf("HGet() = (%q, %v, %v), want (one, true, nil)", string(got), ok, err)
 		}
-		removed, err := store.HDel("h", []string{"b"})
+		removed, err := store.HDel(nil, "h", []string{"b"})
 		if err != nil || removed != 1 {
 			t.Fatalf("HDel() = (%d, %v), want (1, nil)", removed, err)
 		}
@@ -295,7 +295,7 @@ func TestStoreHash(t *testing.T) {
 			pairs[i] = HashFieldValue{Field: "same", Value: []byte("value")}
 		}
 
-		if _, _, err := store.HSet("h", pairs); err != nil {
+		if _, _, err := store.HSet(nil, "h", pairs); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
 		stored := store.valueObjectForTest("h")
@@ -307,7 +307,7 @@ func TestStoreHash(t *testing.T) {
 	t.Run("Compact hash upgrades when entry count exceeds threshold", func(t *testing.T) {
 		store, _ := newStoreWithManualClock()
 		for i := 0; i < compactHashMaxEntries; i++ {
-			if _, _, err := store.HSet("h", []HashFieldValue{{Field: string(rune('a' + i)), Value: []byte("v")}}); err != nil {
+			if _, _, err := store.HSet(nil, "h", []HashFieldValue{{Field: string(rune('a' + i)), Value: []byte("v")}}); err != nil {
 				t.Fatalf("HSet() seed error = %v", err)
 			}
 		}
@@ -316,7 +316,7 @@ func TestStoreHash(t *testing.T) {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}
 
-		added, _, err := store.HSet("h", []HashFieldValue{{Field: "overflow", Value: []byte("v")}})
+		added, _, err := store.HSet(nil, "h", []HashFieldValue{{Field: "overflow", Value: []byte("v")}})
 		if err != nil || added != 1 {
 			t.Fatalf("HSet() overflow = (%d, %v), want (1, nil)", added, err)
 		}
@@ -372,11 +372,11 @@ func TestStoreHash(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				store := NewStore()
-				if _, _, err := store.HSet("h", []HashFieldValue{tt.seed}); err != nil {
+				if _, _, err := store.HSet(nil, "h", []HashFieldValue{tt.seed}); err != nil {
 					t.Fatalf("HSet() seed error = %v", err)
 				}
 
-				added, _, err := store.HSet("h", []HashFieldValue{tt.update})
+				added, _, err := store.HSet(nil, "h", []HashFieldValue{tt.update})
 				if err != nil || added != tt.wantAdded {
 					t.Fatalf("HSet() long update = (%d, %v), want (%d, nil)", added, err, tt.wantAdded)
 				}
@@ -396,7 +396,7 @@ func TestStoreHash(t *testing.T) {
 func TestStoreSet(t *testing.T) {
 	t.Run("SAdd returns newly added count", func(t *testing.T) {
 		store := NewStore()
-		added, _, err := store.SAdd("s", [][]byte{[]byte("a"), []byte("b"), []byte("a")})
+		added, _, err := store.SAdd(nil, "s", [][]byte{[]byte("a"), []byte("b"), []byte("a")})
 		if err != nil {
 			t.Fatalf("SAdd() error = %v", err)
 		}
@@ -404,7 +404,7 @@ func TestStoreSet(t *testing.T) {
 			t.Fatalf("SAdd() = %d, want 2", added)
 		}
 
-		added, _, err = store.SAdd("s", [][]byte{[]byte("b"), []byte("c")})
+		added, _, err = store.SAdd(nil, "s", [][]byte{[]byte("b"), []byte("c")})
 		if err != nil || added != 1 {
 			t.Fatalf("SAdd() second = (%d, %v)", added, err)
 		}
@@ -412,7 +412,7 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("SIsMember reports membership", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("x")}); err != nil {
+		if _, _, err := store.SAdd(nil, "s", [][]byte{[]byte("x")}); err != nil {
 			t.Fatalf("SAdd() error = %v", err)
 		}
 
@@ -432,16 +432,16 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("SRem drops empty set", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("x"), []byte("y")}); err != nil {
+		if _, _, err := store.SAdd(nil, "s", [][]byte{[]byte("x"), []byte("y")}); err != nil {
 			t.Fatalf("SAdd() error = %v", err)
 		}
 
-		removed, err := store.SRem("s", [][]byte{[]byte("x"), []byte("missing")})
+		removed, err := store.SRem(nil, "s", [][]byte{[]byte("x"), []byte("missing")})
 		if err != nil || removed != 1 {
 			t.Fatalf("SRem() = (%d, %v), want (1, nil)", removed, err)
 		}
 
-		removed, err = store.SRem("s", [][]byte{[]byte("y")})
+		removed, err = store.SRem(nil, "s", [][]byte{[]byte("y")})
 		if err != nil || removed != 1 {
 			t.Fatalf("SRem() = (%d, %v)", removed, err)
 		}
@@ -452,7 +452,7 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("SMembers returns every member (order-independent)", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
+		if _, _, err := store.SAdd(nil, "s", [][]byte{[]byte("a"), []byte("b"), []byte("c")}); err != nil {
 			t.Fatalf("SAdd() error = %v", err)
 		}
 
@@ -475,15 +475,15 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("Set ops on wrong type return WRONGTYPE", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set("plain", []byte("x"), 0)
+		_, _ = store.Set(nil, "plain", []byte("x"), 0)
 
-		if _, _, err := store.SAdd("plain", [][]byte{[]byte("m")}); !errors.Is(err, ErrWrongType) {
+		if _, _, err := store.SAdd(nil, "plain", [][]byte{[]byte("m")}); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("SAdd() error = %v, want ErrWrongType", err)
 		}
 		if _, err := store.SIsMember("plain", []byte("m")); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("SIsMember() error = %v, want ErrWrongType", err)
 		}
-		if _, err := store.SRem("plain", [][]byte{[]byte("m")}); !errors.Is(err, ErrWrongType) {
+		if _, err := store.SRem(nil, "plain", [][]byte{[]byte("m")}); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("SRem() error = %v, want ErrWrongType", err)
 		}
 		if _, err := store.SMembers("plain"); !errors.Is(err, ErrWrongType) {
@@ -493,7 +493,7 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("Integer-only set uses intset encoding across commands and snapshots", func(t *testing.T) {
 		store := NewStore()
-		added, _, err := store.SAdd("s", [][]byte{[]byte("2"), []byte("1"), []byte("2"), []byte("-5")})
+		added, _, err := store.SAdd(nil, "s", [][]byte{[]byte("2"), []byte("1"), []byte("2"), []byte("-5")})
 		if err != nil {
 			t.Fatalf("SAdd() error = %v", err)
 		}
@@ -514,7 +514,7 @@ func TestStoreSet(t *testing.T) {
 			t.Fatalf("SIsMember(3) = (%v, %v), want (false, nil)", exists, err)
 		}
 
-		removed, err := store.SRem("s", [][]byte{[]byte("2"), []byte("missing")})
+		removed, err := store.SRem(nil, "s", [][]byte{[]byte("2"), []byte("missing")})
 		if err != nil || removed != 1 {
 			t.Fatalf("SRem() = (%d, %v), want (1, nil)", removed, err)
 		}
@@ -543,13 +543,13 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("Non-integer and mixed sets use general encoding", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.SAdd("strings", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+		if _, _, err := store.SAdd(nil, "strings", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 			t.Fatalf("SAdd(strings) error = %v", err)
 		}
-		if _, _, err := store.SAdd("mixed", [][]byte{[]byte("1"), []byte("b")}); err != nil {
+		if _, _, err := store.SAdd(nil, "mixed", [][]byte{[]byte("1"), []byte("b")}); err != nil {
 			t.Fatalf("SAdd(mixed) error = %v", err)
 		}
-		if _, _, err := store.SAdd("noncanonical", [][]byte{[]byte("01")}); err != nil {
+		if _, _, err := store.SAdd(nil, "noncanonical", [][]byte{[]byte("01")}); err != nil {
 			t.Fatalf("SAdd(noncanonical) error = %v", err)
 		}
 
@@ -563,10 +563,10 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("SRem deletes empty intset", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("1")}); err != nil {
+		if _, _, err := store.SAdd(nil, "s", [][]byte{[]byte("1")}); err != nil {
 			t.Fatalf("SAdd() error = %v", err)
 		}
-		removed, err := store.SRem("s", [][]byte{[]byte("1")})
+		removed, err := store.SRem(nil, "s", [][]byte{[]byte("1")})
 		if err != nil || removed != 1 {
 			t.Fatalf("SRem() = (%d, %v), want (1, nil)", removed, err)
 		}
@@ -577,7 +577,7 @@ func TestStoreSet(t *testing.T) {
 
 	t.Run("Integer set upgrades when non-integer member is added", func(t *testing.T) {
 		store, _ := newStoreWithManualClock()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("1"), []byte("2")}); err != nil {
+		if _, _, err := store.SAdd(nil, "s", [][]byte{[]byte("1"), []byte("2")}); err != nil {
 			t.Fatalf("SAdd() seed error = %v", err)
 		}
 		expiresAt := store.deadlineAfter(time.Hour)
@@ -585,7 +585,7 @@ func TestStoreSet(t *testing.T) {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}
 
-		added, _, err := store.SAdd("s", [][]byte{[]byte("2"), []byte("three")})
+		added, _, err := store.SAdd(nil, "s", [][]byte{[]byte("2"), []byte("three")})
 		if err != nil || added != 1 {
 			t.Fatalf("SAdd() mixed update = (%d, %v), want (1, nil)", added, err)
 		}

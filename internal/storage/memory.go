@@ -17,7 +17,7 @@ const (
 
 // ConfigureMaxMemory enables approximate keyspace accounting and probabilistic
 // LRU eviction for subsequent writes. A limit of 0 disables the feature.
-func (s *Store) ConfigureMaxMemory(limit int64, sampleSize int) {
+func (s *Store) ConfigureMaxMemory(changes Changes, limit int64, sampleSize int) {
 	if s == nil {
 		return
 	}
@@ -36,7 +36,7 @@ func (s *Store) ConfigureMaxMemory(limit int64, sampleSize int) {
 	} else {
 		s.usedMemory.Store(0)
 	}
-	s.writeUnlockAllShardsAndPublish()
+	s.writeUnlockAllShardsAndReport(changes)
 }
 
 // MaxMemory returns the configured approximate keyspace memory limit in bytes.
@@ -59,13 +59,13 @@ func (s *Store) UsedMemory() int64 {
 
 // EnforceMaxMemory evicts least-recently-used candidates until the keyspace is
 // at or below the configured maxmemory limit.
-func (s *Store) EnforceMaxMemory() ([]string, error) {
+func (s *Store) EnforceMaxMemory(changes Changes) ([]string, error) {
 	if !s.maxMemoryEnabled() {
 		return nil, nil
 	}
 
 	s.writeLockAllShards()
-	defer s.writeUnlockAllShardsAndPublish()
+	defer s.writeUnlockAllShardsAndReport(changes)
 
 	limit := s.maxMemory.Load()
 	s.recalculateUsedMemoryLocked(s.now())

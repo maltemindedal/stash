@@ -10,7 +10,7 @@ import (
 func pfAddForTest(t *testing.T, store *Store, key string, elements [][]byte) (int64, error) {
 	t.Helper()
 
-	changed, _, err := store.PFAdd(key, elements)
+	changed, _, err := store.PFAdd(nil, key, elements)
 	return changed, err
 }
 
@@ -172,7 +172,7 @@ func TestStoreHyperLogLogBehavior(t *testing.T) {
 			name: "PFAdd and PFCount reject non-string values with wrong type",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.LeftPush("numbers", [][]byte{[]byte("one")}); err != nil {
+				if _, _, err := store.LeftPush(nil, "numbers", [][]byte{[]byte("one")}); err != nil {
 					t.Fatalf("LeftPush() error = %v", err)
 				}
 
@@ -188,7 +188,7 @@ func TestStoreHyperLogLogBehavior(t *testing.T) {
 			name: "PFAdd and PFCount reject plain string values as invalid HyperLogLogs",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set("greeting", []byte("hello"), 0)
+				_, _ = store.Set(nil, "greeting", []byte("hello"), 0)
 
 				if _, err := pfAddForTest(t, store, "greeting", [][]byte{[]byte("alice")}); !errors.Is(err, ErrNotHyperLogLog) {
 					t.Fatalf("PFAdd() error = %v, want ErrNotHyperLogLog", err)
@@ -208,7 +208,7 @@ func TestStoreHyperLogLogBehavior(t *testing.T) {
 				for i := hllHeaderSize; i < len(payload); i++ {
 					payload[i] = 0xFF
 				}
-				_, _ = store.Set("forged", payload, 0)
+				_, _ = store.Set(nil, "forged", payload, 0)
 
 				if _, err := pfAddForTest(t, store, "forged", [][]byte{[]byte("alice")}); !errors.Is(err, ErrNotHyperLogLog) {
 					t.Fatalf("PFAdd() error = %v, want ErrNotHyperLogLog", err)
@@ -228,7 +228,7 @@ func TestStoreHyperLogLogBehavior(t *testing.T) {
 				for i := hllHeaderSize; i < len(payload); i++ {
 					payload[i] = hllMaxRank
 				}
-				_, _ = store.Set("saturated", payload, 0)
+				_, _ = store.Set(nil, "saturated", payload, 0)
 
 				count, err := store.PFCount([]string{"saturated"})
 				if err != nil {

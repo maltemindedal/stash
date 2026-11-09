@@ -18,7 +18,7 @@ func (e *Executor) handleHSet(ctx context.Context, request *Request) (protocol.V
 		})
 	}
 
-	added, evicted, err := e.store.HSet(key, pairs)
+	added, evicted, err := e.store.HSet(nil, key, pairs)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -57,7 +57,7 @@ func (e *Executor) handleHDel(_ context.Context, request *Request) (protocol.Val
 		fields = append(fields, string(arg))
 	}
 
-	removed, err := e.store.HDel(key, fields)
+	removed, err := e.store.HDel(nil, key, fields)
 	if err != nil {
 		switch {
 		case errors.Is(err, storage.ErrWrongType):
@@ -103,7 +103,7 @@ func (e *Executor) handleSAdd(ctx context.Context, request *Request) (protocol.V
 	}
 
 	key := string(request.Args[0])
-	added, evicted, err := e.store.SAdd(key, request.Args[1:])
+	added, evicted, err := e.store.SAdd(nil, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -137,7 +137,7 @@ func (e *Executor) handleSRem(_ context.Context, request *Request) (protocol.Val
 	}
 
 	key := string(request.Args[0])
-	removed, err := e.store.SRem(key, request.Args[1:])
+	removed, err := e.store.SRem(nil, key, request.Args[1:])
 	if err != nil {
 		switch {
 		case errors.Is(err, storage.ErrWrongType):

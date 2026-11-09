@@ -131,8 +131,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 	if s.store != nil {
-		s.store.ConfigureMaxMemory(s.cfg.MaxMemory, s.cfg.EvictionSampleSize)
-		if evicted, err := s.store.EnforceMaxMemory(); err != nil {
+		s.store.ConfigureMaxMemory(nil, s.cfg.MaxMemory, s.cfg.EvictionSampleSize)
+		if evicted, err := s.store.EnforceMaxMemory(nil); err != nil {
 			return fmt.Errorf("server: enforce maxmemory: %w", err)
 		} else if len(evicted) > 0 {
 			s.logger.Info("applied startup maxmemory eviction", "evicted_keys", len(evicted), "used_memory", s.store.UsedMemory(), "maxmemory", s.cfg.MaxMemory)

@@ -562,7 +562,7 @@ func (e *Executor) handleSet(ctx context.Context, request *Request) (protocol.Va
 	}
 
 	key := string(request.Args[0])
-	evicted, err := e.store.Set(key, request.Args[1], expiresAt)
+	evicted, err := e.store.Set(nil, key, request.Args[1], expiresAt)
 	if err != nil {
 		if errors.Is(err, storage.ErrMemoryLimitExceeded) {
 			return nil, ErrOutOfMemoryError()
@@ -606,7 +606,7 @@ func (e *Executor) handleSetBit(ctx context.Context, request *Request) (protocol
 	}
 
 	key := string(request.Args[0])
-	previous, evicted, err := e.store.SetBit(key, offset, bit)
+	previous, evicted, err := e.store.SetBit(nil, key, offset, bit)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -659,7 +659,7 @@ func (e *Executor) handlePFAdd(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
-	changed, evicted, err := e.store.PFAdd(key, request.Args[1:])
+	changed, evicted, err := e.store.PFAdd(nil, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -695,7 +695,7 @@ func (e *Executor) handleDel(_ context.Context, request *Request) (protocol.Valu
 	touched := make([]string, 0, len(request.Args))
 	if len(request.Args) == 1 {
 		key := string(request.Args[0])
-		if e.store.Delete(key) {
+		if e.store.Delete(nil, key) {
 			removed = 1
 			touched = append(touched, key)
 		}
@@ -706,7 +706,7 @@ func (e *Executor) handleDel(_ context.Context, request *Request) (protocol.Valu
 			keys = append(keys, key)
 		}
 
-		touched = e.store.DeleteMany(keys)
+		touched = e.store.DeleteMany(nil, keys)
 		removed = int64(len(touched))
 	}
 	if len(touched) > 0 {
@@ -722,7 +722,7 @@ func (e *Executor) handleIncr(ctx context.Context, request *Request) (protocol.V
 	}
 
 	key := string(request.Args[0])
-	value, evicted, err := e.store.Increment(key)
+	value, evicted, err := e.store.Increment(nil, key)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -746,7 +746,7 @@ func (e *Executor) handleZAdd(ctx context.Context, request *Request) (protocol.V
 	}
 
 	key := string(request.Args[0])
-	added, evicted, err := e.store.ZAdd(key, entries)
+	added, evicted, err := e.store.ZAdd(nil, key, entries)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
@@ -783,7 +783,7 @@ func (e *Executor) handleZRange(_ context.Context, request *Request) (protocol.V
 
 func (e *Executor) handleXAdd(ctx context.Context, request *Request) (protocol.Value, error) {
 	key := string(request.Args[0])
-	id, evicted, err := e.store.XAdd(key, string(request.Args[1]), request.Args[2:])
+	id, evicted, err := e.store.XAdd(nil, key, string(request.Args[1]), request.Args[2:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}

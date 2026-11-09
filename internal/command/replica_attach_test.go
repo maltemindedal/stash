@@ -55,7 +55,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				// installs, and removes and publishes the keys in it whose TTL
 				// has passed. It also makes every write lock every shard, so it is
 				// set only where it is needed.
-				store.ConfigureMaxMemory(1<<40, 5)
+				store.ConfigureMaxMemory(nil, 1<<40, 5)
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			// Wires the executor and store to the server's replica registry,
@@ -140,11 +140,11 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 			}
 			if tt.fullResyncs {
 				snapshot := storage.NewStore()
-				if _, err := snapshot.Set("expired", []byte("v"), 1); err != nil { // a TTL deadline long past
+				if _, err := snapshot.Set(nil, "expired", []byte("v"), 1); err != nil { // a TTL deadline long past
 					t.Fatalf("Set() error = %v", err)
 				}
 				run(func(int) bool {
-					store.ReplaceWith(snapshot) // as consumeFullResync does, holding no sequencer lock
+					store.ReplaceWith(nil, snapshot) // as consumeFullResync does, holding no sequencer lock
 					return true
 				})
 			}
