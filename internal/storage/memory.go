@@ -126,22 +126,6 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 			size += int64(len(member))
 		}
 		return size
-	case ValueKindZSet:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.ZSetEncoding == ValueEncodingCompact {
-			if value.CompactZSet != nil {
-				size += int64(len(value.CompactZSet.entries))*approxZSetEntryOverhead + int64(len(value.CompactZSet.arena))
-			}
-			return size
-		}
-		if value.ZSet != nil {
-			size += int64(len(value.ZSet.index)) * approxZSetEntryOverhead
-			for member := range value.ZSet.index {
-				size += int64(len(member))
-			}
-		}
-		return size
 	}
 
 	return approximateBaseValueObjectSize(key, value.ExpiresAt)

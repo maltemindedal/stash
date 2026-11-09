@@ -109,9 +109,6 @@ type StringSnapshotStats struct {
 type ValueObject struct {
 	String         []byte
 	List           [][]byte
-	ZSet           *SortedSet
-	CompactZSet    *CompactZSet
-	ZSetEncoding   ValueEncoding
 	ListHead       int32
 	Hash           map[string][]byte
 	CompactHash    *CompactHash
@@ -264,9 +261,6 @@ func (v *ValueObject) emptiedCollection() bool {
 	case ValueKindSet:
 		n, err := v.setLen()
 		return err == nil && n == 0
-	case ValueKindZSet:
-		n, err := v.zsetLen()
-		return err == nil && n == 0
 	}
 	return false
 }
@@ -295,37 +289,8 @@ func (v *ValueObject) containerCopy() *ValueObject {
 	case ValueKindSet:
 		c.Set = maps.Clone(v.Set)
 		c.IntSet = cloneIntSet(v.IntSet)
-	case ValueKindZSet:
-		c.ZSet = cloneSortedSet(v.ZSet)
-		c.CompactZSet = cloneCompactZSet(v.CompactZSet)
 	}
 	return &c
-}
-
-// ZSetValue returns the general sorted-set payload for a sorted-set value.
-// Compact sorted sets are materialized as detached general sorted sets.
-func (v *ValueObject) ZSetValue() (*SortedSet, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindZSet {
-		return nil, ErrWrongType
-	}
-	if v.ZSetEncoding == ValueEncodingCompact {
-		if v.CompactZSet == nil {
-			return nil, errInvalidValueObjectState
-		}
-		set := newSortedSet()
-		for _, entry := range v.CompactZSet.rangeByRank(0, v.CompactZSet.len()-1) {
-			set.add(entry.Member, entry.Score)
-		}
-		return set, nil
-	}
-	if v.ZSet == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.ZSet, nil
 }
 
 func newStringValue(data []byte, expiresAt int64) *ValueObject {
@@ -350,23 +315,6 @@ func newListValue(items [][]byte, expiresAt int64) *ValueObject {
 		List:      items,
 		ExpiresAt: expiresAt,
 		Kind:      ValueKindList,
-	}
-}
-
-func newZSetValue(set *SortedSet, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		ZSet:      set,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindZSet,
-	}
-}
-
-func newCompactZSetValue(set *CompactZSet, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		CompactZSet:  set,
-		ZSetEncoding: ValueEncodingCompact,
-		ExpiresAt:    expiresAt,
-		Kind:         ValueKindZSet,
 	}
 }
 

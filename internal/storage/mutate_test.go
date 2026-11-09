@@ -261,9 +261,8 @@ func describeValueForTest(store *Store, key string) string {
 		sort.Strings(names)
 		fmt.Fprintf(&b, "encoding %d %q", v.SetEncoding, names)
 	case ValueKindZSet:
-		n, _ := v.zsetLen()
-		entries, _ := v.zsetRangeByRank(0, n-1)
-		fmt.Fprintf(&b, "encoding %d %v", v.ZSetEncoding, entries)
+		zset, _ := zsetOf(v)
+		fmt.Fprintf(&b, "compact %v %v", zset.compact != nil, zset.rangeByRank(0, zset.len()-1))
 	case ValueKindStream:
 		stream, _ := streamOf(v)
 		fmt.Fprintf(&b, "last ID %s", stream.lastID)
@@ -487,7 +486,7 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 			// sorted set and runs a mutation that leaves it as it is.
 			name: "a mutation of an empty sorted set",
 			setup: func(s *Store) error {
-				s.setValueObjectForTest(key, newZSetValueForEntries(nil, 0))
+				s.setValueObjectForTest(key, newKindValue(newZSetValueForEntries(nil)))
 				return nil
 			},
 			write: func(s *Store) error { _, _, err := mutateKey(s, key, ValueKindZSet, shrinks, unchanged); return err },

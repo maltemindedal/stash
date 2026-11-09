@@ -14,7 +14,7 @@ func TestValueObjectAccessorsRejectWrongKinds(t *testing.T) {
 		access func(*ValueObject) error
 	}{
 		{name: "ListValue", access: func(v *ValueObject) error { _, err := v.ListValue(); return err }},
-		{name: "ZSetValue", access: func(v *ValueObject) error { _, err := v.ZSetValue(); return err }},
+		{name: "zsetOf", access: func(v *ValueObject) error { _, err := zsetOf(v); return err }},
 		{name: "streamOf", access: func(v *ValueObject) error { _, err := streamOf(v); return err }},
 	}
 
@@ -35,11 +35,6 @@ func TestValueObjectAccessorsRejectInvalidTaggedUnionState(t *testing.T) {
 		value  *ValueObject
 		access func(*ValueObject) error
 	}{
-		{
-			name:   "zset kind without a zset payload",
-			value:  &ValueObject{Kind: ValueKindZSet},
-			access: func(v *ValueObject) error { _, err := v.ZSetValue(); return err },
-		},
 		{
 			name:   "nil value object",
 			value:  nil,
@@ -77,19 +72,6 @@ func TestValueObjectAccessorsMaterializeCompactValues(t *testing.T) {
 		}
 	})
 
-	t.Run("sorted set", func(t *testing.T) {
-		zsetValue := newCompactZSetValue(newCompactZSet([]ZSetEntry{{Member: []byte("m"), Score: 1}}), 0)
-		zset, err := zsetValue.ZSetValue()
-		if err != nil {
-			t.Fatalf("ZSetValue() error = %v", err)
-		}
-
-		entries := zset.rangeByRank(0, 0)
-		if len(entries) != 1 || entries[0].Member != "m" || entries[0].Score != 1 {
-			t.Fatalf("ZSetValue().rangeByRank() = %#v, want m/1", entries)
-		}
-	})
-
 	t.Run("intset", func(t *testing.T) {
 		setValue := newIntSetValue(&IntSet{values: []int64{1}}, 0)
 		set, err := setValue.SetValue()
@@ -106,33 +88,6 @@ func TestValueObjectAccessorsMaterializeCompactValues(t *testing.T) {
 			t.Fatalf("compact set after materialized mutation = (%v, %v), want (false, nil)", contains, err)
 		}
 	})
-}
-
-func TestStoreRejectsInvalidTaggedUnionState(t *testing.T) {
-	tests := []struct {
-		name  string
-		key   string
-		value *ValueObject
-		read  func(*Store, string) error
-	}{
-		{
-			name:  "ZRange over a zset kind without a payload",
-			key:   "leaders",
-			value: &ValueObject{Kind: ValueKindZSet},
-			read:  func(s *Store, key string) error { _, err := s.ZRange(key, 0, -1); return err },
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := NewStore()
-			store.setValueObjectForTest(tt.key, tt.value)
-
-			if err := tt.read(store, tt.key); !errors.Is(err, errInvalidValueObjectState) {
-				t.Fatalf("read error = %v, want errInvalidValueObjectState", err)
-			}
-		})
-	}
 }
 
 // TestAWriteStampsTheValueItCreatesWithTheStoreClock pins where a new value's
@@ -178,8 +133,8 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 		{name: "HSET of a long value (newHashValue)", write: hset("f", long)},
 		{name: "SADD of an integer (newIntSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("1")); return err }},
 		{name: "SADD of a string (newSetValue)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("a")); return err }},
-		{name: "ZADD of a short member (newCompactZSetValue)", write: zadd("m")},
-		{name: "ZADD of a long member (newZSetValue)", write: zadd(long)},
+		{name: "ZADD of a short member (a compact sorted set)", write: zadd("m")},
+		{name: "ZADD of a long member (a general sorted set)", write: zadd(long)},
 		{name: "XADD (a new stream)", write: func(s *Store) error { _, _, err := s.XAdd(key, "*", bulk("f", "v")); return err }},
 	}
 

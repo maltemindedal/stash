@@ -30,7 +30,6 @@ type imageEntry struct {
 	expiresAt int64
 	str       []byte
 	list      [][]byte
-	zset      []ZSetRangeEntry
 	hash      []HashFieldValue
 	set       [][]byte
 	// data is the image of a kind that has moved out of the fields above.
@@ -157,10 +156,6 @@ func (e *imageEntry) recreate(emit func(args [][]byte) error) error {
 		sort.Slice(e.set, func(i, j int) bool { return string(e.set[i]) < string(e.set[j]) })
 		return emitChunked(emit, "SADD", e.key, len(e.set), 1, func(args [][]byte, i int) [][]byte {
 			return append(args, e.set[i])
-		})
-	case ValueKindZSet:
-		return emitChunked(emit, "ZADD", e.key, len(e.zset), 2, func(args [][]byte, i int) [][]byte {
-			return append(args, strconv.AppendFloat(nil, e.zset[i].Score, 'g', -1, 64), []byte(e.zset[i].Member))
 		})
 	default:
 		return fmt.Errorf("storage: cannot recreate value kind %q of key %q", e.kind, e.key)

@@ -2076,9 +2076,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if added != 3 {
 			t.Fatalf("ZAdd() added = %d, want 3", added)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.Kind != ValueKindZSet || stored.ZSetEncoding != ValueEncodingCompact || stored.CompactZSet == nil {
-			t.Fatalf("stored zset = %#v, want compact zset", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:compact" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:compact", got)
 		}
 
 		added, _, err = store.ZAdd("leaders", []ZSetEntry{{Member: []byte("beta"), Score: 0.5}})
@@ -2112,9 +2111,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if _, _, err := store.ZAdd("leaders", entries); err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.ZSetEncoding != ValueEncodingCompact {
-			t.Fatalf("stored zset = %#v, want compact zset for one distinct member", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:compact" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:compact", got)
 		}
 	})
 
@@ -2135,12 +2133,11 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("ZAdd() overflow = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.Kind != ValueKindZSet || stored.ZSetEncoding != ValueEncodingGeneral || stored.ZSet == nil {
-			t.Fatalf("stored zset = %#v, want upgraded general zset", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:general" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:general", got)
 		}
-		if stored.ExpiresAt != expiresAt {
-			t.Fatalf("upgraded zset ExpiresAt = %d, want %d", stored.ExpiresAt, expiresAt)
+		if got := store.expiresAtForTest("leaders"); got != expiresAt {
+			t.Fatalf("upgraded zset expires at %d, want %d", got, expiresAt)
 		}
 		values, err := store.ZRange("leaders", 0, -1)
 		if err != nil {
@@ -2165,9 +2162,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("ZAdd() long member = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.ZSetEncoding != ValueEncodingGeneral || stored.ZSet == nil {
-			t.Fatalf("stored zset = %#v, want upgraded general zset", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:general" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:general", got)
 		}
 		values, err := store.ZRange("leaders", 0, -1)
 		if err != nil {

@@ -384,12 +384,14 @@ func (s *Store) ZAdd(key string, entries []ZSetEntry) (int64, []string, error) {
 
 	return mutateKey(s, key, ValueKindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			created := newZSetValueForEntries(entries, 0)
-			n, err := created.zsetLen()
-			return created, int64(n), err
+			created := newZSetValueForEntries(entries)
+			return newKindValue(created), int64(created.len()), nil
 		}
-		added, err := cur.zsetAdd(entries)
-		return cur, added, err
+		zset, err := zsetOf(cur)
+		if err != nil {
+			return nil, 0, err
+		}
+		return cur, zset.add(entries), nil
 	})
 }
 
@@ -400,13 +402,12 @@ func (s *Store) ZScores(key string, members [][]byte) ([]float64, []bool, error)
 	found := make([]bool, len(members))
 
 	_, _, err := readKey(s, key, func(value *ValueObject) (struct{}, error) {
+		zset, err := zsetOf(value)
+		if err != nil {
+			return struct{}{}, err
+		}
 		for i, member := range members {
-			score, exists, err := value.zsetScore(member)
-			if err != nil {
-				return struct{}{}, err
-			}
-			scores[i] = score
-			found[i] = exists
+			scores[i], found[i] = zset.score(member)
 		}
 		return struct{}{}, nil
 	})
@@ -420,16 +421,16 @@ func (s *Store) ZScores(key string, members [][]byte) ([]float64, []bool, error)
 // ZRange returns an inclusive rank range from the sorted set stored at key.
 func (s *Store) ZRange(key string, start, stop int64) ([]ZSetRangeEntry, error) {
 	entries, found, err := readKey(s, key, func(value *ValueObject) ([]ZSetRangeEntry, error) {
-		setLen, err := value.zsetLen()
+		zset, err := zsetOf(value)
 		if err != nil {
 			return nil, err
 		}
 
-		from, to, ok := normalizeListRange(setLen, start, stop)
+		from, to, ok := normalizeListRange(zset.len(), start, stop)
 		if !ok {
 			return []ZSetRangeEntry{}, nil
 		}
-		return value.zsetRangeByRank(from, to)
+		return zset.rangeByRank(from, to), nil
 	})
 	if err != nil {
 		return nil, err
@@ -447,13 +448,13 @@ func (s *Store) ZRange(key string, start, stop int64) ([]ZSetRangeEntry, error) 
 // so the result reflects one consistent snapshot of the set.
 func (s *Store) ZRangeByScores(key string, scoreRanges ...ScoreRange) ([]ZSetRangeEntry, error) {
 	entries, found, err := readKey(s, key, func(value *ValueObject) ([]ZSetRangeEntry, error) {
+		zset, err := zsetOf(value)
+		if err != nil {
+			return nil, err
+		}
 		var entries []ZSetRangeEntry
 		for _, scoreRange := range scoreRanges {
-			ranged, err := value.zsetRangeByScore(scoreRange)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, ranged...)
+			entries = append(entries, zset.rangeByScore(scoreRange)...)
 		}
 		return entries, nil
 	})
@@ -650,17 +651,6 @@ func (s *Store) imageLocked(now int64) *Image {
 				entry.list = make([][]byte, len(list))
 				for j, item := range list {
 					entry.list[j] = a.bytes(item)
-				}
-			case ValueKindZSet:
-				setLen, err := value.zsetLen()
-				if err != nil {
-					continue
-				}
-				if setLen > 0 {
-					entry.zset, err = value.zsetRangeByRank(0, setLen-1)
-					if err != nil {
-						continue
-					}
 				}
 			case ValueKindHash:
 				hashEntries, err := value.hashEntries()

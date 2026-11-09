@@ -159,3 +159,33 @@ func assertRecreationCommands(t testing.TB, store *Store, want ...string) {
 		t.Fatalf("recreation commands = %q, want %q", got, want)
 	}
 }
+
+// encodingForTest names the kind and encoding of the value stored at key, as
+// "zset:compact" or "zset:general", or returns "" when the key is absent.
+func (s *Store) encodingForTest(key string) string {
+	v := s.valueObjectForTest(key)
+	if v == nil {
+		return ""
+	}
+	var compact bool
+	switch data := v.data.(type) {
+	case *zsetValue:
+		compact = data.compact != nil
+	default:
+		return string(v.Kind)
+	}
+	if compact {
+		return string(v.Kind) + ":compact"
+	}
+	return string(v.Kind) + ":general"
+}
+
+// expiresAtForTest returns the TTL deadline stored for key: 0 when the key has
+// none or is absent.
+func (s *Store) expiresAtForTest(key string) int64 {
+	v := s.valueObjectForTest(key)
+	if v == nil {
+		return 0
+	}
+	return v.ExpiresAt
+}
