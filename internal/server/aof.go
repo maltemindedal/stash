@@ -162,14 +162,18 @@ func (s *Server) closeAOFWriter() error {
 	return nil
 }
 
-// evictionCount is a Changes that passes each change on and counts the
-// memory-pressure evictions among them.
+// evictionCount is a Changes that passes each change on and counts the keys
+// removed among them, and how many of those a memory-pressure eviction removed.
 type evictionCount struct {
 	changes storage.Changes
+	removed int
 	evicted int
 }
 
 func (c *evictionCount) KeyChanged(key string, cause storage.Cause) {
+	if cause != storage.Written {
+		c.removed++
+	}
 	if cause == storage.MemoryEvicted {
 		c.evicted++
 	}
@@ -203,10 +207,10 @@ func (s *Server) enforceMaxMemoryAtStartup() error {
 
 	err := recordErr
 	if err != nil {
-		err = fmt.Errorf("server: append a DEL of the %d keys evicted at startup to aof %q: %w", count.evicted, s.cfg.AOFPath, err)
-	} else if count.evicted > 0 && s.aofWriter != nil {
+		err = fmt.Errorf("server: append a DEL of the %d keys expired or evicted at startup to aof %q: %w", count.removed, s.cfg.AOFPath, err)
+	} else if count.removed > 0 && s.aofWriter != nil {
 		if syncErr := s.aofWriter.Sync(); syncErr != nil {
-			err = fmt.Errorf("server: fsync a DEL of the %d keys evicted at startup to aof %q: %w", count.evicted, s.cfg.AOFPath, syncErr)
+			err = fmt.Errorf("server: fsync a DEL of the %d keys expired or evicted at startup to aof %q: %w", count.removed, s.cfg.AOFPath, syncErr)
 		}
 	}
 	if err != nil {

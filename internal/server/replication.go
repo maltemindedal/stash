@@ -714,9 +714,8 @@ func (s *ReplicaStream) Active() bool {
 // replica, and returns the offset at its end. When ordered, its caller holds
 // the write's sequencer locks until it returns, so it skips the registry lock
 // while no replica is registered (ReplicaRegistry.PropagateOrdered). Otherwise
-// it always takes the lock (ReplicaRegistry.Propagate): the server's own
-// writes, such as the expiry DELs a replica link's full resync publishes while
-// holding no sequencer lock (consumeFullResync).
+// it always takes the lock (ReplicaRegistry.Propagate): the Recorder never
+// passes ordered for the server's own writes, the DELs of a Background unit.
 func (s *ReplicaStream) Propagate(payload []byte, ordered bool) (end int64) {
 	return s.propagate(payload, ordered).endOffset
 }

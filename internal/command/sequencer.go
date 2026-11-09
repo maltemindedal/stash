@@ -322,6 +322,9 @@ func (e *Executor) executeAndRecord(ctx context.Context, request *Request) (serv
 // the replication stream becomes the client's last write offset, which WAIT
 // waits for.
 func (e *Executor) record(request *Request, result server.ExecuteResult) (server.ExecuteResult, error) {
+	// A handler that records its own write (BLPOP) gets here before
+	// executeRequestDetailed has added the DEL of the keys it removed.
+	request.recordRemovals()
 	outcome := e.recorder.Record(&request.write)
 	switch {
 	case outcome.Withheld && request.origin != record.OriginMaster:
