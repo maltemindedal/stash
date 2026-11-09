@@ -20,7 +20,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 				rng := rand.New(rand.NewSource(seed))
 				store := NewStore()
 				if accounting {
-					store.ConfigureMaxMemory(1<<40, 16)
+					store.ConfigureMaxMemory(nil, 1<<40, 16)
 				}
 				var model [][]byte
 				next := 0
@@ -37,7 +37,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 					switch op := rng.Intn(10); {
 					case op < 3: // LPUSH
 						values := newValues(1 + rng.Intn(3))
-						length, _, err := store.LeftPush("k", values)
+						length, err := store.LeftPush(nil, "k", values)
 						if err != nil {
 							t.Fatalf("step %d: LeftPush error = %v", step, err)
 						}
@@ -49,7 +49,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						}
 					case op < 6: // RPUSH
 						values := newValues(1 + rng.Intn(3))
-						length, _, err := store.RightPush("k", values)
+						length, err := store.RightPush(nil, "k", values)
 						if err != nil {
 							t.Fatalf("step %d: RightPush error = %v", step, err)
 						}
@@ -58,7 +58,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 							t.Fatalf("step %d: RightPush length = %d, want %d", step, length, len(model))
 						}
 					case op == 6: // LPOP
-						got, ok, err := store.LeftPop("k")
+						got, ok, err := store.LeftPop(nil, "k")
 						if err != nil {
 							t.Fatalf("step %d: LeftPop error = %v", step, err)
 						}
@@ -73,7 +73,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						}
 						model = model[1:]
 					case op == 7: // RPOP
-						got, ok, err := store.RightPop("k")
+						got, ok, err := store.RightPop(nil, "k")
 						if err != nil {
 							t.Fatalf("step %d: RightPop error = %v", step, err)
 						}
@@ -89,7 +89,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						model = model[:len(model)-1]
 					case op == 8: // LPOP count
 						count := 1 + rng.Intn(4)
-						got, ok, err := store.LeftPopN("k", count)
+						got, ok, err := store.LeftPopN(nil, "k", count)
 						if err != nil {
 							t.Fatalf("step %d: LeftPopN error = %v", step, err)
 						}
@@ -105,7 +105,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						model = model[n:]
 					default: // RPOP count
 						count := 1 + rng.Intn(4)
-						got, ok, err := store.RightPopN("k", count)
+						got, ok, err := store.RightPopN(nil, "k", count)
 						if err != nil {
 							t.Fatalf("step %d: RightPopN error = %v", step, err)
 						}
@@ -152,7 +152,7 @@ func TestLeftPushDoesNotCopyTheList(t *testing.T) {
 	for i := range values {
 		values[i] = []byte("v")
 	}
-	if _, _, err := store.RightPush("l", values); err != nil {
+	if _, err := store.RightPush(nil, "l", values); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 	one := [][]byte{[]byte("x")}
@@ -161,10 +161,10 @@ func TestLeftPushDoesNotCopyTheList(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < rounds; i++ {
-		if _, _, err := store.LeftPush("l", one); err != nil {
+		if _, err := store.LeftPush(nil, "l", one); err != nil {
 			t.Fatalf("LeftPush() error = %v", err)
 		}
-		if _, _, err := store.LeftPop("l"); err != nil {
+		if _, _, err := store.LeftPop(nil, "l"); err != nil {
 			t.Fatalf("LeftPop() error = %v", err)
 		}
 	}
@@ -185,7 +185,7 @@ func TestBuildingAListWithLeftPushIsLinear(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < pushes; i++ {
-		if _, _, err := store.LeftPush("l", one); err != nil {
+		if _, err := store.LeftPush(nil, "l", one); err != nil {
 			t.Fatalf("LeftPush() error = %v", err)
 		}
 	}

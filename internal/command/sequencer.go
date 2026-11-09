@@ -9,6 +9,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/server"
+	"github.com/maltemindedal/stash/internal/storage"
 )
 
 // sequencer orders the effects of requests against one another, which the sharded
@@ -37,8 +38,8 @@ import (
 // While maxmemory is set, an Accounted write (a Growing write under maxmemory)
 // also holds every stripe (writeShapeOf). Making room for it can cause a
 // Memory-pressure eviction anywhere in the keyspace, and its sweep a TTL
-// eviction, and their DELs are recorded with its own frames or through the
-// expiration listener while it runs. So it no longer commutes with a write of
+// eviction, and their DEL is recorded after its own frame, in the same write
+// (executionEffects.KeyChanged). So it no longer commutes with a write of
 // an evicted key: held to its own stripe, such a write could be applied after
 // the Eviction and still be recorded before its DEL, and replay would delete a
 // live key. Shrinking writes (DEL, the pops, HDEL, SREM) never evict or sweep,
@@ -62,8 +63,8 @@ import (
 // replica only when no write sits between being applied and having its frames
 // counted, so a write is counted either below the new replica's base, and is in
 // its snapshot, or after the replica is registered. WAIT's GETACK, which holds
-// neither gate nor stripe, always takes the lock, and so do the server's own
-// writes, the expiry DELs: the Recorder does not vouch for who publishes them.
+// neither gate nor stripe, always takes the lock, and so do the DELs of a
+// Background unit, which the Recorder never propagates as ordered.
 //
 // PSYNC attaches a replica at an attach cut (attachCut): it copies the snapshot
 // it sends the replica and registers the replica while it holds gate shared and
@@ -304,6 +305,10 @@ func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.
 func (e *Executor) executeAndRecord(ctx context.Context, request *Request) (server.ExecuteResult, error) {
 	result, err := e.executeRequestDetailed(ctx, request, true)
 	if err != nil {
+		// A command that failed has no frame of its own, but its write holds
+		// the DEL of any key its sweep removed, and that of the commands an
+		// EXEC ran before it was cancelled. The reply stays the command's error.
+		e.recorder.Record(&request.write)
 		return result, err
 	}
 	return e.record(request, result)
@@ -317,6 +322,9 @@ func (e *Executor) executeAndRecord(ctx context.Context, request *Request) (serv
 // the replication stream becomes the client's last write offset, which WAIT
 // waits for.
 func (e *Executor) record(request *Request, result server.ExecuteResult) (server.ExecuteResult, error) {
+	// A handler that records its own write (BLPOP) gets here before
+	// executeRequestDetailed has added the DEL of the keys it removed.
+	request.recordRemovals()
 	outcome := e.recorder.Record(&request.write)
 	switch {
 	case outcome.Withheld && request.origin != record.OriginMaster:
@@ -332,12 +340,34 @@ func (e *Executor) record(request *Request, result server.ExecuteResult) (server
 	return result, nil
 }
 
-// BeginBackgroundWrite orders work the server does on its own initiative (the
-// expiry sweep, the snapshot a rewrite takes) against client requests, as a
-// write is ordered. The caller calls the returned function when its frames have
-// been applied.
+// BeginBackgroundWrite orders the snapshot an AOF rewrite takes against client
+// requests, as a write of unknown keys is ordered. The caller calls the returned
+// function when the snapshot is taken.
 func (e *Executor) BeginBackgroundWrite() (release func()) {
 	return e.seq.beginWrite(keysUnknown, nil)
+}
+
+// RunBackgroundUnit runs work the server does on its own initiative (a sample
+// of the active expiry loop, the maxmemory enforcement at startup, the keyspace
+// swap of a full resync) as a Background unit: ordered as a write of unknown
+// keys, so that an Eviction and a later write of the same key reach the log in
+// the order they happened. Work reports to the Changes it is handed, as a
+// request's handler does (executionEffects.KeyChanged): every change
+// invalidates WATCH, and the DEL of the keys work removed is recorded with
+// Origin Server before the ordering is released. It returns the error of an
+// append that failed.
+func (e *Executor) RunBackgroundUnit(work func(changes storage.Changes)) error {
+	release := e.seq.beginWrite(keysUnknown, nil)
+	defer release()
+
+	effects := executionEffects{watches: e.watchRegistry}
+	work(&effects)
+	if len(effects.removed) == 0 {
+		return nil
+	}
+	w := record.Write{Origin: record.OriginServer}
+	w.AddDeletes(effects.removed, record.ToBoth)
+	return e.recorder.Record(&w).Err
 }
 
 // writeShapeOf is the key shape a write named name is ordered by: the keys its

@@ -177,6 +177,9 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 			inline:        request.inline,
 		}
 		result, execErr := e.executeRequestDetailed(ctx, queuedRequest, false)
+		// A command that failed can still have removed keys (see
+		// executeRequestDetailed), so its write is kept either way.
+		request.write.Extend(&queuedRequest.write)
 		if execErr != nil {
 			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
 				return server.ExecuteResult{}, execErr
@@ -189,7 +192,6 @@ func (e *Executor) handleExec(ctx context.Context, request *Request) (server.Exe
 			continue
 		}
 		responses = append(responses, result.Responses[0])
-		request.write.Extend(&queuedRequest.write)
 	}
 
 	return server.SingleResponse(protocol.Array{Elements: responses}), nil
@@ -482,16 +484,13 @@ func (e *Executor) handleSet(ctx context.Context, request *Request) (protocol.Va
 	}
 
 	key := string(request.Args[0])
-	evicted, err := e.store.Set(key, request.Args[1], expiresAt)
-	if err != nil {
+	if err := e.store.Set(&request.effects, key, request.Args[1], expiresAt); err != nil {
 		if errors.Is(err, storage.ErrMemoryLimitExceeded) {
 			return nil, ErrOutOfMemoryError()
 		}
 		return nil, err
 	}
 	request.effects.setExpiryMillis = expiresAt
-	e.touchWatchKeys(key)
-	e.recordEvictedKeys(request, evicted)
 	return protocol.SimpleString{Value: "OK"}, nil
 }
 
@@ -526,12 +525,11 @@ func (e *Executor) handleSetBit(ctx context.Context, request *Request) (protocol
 	}
 
 	key := string(request.Args[0])
-	previous, evicted, err := e.store.SetBit(key, offset, bit)
+	previous, err := e.store.SetBit(&request.effects, key, offset, bit)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: previous}, nil
 }
 
@@ -579,12 +577,11 @@ func (e *Executor) handlePFAdd(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
-	changed, evicted, err := e.store.PFAdd(key, request.Args[1:])
+	changed, err := e.store.PFAdd(&request.effects, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: changed}, nil
 }
 
@@ -611,29 +608,19 @@ func (e *Executor) handleDel(_ context.Context, request *Request) (protocol.Valu
 		return nil, wrongNumberOfArgumentsError("DEL")
 	}
 
-	removed := int64(0)
-	touched := make([]string, 0, len(request.Args))
 	if len(request.Args) == 1 {
-		key := string(request.Args[0])
-		if e.store.Delete(key) {
-			removed = 1
-			touched = append(touched, key)
+		if e.store.Delete(&request.effects, string(request.Args[0])) {
+			return protocol.Integer{Value: 1}, nil
 		}
-	} else {
-		keys := make([]string, 0, len(request.Args))
-		for _, arg := range request.Args {
-			key := string(arg)
-			keys = append(keys, key)
-		}
-
-		touched = e.store.DeleteMany(keys)
-		removed = int64(len(touched))
-	}
-	if len(touched) > 0 {
-		e.touchWatchKeys(touched...)
+		return protocol.Integer{Value: 0}, nil
 	}
 
-	return protocol.Integer{Value: removed}, nil
+	keys := make([]string, 0, len(request.Args))
+	for _, arg := range request.Args {
+		keys = append(keys, string(arg))
+	}
+	removed := e.store.DeleteMany(&request.effects, keys)
+	return protocol.Integer{Value: int64(len(removed))}, nil
 }
 
 func (e *Executor) handleIncr(ctx context.Context, request *Request) (protocol.Value, error) {
@@ -642,12 +629,11 @@ func (e *Executor) handleIncr(ctx context.Context, request *Request) (protocol.V
 	}
 
 	key := string(request.Args[0])
-	value, evicted, err := e.store.Increment(key)
+	value, err := e.store.Increment(&request.effects, key)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: value}, nil
 }
 
@@ -666,12 +652,11 @@ func (e *Executor) handleZAdd(ctx context.Context, request *Request) (protocol.V
 	}
 
 	key := string(request.Args[0])
-	added, evicted, err := e.store.ZAdd(key, entries)
+	added, err := e.store.ZAdd(&request.effects, key, entries)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 
@@ -703,13 +688,12 @@ func (e *Executor) handleZRange(_ context.Context, request *Request) (protocol.V
 
 func (e *Executor) handleXAdd(ctx context.Context, request *Request) (protocol.Value, error) {
 	key := string(request.Args[0])
-	id, evicted, err := e.store.XAdd(key, string(request.Args[1]), request.Args[2:])
+	id, err := e.store.XAdd(&request.effects, key, string(request.Args[1]), request.Args[2:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
 	request.effects.streamID = id
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.TextBulkString{Value: id}, nil
 }
 
@@ -818,11 +802,6 @@ func storageCommandError(err error) error {
 	default:
 		return err
 	}
-}
-
-func (e *Executor) recordWriteEffects(request *Request, key string, evicted []string) {
-	e.touchWatchKeys(key)
-	e.recordEvictedKeys(request, evicted)
 }
 
 func pubSubAckResponse(kind string, channel protocol.Value, count int) protocol.Array {
@@ -952,12 +931,4 @@ func clientStateOf(request *Request) (*server.ClientState, error) {
 	}
 
 	return request.client, nil
-}
-
-func (e *Executor) touchWatchKeys(keys ...string) {
-	if len(keys) == 0 {
-		return
-	}
-
-	e.watchRegistry.Touch(keys...)
 }

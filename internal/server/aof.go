@@ -11,6 +11,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/storage"
 )
 
 func (s *Server) initializePersistence(ctx context.Context) error {
@@ -127,9 +128,7 @@ func (s *Server) initializePersistence(ctx context.Context) error {
 			s.logger.Warn("failed to close stale AOF writer before reopening", "path", s.cfg.AOFPath, "error", closeErr)
 		}
 	}
-	if sequencer, ok := s.executor.(backgroundWriteSequencer); ok {
-		writer.SetRewriteGuard(sequencer.BeginBackgroundWrite)
-	}
+	writer.SetRewriteGuard(s.executor.BeginBackgroundWrite)
 	s.aofWriter = writer
 	s.recorder.SetLog(writer)
 	return nil
@@ -163,61 +162,63 @@ func (s *Server) closeAOFWriter() error {
 	return nil
 }
 
-// recordExpiredKeys gives an active TTL eviction the same effects a
-// client-issued DEL would have had: it invalidates WATCH on the keys, appends
-// the deletion to the AOF, and forwards it to replicas. The store evicts expired
-// keys on its own schedule, so without this the deletion exists only in this
-// process's memory: replicas keep serving the keys and replaying the AOF
-// restores them.
-func (s *Server) recordExpiredKeys(keys []string) {
-	if s == nil || len(keys) == 0 {
-		return
-	}
-
-	s.watchRegistry.Touch(keys...)
-
-	// Under appendfsync always, which promises durability before a mutation is
-	// announced, a DEL that could not be appended is not propagated either,
-	// exactly as a client's write is not. The deferred policies make no such
-	// promise, and a replica left serving a key this server has already
-	// dropped is the worse outcome, so there the failure is logged and the
-	// deletion still goes. The sweep, an accounted write and a replica's full
-	// resync (replicaStore.Replace) each publish expiries while the sequencer
-	// orders them, and the store hands every expiry to whichever of them
-	// publishes next. The Recorder still propagates the server's own writes as
-	// unordered, so the Master counts them under its lock and nothing here
-	// depends on every publisher holding that ordering.
-	w := record.Write{Origin: record.OriginServer}
-	w.Add(record.DeleteFrame(keys), record.ToBoth)
-	s.recorder.Record(&w)
+// evictionCount is a Changes that passes each change on and counts the keys
+// removed among them, and how many of those a memory-pressure eviction removed.
+type evictionCount struct {
+	changes storage.Changes
+	removed int
+	evicted int
 }
 
-// persistStartupEvictions appends a DEL of the keys the startup memory-pressure
-// eviction removed to the AOF and fsyncs it, under every fsync policy, so a
-// failure is known before the server accepts a client. Without it the next
-// start replays their SETs and brings them back. Each DEL names at most
-// aof.ItemsPerCommand keys, because one start can evict more keys than the
-// loader accepts in one command. Startup runs before the listener opens, so no
-// client has a WATCH and no Replica is attached, and a Replica that attaches
-// later gets the keyspace without these keys in its full resync: the AOF is the
-// only place the DEL goes.
-func (s *Server) persistStartupEvictions(keys []string) error {
-	if s == nil || s.aofWriter == nil || len(keys) == 0 {
-		return nil
+func (c *evictionCount) KeyChanged(key string, cause storage.Cause) {
+	if cause != storage.Written {
+		c.removed++
+	}
+	if cause == storage.MemoryEvicted {
+		c.evicted++
+	}
+	if c.changes != nil {
+		c.changes.KeyChanged(key, cause)
+	}
+}
+
+// enforceMaxMemoryAtStartup turns memory accounting on and evicts keys until
+// the keyspace fits the limit, as one Background unit, which records a DEL of
+// the keys it removed. It then fsyncs the append-only file under every fsync
+// policy, so a failure is known before the server accepts a client. Without
+// the DEL the next start replays the keys' SETs and brings them back. Startup
+// runs before the listener opens, so no client has a WATCH and no Replica is
+// attached, and a Replica that attaches later gets the keyspace without these
+// keys in its full resync.
+func (s *Server) enforceMaxMemoryAtStartup() error {
+	count := &evictionCount{}
+	var enforceErr error
+	recordErr := s.executor.RunBackgroundUnit(func(changes storage.Changes) {
+		count.changes = changes
+		s.store.ConfigureMaxMemory(count, s.cfg.MaxMemory, s.cfg.EvictionSampleSize)
+		enforceErr = s.store.EnforceMaxMemory(count)
+	})
+	if enforceErr != nil {
+		return fmt.Errorf("server: enforce maxmemory: %w", enforceErr)
+	}
+	if count.evicted > 0 {
+		s.logger.Info("applied startup maxmemory eviction", "evicted_keys", count.evicted, "used_memory", s.store.UsedMemory(), "maxmemory", s.cfg.MaxMemory)
 	}
 
-	w := record.Write{Origin: record.OriginServer}
-	for start := 0; start < len(keys); start += aof.ItemsPerCommand {
-		end := min(start+aof.ItemsPerCommand, len(keys))
-		w.Add(record.DeleteFrame(keys[start:end]), record.ToAOF)
+	err := recordErr
+	if err != nil {
+		err = fmt.Errorf("server: append a DEL of the %d keys expired or evicted at startup to aof %q: %w", count.removed, s.cfg.AOFPath, err)
+	} else if count.removed > 0 && s.aofWriter != nil {
+		if syncErr := s.aofWriter.Sync(); syncErr != nil {
+			err = fmt.Errorf("server: fsync a DEL of the %d keys expired or evicted at startup to aof %q: %w", count.removed, s.cfg.AOFPath, syncErr)
+		}
 	}
-	if outcome := s.recorder.Record(&w); outcome.Err != nil {
-		return fmt.Errorf("server: append a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, outcome.Err)
+	if err != nil {
+		if closeErr := s.closeAOFWriter(); closeErr != nil {
+			s.logger.Warn("failed to close AOF writer after the startup eviction append failed", "error", closeErr)
+		}
 	}
-	if err := s.aofWriter.Sync(); err != nil {
-		return fmt.Errorf("server: fsync a DEL of the %d keys evicted at startup to aof %q: %w", len(keys), s.cfg.AOFPath, err)
-	}
-	return nil
+	return err
 }
 
 func aofFileState(path string) (bool, int64, error) {

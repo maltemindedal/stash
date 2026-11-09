@@ -404,7 +404,7 @@ func TestARewriteRequestedWhileOneIsInFlightRunsAgainOnTheNewKeyspace(t *testing
 			}()
 
 			store := storage.NewStore()
-			if _, err := store.Set("old", []byte("1"), 0); err != nil {
+			if err := store.Set(nil, "old", []byte("1"), 0); err != nil {
 				t.Fatalf("Set() error = %v", err)
 			}
 			if _, err := writer.Append([]byte("*3\r\n$3\r\nSET\r\n$3\r\nold\r\n$1\r\n1\r\n")); err != nil {
@@ -433,10 +433,10 @@ func TestARewriteRequestedWhileOneIsInFlightRunsAgainOnTheNewKeyspace(t *testing
 			}
 
 			replacement := storage.NewStore()
-			if _, err := replacement.Set("fresh", []byte("2"), 0); err != nil {
+			if err := replacement.Set(nil, "fresh", []byte("2"), 0); err != nil {
 				t.Fatalf("Set() error = %v", err)
 			}
-			store.ReplaceWith(replacement)
+			store.ReplaceWith(nil, replacement)
 			if err := writer.RequestRewrite(context.Background(), store); err != nil {
 				t.Fatalf("RequestRewrite() error = %v", err)
 			}

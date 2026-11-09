@@ -1,14 +1,14 @@
 package storage
 
 // SAdd adds the supplied members to the set stored at key and returns the
-// number of newly added members. When maxmemory is configured it first frees
-// space and reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) SAdd(key string, members [][]byte) (int64, []string, error) {
+// number of newly added members. When maxmemory is configured it first evicts
+// keys to make room.
+func (s *Store) SAdd(changes Changes, key string, members [][]byte) (int64, error) {
 	if len(members) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, key, ValueKindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, changes, key, ValueKindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newSetValueForMembers(members, 0)
 			n, err := created.setLen()
@@ -29,16 +29,19 @@ func (s *Store) SIsMember(key string, member []byte) (bool, error) {
 
 // SRem removes the supplied members from the set stored at key and returns the
 // number of members actually removed. An empty set is deleted from the store.
-func (s *Store) SRem(key string, members [][]byte) (int64, error) {
+func (s *Store) SRem(changes Changes, key string, members [][]byte) (int64, error) {
 	if len(members) == 0 {
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, key, ValueKindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, err := mutateKey(s, changes, key, ValueKindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			return nil, 0, nil
+			return nil, 0, errUnchanged
 		}
 		removed, err := cur.setRemove(members)
+		if err == nil && removed == 0 {
+			err = errUnchanged
+		}
 		return cur, removed, err
 	})
 	return removed, err

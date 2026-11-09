@@ -18,7 +18,7 @@ func BenchmarkHash(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			store := NewStore()
-			if _, _, err := store.HSet("h", pairs); err != nil {
+			if _, err := store.HSet(nil, "h", pairs); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -30,14 +30,14 @@ func BenchmarkHash(b *testing.B) {
 		for i := range pairs {
 			pairs[i] = HashFieldValue{Field: fmt.Sprintf("f%d", i), Value: payload}
 		}
-		if _, _, err := store.HSet("h", pairs); err != nil {
+		if _, err := store.HSet(nil, "h", pairs); err != nil {
 			b.Fatal(err)
 		}
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, _, err := store.HSet("h", pairs); err != nil {
+			if _, err := store.HSet(nil, "h", pairs); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -45,7 +45,7 @@ func BenchmarkHash(b *testing.B) {
 
 	b.Run("HGet hit", func(b *testing.B) {
 		store := NewStore()
-		if _, _, err := store.HSet("h", []HashFieldValue{{Field: "f", Value: payload}}); err != nil {
+		if _, err := store.HSet(nil, "h", []HashFieldValue{{Field: "f", Value: payload}}); err != nil {
 			b.Fatal(err)
 		}
 		b.ReportAllocs()
@@ -64,7 +64,7 @@ func BenchmarkHash(b *testing.B) {
 		for i := range pairs {
 			pairs[i] = HashFieldValue{Field: fmt.Sprintf("f%d", i), Value: payload}
 		}
-		if _, _, err := store.HSet("h", pairs); err != nil {
+		if _, err := store.HSet(nil, "h", pairs); err != nil {
 			b.Fatal(err)
 		}
 		b.ReportAllocs()
@@ -86,7 +86,7 @@ func BenchmarkZSet(b *testing.B) {
 		for i := range entries {
 			entries[i] = ZSetEntry{Member: fmt.Appendf(nil, "m%d", i), Score: float64(i)}
 		}
-		if _, _, err := store.ZAdd("z", entries); err != nil {
+		if _, err := store.ZAdd(nil, "z", entries); err != nil {
 			b.Fatal(err)
 		}
 		return store
@@ -129,7 +129,7 @@ func BenchmarkSet(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			store := NewStore()
-			if _, _, err := store.SAdd("s", members); err != nil {
+			if _, err := store.SAdd(nil, "s", members); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -141,14 +141,14 @@ func BenchmarkSet(b *testing.B) {
 		for i := range members {
 			members[i] = fmt.Appendf(nil, "m%d", i)
 		}
-		if _, _, err := store.SAdd("s", members); err != nil {
+		if _, err := store.SAdd(nil, "s", members); err != nil {
 			b.Fatal(err)
 		}
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, _, err := store.SAdd("s", members); err != nil {
+			if _, err := store.SAdd(nil, "s", members); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -156,7 +156,7 @@ func BenchmarkSet(b *testing.B) {
 
 	b.Run("SIsMember hit", func(b *testing.B) {
 		store := NewStore()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("m")}); err != nil {
+		if _, err := store.SAdd(nil, "s", [][]byte{[]byte("m")}); err != nil {
 			b.Fatal(err)
 		}
 		member := []byte("m")
@@ -180,10 +180,10 @@ func BenchmarkSet(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			store := NewStore()
-			if _, _, err := store.SAdd("s", members); err != nil {
+			if _, err := store.SAdd(nil, "s", members); err != nil {
 				b.Fatal(err)
 			}
-			if _, err := store.SRem("s", members); err != nil {
+			if _, err := store.SRem(nil, "s", members); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -191,7 +191,7 @@ func BenchmarkSet(b *testing.B) {
 
 	b.Run("SRem miss batch", func(b *testing.B) {
 		store := NewStore()
-		if _, _, err := store.SAdd("s", [][]byte{[]byte("present")}); err != nil {
+		if _, err := store.SAdd(nil, "s", [][]byte{[]byte("present")}); err != nil {
 			b.Fatal(err)
 		}
 		members := make([][]byte, 16)
@@ -202,7 +202,7 @@ func BenchmarkSet(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.SRem("s", members); err != nil {
+			if _, err := store.SRem(nil, "s", members); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -214,7 +214,7 @@ func BenchmarkSet(b *testing.B) {
 		for i := range members {
 			members[i] = fmt.Appendf(nil, "m%d", i)
 		}
-		if _, _, err := store.SAdd("s", members); err != nil {
+		if _, err := store.SAdd(nil, "s", members); err != nil {
 			b.Fatal(err)
 		}
 		b.ReportAllocs()
@@ -240,7 +240,7 @@ func BenchmarkList(b *testing.B) {
 			for i := range values {
 				values[i] = payload
 			}
-			if _, _, err := store.RightPush("l", values); err != nil {
+			if _, err := store.RightPush(nil, "l", values); err != nil {
 				b.Fatal(err)
 			}
 			return store
@@ -253,10 +253,10 @@ func BenchmarkList(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, _, err := store.LeftPush("l", one); err != nil {
+				if _, err := store.LeftPush(nil, "l", one); err != nil {
 					b.Fatal(err)
 				}
-				if _, _, err := store.LeftPop("l"); err != nil {
+				if _, _, err := store.LeftPop(nil, "l"); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -269,10 +269,10 @@ func BenchmarkList(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, _, err := store.RightPush("l", one); err != nil {
+				if _, err := store.RightPush(nil, "l", one); err != nil {
 					b.Fatal(err)
 				}
-				if _, _, err := store.RightPop("l"); err != nil {
+				if _, _, err := store.RightPop(nil, "l"); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -284,8 +284,8 @@ func BenchmarkList(b *testing.B) {
 		name string
 		push func(*Store, [][]byte) error
 	}{
-		{"LPush", func(s *Store, v [][]byte) error { _, _, err := s.LeftPush("l", v); return err }},
-		{"RPush", func(s *Store, v [][]byte) error { _, _, err := s.RightPush("l", v); return err }},
+		{"LPush", func(s *Store, v [][]byte) error { _, err := s.LeftPush(nil, "l", v); return err }},
+		{"RPush", func(s *Store, v [][]byte) error { _, err := s.RightPush(nil, "l", v); return err }},
 	} {
 		b.Run("Build 5000 with "+build.name, func(b *testing.B) {
 			one := [][]byte{payload}
@@ -333,7 +333,7 @@ func BenchmarkAccountedCollections(b *testing.B) {
 			b.Fatal(err)
 		}
 		if limit > 0 {
-			store.ConfigureMaxMemory(limit, 16)
+			store.ConfigureMaxMemory(nil, limit, 16)
 		}
 		return store
 	}
@@ -353,15 +353,15 @@ func BenchmarkAccountedCollections(b *testing.B) {
 			fieldName := []string{"extra"}
 			for _, mode := range modes {
 				b.Run(mode.name, func(b *testing.B) {
-					store := filled(b, mode.limit, func(s *Store) error { _, _, err := s.HSet("h", pairs); return err })
+					store := filled(b, mode.limit, func(s *Store) error { _, err := s.HSet(nil, "h", pairs); return err })
 					b.ReportAllocs()
 					b.ResetTimer()
 
 					for i := 0; i < b.N; i++ {
-						if added, _, err := store.HSet("h", field); err != nil || added != 1 {
+						if added, err := store.HSet(nil, "h", field); err != nil || added != 1 {
 							b.Fatalf("HSet() = %d, %v, want 1 field added", added, err)
 						}
-						if removed, err := store.HDel("h", fieldName); err != nil || removed != 1 {
+						if removed, err := store.HDel(nil, "h", fieldName); err != nil || removed != 1 {
 							b.Fatalf("HDel() = %d, %v, want 1 field removed", removed, err)
 						}
 					}
@@ -373,15 +373,15 @@ func BenchmarkAccountedCollections(b *testing.B) {
 			one := [][]byte{extra}
 			for _, mode := range modes {
 				b.Run(mode.name, func(b *testing.B) {
-					store := filled(b, mode.limit, func(s *Store) error { _, _, err := s.SAdd("s", members); return err })
+					store := filled(b, mode.limit, func(s *Store) error { _, err := s.SAdd(nil, "s", members); return err })
 					b.ReportAllocs()
 					b.ResetTimer()
 
 					for i := 0; i < b.N; i++ {
-						if added, _, err := store.SAdd("s", one); err != nil || added != 1 {
+						if added, err := store.SAdd(nil, "s", one); err != nil || added != 1 {
 							b.Fatalf("SAdd() = %d, %v, want 1 member added", added, err)
 						}
-						if removed, err := store.SRem("s", one); err != nil || removed != 1 {
+						if removed, err := store.SRem(nil, "s", one); err != nil || removed != 1 {
 							b.Fatalf("SRem() = %d, %v, want 1 member removed", removed, err)
 						}
 					}
@@ -393,15 +393,15 @@ func BenchmarkAccountedCollections(b *testing.B) {
 			one := [][]byte{payload}
 			for _, mode := range modes {
 				b.Run(mode.name, func(b *testing.B) {
-					store := filled(b, mode.limit, func(s *Store) error { _, _, err := s.RightPush("l", values); return err })
+					store := filled(b, mode.limit, func(s *Store) error { _, err := s.RightPush(nil, "l", values); return err })
 					b.ReportAllocs()
 					b.ResetTimer()
 
 					for i := 0; i < b.N; i++ {
-						if length, _, err := store.RightPush("l", one); err != nil || length != int64(n+1) {
+						if length, err := store.RightPush(nil, "l", one); err != nil || length != int64(n+1) {
 							b.Fatalf("RightPush() = %d, %v, want length %d", length, err, n+1)
 						}
-						if _, ok, err := store.RightPop("l"); err != nil || !ok {
+						if _, ok, err := store.RightPop(nil, "l"); err != nil || !ok {
 							b.Fatalf("RightPop() ok = %v, err = %v, want a value", ok, err)
 						}
 					}
@@ -424,11 +424,11 @@ func BenchmarkAccountedCollections(b *testing.B) {
 			}
 			store := NewStore()
 			if limit > 0 {
-				store.ConfigureMaxMemory(limit, 16)
+				store.ConfigureMaxMemory(nil, limit, 16)
 			}
 			refill := func() {
 				for _, key := range keys {
-					if _, _, err := store.RightPush(key, values); err != nil {
+					if _, err := store.RightPush(nil, key, values); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -456,7 +456,7 @@ func BenchmarkAccountedCollections(b *testing.B) {
 							left = n
 						}
 						left--
-						if _, ok, err := store.RightPop(keys[list]); err != nil || !ok {
+						if _, ok, err := store.RightPop(nil, keys[list]); err != nil || !ok {
 							b.Fatalf("RightPop() ok = %v, err = %v, want a value", ok, err)
 						}
 					}
@@ -487,7 +487,7 @@ func BenchmarkAccountedCollections(b *testing.B) {
 							left = n
 						}
 						left -= popCount
-						if popped, ok, err := store.RightPopN(keys[list], popCount); err != nil || !ok || len(popped) != popCount {
+						if popped, ok, err := store.RightPopN(nil, keys[list], popCount); err != nil || !ok || len(popped) != popCount {
 							b.Fatalf("RightPopN() = %d values, ok = %v, err = %v, want %d values", len(popped), ok, err, popCount)
 						}
 					}

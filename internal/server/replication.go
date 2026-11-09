@@ -153,7 +153,7 @@ type replicaStore struct{ server *Server }
 // new one. Until that rewrite has replaced the file, a restart still replays
 // the old history.
 //
-// The swap runs as a background write, ordered against client requests and
+// The swap runs as a Background unit, ordered against client requests and
 // against the copy an AOF rewrite takes, so a rewrite copies the keyspace from
 // before the swap or from after it, never half of each, and RequestRewrite
 // runs another after one that copied the old keyspace.
@@ -165,13 +165,12 @@ func (r replicaStore) Replace(snapshot []byte) error {
 		return err
 	}
 
-	release := func() {}
-	if sequencer, ok := s.executor.(backgroundWriteSequencer); ok {
-		release = sequencer.BeginBackgroundWrite()
-	}
-	s.store.ReplaceWith(snapshotStore)
-	release()
-
+	// The swap is a Background unit: no write is halfway to the log while the
+	// keyspace changes under it, and the DEL of the keys the new keyspace
+	// held past their TTL is recorded. The Recorder logs an append that fails.
+	_ = s.executor.RunBackgroundUnit(func(changes storage.Changes) {
+		s.store.ReplaceWith(changes, snapshotStore)
+	})
 	s.logger.Info(
 		"applied full resync snapshot",
 		"snapshot_size_bytes", len(snapshot),

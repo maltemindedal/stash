@@ -441,7 +441,7 @@ func TestUnderMaxMemoryOnlyShrinkingWritesKeepTheirOwnStripes(t *testing.T) {
 
 	for _, maxMemory := range []int64{0, 1 << 20} {
 		executor := newTestExecutor()
-		executor.store.ConfigureMaxMemory(maxMemory, 0)
+		executor.store.ConfigureMaxMemory(nil, maxMemory, 0)
 		for name, spec := range executor.commands {
 			if !spec.durable {
 				continue

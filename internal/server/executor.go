@@ -21,6 +21,19 @@ type CommandExecutor interface {
 	// package's sequencer), as call describes it, and records the command
 	// frames of its write (record.Recorder) before it returns.
 	Handle(ctx context.Context, call Call, request protocol.Value) (ExecuteResult, error)
+	// RunBackgroundUnit runs work the server does on its own initiative as a
+	// Background unit: a sample of the active expiry loop, the maxmemory
+	// enforcement at startup, the keyspace swap of a full resync. The unit is
+	// ordered as a write of unknown keys. Each keyspace change the Changes it
+	// hands work hears invalidates WATCH on the key, and the DEL of the keys
+	// work removed is recorded with Origin Server before the ordering is
+	// released. It returns the error of an append that failed, which the
+	// Recorder has also logged.
+	RunBackgroundUnit(work func(changes storage.Changes)) error
+	// BeginBackgroundWrite orders the snapshot an AOF rewrite takes as a write
+	// of unknown keys, so that no command sits between being applied and being
+	// appended while it is taken. The returned function ends the ordering.
+	BeginBackgroundWrite() (release func())
 }
 
 // ErrNotRecorded is what the command executor returns, wrapping the cause, for
@@ -46,14 +59,6 @@ type Call struct {
 	// Inline marks a request run on the Event loop's goroutine, where whatever
 	// would block returns an error instead.
 	Inline bool
-}
-
-// backgroundWriteSequencer orders work the server does on its own (the expiry
-// sweep, the snapshot of an AOF rewrite) against client requests. The returned
-// function is called when that work's frames have been applied. It stays
-// optional until the background runners' wiring is made required (#44).
-type backgroundWriteSequencer interface {
-	BeginBackgroundWrite() (release func())
 }
 
 // NewExecutorFunc builds the command executor from the server's Services. New

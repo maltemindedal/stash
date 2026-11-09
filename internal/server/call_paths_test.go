@@ -23,6 +23,7 @@ import (
 // recordingExecutor answers every request with +OK, and records the Call each
 // one came with.
 type recordingExecutor struct {
+	unorderedBackground
 	mu    sync.Mutex
 	calls []recordedCall
 }

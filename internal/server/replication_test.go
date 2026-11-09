@@ -243,7 +243,7 @@ func (a stubAddr) String() string  { return string(a) }
 // psyncLikeExecutor answers PSYNC as the command executor does, making the
 // client a replica and answering with FULLRESYNC and a snapshot, and answers
 // every other request with +OK.
-type psyncLikeExecutor struct{}
+type psyncLikeExecutor struct{ unorderedBackground }
 
 func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
 	if commandName(request) != "PSYNC" {

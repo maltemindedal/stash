@@ -55,7 +55,7 @@ func BenchmarkSequencedSetUnderMaxMemory(b *testing.B) {
 					s.Recorder = record.New(stream, s.Logger)
 					s.Recorder.SetLog(log)
 				})
-				executor.store.ConfigureMaxMemory(maxMemory, 0)
+				executor.store.ConfigureMaxMemory(nil, maxMemory, 0)
 				var writers atomic.Int64
 
 				b.ReportAllocs()

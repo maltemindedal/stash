@@ -879,7 +879,7 @@ func (c *streamRecorder) Bytes() []byte {
 // the key. A frame propagated after the cut is held by the feed until Start.
 func TestAttachCopiesTheSnapshotAndRegistersTheReplicaInsideItsCut(t *testing.T) {
 	store := storage.NewStore()
-	if _, err := store.Set("key", []byte("value"), 0); err != nil {
+	if err := store.Set(nil, "key", []byte("value"), 0); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	master := NewMaster(store, nil, nil)

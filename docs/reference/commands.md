@@ -10,6 +10,7 @@ The `commandSpecs` table in [`internal/command/types.go`](../../internal/command
 - Type-specific commands return a Redis-style `WRONGTYPE` error when the key holds a different value kind.
 - **Replicated** marks commands forwarded to connected replicas.
 - **Durable** marks commands written to the append-only file when `--aof` is set.
+- With `--maxmemory` set, a write other than `DEL`, `LPOP`, `RPOP`, `BLPOP`, `HDEL` and `SREM` can remove other keys: keys whose TTL has passed, which it sweeps before it measures the keyspace, and keys it evicts to make room. Their `DEL` is replicated and durable as part of the write, after the write's own command. So `WAIT` after the write also waits for the `DEL`, and under `--appendfsync always` a write whose `DEL` cannot be made durable returns `ERR persistence failure`. See [Memory limits and eviction](../guides/memory-and-eviction.md#evictions-are-replicated-and-made-durable).
 
 ## Protocol errors
 
