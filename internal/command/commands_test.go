@@ -1306,12 +1306,13 @@ func TestExecutorWait(t *testing.T) {
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		// The client wrote 50 bytes before the replica attached, so they are in
-		// its snapshot: the replica counts for them once it acknowledges anything.
+		// The replica attaches at offset 50 and the client's last write ends at
+		// 60, so only an acknowledgement of 10 bytes or more of the replica's own
+		// count reaches it. The replica acknowledges exactly 10 below.
 		executor.master.Propagate(make([]byte, 50), true)
 		executor.master.Add(replication.Candidate{ID: 11, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 11, serverConn)}, serverConn)
 		writer := newTestClientState(executor, 1)
-		writer.SetLastWriteReplicationOffset(50)
+		writer.SetLastWriteReplicationOffset(60)
 		// This WAIT ends when the replica acknowledges, not when a clock says so: the
 		// replica acknowledges the moment GETACK reaches it, and WAIT's own timeout
 		// is an hour, so a replica goroutine that the machine does not schedule for a
@@ -1326,7 +1327,7 @@ func TestExecutorWait(t *testing.T) {
 		go func() {
 			defer close(replicaDone)
 
-			replicaErr = acknowledgeGetAck(replicaConn, executor.master, 11, 50)
+			replicaErr = acknowledgeGetAck(replicaConn, executor.master, 11, 10)
 			if replicaErr != nil {
 				cancel()
 			}

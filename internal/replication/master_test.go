@@ -28,7 +28,7 @@ func encodeFrame(t testing.TB, frame protocol.Value) []byte {
 	return payload
 }
 
-func TestReplicaRegistryackedWithNotify(t *testing.T) {
+func TestAnAcknowledgementWakesWhoeverWaitsForIt(t *testing.T) {
 	master := newTestMaster()
 	serverConn, replicaConn := net.Pipe()
 	defer func() { _ = serverConn.Close() }()
@@ -57,7 +57,7 @@ func TestReplicaRegistryackedWithNotify(t *testing.T) {
 	}
 }
 
-func TestReplicaRegistrydetachAndCloseReturnsCloseError(t *testing.T) {
+func TestDetachingAndClosingAReplicaReturnsItsCloseError(t *testing.T) {
 	master := newTestMaster()
 	conn := &closeCounter{closeErr: errors.New("close boom")}
 	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)}, conn)
@@ -176,7 +176,7 @@ func framesAwayFromTheirOffsets(t *testing.T, stream []byte, ends map[string]int
 }
 
 // TestAReplicaThatRefusesAFrameIsDroppedOnce checks that a replica whose feed
-// refuses a frame is dropped by one path, once: the feed-error handler, called
+// refuses a frame is dropped by one path, once: the drop handler, called
 // after the master lock is released so that it can take the lock as
 // dropReplica does, or the master's detachAndClose when no handler is set. The
 // other replicas still receive the frame, and its offset is counted once.
@@ -185,7 +185,7 @@ func TestAReplicaThatRefusesAFrameIsDroppedOnce(t *testing.T) {
 		name        string
 		withHandler bool
 	}{
-		{name: "through the feed-error handler", withHandler: true},
+		{name: "through the drop handler", withHandler: true},
 		{name: "by the master when no handler is set", withHandler: false},
 	}
 
@@ -358,7 +358,7 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 // write it has not acknowledged. Each replica attaches at a different moment,
 // since one attach does not always land between two frames.
 //
-// The replicas register as PSYNC registers them, through BeginAttach, Reserve and
+// The replicas register as PSYNC registers them, through beginAttach, reserve and
 // Start, but outside an attach cut, which is the command sequencer's. A client
 // write skips the master lock while no replica is registered and relies on the
 // cut instead, so it is covered where the cut is, by
@@ -507,9 +507,9 @@ func TestWithNoReplicaRegisteredOnlyOrderedFramesSkipTheMastersLock(t *testing.T
 	}
 }
 
-// TestAReplicaAttachesInThreeSteps walks a replica through BeginAttach, Reserve
+// TestAReplicaAttachesInThreeSteps walks a replica through beginAttach, reserve
 // and Start, as PSYNC takes them, and checks what each step makes visible: the
-// master is active from BeginAttach, so writes are ordered; Reserve registers
+// master is active from beginAttach, so writes are ordered; reserve registers
 // the replica at the master offset of that moment with a feed that queues every
 // frame counted after it without writing; Start writes what was queued and what
 // follows, in order.
@@ -522,14 +522,14 @@ func TestAReplicaAttachesInThreeSteps(t *testing.T) {
 	}
 	master.beginAttach()
 	if !master.Active() {
-		t.Fatal("Active() = false after BeginAttach, want true: writes must be ordered from then on")
+		t.Fatal("Active() = false after beginAttach, want true: writes must be ordered from then on")
 	}
 	master.countAndQueue(payload) // before the cut: in the snapshot, not the stream
 
 	conn := &streamRecorder{}
 	master.reserve(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)})
 	if !master.Active() || master.Count() != 1 {
-		t.Fatalf("after Reserve: Active() = %v and Count() = %d, want true and 1", master.Active(), master.Count())
+		t.Fatalf("after reserve: Active() = %v and Count() = %d, want true and 1", master.Active(), master.Count())
 	}
 	if _, queued, _ := master.countAndQueue(payload); queued != 1 {
 		t.Fatalf("Propagate() during the transfer queued for %d replicas, want 1", queued)
@@ -555,7 +555,7 @@ func TestAReplicaAttachesInThreeSteps(t *testing.T) {
 	}
 
 	// Acknowledging both frames puts it at the master's offset, since its base
-	// is the frame counted before Reserve.
+	// is the frame counted before reserve.
 	master.Ack(1, int64(2*len(payload)))
 	if got := master.Acked(master.Offset()); got != 1 {
 		t.Fatalf("Acked(%d) = %d, want 1", master.Offset(), got)
@@ -570,10 +570,10 @@ func TestAReplicaAttachesInThreeSteps(t *testing.T) {
 	}
 }
 
-// TestAnAttachThatEndsWithoutAReplicaLeavesTheRegistryInactive has an attach
-// end without Reserve, as a PSYNC that fails inside its cut does, and checks
+// TestAnAttachThatEndsWithoutAReplicaLeavesTheMasterInactive has an attach
+// end without reserve, as a PSYNC that fails inside its cut does, and checks
 // that the master stops counting it, so writes stop being ordered for it.
-func TestAnAttachThatEndsWithoutAReplicaLeavesTheRegistryInactive(t *testing.T) {
+func TestAnAttachThatEndsWithoutAReplicaLeavesTheMasterInactive(t *testing.T) {
 	master := newTestMaster()
 	master.beginAttach()
 	master.beginAttach()
@@ -768,11 +768,11 @@ func TestEndStreamsHalfClosesEachReplicaAndWaitsForItToLeave(t *testing.T) {
 	}
 }
 
-// TestWaitFeedsWaitsForTheFeedErrorHandler stops a replica's feed with a failed
-// write while the feed-error handler is held up. WaitFeeds must not return until
+// TestWaitFeedsWaitsForTheDropHandler stops a replica's feed with a failed
+// write while the drop handler is held up. WaitFeeds must not return until
 // the handler has, so that nothing a feed logs comes after ListenAndServe, which
 // calls it, has returned. The feed's goroutine used to outlive the server.
-func TestWaitFeedsWaitsForTheFeedErrorHandler(t *testing.T) {
+func TestWaitFeedsWaitsForTheDropHandler(t *testing.T) {
 	master := newTestMaster()
 	handling := make(chan struct{})
 	release := make(chan struct{})
@@ -792,14 +792,14 @@ func TestWaitFeedsWaitsForTheFeedErrorHandler(t *testing.T) {
 	}()
 	select {
 	case <-waited:
-		t.Fatal("WaitFeeds() returned while the feed-error handler was still running")
+		t.Fatal("WaitFeeds() returned while the drop handler was still running")
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(release)
 	select {
 	case <-waited:
 	case <-time.After(5 * time.Second):
-		t.Fatal("WaitFeeds() had not returned 5s after the feed-error handler did")
+		t.Fatal("WaitFeeds() had not returned 5s after the drop handler did")
 	}
 }
 
