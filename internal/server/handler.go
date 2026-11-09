@@ -60,7 +60,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	stopClose := context.AfterFunc(ctx, func() {
 		// A replica's connection stays open while shutdown sends it what its
-		// feed holds (ReplicaRegistry.StopFeeds), and shutdown closes it after
+		// feed holds (Master.StopFeeds), and shutdown closes it after
 		// that (ClientRegistry.CloseAll).
 		if state.IsReplica() {
 			return

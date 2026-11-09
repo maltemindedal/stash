@@ -22,9 +22,10 @@ const replicaFeedWriteChunk = 1 << 20
 // replica's socket before the replica is considered stalled and dropped.
 const replicaFeedWriteTimeout = 30 * time.Second
 
-// errReplicaBacklog reports that a replica has fallen further behind than
-// replicaFeedLimit allows.
-var errReplicaBacklog = errors.New("server: replica is too far behind the propagated stream")
+// ErrReplicaBacklog reports that a replica has fallen further behind than
+// replicaFeedLimit allows, counting the writes made while its full resync
+// reply was being sent.
+var ErrReplicaBacklog = errors.New("server: replica is too far behind the propagated stream")
 
 // replicaFeed carries the propagated command stream to one replica. A writer that
 // propagates a command only appends its bytes to the feed, which never blocks on
@@ -71,7 +72,7 @@ func (f *replicaFeed) enqueue(payload []byte) error {
 	}
 	if len(f.pending)+len(payload) > f.limit {
 		f.mu.Unlock()
-		return errReplicaBacklog
+		return ErrReplicaBacklog
 	}
 	f.pending = append(f.pending, payload...)
 	f.mu.Unlock()

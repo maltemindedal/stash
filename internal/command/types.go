@@ -103,8 +103,7 @@ type Executor struct {
 	pubSubRegistry      *server.PubSubRegistry
 	requirePass         string
 	commands            map[string]commandSpec
-	replication         *server.ReplicationState
-	replicaPeers        *server.ReplicaRegistry
+	master              *server.Master
 	slowlogRegistry     *server.SlowlogRegistry
 	slowlogThreshold    time.Duration
 	serverStatsProvider func() server.Stats
@@ -128,8 +127,7 @@ func New(services server.Services) (*Executor, error) {
 		watchRegistry:       services.Watches,
 		pubSubRegistry:      services.PubSub,
 		requirePass:         services.RequirePass,
-		replication:         services.Replication,
-		replicaPeers:        services.Replicas,
+		master:              services.Master,
 		slowlogRegistry:     services.Slowlog,
 		slowlogThreshold:    services.SlowlogThreshold,
 		serverStatsProvider: services.Stats,

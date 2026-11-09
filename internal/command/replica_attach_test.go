@@ -22,7 +22,7 @@ import (
 // TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt attaches
 // replicas one at a time through PSYNC's attach cut while frames are handed to
 // the replicas from the paths that do so: client writes, which the sequencer
-// orders and which count their frames without the registry lock while no
+// orders and which count their frames without the Master's lock while no
 // replica is registered; WAIT's GETACK, which nothing orders; and the expiry
 // DELs that a replica's own full resync publishes, which nothing orders either.
 // Each replica acknowledges what it was sent up to a client write's frame, and
@@ -58,8 +58,8 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				store.ConfigureMaxMemory(1<<40, 5)
 			}
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			// Wires the executor and store to the server's replica registry,
-			// offsets, write ordering and expiry publishing, as in production.
+			// Wires the executor and store to the server's Master, write
+			// ordering and expiry publishing, as in production.
 			var executor *Executor
 			if _, err := server.New(config.Config{}, logger, store, func(services server.Services) (server.CommandExecutor, error) {
 				built, err := New(services)
@@ -68,7 +68,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 			}); err != nil {
 				t.Fatalf("server.New() error = %v", err)
 			}
-			registry := executor.replicaPeers
+			registry := executor.master
 
 			// A client write's value -> the end offset counted for its frame, for
 			// the writes made since the current replica attached. It is emptied at
@@ -131,8 +131,9 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 			}
 			if tt.getAcks {
 				run(func(int) bool {
-					if err := executor.requestReplicaAcknowledgements(); err != nil {
-						t.Errorf("requestReplicaAcknowledgements() error = %v", err)
+					// Wanting no Replica, Await only sends its GETACK.
+					if _, _, err := registry.Await(context.Background(), 0, 0, 0); err != nil {
+						t.Errorf("Await() error = %v", err)
 						return false
 					}
 					return true
@@ -144,7 +145,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 					t.Fatalf("Set() error = %v", err)
 				}
 				run(func(int) bool {
-					store.ReplaceWith(snapshot) // as consumeFullResync does, holding no sequencer lock
+					store.ReplaceWith(snapshot) // as a full resync does, holding no sequencer lock
 					return true
 				})
 			}
@@ -176,16 +177,16 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 					end, ok := ends[tag]
 					return end, ok
 				})
-				if !registry.UpdateAck(id, int64(prefix)) {
-					t.Fatalf("UpdateAck(%d) = false, want true", id)
+				if !registry.Ack(id, int64(prefix)) {
+					t.Fatalf("Ack(%d) = false, want true", id)
 				}
-				if got := registry.CountReplicasAtOrAbove(end); got != 1 {
+				if got := registry.Acked(end); got != 1 {
 					t.Errorf("attach %d: the replica acknowledged the %d bytes it was sent up to a client write counted to end at %d, and counts below it: a frame counted after its base was not sent to it", i, prefix, end)
 				}
-				if got := registry.CountReplicasAtOrAbove(end + 1); got != 0 {
+				if got := registry.Acked(end + 1); got != 0 {
 					t.Errorf("attach %d: the replica acknowledged the %d bytes it was sent up to a client write counted to end at %d, and counts past it: it was sent a frame counted at or below its base", i, prefix, end)
 				}
-				registry.Remove(id)
+				registry.Detach(id)
 			}
 		})
 	}

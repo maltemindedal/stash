@@ -64,8 +64,8 @@ func TestReplicaFeedRejectsAReplicaThatFallsTooFarBehind(t *testing.T) {
 	if err := feed.enqueue(bytes.Repeat([]byte("x"), 60)); err != nil {
 		t.Fatalf("enqueue within the limit error = %v", err)
 	}
-	if err := feed.enqueue(bytes.Repeat([]byte("x"), 60)); !errors.Is(err, errReplicaBacklog) {
-		t.Fatalf("enqueue over the limit error = %v, want errReplicaBacklog", err)
+	if err := feed.enqueue(bytes.Repeat([]byte("x"), 60)); !errors.Is(err, ErrReplicaBacklog) {
+		t.Fatalf("enqueue over the limit error = %v, want ErrReplicaBacklog", err)
 	}
 	if got := feed.backlog(); got != 60 {
 		t.Fatalf("backlog() = %d, want the rejected payload not queued", got)

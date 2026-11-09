@@ -543,7 +543,7 @@ func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	replication, replicas := &server.ReplicationState{}, server.NewReplicaRegistry()
+	master := server.NewMaster(store, nil, logger)
 	executor, err := command.New(server.Services{
 		Store:            store,
 		Logger:           logger,
@@ -551,11 +551,10 @@ func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
 		PubSub:           server.NewPubSubRegistry(),
 		Slowlog:          server.NewSlowlogRegistry(),
 		SlowlogThreshold: -1,
-		Replication:      replication,
-		Replicas:         replicas,
+		Master:           master,
 		Stats:            func() server.Stats { return server.Stats{Role: "master", AOFLastWriteOK: true} },
 		RewriteAOF:       func(context.Context) error { return errors.New("append only file persistence is not enabled") },
-		Recorder:         record.New(server.NewReplicaStream(replication, replicas, logger), logger),
+		Recorder:         record.New(master, logger),
 	})
 	if err != nil {
 		t.Fatalf("command.New() error = %v", err)

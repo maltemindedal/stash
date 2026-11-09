@@ -31,12 +31,11 @@ type Server struct {
 	store             *storage.Store
 	executor          CommandExecutor
 	registry          *ClientRegistry
-	replicaPeers      *ReplicaRegistry
+	master            *Master
 	watchRegistry     *WatchRegistry
 	pubSubRegistry    *PubSubRegistry
 	monitorRegistry   *MonitorRegistry
 	slowlogRegistry   *SlowlogRegistry
-	replication       *ReplicationState
 	aofWriter         *aof.Writer
 	recorder          *record.Recorder
 	runtimeCtx        context.Context
@@ -72,17 +71,15 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		logger:          logger,
 		store:           store,
 		registry:        NewClientRegistry(),
-		replicaPeers:    NewReplicaRegistry(),
 		watchRegistry:   NewWatchRegistry(),
 		pubSubRegistry:  NewPubSubRegistry(),
 		monitorRegistry: NewMonitorRegistry(),
 		slowlogRegistry: NewSlowlogRegistry(),
-		replication:     newReplicationState(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
 	srv.link = &Link{MasterAuth: cfg.MasterAuth, Store: replicaStore{server: srv}, Logger: logger}
-	srv.replicaPeers.SetFeedErrorHandler(srv.dropReplica)
-	srv.recorder = record.New(NewReplicaStream(srv.replication, srv.replicaPeers, logger), logger)
+	srv.master = NewMaster(store, srv.dropReplica, logger)
+	srv.recorder = record.New(srv.master, logger)
 
 	executor, err := newExecutor(Services{
 		Store:            store,
@@ -92,8 +89,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		PubSub:           srv.pubSubRegistry,
 		Slowlog:          srv.slowlogRegistry,
 		SlowlogThreshold: cfg.SlowlogLogSlowerThan,
-		Replication:      srv.replication,
-		Replicas:         srv.replicaPeers,
+		Master:           srv.master,
 		Stats:            srv.ServerStats,
 		RewriteAOF:       srv.beginAOFRewrite,
 		Recorder:         srv.recorder,
@@ -202,7 +198,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	<-evictionDone
 	// Every connection is closed by now, so every replica's feed has ended or
 	// is ending; nothing it logs may come after ListenAndServe returns.
-	s.replicaPeers.WaitFeeds()
+	s.master.WaitFeeds()
 
 	var errs []error
 	if serveErr != nil {
@@ -331,7 +327,7 @@ func (s *Server) registerClient(conn ClientConn) (uint64, *ClientState) {
 // connection-scoped client state (which detaches watch, pub/sub, and monitor
 // registrations).
 func (s *Server) teardownClient(clientID uint64, logger *slog.Logger) {
-	if peer := s.replicaPeers.Remove(clientID); peer != nil {
+	if peer := s.master.Detach(clientID); peer != nil {
 		logger.Info("replica disconnected", "replica_id", clientID, "listening_port", peer.ListeningPort)
 	}
 	s.registry.Remove(clientID)
@@ -402,13 +398,13 @@ func (s *Server) shutdown() {
 		// CloseAll below once the grace has passed. A write made from here on
 		// reaches no replica.
 		deadline := time.Now().Add(replicaShutdownGrace)
-		if replicas := s.replicaPeers.StopPropagating(); replicas > 0 {
+		if replicas := s.master.StopPropagating(); replicas > 0 {
 			s.logger.Info("sending the replicas what is queued for them before shutting down", "replicas", replicas, "grace", replicaShutdownGrace)
 		}
-		if unfinished := s.replicaPeers.StopFeeds(time.Until(deadline)); unfinished > 0 {
+		if unfinished := s.master.StopFeeds(time.Until(deadline)); unfinished > 0 {
 			s.logger.Warn("some replicas did not receive the last propagated commands before shutdown", "replicas", unfinished)
 		}
-		s.replicaPeers.EndStreams(deadline)
+		s.master.EndStreams(deadline)
 
 		s.listenerMu.RLock()
 		listener := s.listener
@@ -517,7 +513,7 @@ func (s *Server) clearClientStates() {
 
 // ReplicaCount returns the number of replica peers connected to this server.
 func (s *Server) ReplicaCount() int {
-	return s.replicaPeers.Count()
+	return s.master.Count()
 }
 
 // ServerStats returns a snapshot of server-level observability data.
@@ -531,15 +527,7 @@ func (s *Server) ServerStats() Stats {
 		role = "slave"
 	}
 
-	replicaPeers := s.replicaPeers.Snapshot()
-	replicas := make([]ReplicaInfo, 0, len(replicaPeers))
-	for _, peer := range replicaPeers {
-		replicas = append(replicas, ReplicaInfo{
-			ID:                peer.ID,
-			ListeningPort:     peer.ListeningPort,
-			AckedMasterOffset: peer.acknowledgedMasterOffset(),
-		})
-	}
+	master := s.master.Info()
 
 	writer := s.aofWriter
 	return Stats{
@@ -547,10 +535,10 @@ func (s *Server) ServerStats() Stats {
 		MonitoringClients:   s.monitorRegistry.Count(),
 		CommandsProcessed:   s.commandsProcessed.Load(),
 		Role:                role,
-		MasterReplicationID: s.replication.MasterReplicationID,
-		MasterOffset:        s.replication.MasterOffset(),
+		MasterReplicationID: master.ReplicationID,
+		MasterOffset:        master.Offset,
 		ReplicaOffset:       s.link.Offset(),
-		Replicas:            replicas,
+		Replicas:            master.Replicas,
 		AOFEnabled:          writer != nil,
 		AOFLastWriteOK:      writer.LastWriteOK(),
 	}

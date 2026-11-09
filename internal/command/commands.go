@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -24,13 +23,6 @@ const pubSubWriteTimeout = 100 * time.Millisecond
 // 292 years. A longer request is clamped to it: converting it as given overflowed
 // to a negative duration, so a WAIT asked to wait a very long time returned at once.
 const maxWaitMillis = math.MaxInt64 / int64(time.Millisecond)
-
-var cachedReplConfGetAckPayload = sync.OnceValues(func() ([]byte, error) {
-	return protocol.Encode(propagationFrame(&Request{
-		Name: "REPLCONF",
-		Args: [][]byte{[]byte("GETACK"), []byte("*")},
-	}))
-})
 
 var pubSubSubscriberSlicePool = sync.Pool{
 	New: func() any {
@@ -244,7 +236,7 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 		}
 
 		if state := request.client; state != nil && state.IsReplica() {
-			if updated := e.replicaPeers.UpdateAck(state.ID, ackOffset); updated {
+			if updated := e.master.Ack(state.ID, ackOffset); updated {
 				// The replica's own count, from zero when it attached. INFO and
 				// WAIT add the master offset it attached at.
 				e.logger.Debug("replica acknowledged offset", "replica_id", state.ID, "replica_offset", ackOffset)
@@ -273,9 +265,6 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	if string(request.Args[0]) != "?" || string(request.Args[1]) != "-1" {
 		return server.ExecuteResult{}, ErrSyntaxError()
 	}
-	if e.replication.MasterReplicationID == "" {
-		return server.ExecuteResult{}, fmt.Errorf("replication state unavailable")
-	}
 	state, err := clientStateOf(request)
 	if err != nil {
 		return server.ExecuteResult{}, err
@@ -286,58 +275,17 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 		return server.ExecuteResult{}, ErrNotAllowedInTransactionError()
 	}
 
-	entries, snapshotStats := e.attachReplica(state)
-	// Encoding the snapshot happens after the cut, so writers wait only for the copy.
-	payload, writeStats := rdb.BuildSnapshot(entries)
-	if snapshotStats.SkippedUnsupportedKeys > 0 {
-		// RDB support is scoped to DB 0 string keys, so a master holding
-		// collections transfers only its string keyspace on full resync.
-		e.logger.Warn(
-			"full resync snapshot skipped unsupported value types",
-			"skipped_unsupported_keys", snapshotStats.SkippedUnsupportedKeys,
-			"exported_keys", snapshotStats.ExportedKeys,
-		)
-	}
-
+	// The Master copies the snapshot and registers the replica at one attach
+	// cut, and the replica's feed holds every write made since; the connection
+	// starts the feed once this reply is ahead of it.
+	attachment := e.master.Attach(server.Candidate{
+		ID: state.ID, ListeningPort: state.ReplicaListeningPort(), Out: state,
+	}, e.seq.attachCut)
 	state.PromoteToReplica()
-	e.logger.Info(
-		"serving full resync to replica",
-		"replica_id", state.ID,
-		"master_replid", e.replication.MasterReplicationID,
-		"snapshot_size_bytes", len(payload),
-		"snapshot_keys", writeStats.WrittenKeys,
-	)
 
-	result := server.MultiResponse(
-		protocol.SimpleString{Value: fmt.Sprintf("FULLRESYNC %s 0", e.replication.MasterReplicationID)},
-		protocol.BulkString{Data: payload},
-	)
-	// The replica is registered and its feed is holding every write made since
-	// the snapshot; the connection starts the feed once this reply is ahead of it.
+	result := server.MultiResponse(attachment.Reply()...)
 	result.RegisterReplica = true
 	return result, nil
-}
-
-// attachReplica copies the string keyspace for a replica's full resync and
-// registers the replica, at one attach cut (sequencer.attachCut): every write is
-// then in exactly one of the copy and the replica's stream. The replica's feed
-// holds that stream until the connection starts it, after the reply.
-func (e *Executor) attachReplica(state *server.ClientState) ([]storage.StringSnapshotEntry, storage.StringSnapshotStats) {
-	release := e.seq.attachCut(e.replicaPeers.BeginAttach)
-	defer release()
-	// Nothing below returns an error before Reserve, but a panic would leave the
-	// registry counting an attach that never ends, and every write ordered.
-	reserved := false
-	defer func() {
-		if !reserved {
-			e.replicaPeers.EndAttach()
-		}
-	}()
-
-	entries, stats := e.store.SnapshotStrings()
-	e.replicaPeers.Reserve(e.replication, state.ID, state.ReplicaListeningPort(), state)
-	reserved = true
-	return entries, stats
 }
 
 func (e *Executor) handleWait(ctx context.Context, request *Request) (server.ExecuteResult, error) {
@@ -349,7 +297,7 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 	targetOffset := e.waitTargetOffset(request)
 	startedAt := time.Now()
 
-	ackedReplicas := e.countReplicasAtOrAbove(targetOffset)
+	ackedReplicas := e.master.Acked(targetOffset)
 	e.logger.Debug(
 		"WAIT requested",
 		"target_replicas", replicas,
@@ -376,11 +324,12 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 		return server.ExecuteResult{}, err
 	}
 
-	if err := e.requestReplicaAcknowledgements(); err != nil {
+	timeout := time.Duration(min(timeoutMillis, maxWaitMillis)) * time.Millisecond
+	ackedReplicas, timedOut, err := e.master.Await(ctx, replicas, targetOffset, timeout)
+	if err != nil {
 		return server.ExecuteResult{}, err
 	}
-
-	return e.waitForReplicaAcknowledgements(ctx, replicas, timeoutMillis, targetOffset, startedAt)
+	return e.finishWaitResult(replicas, ackedReplicas, targetOffset, startedAt, timedOut), nil
 }
 
 func parseWaitArguments(request *Request) (int64, int64, error) {
@@ -405,28 +354,7 @@ func (e *Executor) waitTargetOffset(request *Request) int64 {
 		return state.LastWriteReplicationOffset()
 	}
 
-	return e.replication.MasterOffset()
-}
-
-func (e *Executor) waitForReplicaAcknowledgements(ctx context.Context, replicas int64, timeoutMillis int64, targetOffset int64, startedAt time.Time) (server.ExecuteResult, error) {
-	timer := time.NewTimer(time.Duration(min(timeoutMillis, maxWaitMillis)) * time.Millisecond)
-	defer timer.Stop()
-
-	for {
-		ackedReplicas, notified := e.countReplicasAtOrAboveWithNotify(targetOffset)
-		if int64(ackedReplicas) >= replicas {
-			return e.finishWaitResult(replicas, ackedReplicas, targetOffset, startedAt, false), nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return server.ExecuteResult{}, ctx.Err()
-		case <-timer.C:
-			finalAcked := e.countReplicasAtOrAbove(targetOffset)
-			return e.finishWaitResult(replicas, finalAcked, targetOffset, startedAt, true), nil
-		case <-notified:
-		}
-	}
+	return e.master.Offset()
 }
 
 func (e *Executor) finishWaitResult(replicas int64, ackedReplicas int, targetOffset int64, startedAt time.Time, timedOut bool) server.ExecuteResult {
@@ -1031,33 +959,4 @@ func (e *Executor) touchWatchKeys(keys ...string) {
 	}
 
 	e.watchRegistry.Touch(keys...)
-}
-
-func (e *Executor) countReplicasAtOrAbove(targetOffset int64) int {
-	return e.replicaPeers.CountReplicasAtOrAbove(targetOffset)
-}
-
-func (e *Executor) countReplicasAtOrAboveWithNotify(targetOffset int64) (int, <-chan struct{}) {
-	return e.replicaPeers.CountReplicasAtOrAboveWithNotify(targetOffset)
-}
-
-func (e *Executor) requestReplicaAcknowledgements() error {
-	encoded, err := cachedReplConfGetAckPayload()
-	if err != nil {
-		return fmt.Errorf("encode REPLCONF GETACK: %w", err)
-	}
-
-	// GETACK is part of the stream and counts toward the offset like a write, so
-	// it is counted and queued in the same step as writes are; a replica that
-	// refuses it is dropped the way propagation drops one. WAIT holds no sequencer
-	// lock here, so nothing orders it against an attach cut, and it takes the
-	// registry lock even with no replica registered (Propagate, not
-	// PropagateOrdered).
-	_, queued, refused := e.replicaPeers.Propagate(e.replication, encoded)
-	e.logger.Debug("requested replica acknowledgements", "replica_count", queued+refused, "payload_size", len(encoded))
-	if refused > 0 {
-		e.logger.Warn("failed to request replica ACK", "refused", refused, "requested", queued+refused)
-	}
-
-	return nil
 }
