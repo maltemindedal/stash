@@ -33,19 +33,18 @@ var (
 
 // Store is a thread-safe in-memory key/value store.
 type Store struct {
-	shards             []Shard
-	seed               maphash.Seed
-	waiters            *listWaiters
-	loggerMu           sync.RWMutex
-	logger             *slog.Logger
-	expirationMu       sync.Mutex
-	expirationListener func(keys []string)
+	shards           []Shard
+	seed             maphash.Seed
+	waiters          *listWaiters
+	loggerMu         sync.RWMutex
+	logger           *slog.Logger
+	backgroundMu     sync.Mutex
+	backgroundRunner func(work func(changes Changes))
 	// removed is the keys the holder of every shard write lock has removed on
 	// its own initiative during that hold. Those locks guard it, and the holder
 	// empties it as it releases them (writeUnlockAllShardsAndReport), so one
 	// call never hands on what another removed.
 	removed                  removals
-	evictionGuard            func() (release func())
 	usedMemory               atomic.Int64
 	keyKindCounts            [keyStatsKindCount]atomic.Int64
 	maxMemory                atomic.Int64
@@ -99,52 +98,35 @@ func (s *Store) SetLogger(logger *slog.Logger) {
 	s.logger = logger
 }
 
-// SetExpirationListener registers the sink for keys the store removed because
-// their TTL had passed.
+// SetBackgroundRunner registers run, which the store calls with each piece of
+// work it does on its own initiative: one sample of the active expiry loop.
 //
-// Expiry is the one keyspace mutation the store performs on its own initiative
-// rather than on a caller's instruction, which makes it the one a caller cannot
-// otherwise see. A caller that replicates and persists mutations has to see
-// it. Two paths sweep for it: the background eviction loop, and the keyspace
-// recalculation every accounted write runs. Both report here.
-//
-// A key dropped because the very operation reading it found it expired is not
-// reported: passive expiry is a conclusion any server holding the key reaches
-// from the TTL it already has. The listener runs with no shard lock held, on
-// whichever goroutine noticed the expiry.
-func (s *Store) SetExpirationListener(listener func(keys []string)) {
+// A TTL eviction by that loop is a keyspace change no caller asked for, so no
+// request's Changes hears of it, yet whoever replicates and persists writes has
+// to. run calls work with the Changes that hears it, and orders work against
+// the writes it is also recording: a key expiring and being set again must
+// reach the log in the order they happened. Without a runner the store calls
+// work with a nil Changes.
+func (s *Store) SetBackgroundRunner(run func(work func(changes Changes))) {
 	if s == nil {
 		return
 	}
 
-	s.expirationMu.Lock()
-	defer s.expirationMu.Unlock()
-	s.expirationListener = listener
+	s.backgroundMu.Lock()
+	defer s.backgroundMu.Unlock()
+	s.backgroundRunner = run
 }
 
-// SetEvictionGuard registers a function the background eviction loop calls before
-// each sample and whose result it calls once the sample's removals have been
-// handed to the expiration listener. It lets the owner of the listener order those
-// removals against the writes it is also logging: a key expiring and being set
-// again must reach the log in the order they happened.
-func (s *Store) SetEvictionGuard(guard func() (release func())) {
-	if s == nil {
+// runInBackground runs work through the background runner.
+func (s *Store) runInBackground(work func(changes Changes)) {
+	s.backgroundMu.Lock()
+	run := s.backgroundRunner
+	s.backgroundMu.Unlock()
+	if run == nil {
+		work(nil)
 		return
 	}
-
-	s.expirationMu.Lock()
-	defer s.expirationMu.Unlock()
-	s.evictionGuard = guard
-}
-
-func (s *Store) acquireEvictionGuard() func() {
-	s.expirationMu.Lock()
-	guard := s.evictionGuard
-	s.expirationMu.Unlock()
-	if guard == nil {
-		return func() {}
-	}
-	return guard()
+	run(work)
 }
 
 // removals is the keys one call removed that its caller did not ask it to
@@ -163,14 +145,12 @@ func (s *Store) noteExpiredLocked(keys []string) {
 }
 
 // writeUnlockAllShardsAndReport releases every shard write lock and then tells
-// changes which keys the hold swept and which it evicted to make room. Without
-// a Changes, the expiration listener hears of the swept keys.
+// changes which keys the hold swept and which it evicted to make room.
 func (s *Store) writeUnlockAllShardsAndReport(changes Changes) {
 	removed := s.removed
 	s.removed = removals{}
 	s.writeUnlockAllShards()
 	if changes == nil {
-		s.publishExpired(removed.expired)
 		return
 	}
 	for _, key := range removed.expired {
@@ -178,23 +158,6 @@ func (s *Store) writeUnlockAllShardsAndReport(changes Changes) {
 	}
 	for _, key := range removed.evicted {
 		changes.KeyChanged(key, MemoryEvicted)
-	}
-}
-
-// publishExpired hands keys removed by an active TTL eviction to the listener.
-// Callers must hold no shard lock: the listener reaches replication and
-// durability sinks, which must never be entered under a store lock.
-func (s *Store) publishExpired(keys []string) {
-	if len(keys) == 0 {
-		return
-	}
-
-	s.expirationMu.Lock()
-	listener := s.expirationListener
-	s.expirationMu.Unlock()
-
-	if listener != nil {
-		listener(keys)
 	}
 }
 

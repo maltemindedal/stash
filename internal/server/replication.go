@@ -1031,7 +1031,12 @@ func (s *Server) consumeFullResync(parser *protocol.Parser) error {
 	if err != nil {
 		return fmt.Errorf("load replication snapshot: %w", err)
 	}
-	s.store.ReplaceWith(nil, snapshotStore)
+	// The swap is a Background unit: no write is halfway to the log while the
+	// keyspace changes under it, and the DEL of the keys the new keyspace
+	// held past their TTL is recorded. The Recorder logs an append that fails.
+	_ = s.executor.RunBackgroundUnit(func(changes storage.Changes) {
+		s.store.ReplaceWith(changes, snapshotStore)
+	})
 	s.logger.Info(
 		"applied full resync snapshot",
 		"snapshot_size_bytes", len(snapshot.Data),

@@ -26,7 +26,8 @@ const (
 // the operation that touches a key finds it expired: every server that holds
 // the key reaches that conclusion from the TTL it already has.
 //
-// A nil Changes hears nothing.
+// A nil Changes hears nothing: the caller gives up knowing which keys the
+// write evicted.
 type Changes interface {
 	KeyChanged(key string, cause Cause)
 }

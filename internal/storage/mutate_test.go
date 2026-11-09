@@ -821,9 +821,6 @@ func TestShrinkingWritesLockOnlyTheirOwnShardAndNeverEvict(t *testing.T) {
 		w := w
 		t.Run(w.name, func(t *testing.T) {
 			store, clock := newStoreWithManualClock()
-			var heard []string
-			store.SetExpirationListener(func(keys []string) { heard = append(heard, keys...) })
-
 			key := keyOnShard(store, len(store.shards)-1)
 			stale := keyOnShard(store, 0)
 			if err := w.setup(store, key); err != nil {
@@ -862,11 +859,8 @@ func TestShrinkingWritesLockOnlyTheirOwnShardAndNeverEvict(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s error = %v", w.name, err)
 			}
-			if len(heard) != 0 {
-				t.Fatalf("%s swept %v; a shrinking write sweeps nothing", w.name, heard)
-			}
 			if store.valueObjectForTest(stale) == nil {
-				t.Fatalf("%s removed %s from another shard", w.name, stale)
+				t.Fatalf("%s swept %s from another shard; a shrinking write sweeps nothing", w.name, stale)
 			}
 			requireExactUsedMemory(t, store)
 		})

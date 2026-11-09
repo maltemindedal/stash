@@ -41,6 +41,15 @@ func (e *evictedKeys) KeyChanged(key string, cause Cause) {
 	}
 }
 
+// expiredKeys is a Changes that keeps the keys a sweep removed.
+type expiredKeys []string
+
+func (e *expiredKeys) KeyChanged(key string, cause Cause) {
+	if cause == Expired {
+		*e = append(*e, key)
+	}
+}
+
 func bytesOf(values ...string) [][]byte {
 	out := make([][]byte, len(values))
 	for i, value := range values {
@@ -224,8 +233,6 @@ func TestAnAccountedWriteReportsTheKeysItsSweepRemovedAsExpired(t *testing.T) {
 	}
 	clock.advance(time.Minute)
 
-	listened := 0
-	store.SetExpirationListener(func([]string) { listened++ })
 	changes := &heardChanges{store: store}
 	if err := store.Set(changes, "k", []byte("v"), 0); err != nil {
 		t.Fatal(err)
@@ -234,8 +241,5 @@ func TestAnAccountedWriteReportsTheKeysItsSweepRemovedAsExpired(t *testing.T) {
 	want := []keyChange{{key: "stale", cause: Expired}, {key: "k", cause: Written}}
 	if !slices.Equal(changes.heard, want) {
 		t.Fatalf("changes heard = %v, want %v", changes.heard, want)
-	}
-	if listened != 0 {
-		t.Fatal("the expiration listener heard of a key the write's Changes was told of")
 	}
 }

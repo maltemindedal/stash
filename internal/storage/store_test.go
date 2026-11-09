@@ -1201,8 +1201,12 @@ func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 	defer cancel()
 
 	reported := make(chan []string, 8)
-	store.SetExpirationListener(func(keys []string) {
-		reported <- keys
+	store.SetBackgroundRunner(func(work func(changes Changes)) {
+		var expired expiredKeys
+		work(&expired)
+		if len(expired) > 0 {
+			reported <- expired
+		}
 	})
 	store.StartEviction(ctx, 5*time.Millisecond, 10)
 
@@ -1216,12 +1220,12 @@ func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 	}
 }
 
-// TestStoreActiveEvictionSurvivesAPanickingListener pins that a panic in one
-// pass ends that pass, not the loop. The listener reaches replication and
+// TestStoreActiveEvictionSurvivesAPanickingRunner pins that a panic in one
+// pass ends that pass, not the loop. The runner reaches replication and
 // durability sinks, so a bug there is the likely source; before, the recover sat
 // outside the loop and one panic silently stopped all active expiry for the life
 // of the process.
-func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
+func TestStoreActiveEvictionSurvivesAPanickingRunner(t *testing.T) {
 	store, _ := newStoreWithManualClock()
 	past := store.deadlineAfter(-time.Millisecond)
 	_ = store.Set(nil, "first", []byte("1"), past)
@@ -1231,10 +1235,15 @@ func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
 
 	reported := make(chan []string, 8)
 	var panicked atomic.Bool
-	store.SetExpirationListener(func(keys []string) {
-		reported <- keys
+	store.SetBackgroundRunner(func(work func(changes Changes)) {
+		var expired expiredKeys
+		work(&expired)
+		if len(expired) == 0 {
+			return
+		}
+		reported <- expired
 		if panicked.CompareAndSwap(false, true) {
-			panic("listener bug")
+			panic("runner bug")
 		}
 	})
 	done := store.StartEviction(ctx, 5*time.Millisecond, 10)
@@ -1255,7 +1264,7 @@ func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
 			t.Fatalf("pass after the panic reported %v, want [second]", keys)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("active eviction stopped for good after a listener panic")
+		t.Fatal("active eviction stopped for good after a runner panic")
 	}
 	select {
 	case <-done:
@@ -1274,31 +1283,22 @@ func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
 	store, _ := newStoreWithManualClock()
 	store.ConfigureMaxMemory(nil, 1<<20, 16)
 
-	reported := make(chan []string, 8)
-	store.SetExpirationListener(func(keys []string) {
-		reported <- keys
-	})
-
 	// Stored while accounting is already on, so the sweep that removes it is the
 	// one the next write runs rather than anything this one did.
-	if err := store.Set(nil, "stale", []byte("value"), store.deadlineAfter(-time.Minute)); err != nil {
+	var swept expiredKeys
+	if err := store.Set(&swept, "stale", []byte("value"), store.deadlineAfter(-time.Minute)); err != nil {
 		t.Fatalf("Set(stale) error = %v", err)
 	}
-	if len(reported) != 0 {
-		t.Fatalf("expired keys reported = %v, want none before the key is swept", <-reported)
+	if len(swept) != 0 {
+		t.Fatalf("expired keys reported = %v, want none before the key is swept", swept)
 	}
 
-	if err := store.Set(nil, "live", []byte("value"), 0); err != nil {
+	if err := store.Set(&swept, "live", []byte("value"), 0); err != nil {
 		t.Fatalf("Set(live) error = %v", err)
 	}
 
-	select {
-	case keys := <-reported:
-		if len(keys) != 1 || keys[0] != "stale" {
-			t.Fatalf("expired keys = %v, want [stale]", keys)
-		}
-	default:
-		t.Fatal("accounted write did not report the expired key it swept")
+	if len(swept) != 1 || swept[0] != "stale" {
+		t.Fatalf("expired keys = %v, want [stale]", swept)
 	}
 }
 

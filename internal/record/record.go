@@ -120,8 +120,8 @@ type Log interface {
 // Stream is the replication stream. Propagate counts payload into the
 // replication offset and queues it for every Replica, and returns the offset
 // at its end. ordered says that the caller holds the write's ordering in the
-// command sequencer, so a stream may skip work the ordering already does; a
-// write the server makes on its own can be published holding none. Active
+// command sequencer, so a stream may skip work the ordering already does; the
+// Recorder never says so for a write the server makes on its own. Active
 // reports whether a Replica is attached or attaching. Neither keeps a
 // reference to payload after it returns.
 type Stream interface {

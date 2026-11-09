@@ -99,8 +99,7 @@ func TestStoreMaxMemoryRefusesAnImpossibleWriteWithoutEvicting(t *testing.T) {
 func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	store, clock := newStoreWithManualClock()
 	store.ConfigureMaxMemory(nil, 1<<20, 16)
-	reported := make(chan []string, 4)
-	store.SetExpirationListener(func(keys []string) { reported <- keys })
+	var swept expiredKeys
 
 	if err := store.Set(nil, "soon", []byte("v"), clock.now()+60); err != nil {
 		t.Fatalf("Set(soon) error = %v", err)
@@ -110,29 +109,22 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	}
 
 	// Before the deadline: still there, nothing swept.
-	if err := store.Set(nil, "other-1", []byte("v"), 0); err != nil {
+	if err := store.Set(&swept, "other-1", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-1) error = %v", err)
 	}
-	select {
-	case keys := <-reported:
-		t.Fatalf("a write before any deadline swept %v", keys)
-	default:
+	if len(swept) != 0 {
+		t.Fatalf("a write before any deadline swept %v", swept)
 	}
 	if store.valueObjectForTest("soon") == nil {
 		t.Fatal("the key was swept before its deadline")
 	}
 
 	clock.advance(90 * time.Millisecond)
-	if err := store.Set(nil, "other-2", []byte("v"), 0); err != nil {
+	if err := store.Set(&swept, "other-2", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-2) error = %v", err)
 	}
-	select {
-	case keys := <-reported:
-		if len(keys) != 1 || keys[0] != "soon" {
-			t.Fatalf("swept %v, want [soon]", keys)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("the first write after the deadline did not sweep the expired key")
+	if len(swept) != 1 || swept[0] != "soon" {
+		t.Fatalf("the first write after the deadline swept %v, want [soon]", swept)
 	}
 	if store.valueObjectForTest("later") == nil {
 		t.Fatal("the swept keyspace lost a key whose deadline had not passed")
@@ -146,31 +138,30 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 // to a key whose TTL deadline passes while the write runs. Under maxmemory the
 // write sweeps expired keys to make room, and that sweep judges expiry by the
 // clock reading at which the write found its key live: the key is neither
-// reported to the expiration listener nor counted out of used memory.
+// reported to the write's Changes as expired nor counted out of used memory.
 func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 	tests := []struct {
 		name  string
-		write func(store *Store, key string) error
+		write func(store *Store, changes Changes, key string) error
 	}{
 		{
 			name: "INCR that adds a digit",
-			write: func(store *Store, key string) error {
-				_, err := store.Increment(nil, key)
+			write: func(store *Store, changes Changes, key string) error {
+				_, err := store.Increment(changes, key)
 				return err
 			},
 		},
 		{
 			name: "SETBIT past the end",
-			write: func(store *Store, key string) error {
-				_, err := store.SetBit(nil, key, 15, 1)
+			write: func(store *Store, changes Changes, key string) error {
+				_, err := store.SetBit(changes, key, 15, 1)
 				return err
 			},
 		},
 		{
 			name: "SET to a longer value with a TTL",
-			write: func(store *Store, key string) error {
-				err := store.Set(nil, key, []byte("longer"), store.deadlineAfter(time.Hour))
-				return err
+			write: func(store *Store, changes Changes, key string) error {
+				return store.Set(changes, key, []byte("longer"), store.deadlineAfter(time.Hour))
 			},
 		},
 	}
@@ -178,10 +169,10 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			store, key, heard := writeAcrossItsKeysDeadline(t, tt.write)
+			store, key, swept := writeAcrossItsKeysDeadline(t, tt.write)
 
-			if len(heard) != 0 {
-				t.Errorf("the expiration listener heard %v, want nothing: the write found %s live", heard, key)
+			if len(swept) != 0 {
+				t.Errorf("the write reported %v as expired, want nothing: it found %s live", swept, key)
 			}
 			if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
 				t.Errorf("UsedMemory() = %d after the write, recount = %d", used, want)
@@ -194,7 +185,7 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 // TTL deadline an hour out, under maxmemory. It runs write on that key so that
 // the write takes its clock reading at or before the key's deadline and makes
 // room after it, and returns the store, the key, and the keys the expiration
-// listener heard.
+// write reported as expired.
 //
 // An accounted write reads the clock and then takes every shard lock in
 // ascending order, so while the test holds the last shard's lock the write
@@ -203,13 +194,12 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 // to that reading, under that same lock, and moves the clock past it before it
 // lets the write go on: any reading the write took after its first would find
 // the key expired.
-func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key string) error) (*Store, string, []string) {
+func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, changes Changes, key string) error) (*Store, string, []string) {
 	t.Helper()
 
 	store, clock := newStoreWithManualClock()
 	store.ConfigureMaxMemory(nil, 1<<20, 16)
-	var heard []string
-	store.SetExpirationListener(func(keys []string) { heard = append(heard, keys...) })
+	var swept expiredKeys
 
 	lastIndex := len(store.shards) - 1
 	key := ""
@@ -225,7 +215,7 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 	last := &store.shards[lastIndex]
 	last.mu.Lock()
 	done := make(chan error, 1)
-	go func() { done <- write(store, key) }()
+	go func() { done <- write(store, &swept, key) }()
 	for store.shards[0].mu.TryLock() {
 		store.shards[0].mu.Unlock()
 		runtime.Gosched()
@@ -239,7 +229,7 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 	if err := <-done; err != nil {
 		t.Fatalf("the write failed: %v", err)
 	}
-	return store, key, heard
+	return store, key, swept
 }
 
 // TestStoreExpiryLowerBound pins how the earliest-deadline bound is kept: unknown

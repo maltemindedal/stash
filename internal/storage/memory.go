@@ -17,6 +17,8 @@ const (
 
 // ConfigureMaxMemory enables approximate keyspace accounting and probabilistic
 // LRU eviction for subsequent writes. A limit of 0 disables the feature.
+// Enabling it measures the keyspace, and changes hears which expired keys that
+// swept out.
 func (s *Store) ConfigureMaxMemory(changes Changes, limit int64, sampleSize int) {
 	if s == nil {
 		return
@@ -58,10 +60,10 @@ func (s *Store) UsedMemory() int64 {
 }
 
 // EnforceMaxMemory evicts least-recently-used candidates until the keyspace is
-// at or below the configured maxmemory limit.
-func (s *Store) EnforceMaxMemory(changes Changes) ([]string, error) {
+// at or below the configured maxmemory limit, and tells changes which.
+func (s *Store) EnforceMaxMemory(changes Changes) error {
 	if !s.maxMemoryEnabled() {
-		return nil, nil
+		return nil
 	}
 
 	s.writeLockAllShards()
@@ -70,18 +72,10 @@ func (s *Store) EnforceMaxMemory(changes Changes) ([]string, error) {
 	limit := s.maxMemory.Load()
 	s.recalculateUsedMemoryLocked(s.now())
 	if s.usedMemory.Load() <= limit {
-		return nil, nil
+		return nil
 	}
 
-	// Until startup runs as a Background unit, the server takes the evicted
-	// keys from here and not from changes.
-	err := s.evictUntilMemoryAtOrBelowLocked(limit, nil)
-	evicted := s.removed.evicted
-	s.removed.evicted = nil
-	if err != nil {
-		return nil, err
-	}
-	return evicted, nil
+	return s.evictUntilMemoryAtOrBelowLocked(limit, nil)
 }
 
 func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64 {
@@ -176,9 +170,8 @@ func approximateBaseValueObjectSize(key string, expiresAt int64) int64 {
 
 // recalculateUsedMemoryLocked re-measures the whole keyspace, dropping the
 // expired keys it passes on the way. Those drops are a sweep rather than the
-// caller's own mutation, so they are noted for the expiration listener instead
-// of being folded into whatever the caller is returning. The caller holds every
-// shard write lock.
+// caller's own write, so they are noted for the caller's Changes to hear as
+// Expired. The caller holds every shard write lock.
 func (s *Store) recalculateUsedMemoryLocked(now int64) int64 {
 	used := int64(0)
 	next := maxInt64Value
