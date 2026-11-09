@@ -2,7 +2,6 @@ package storage
 
 import (
 	"errors"
-	"math"
 	"sync/atomic"
 )
 
@@ -103,12 +102,8 @@ type StringSnapshotStats struct {
 // milliseconds. Reads refresh it with atomic stores so shard read paths can
 // keep their RLock fast path while still providing data for approximate LRU
 // eviction.
-//
-// A list keeps its values in List[ListHead:]; see liveList.
 type ValueObject struct {
 	String         []byte
-	List           [][]byte
-	ListHead       int32
 	ExpiresAt      int64
 	LastAccessedAt int64
 	Kind           ValueKind
@@ -144,132 +139,22 @@ func (v *ValueObject) StringValue() ([]byte, error) {
 	return v.String, nil
 }
 
-// ListValue returns the list payload for a list value.
-func (v *ValueObject) ListValue() ([][]byte, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindList {
-		return nil, ErrWrongType
-	}
-
-	return v.liveList(), nil
-}
-
-// liveList returns the values of a list value. List holds the whole array the
-// list lives in and ListHead counts the dead (nil) slots at its front, left by
-// pops from the left. LPUSH refills those slots, so a list used from its left end
-// is neither copied on push nor left holding memory it no longer needs.
-func (v *ValueObject) liveList() [][]byte {
-	return v.List[v.ListHead:]
-}
-
-// dropListFront removes the n left-most values of a list without copying: their
-// slots become dead, and a later LPUSH can refill them.
-func (v *ValueObject) dropListFront(n int) {
-	if head := int(v.ListHead) + n; head <= math.MaxInt32 {
-		v.ListHead = int32(head)
-		return
-	}
-
-	// Two billion pops from the left with no append moving the list into a new
-	// array: copy what is left instead of letting the head overflow.
-	v.List = append([][]byte(nil), v.List[int(v.ListHead)+n:]...)
-	v.ListHead = 0
-}
-
-// dropListEnd removes the n right-most values of a list.
-func (v *ValueObject) dropListEnd(n int) {
-	v.List = v.List[:len(v.List)-n]
-}
-
-// popListFront removes the left-most value of a list that is not empty, and
-// returns it with the number of values left. It and popListBack are two methods
-// rather than one taking a side so that each inlines: the call cost a pop about
-// 3% of its time.
-func (v *ValueObject) popListFront() ([]byte, int) {
-	list := v.liveList()
-	item := list[0]
-	list[0] = nil
-	v.dropListFront(1)
-	return item, len(list) - 1
-}
-
-// popListBack removes the right-most value of a list that is not empty, and
-// returns it with the number of values left.
-func (v *ValueObject) popListBack() ([]byte, int) {
-	list := v.liveList()
-	last := len(list) - 1
-	item := list[last]
-	list[last] = nil
-	v.dropListEnd(1)
-	return item, last
-}
-
-// popListValues removes up to count values, which must not be negative, from
-// the left or right end of a list that is not empty. It returns them in the
-// order they were popped, with the number of values left. count is an int, which
-// the command parses as one, so no int64 is narrowed on the way (6db82b0).
-func (v *ValueObject) popListValues(count int, left bool) ([][]byte, int) {
-	list := v.liveList()
-	n := min(count, len(list))
-	popped := make([][]byte, n)
-	if left {
-		for i := 0; i < n; i++ {
-			popped[i] = list[i]
-			list[i] = nil
-		}
-		v.dropListFront(n)
-	} else {
-		for i := 0; i < n; i++ {
-			src := len(list) - 1 - i
-			popped[i] = list[src]
-			list[src] = nil
-		}
-		v.dropListEnd(n)
-	}
-	return popped, len(list) - n
-}
-
 // emptied reports whether v is a list, hash, set or sorted set with nothing
 // left in it, which a write deletes rather than keeps. A string or a stream is
-// kept however short it is. The list case is answered here, where it inlines,
-// because the pops are the commonest shrinking writes.
+// kept however short it is.
 func (v *ValueObject) emptied() bool {
-	if v.Kind == ValueKindList {
-		return len(v.List) == int(v.ListHead)
-	}
-	return v.emptiedCollection()
-}
-
-// emptiedCollection is emptied for a value that is not a list.
-func (v *ValueObject) emptiedCollection() bool {
-	if v.data != nil {
-		return v.data.empty()
-	}
-	switch v.Kind {
-	}
-	return false
+	return v.data != nil && v.data.empty()
 }
 
 // containerCopy returns a copy of v that a growing write can edit while v stays
 // stored under its key, so that a write refused for want of memory leaves v as
-// it was. It copies the container and not the elements: a list's array, a
-// hash's map or compact entries and arena, a set's map or integers, a sorted
-// set's index and skip list or compact entries and arena, and a stream's
-// records. The element byte strings are shared, because nothing edits one in
-// place once it is stored. A string's bytes are shared too, so a write that
-// edits a string's bytes in place must not be handed this copy.
+// it was. It copies the container and not the elements (see kindValue.clone). A
+// string's bytes are shared too, so a write that edits a string's bytes in place
+// must not be handed this copy.
 func (v *ValueObject) containerCopy() *ValueObject {
 	c := *v
 	if v.data != nil {
 		c.data = v.data.clone()
-		return &c
-	}
-	switch v.Kind {
-	case ValueKindList:
-		c.List = append([][]byte(nil), v.liveList()...)
-		c.ListHead = 0
 	}
 	return &c
 }
@@ -285,17 +170,6 @@ func newOwnedStringValue(data []byte, expiresAt int64) *ValueObject {
 		String:    data,
 		ExpiresAt: expiresAt,
 		Kind:      ValueKindString,
-	}
-}
-
-// newListValue stores an already-owned list representation without cloning.
-// Callers must only pass slices whose element bytes are not aliased with caller-
-// controlled memory.
-func newListValue(items [][]byte, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		List:      items,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindList,
 	}
 }
 

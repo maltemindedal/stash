@@ -22,16 +22,14 @@ type SnapshotStats struct {
 	SkippedExpiredKeys int
 }
 
-// imageEntry is one key of a keyspace image. kind selects the payload field
-// that is valid.
+// imageEntry is one key of a keyspace image. data is the image of a collection
+// and nil for a string, whose bytes are str.
 type imageEntry struct {
 	key       string
 	kind      ValueKind
 	expiresAt int64
 	str       []byte
-	list      [][]byte
-	// data is the image of a kind that has moved out of the fields above.
-	data kindImage
+	data      kindImage
 }
 
 // arena hands out the copies an image holds of the bytes it is taken from. It
@@ -124,30 +122,21 @@ func (img *Image) Recreate(emit func(args [][]byte) error) (keys int, err error)
 }
 
 func (e *imageEntry) recreate(emit func(args [][]byte) error) error {
-	// Only SET's PXAT recreates a TTL. No command gives a collection one today,
-	// but refusing it keeps a future TTL from being dropped without a word.
-	if e.kind != ValueKindString && e.expiresAt > 0 {
-		return fmt.Errorf("storage: cannot recreate the TTL of %s key %q", e.kind, e.key)
-	}
-
 	if e.data != nil {
+		// Only SET's PXAT recreates a TTL. No command gives a collection one
+		// today, but refusing it keeps a future TTL from being dropped without a
+		// word.
+		if e.expiresAt > 0 {
+			return fmt.Errorf("storage: cannot recreate the TTL of %s key %q", e.kind, e.key)
+		}
 		return e.data.recreate(e.key, emit)
 	}
 
-	switch e.kind {
-	case ValueKindString:
-		args := [][]byte{[]byte("SET"), []byte(e.key), e.str}
-		if e.expiresAt > 0 {
-			args = append(args, []byte("PXAT"), strconv.AppendInt(nil, e.expiresAt, 10))
-		}
-		return emit(args)
-	case ValueKindList:
-		return emitChunked(emit, "RPUSH", e.key, len(e.list), 1, func(args [][]byte, i int) [][]byte {
-			return append(args, e.list[i])
-		})
-	default:
-		return fmt.Errorf("storage: cannot recreate value kind %q of key %q", e.kind, e.key)
+	args := [][]byte{[]byte("SET"), []byte(e.key), e.str}
+	if e.expiresAt > 0 {
+		args = append(args, []byte("PXAT"), strconv.AppendInt(nil, e.expiresAt, 10))
 	}
+	return emit(args)
 }
 
 // emitChunked emits name commands that together carry count items for key, at

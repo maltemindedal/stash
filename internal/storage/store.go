@@ -299,13 +299,17 @@ func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
 	var item []byte
 	remaining := 0
 	ok, _, err := mutateKey(s, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
-		if cur == nil || len(cur.liveList()) == 0 {
+		if cur == nil {
 			return nil, false, nil
 		}
+		list, err := listOf(cur)
+		if err != nil || list.empty() {
+			return nil, false, err
+		}
 		if left {
-			item, remaining = cur.popListFront()
+			item, remaining = list.popFront()
 		} else {
-			item, remaining = cur.popListBack()
+			item, remaining = list.popBack()
 		}
 		return cur, true, nil
 	})
@@ -339,10 +343,14 @@ func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
 	var values [][]byte
 	remaining := 0
 	ok, _, err := mutateKey(s, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
-		if cur == nil || len(cur.liveList()) == 0 {
+		if cur == nil {
 			return nil, false, nil
 		}
-		values, remaining = cur.popListValues(count, left)
+		list, err := listOf(cur)
+		if err != nil || list.empty() {
+			return nil, false, err
+		}
+		values, remaining = list.popValues(count, left)
 		return cur, true, nil
 	})
 	if len(values) > 0 && remaining > 0 {
@@ -354,16 +362,17 @@ func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
 // ListRange returns an inclusive range of values from the list stored at key.
 func (s *Store) ListRange(key string, start, stop int64) ([][]byte, error) {
 	values, found, err := readKey(s, key, func(value *ValueObject) ([][]byte, error) {
-		list, err := value.ListValue()
+		list, err := listOf(value)
 		if err != nil {
 			return nil, err
 		}
 
-		from, to, ok := normalizeListRange(len(list), start, stop)
+		live := list.live()
+		from, to, ok := normalizeListRange(len(live), start, stop)
 		if !ok {
 			return [][]byte{}, nil
 		}
-		return cloneList(list[from : to+1]), nil
+		return cloneList(live[from : to+1]), nil
 	})
 	if err != nil {
 		return nil, err
@@ -642,16 +651,8 @@ func (s *Store) imageLocked(now int64) *Image {
 			entry := imageEntry{key: key, kind: value.Kind, expiresAt: value.ExpiresAt}
 			if value.data != nil {
 				entry.data = value.data.image(&a)
-			}
-			switch value.Kind {
-			case ValueKindString:
+			} else {
 				entry.str = a.bytes(value.String)
-			case ValueKindList:
-				list := value.liveList()
-				entry.list = make([][]byte, len(list))
-				for j, item := range list {
-					entry.list[j] = a.bytes(item)
-				}
 			}
 
 			entries = append(entries, entry)
@@ -850,25 +851,13 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 
 	length, evicted, err := mutateKey(s, key, ValueKindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			cur = newListValue(nil, 0)
+			cur = newKindValue(&listValue{})
 		}
-		full, head := cur.List, int(cur.ListHead) // the array the list lives in, and the dead slots ahead of it
-		list := full[head:]
-		additions := cloneList(values)
-		if left {
-			full, head = prependList(full, head, list, additions)
-		} else {
-			grown := append(list, additions...)
-			if len(list) > 0 && &grown[0] == &list[0] {
-				// It fitted: the list still lives in the same array, and so do the
-				// dead slots ahead of it.
-				full = full[:head+len(grown)]
-			} else {
-				full, head = grown, 0
-			}
+		list, err := listOf(cur)
+		if err != nil {
+			return nil, 0, err
 		}
-		cur.List, cur.ListHead = full, int32(head)
-		return cur, int64(len(full) - head), nil
+		return cur, int64(list.push(cloneList(values), left)), nil
 	})
 	if err != nil {
 		return 0, nil, err
@@ -876,32 +865,6 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 
 	s.wakeNextListWaiter(key)
 	return length, evicted, nil
-}
-
-// prependList puts additions in front of list, the last addition first, and
-// returns the array the result lives in and how many dead slots precede it. full
-// and head describe where list currently lives (see ValueObject.liveList); full
-// is nil when there is nothing to reuse. When the dead slots ahead of list are
-// enough it fills them and copies nothing. Otherwise it moves the list into a new
-// array with as much headroom as the list has values, so pushing to the front
-// copies the list once per doubling instead of once per push.
-func prependList(full [][]byte, head int, list, additions [][]byte) ([][]byte, int) {
-	k := len(additions)
-	if head >= k {
-		start := head - k
-		for i, item := range additions {
-			full[start+k-1-i] = item
-		}
-		return full, start
-	}
-
-	headroom := min(len(list), math.MaxInt32-k)
-	grown := make([][]byte, headroom+k+len(list))
-	for i, item := range additions {
-		grown[headroom+k-1-i] = item
-	}
-	copy(grown[headroom+k:], list)
-	return grown, headroom
 }
 
 func normalizeListRange(length int, start, stop int64) (int, int, bool) {

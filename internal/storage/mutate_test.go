@@ -243,7 +243,8 @@ func describeValueForTest(store *Store, key string) string {
 	case ValueKindString:
 		fmt.Fprintf(&b, "%q", v.String)
 	case ValueKindList:
-		fmt.Fprintf(&b, "%q", v.liveList())
+		list, _ := listOf(v)
+		fmt.Fprintf(&b, "%q", list.live())
 	case ValueKindHash:
 		hash, _ := hashOf(v)
 		entries := hash.entries()

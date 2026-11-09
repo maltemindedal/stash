@@ -13,7 +13,9 @@ func TestValueObjectAccessorsRejectWrongKinds(t *testing.T) {
 		name   string
 		access func(*ValueObject) error
 	}{
-		{name: "ListValue", access: func(v *ValueObject) error { _, err := v.ListValue(); return err }},
+		{name: "listOf", access: func(v *ValueObject) error { _, err := listOf(v); return err }},
+		{name: "hashOf", access: func(v *ValueObject) error { _, err := hashOf(v); return err }},
+		{name: "setOf", access: func(v *ValueObject) error { _, err := setOf(v); return err }},
 		{name: "zsetOf", access: func(v *ValueObject) error { _, err := zsetOf(v); return err }},
 		{name: "streamOf", access: func(v *ValueObject) error { _, err := streamOf(v); return err }},
 	}
@@ -88,8 +90,8 @@ func TestAWriteStampsTheValueItCreatesWithTheStoreClock(t *testing.T) {
 		{name: "INCR (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.Increment(key); return err }},
 		{name: "SETBIT (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.SetBit(key, 9, 1); return err }},
 		{name: "PFADD (newOwnedStringValue)", write: func(s *Store) error { _, _, err := s.PFAdd(key, bulk("a")); return err }},
-		{name: "LPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.LeftPush(key, bulk("a")); return err }},
-		{name: "RPUSH (newListValue)", write: func(s *Store) error { _, _, err := s.RightPush(key, bulk("a")); return err }},
+		{name: "LPUSH (a new list)", write: func(s *Store) error { _, _, err := s.LeftPush(key, bulk("a")); return err }},
+		{name: "RPUSH (a new list)", write: func(s *Store) error { _, _, err := s.RightPush(key, bulk("a")); return err }},
 		{name: "HSET of a short value (a compact hash)", write: hset("f", "v")},
 		{name: "HSET of a long value (a table hash)", write: hset("f", long)},
 		{name: "SADD of an integer (an integer set)", write: func(s *Store) error { _, _, err := s.SAdd(key, bulk("1")); return err }},
