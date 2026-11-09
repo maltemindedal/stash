@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 )
 
@@ -103,7 +104,11 @@ func TestPipelinedRepliesArriveBeforeABlockingCommandBlocks(t *testing.T) {
 }
 
 func TestPipelinedRepliesAreAllDeliveredWhenTheClientClosesItsSendSide(t *testing.T) {
-	addr, cancel, errCh := startTestServer(t, defaultTestConfig())
+	forEachNetworkingMode(t, defaultTestConfig(), testPipelinedRepliesAreAllDeliveredWhenTheClientClosesItsSendSide)
+}
+
+func testPipelinedRepliesAreAllDeliveredWhenTheClientClosesItsSendSide(t *testing.T, cfg config.Config) {
+	addr, cancel, errCh := startTestServer(t, cfg)
 	defer func() {
 		cancel()
 		waitForServerStop(t, errCh)
@@ -142,4 +147,33 @@ func TestPipelinedRepliesAreAllDeliveredWhenTheClientClosesItsSendSide(t *testin
 	if want := strings.Repeat("+PONG\r\n", requests); got.String() != want {
 		t.Fatalf("received %d bytes, want %d replies (%d bytes) after the client half-closed", got.Len(), requests, len(want))
 	}
+}
+
+func TestPipelinedRequestsAreAnsweredInOrder(t *testing.T) {
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		addr, stop, errCh := startTestServer(t, cfg)
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
+
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		defer closeTestResource(t, conn)
+		parser := protocol.NewParser(conn)
+
+		// A pipeline sent in one burst, whose last frame arrives in two writes.
+		pipeline := "*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfo"
+		if _, err := conn.Write([]byte(pipeline)); err != nil {
+			t.Fatalf("Write(pipeline) error = %v", err)
+		}
+		assertValuesEqual(t, readReplyWithin(t, conn, parser, 3*time.Second, "reply to PING"), protocol.SimpleString{Value: "PONG"})
+		assertValuesEqual(t, readReplyWithin(t, conn, parser, 3*time.Second, "reply to SET"), protocol.SimpleString{Value: "OK"})
+		if _, err := conn.Write([]byte("o\r\n")); err != nil {
+			t.Fatalf("Write(pipeline tail) error = %v", err)
+		}
+		assertValuesEqual(t, readReplyWithin(t, conn, parser, 3*time.Second, "reply to GET"), protocol.BulkString{Data: []byte("bar")})
+	})
 }
