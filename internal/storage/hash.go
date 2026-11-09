@@ -2,11 +2,10 @@ package storage
 
 // HSet assigns one or more field/value pairs on the hash stored at key and
 // returns the number of newly created fields. Existing fields are overwritten.
-// When maxmemory is configured it first frees space and reports the keys
-// evicted to make room; otherwise it evicts nothing.
-func (s *Store) HSet(changes Changes, key string, pairs []HashFieldValue) (int64, []string, error) {
+// When maxmemory is configured it first evicts keys to make room.
+func (s *Store) HSet(changes Changes, key string, pairs []HashFieldValue) (int64, error) {
 	if len(pairs) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
 	return mutateKey(s, changes, key, ValueKindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
@@ -50,7 +49,7 @@ func (s *Store) HDel(changes Changes, key string, fields []string) (int64, error
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, changes, key, ValueKindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, err := mutateKey(s, changes, key, ValueKindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			return nil, 0, errUnchanged
 		}

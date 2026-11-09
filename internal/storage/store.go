@@ -152,6 +152,8 @@ func (s *Store) acquireEvictionGuard() func() {
 type removals struct {
 	// expired are active TTL evictions: keys a sweep found past their deadline.
 	expired []string
+	// evicted are memory-pressure evictions: keys removed to make room.
+	evicted []string
 }
 
 // noteExpiredLocked adds keys a sweep removed to what the caller's hold of
@@ -161,8 +163,8 @@ func (s *Store) noteExpiredLocked(keys []string) {
 }
 
 // writeUnlockAllShardsAndReport releases every shard write lock and then tells
-// changes which keys the hold swept. Without a Changes, the expiration listener
-// hears of them.
+// changes which keys the hold swept and which it evicted to make room. Without
+// a Changes, the expiration listener hears of the swept keys.
 func (s *Store) writeUnlockAllShardsAndReport(changes Changes) {
 	removed := s.removed
 	s.removed = removals{}
@@ -173,6 +175,9 @@ func (s *Store) writeUnlockAllShardsAndReport(changes Changes) {
 	}
 	for _, key := range removed.expired {
 		changes.KeyChanged(key, Expired)
+	}
+	for _, key := range removed.evicted {
+		changes.KeyChanged(key, MemoryEvicted)
 	}
 }
 
@@ -194,9 +199,8 @@ func (s *Store) publishExpired(keys []string) {
 }
 
 // Set stores a byte slice under the provided key. When maxmemory is configured
-// it first frees space and reports the keys evicted to make room; otherwise it
-// evicts nothing.
-func (s *Store) Set(changes Changes, key string, value []byte, expiresAt int64) ([]string, error) {
+// it first evicts keys to make room.
+func (s *Store) Set(changes Changes, key string, value []byte, expiresAt int64) error {
 	return replaceKey(s, changes, key, newStringValue(value, expiresAt))
 }
 
@@ -232,7 +236,7 @@ func (s *Store) withStringValue(key string, fn func(data []byte) error) (bool, e
 // Delete removes a key from the store and reports whether it held a live value.
 func (s *Store) Delete(changes Changes, key string) bool {
 	// A mutation that accepts every kind and never fails cannot return an error.
-	deleted, _, _ := mutateKey(s, changes, key, anyKind, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	deleted, _ := mutateKey(s, changes, key, anyKind, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil {
 			return nil, false, errUnchanged
 		}
@@ -258,15 +262,14 @@ func (s *Store) DeleteMany(changes Changes, keys []string) []string {
 }
 
 // Increment atomically increments the string value stored at key by one. When
-// maxmemory is configured it first frees space and reports the keys evicted to
-// make room; otherwise it evicts nothing.
-func (s *Store) Increment(changes Changes, key string) (int64, []string, error) {
-	return mutateString(s, changes, key, func(w stringWrite) (int64, []string, error) {
+// maxmemory is configured it first evicts keys to make room.
+func (s *Store) Increment(changes Changes, key string) (int64, error) {
+	return mutateString(s, changes, key, func(w stringWrite) (int64, error) {
 		parsed := int64(0)
 		if current, ok := w.Current(); ok {
 			n, err := strconv.ParseInt(string(current), 10, 64)
 			if err != nil || n == math.MaxInt64 {
-				return 0, nil, ErrValueNotInteger
+				return 0, ErrValueNotInteger
 			}
 			parsed = n
 		}
@@ -274,26 +277,26 @@ func (s *Store) Increment(changes Changes, key string) (int64, []string, error) 
 
 		var digits [20]byte // the longest int64, with its sign
 		next := strconv.AppendInt(digits[:0], parsed, 10)
-		payload, evicted, err := w.Payload(len(next))
+		payload, err := w.Payload(len(next))
 		if err != nil {
-			return 0, nil, err
+			return 0, err
 		}
 		copy(payload, next)
-		return parsed, evicted, nil
+		return parsed, nil
 	})
 }
 
 // LeftPush prepends one or more values to the list stored at key and returns
-// the new length. When maxmemory is configured it first frees space and reports
-// the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) LeftPush(changes Changes, key string, values [][]byte) (int64, []string, error) {
+// the new length. When maxmemory is configured it first evicts keys to make
+// room.
+func (s *Store) LeftPush(changes Changes, key string, values [][]byte) (int64, error) {
 	return s.pushList(changes, key, values, true)
 }
 
 // RightPush appends one or more values to the list stored at key and returns
-// the new length. When maxmemory is configured it first frees space and reports
-// the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) RightPush(changes Changes, key string, values [][]byte) (int64, []string, error) {
+// the new length. When maxmemory is configured it first evicts keys to make
+// room.
+func (s *Store) RightPush(changes Changes, key string, values [][]byte) (int64, error) {
 	return s.pushList(changes, key, values, false)
 }
 
@@ -316,7 +319,7 @@ func (s *Store) popOne(changes Changes, key string, left bool) ([]byte, bool, er
 	// carrying them was copied on every return and made a pop over 10% slower.
 	var item []byte
 	remaining := 0
-	ok, _, err := mutateKey(s, changes, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, err := mutateKey(s, changes, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil || len(cur.liveList()) == 0 {
 			return nil, false, errUnchanged
 		}
@@ -356,7 +359,7 @@ func (s *Store) popN(changes Changes, key string, count int, left bool) ([][]byt
 	// As in popOne, the values and the count left come back through variables.
 	var values [][]byte
 	remaining := 0
-	ok, _, err := mutateKey(s, changes, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, err := mutateKey(s, changes, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil || len(cur.liveList()) == 0 {
 			return nil, false, errUnchanged
 		}
@@ -396,11 +399,11 @@ func (s *Store) ListRange(key string, start, stop int64) ([][]byte, error) {
 }
 
 // ZAdd inserts or updates one or more sorted-set members and returns the number
-// of newly added members. When maxmemory is configured it first frees space and
-// reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) ZAdd(changes Changes, key string, entries []ZSetEntry) (int64, []string, error) {
+// of newly added members. When maxmemory is configured it first evicts keys to
+// make room.
+func (s *Store) ZAdd(changes Changes, key string, entries []ZSetEntry) (int64, error) {
 	if len(entries) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
 	return mutateKey(s, changes, key, ValueKindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
@@ -488,11 +491,10 @@ func (s *Store) ZRangeByScores(key string, scoreRanges ...ScoreRange) ([]ZSetRan
 }
 
 // XAdd appends a new stream entry to the stream stored at key and returns its
-// ID. When maxmemory is configured it first frees space and reports the keys
-// evicted to make room; otherwise it evicts nothing.
-func (s *Store) XAdd(changes Changes, key, rawID string, values [][]byte) (string, []string, error) {
+// ID. When maxmemory is configured it first evicts keys to make room.
+func (s *Store) XAdd(changes Changes, key, rawID string, values [][]byte) (string, error) {
 	if len(values) == 0 || len(values)%2 != 0 {
-		return "", nil, ErrSyntax
+		return "", ErrSyntax
 	}
 
 	return mutateKey(s, changes, key, ValueKindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
@@ -935,12 +937,12 @@ func cloneList(items [][]byte) [][]byte {
 	return cloned
 }
 
-func (s *Store) pushList(changes Changes, key string, values [][]byte, left bool) (int64, []string, error) {
+func (s *Store) pushList(changes Changes, key string, values [][]byte, left bool) (int64, error) {
 	if len(values) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
-	length, evicted, err := mutateKey(s, changes, key, ValueKindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	length, err := mutateKey(s, changes, key, ValueKindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			cur = newListValue(nil, 0)
 		}
@@ -963,11 +965,11 @@ func (s *Store) pushList(changes Changes, key string, values [][]byte, left bool
 		return cur, int64(len(full) - head), nil
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 
 	s.wakeNextListWaiter(key)
-	return length, evicted, nil
+	return length, nil
 }
 
 // prependList puts additions in front of list, the last addition first, and

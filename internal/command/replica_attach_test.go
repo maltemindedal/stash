@@ -140,7 +140,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 			}
 			if tt.fullResyncs {
 				snapshot := storage.NewStore()
-				if _, err := snapshot.Set(nil, "expired", []byte("v"), 1); err != nil { // a TTL deadline long past
+				if err := snapshot.Set(nil, "expired", []byte("v"), 1); err != nil { // a TTL deadline long past
 					t.Fatalf("Set() error = %v", err)
 				}
 				run(func(int) bool {

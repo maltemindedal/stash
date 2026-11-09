@@ -32,6 +32,15 @@ func (h *heardChanges) KeyChanged(key string, cause Cause) {
 	}
 }
 
+// evictedKeys is a Changes that keeps the keys a write evicted to make room.
+type evictedKeys []string
+
+func (e *evictedKeys) KeyChanged(key string, cause Cause) {
+	if cause == MemoryEvicted {
+		*e = append(*e, key)
+	}
+}
+
 func bytesOf(values ...string) [][]byte {
 	out := make([][]byte, len(values))
 	for i, value := range values {
@@ -49,22 +58,22 @@ var storeWrites = []struct {
 	write     func(s *Store, changes Changes) error
 	unchanged bool
 }{
-	{name: "Set", write: func(s *Store, c Changes) error { _, err := s.Set(c, "k", []byte("v"), 0); return err }},
-	{name: "SetBit", write: func(s *Store, c Changes) error { _, _, err := s.SetBit(c, "k", 7, 1); return err }},
-	{name: "PFAdd", write: func(s *Store, c Changes) error { _, _, err := s.PFAdd(c, "k", bytesOf("a")); return err }},
-	{name: "Increment", write: func(s *Store, c Changes) error { _, _, err := s.Increment(c, "k"); return err }},
-	{name: "LeftPush", write: func(s *Store, c Changes) error { _, _, err := s.LeftPush(c, "k", bytesOf("a")); return err }},
-	{name: "RightPush", write: func(s *Store, c Changes) error { _, _, err := s.RightPush(c, "k", bytesOf("a")); return err }},
+	{name: "Set", write: func(s *Store, c Changes) error { err := s.Set(c, "k", []byte("v"), 0); return err }},
+	{name: "SetBit", write: func(s *Store, c Changes) error { _, err := s.SetBit(c, "k", 7, 1); return err }},
+	{name: "PFAdd", write: func(s *Store, c Changes) error { _, err := s.PFAdd(c, "k", bytesOf("a")); return err }},
+	{name: "Increment", write: func(s *Store, c Changes) error { _, err := s.Increment(c, "k"); return err }},
+	{name: "LeftPush", write: func(s *Store, c Changes) error { _, err := s.LeftPush(c, "k", bytesOf("a")); return err }},
+	{name: "RightPush", write: func(s *Store, c Changes) error { _, err := s.RightPush(c, "k", bytesOf("a")); return err }},
 	{name: "ZAdd", write: func(s *Store, c Changes) error {
-		_, _, err := s.ZAdd(c, "k", []ZSetEntry{{Member: []byte("a"), Score: 1}})
+		_, err := s.ZAdd(c, "k", []ZSetEntry{{Member: []byte("a"), Score: 1}})
 		return err
 	}},
-	{name: "XAdd", write: func(s *Store, c Changes) error { _, _, err := s.XAdd(c, "k", "1-1", bytesOf("f", "v")); return err }},
+	{name: "XAdd", write: func(s *Store, c Changes) error { _, err := s.XAdd(c, "k", "1-1", bytesOf("f", "v")); return err }},
 	{name: "HSet", write: func(s *Store, c Changes) error {
-		_, _, err := s.HSet(c, "k", []HashFieldValue{{Field: "f", Value: []byte("v")}})
+		_, err := s.HSet(c, "k", []HashFieldValue{{Field: "f", Value: []byte("v")}})
 		return err
 	}},
-	{name: "SAdd", write: func(s *Store, c Changes) error { _, _, err := s.SAdd(c, "k", bytesOf("a")); return err }},
+	{name: "SAdd", write: func(s *Store, c Changes) error { _, err := s.SAdd(c, "k", bytesOf("a")); return err }},
 
 	{name: "LeftPop", setup: pushed("k", "a", "b"), write: func(s *Store, c Changes) error { _, _, err := s.LeftPop(c, "k"); return err }},
 	{name: "LeftPop of a missing key", unchanged: true, write: func(s *Store, c Changes) error { _, _, err := s.LeftPop(c, "k"); return err }},
@@ -89,7 +98,7 @@ var storeWrites = []struct {
 func pushed(key string, values ...string) func(*testing.T, *Store) {
 	return func(t *testing.T, s *Store) {
 		t.Helper()
-		if _, _, err := s.RightPush(nil, key, bytesOf(values...)); err != nil {
+		if _, err := s.RightPush(nil, key, bytesOf(values...)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -98,7 +107,7 @@ func pushed(key string, values ...string) func(*testing.T, *Store) {
 func hashed(key, field string) func(*testing.T, *Store) {
 	return func(t *testing.T, s *Store) {
 		t.Helper()
-		if _, _, err := s.HSet(nil, key, []HashFieldValue{{Field: field, Value: []byte("v")}}); err != nil {
+		if _, err := s.HSet(nil, key, []HashFieldValue{{Field: field, Value: []byte("v")}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -107,7 +116,7 @@ func hashed(key, field string) func(*testing.T, *Store) {
 func membered(key, member string) func(*testing.T, *Store) {
 	return func(t *testing.T, s *Store) {
 		t.Helper()
-		if _, _, err := s.SAdd(nil, key, bytesOf(member)); err != nil {
+		if _, err := s.SAdd(nil, key, bytesOf(member)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -148,16 +157,16 @@ func TestAFailedWriteReportsNoChange(t *testing.T) {
 		name  string
 		write func(s *Store, changes Changes) error
 	}{
-		{name: "RightPush to a string", write: func(s *Store, c Changes) error { _, _, err := s.RightPush(c, "k", bytesOf("a")); return err }},
+		{name: "RightPush to a string", write: func(s *Store, c Changes) error { _, err := s.RightPush(c, "k", bytesOf("a")); return err }},
 		{name: "LeftPop of a string", write: func(s *Store, c Changes) error { _, _, err := s.LeftPop(c, "k"); return err }},
-		{name: "Increment of a string that is no number", write: func(s *Store, c Changes) error { _, _, err := s.Increment(c, "k"); return err }},
+		{name: "Increment of a string that is no number", write: func(s *Store, c Changes) error { _, err := s.Increment(c, "k"); return err }},
 	}
 	for _, maxMemory := range []int64{0, 1 << 20} {
 		for _, tt := range tests {
 			t.Run(fmt.Sprintf("%s, maxmemory %d", tt.name, maxMemory), func(t *testing.T) {
 				store := NewStore()
 				store.ConfigureMaxMemory(nil, maxMemory, 0)
-				if _, err := store.Set(nil, "k", []byte("text"), 0); err != nil {
+				if err := store.Set(nil, "k", []byte("text"), 0); err != nil {
 					t.Fatal(err)
 				}
 
@@ -187,7 +196,7 @@ func TestChangesAreHeardWithNoShardLockHeld(t *testing.T) {
 			if tt.setup != nil {
 				tt.setup(t, store)
 			}
-			if _, err := store.Set(nil, "stale", []byte("v"), store.deadlineAfter(time.Second)); err != nil {
+			if err := store.Set(nil, "stale", []byte("v"), store.deadlineAfter(time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			clock.advance(time.Minute)
@@ -210,7 +219,7 @@ func TestChangesAreHeardWithNoShardLockHeld(t *testing.T) {
 func TestAnAccountedWriteReportsTheKeysItsSweepRemovedAsExpired(t *testing.T) {
 	store, clock := newStoreWithManualClock()
 	store.ConfigureMaxMemory(nil, 1<<20, 0)
-	if _, err := store.Set(nil, "stale", []byte("v"), store.deadlineAfter(time.Second)); err != nil {
+	if err := store.Set(nil, "stale", []byte("v"), store.deadlineAfter(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	clock.advance(time.Minute)
@@ -218,7 +227,7 @@ func TestAnAccountedWriteReportsTheKeysItsSweepRemovedAsExpired(t *testing.T) {
 	listened := 0
 	store.SetExpirationListener(func([]string) { listened++ })
 	changes := &heardChanges{store: store}
-	if _, err := store.Set(changes, "k", []byte("v"), 0); err != nil {
+	if err := store.Set(changes, "k", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
 

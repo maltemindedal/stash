@@ -17,12 +17,11 @@ func (e *Executor) handleLPush(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
-	length, evicted, err := e.store.LeftPush(nil, key, request.Args[1:])
+	length, err := e.store.LeftPush(&request.effects, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: length}, nil
 }
 
@@ -32,12 +31,11 @@ func (e *Executor) handleRPush(ctx context.Context, request *Request) (protocol.
 	}
 
 	key := string(request.Args[0])
-	length, evicted, err := e.store.RightPush(nil, key, request.Args[1:])
+	length, err := e.store.RightPush(&request.effects, key, request.Args[1:])
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: length}, nil
 }
 
@@ -99,7 +97,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 			return server.ExecuteResult{}, server.ErrClientDisconnected
 		}
 
-		value, ok, err := e.store.LeftPop(nil, key)
+		value, ok, err := e.store.LeftPop(&request.effects, key)
 		if err != nil {
 			release()
 			e.store.UnsubscribeListPush(key, waiter)
@@ -110,7 +108,6 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		}
 		if ok {
 			e.store.UnsubscribeListPush(key, waiter)
-			e.touchWatchKeys(key)
 			result := server.SingleResponse(protocol.Array{Elements: []protocol.Value{
 				protocol.BulkString{Data: clone(request.Args[0])},
 				protocol.BulkString{Data: value},
@@ -192,9 +189,9 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 			err   error
 		)
 		if left {
-			value, ok, err = e.store.LeftPop(nil, key)
+			value, ok, err = e.store.LeftPop(&request.effects, key)
 		} else {
-			value, ok, err = e.store.RightPop(nil, key)
+			value, ok, err = e.store.RightPop(&request.effects, key)
 		}
 		if err != nil {
 			if errors.Is(err, storage.ErrWrongType) {
@@ -206,7 +203,6 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 			return protocol.BulkString{Null: true}, nil
 		}
 
-		e.touchWatchKeys(key)
 		return protocol.BulkString{Data: value}, nil
 	}
 
@@ -225,9 +221,9 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 		ok     bool
 	)
 	if left {
-		values, ok, err = e.store.LeftPopN(nil, key, count)
+		values, ok, err = e.store.LeftPopN(&request.effects, key, count)
 	} else {
-		values, ok, err = e.store.RightPopN(nil, key, count)
+		values, ok, err = e.store.RightPopN(&request.effects, key, count)
 	}
 	if err != nil {
 		if errors.Is(err, storage.ErrWrongType) {
@@ -242,9 +238,6 @@ func (e *Executor) popList(request *Request, name string, left bool) (protocol.V
 		return protocol.Array{Null: true}, nil
 	}
 
-	if count > 0 && len(values) > 0 {
-		e.touchWatchKeys(key)
-	}
 	return listResponse(values), nil
 }
 

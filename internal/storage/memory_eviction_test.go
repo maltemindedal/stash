@@ -19,7 +19,7 @@ func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
 	keys := make([]string, 20)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("key-%02d", i)
-		if _, err := store.Set(nil, keys[i], payload, 0); err != nil {
+		if err := store.Set(nil, keys[i], payload, 0); err != nil {
 			t.Fatalf("Set(%s) error = %v", keys[i], err)
 		}
 		clock.advance(time.Millisecond) // key-00 is the stalest
@@ -28,7 +28,8 @@ func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
 	limit := store.UsedMemory()
 	store.ConfigureMaxMemory(nil, limit, 1000)
 
-	evicted, err := store.Set(nil, "a-new-key", payload, 0)
+	var evicted evictedKeys
+	err := store.Set(&evicted, "a-new-key", payload, 0)
 	if err != nil {
 		t.Fatalf("Set() at the limit error = %v, want it to evict and succeed", err)
 	}
@@ -63,11 +64,11 @@ func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
 // attempt to make room, and the key keeps its old value.
 func TestStoreMaxMemoryRefusesAnImpossibleWriteWithoutEvicting(t *testing.T) {
 	store := NewStore()
-	if _, err := store.Set(nil, "target", []byte("small"), 0); err != nil {
+	if err := store.Set(nil, "target", []byte("small"), 0); err != nil {
 		t.Fatalf("Set(target) error = %v", err)
 	}
 	for i := 0; i < 10; i++ {
-		if _, err := store.Set(nil, fmt.Sprintf("bystander-%d", i), []byte("v"), 0); err != nil {
+		if err := store.Set(nil, fmt.Sprintf("bystander-%d", i), []byte("v"), 0); err != nil {
 			t.Fatalf("Set(bystander) error = %v", err)
 		}
 	}
@@ -75,7 +76,8 @@ func TestStoreMaxMemoryRefusesAnImpossibleWriteWithoutEvicting(t *testing.T) {
 	store.ConfigureMaxMemory(nil, store.UsedMemory(), 1000)
 	before := store.Len()
 
-	evicted, err := store.Set(nil, "target", []byte(strings.Repeat("y", 1<<16)), 0)
+	var evicted evictedKeys
+	err := store.Set(&evicted, "target", []byte(strings.Repeat("y", 1<<16)), 0)
 	if !errors.Is(err, ErrMemoryLimitExceeded) {
 		t.Fatalf("Set() error = %v, want ErrMemoryLimitExceeded", err)
 	}
@@ -100,15 +102,15 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	reported := make(chan []string, 4)
 	store.SetExpirationListener(func(keys []string) { reported <- keys })
 
-	if _, err := store.Set(nil, "soon", []byte("v"), clock.now()+60); err != nil {
+	if err := store.Set(nil, "soon", []byte("v"), clock.now()+60); err != nil {
 		t.Fatalf("Set(soon) error = %v", err)
 	}
-	if _, err := store.Set(nil, "later", []byte("v"), clock.now()+time.Hour.Milliseconds()); err != nil {
+	if err := store.Set(nil, "later", []byte("v"), clock.now()+time.Hour.Milliseconds()); err != nil {
 		t.Fatalf("Set(later) error = %v", err)
 	}
 
 	// Before the deadline: still there, nothing swept.
-	if _, err := store.Set(nil, "other-1", []byte("v"), 0); err != nil {
+	if err := store.Set(nil, "other-1", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-1) error = %v", err)
 	}
 	select {
@@ -121,7 +123,7 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	}
 
 	clock.advance(90 * time.Millisecond)
-	if _, err := store.Set(nil, "other-2", []byte("v"), 0); err != nil {
+	if err := store.Set(nil, "other-2", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-2) error = %v", err)
 	}
 	select {
@@ -153,21 +155,21 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 		{
 			name: "INCR that adds a digit",
 			write: func(store *Store, key string) error {
-				_, _, err := store.Increment(nil, key)
+				_, err := store.Increment(nil, key)
 				return err
 			},
 		},
 		{
 			name: "SETBIT past the end",
 			write: func(store *Store, key string) error {
-				_, _, err := store.SetBit(nil, key, 15, 1)
+				_, err := store.SetBit(nil, key, 15, 1)
 				return err
 			},
 		},
 		{
 			name: "SET to a longer value with a TTL",
 			write: func(store *Store, key string) error {
-				_, err := store.Set(nil, key, []byte("longer"), store.deadlineAfter(time.Hour))
+				err := store.Set(nil, key, []byte("longer"), store.deadlineAfter(time.Hour))
 				return err
 			},
 		},
@@ -216,7 +218,7 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 			key = candidate
 		}
 	}
-	if _, err := store.Set(nil, key, []byte("9"), store.deadlineAfter(time.Hour)); err != nil {
+	if err := store.Set(nil, key, []byte("9"), store.deadlineAfter(time.Hour)); err != nil {
 		t.Fatalf("Set(%s) error = %v", key, err)
 	}
 
@@ -248,7 +250,7 @@ func TestStoreExpiryLowerBound(t *testing.T) {
 	soon := store.deadlineAfter(time.Hour)
 	later := soon + 60_000
 
-	if _, err := store.Set(nil, "off", []byte("v"), soon); err != nil {
+	if err := store.Set(nil, "off", []byte("v"), soon); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	if got := store.nextExpiry.Load(); got != 0 {
@@ -259,14 +261,14 @@ func TestStoreExpiryLowerBound(t *testing.T) {
 	if got := store.nextExpiry.Load(); got != soon {
 		t.Fatalf("nextExpiry = %d after enabling maxmemory, want the exact earliest deadline %d", got, soon)
 	}
-	if _, err := store.Set(nil, "later", []byte("v"), later); err != nil {
+	if err := store.Set(nil, "later", []byte("v"), later); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	if got := store.nextExpiry.Load(); got != soon {
 		t.Fatalf("nextExpiry = %d after storing a later deadline, want it unchanged at %d", got, soon)
 	}
 	earlier := soon - 1000
-	if _, err := store.Set(nil, "earlier", []byte("v"), earlier); err != nil {
+	if err := store.Set(nil, "earlier", []byte("v"), earlier); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	if got := store.nextExpiry.Load(); got != earlier {
@@ -291,7 +293,7 @@ func TestAccountedInsertsDoNotScanTheKeyspace(t *testing.T) {
 	store := NewStore()
 	value := []byte("value-of-about-thirty-two-bytes!")
 	for i := 0; i < 100_000; i++ {
-		if _, err := store.Set(nil, fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+		if err := store.Set(nil, fmt.Sprintf("seed-%d", i), value, 0); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 	}
@@ -299,7 +301,7 @@ func TestAccountedInsertsDoNotScanTheKeyspace(t *testing.T) {
 
 	start := time.Now()
 	for i := 0; i < 300; i++ {
-		if _, err := store.Set(nil, fmt.Sprintf("new-%d", i), value, 0); err != nil {
+		if err := store.Set(nil, fmt.Sprintf("new-%d", i), value, 0); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 	}

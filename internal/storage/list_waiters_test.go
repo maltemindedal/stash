@@ -174,7 +174,7 @@ func rightPush(t *testing.T, s *Store, key string, values ...string) {
 	for _, value := range values {
 		elements = append(elements, []byte(value))
 	}
-	if _, _, err := s.RightPush(nil, key, elements); err != nil {
+	if _, err := s.RightPush(nil, key, elements); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 }

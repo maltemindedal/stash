@@ -25,7 +25,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 				payload := []byte("hello")
-				_, _ = store.Set(nil, "greeting", payload, 0)
+				_ = store.Set(nil, "greeting", payload, 0)
 				payload[0] = 'H'
 
 				got, ok, err := store.Get("greeting")
@@ -44,7 +44,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Get returns defensive copy",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "greeting", []byte("hello"), 0)
+				_ = store.Set(nil, "greeting", []byte("hello"), 0)
 
 				got, ok, err := store.Get("greeting")
 				if err != nil {
@@ -72,7 +72,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Get passively evicts expired key",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "expired", []byte("value"), store.deadlineAfter(-time.Millisecond))
+				_ = store.Set(nil, "expired", []byte("value"), store.deadlineAfter(-time.Millisecond))
 
 				if _, ok, err := store.Get("expired"); err != nil {
 					t.Fatalf("Get() error = %v", err)
@@ -88,7 +88,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Delete treats expired key as absent",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "expired", []byte("value"), store.deadlineAfter(-time.Millisecond))
+				_ = store.Set(nil, "expired", []byte("value"), store.deadlineAfter(-time.Millisecond))
 
 				if ok := store.Delete(nil, "expired"); ok {
 					t.Fatal("Delete() ok = true, want false for expired key")
@@ -103,7 +103,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 
-				first, _, err := store.Increment(nil, "counter")
+				first, err := store.Increment(nil, "counter")
 				if err != nil {
 					t.Fatalf("Increment() first error = %v", err)
 				}
@@ -111,7 +111,7 @@ func TestStoreValueBehavior(t *testing.T) {
 					t.Fatalf("Increment() first = %d, want 1", first)
 				}
 
-				second, _, err := store.Increment(nil, "counter")
+				second, err := store.Increment(nil, "counter")
 				if err != nil {
 					t.Fatalf("Increment() second error = %v", err)
 				}
@@ -124,9 +124,9 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Increment rejects non-integer strings",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "counter", []byte("hello"), 0)
+				_ = store.Set(nil, "counter", []byte("hello"), 0)
 
-				if _, _, err := store.Increment(nil, "counter"); !errors.Is(err, ErrValueNotInteger) {
+				if _, err := store.Increment(nil, "counter"); !errors.Is(err, ErrValueNotInteger) {
 					t.Fatalf("Increment() error = %v, want ErrValueNotInteger", err)
 				}
 			},
@@ -135,7 +135,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Get rejects list values with wrong type",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.LeftPush(nil, "numbers", [][]byte{[]byte("one")}); err != nil {
+				if _, err := store.LeftPush(nil, "numbers", [][]byte{[]byte("one")}); err != nil {
 					t.Fatalf("LeftPush() error = %v", err)
 				}
 
@@ -149,7 +149,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 
-				previous, _, err := store.SetBit(nil, "bitmap", 16, 1)
+				previous, err := store.SetBit(nil, "bitmap", 16, 1)
 				if err != nil {
 					t.Fatalf("SetBit() error = %v", err)
 				}
@@ -192,11 +192,11 @@ func TestStoreValueBehavior(t *testing.T) {
 				for _, maxMemory := range []int64{0, 1 << 30} {
 					store.ConfigureMaxMemory(nil, maxMemory, 16)
 					deadline := store.deadlineAfter(time.Hour)
-					if _, err := store.Set(nil, "bitmap", []byte("ab"), deadline); err != nil {
+					if err := store.Set(nil, "bitmap", []byte("ab"), deadline); err != nil {
 						t.Fatalf("Set() error = %v", err)
 					}
 
-					if _, _, err := store.SetBit(nil, "bitmap", 31, 1); err != nil {
+					if _, err := store.SetBit(nil, "bitmap", 31, 1); err != nil {
 						t.Fatalf("SetBit() with maxmemory %d error = %v", maxMemory, err)
 					}
 					if got, _, err := store.Get("bitmap"); err != nil || !bytes.Equal(got, []byte{'a', 'b', 0, 1}) {
@@ -213,10 +213,10 @@ func TestStoreValueBehavior(t *testing.T) {
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
 
-				if previous, _, err := store.SetBit(nil, "bitmap", 7, 1); err != nil || previous != 0 {
+				if previous, err := store.SetBit(nil, "bitmap", 7, 1); err != nil || previous != 0 {
 					t.Fatalf("first SetBit() previous = %d, error = %v, want 0 nil", previous, err)
 				}
-				if previous, _, err := store.SetBit(nil, "bitmap", 7, 0); err != nil || previous != 1 {
+				if previous, err := store.SetBit(nil, "bitmap", 7, 0); err != nil || previous != 1 {
 					t.Fatalf("second SetBit() previous = %d, error = %v, want 1 nil", previous, err)
 				}
 			},
@@ -247,7 +247,7 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "BitCount supports inclusive and negative byte ranges",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "bitmap", []byte{0xff, 0x00, 0x0f}, 0)
+				_ = store.Set(nil, "bitmap", []byte{0xff, 0x00, 0x0f}, 0)
 
 				count, _, err := store.BitCount("bitmap", nil, nil)
 				if err != nil {
@@ -289,14 +289,14 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "Bitmap ops reject wrong value type",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.LeftPush(nil, "numbers", [][]byte{[]byte("one")}); err != nil {
+				if _, err := store.LeftPush(nil, "numbers", [][]byte{[]byte("one")}); err != nil {
 					t.Fatalf("LeftPush() error = %v", err)
 				}
 
 				if _, _, err := store.GetBit("numbers", 0); !errors.Is(err, ErrWrongType) {
 					t.Fatalf("GetBit() error = %v, want ErrWrongType", err)
 				}
-				if _, _, err := store.SetBit(nil, "numbers", 0, 1); !errors.Is(err, ErrWrongType) {
+				if _, err := store.SetBit(nil, "numbers", 0, 1); !errors.Is(err, ErrWrongType) {
 					t.Fatalf("SetBit() error = %v, want ErrWrongType", err)
 				}
 				if _, _, err := store.BitCount("numbers", nil, nil); !errors.Is(err, ErrWrongType) {
@@ -312,13 +312,13 @@ func TestStoreValueBehavior(t *testing.T) {
 				if _, _, err := store.GetBit("bitmap", -1); !errors.Is(err, ErrValueNotInteger) {
 					t.Fatalf("GetBit() error = %v, want ErrValueNotInteger", err)
 				}
-				if _, _, err := store.SetBit(nil, "bitmap", -1, 1); !errors.Is(err, ErrValueNotInteger) {
+				if _, err := store.SetBit(nil, "bitmap", -1, 1); !errors.Is(err, ErrValueNotInteger) {
 					t.Fatalf("SetBit(negative offset) error = %v, want ErrValueNotInteger", err)
 				}
-				if _, _, err := store.SetBit(nil, "bitmap", 0, 2); !errors.Is(err, ErrValueNotInteger) {
+				if _, err := store.SetBit(nil, "bitmap", 0, 2); !errors.Is(err, ErrValueNotInteger) {
 					t.Fatalf("SetBit(invalid bit) error = %v, want ErrValueNotInteger", err)
 				}
-				if _, _, err := store.SetBit(nil, "bitmap", MaxBitmapOffset+1, 1); !errors.Is(err, ErrValueNotInteger) {
+				if _, err := store.SetBit(nil, "bitmap", MaxBitmapOffset+1, 1); !errors.Is(err, ErrValueNotInteger) {
 					t.Fatalf("SetBit() error = %v, want ErrValueNotInteger", err)
 				}
 			},
@@ -327,12 +327,12 @@ func TestStoreValueBehavior(t *testing.T) {
 			name: "SetBit under accounting sets the bit, and a refused SetBit leaves the payload as it was",
 			run: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, err := store.Set(nil, "bitmap", []byte{0x00}, 0); err != nil {
+				if err := store.Set(nil, "bitmap", []byte{0x00}, 0); err != nil {
 					t.Fatalf("Set() error = %v", err)
 				}
 				store.ConfigureMaxMemory(nil, 1<<20, 16)
 
-				if _, _, err := store.SetBit(nil, "bitmap", 0, 1); err != nil {
+				if _, err := store.SetBit(nil, "bitmap", 0, 1); err != nil {
 					t.Fatalf("SetBit() error = %v", err)
 				}
 				if got, _, err := store.Get("bitmap"); err != nil || len(got) != 1 || got[0] != 0x80 {
@@ -348,7 +348,7 @@ func TestStoreValueBehavior(t *testing.T) {
 				// (TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas): a write
 				// that cannot change the value's size cannot be refused.
 				store.ConfigureMaxMemory(nil, store.UsedMemory(), 16)
-				if _, _, err := store.SetBit(nil, "bitmap", 1<<20, 1); !errors.Is(err, ErrMemoryLimitExceeded) {
+				if _, err := store.SetBit(nil, "bitmap", 1<<20, 1); !errors.Is(err, ErrMemoryLimitExceeded) {
 					t.Fatalf("SetBit() past the end at the limit error = %v, want ErrMemoryLimitExceeded", err)
 				}
 				if got, _, err := store.Get("bitmap"); err != nil || len(got) != 1 || got[0] != 0x80 {
@@ -371,7 +371,7 @@ func TestStoreValueBehavior(t *testing.T) {
 				// call failed.
 				var before, after runtime.MemStats
 				runtime.ReadMemStats(&before)
-				_, _, err := store.SetBit(nil, "bitmap", MaxBitmapOffset, 1)
+				_, err := store.SetBit(nil, "bitmap", MaxBitmapOffset, 1)
 				runtime.ReadMemStats(&after)
 
 				if !errors.Is(err, ErrMemoryLimitExceeded) {
@@ -408,7 +408,7 @@ func TestStoreAccessTracking(t *testing.T) {
 		{
 			name: "Get refreshes string last accessed",
 			write: func(store *Store, key string) error {
-				_, err := store.Set(nil, key, []byte("Stash"), 0)
+				err := store.Set(nil, key, []byte("Stash"), 0)
 				return err
 			},
 			read: func(store *Store, key string) error {
@@ -422,7 +422,7 @@ func TestStoreAccessTracking(t *testing.T) {
 		{
 			name: "ListRange refreshes list last accessed",
 			write: func(store *Store, key string) error {
-				_, _, err := store.RightPush(nil, key, [][]byte{[]byte("a"), []byte("b")})
+				_, err := store.RightPush(nil, key, [][]byte{[]byte("a"), []byte("b")})
 				return err
 			},
 			read: func(store *Store, key string) error {
@@ -433,7 +433,7 @@ func TestStoreAccessTracking(t *testing.T) {
 		{
 			name: "HGet refreshes hash last accessed even for missing fields",
 			write: func(store *Store, key string) error {
-				_, _, err := store.HSet(nil, key, []HashFieldValue{{Field: "lang", Value: []byte("go")}})
+				_, err := store.HSet(nil, key, []HashFieldValue{{Field: "lang", Value: []byte("go")}})
 				return err
 			},
 			read: func(store *Store, key string) error {
@@ -444,7 +444,7 @@ func TestStoreAccessTracking(t *testing.T) {
 		{
 			name: "SIsMember refreshes set last accessed for misses",
 			write: func(store *Store, key string) error {
-				_, _, err := store.SAdd(nil, key, [][]byte{[]byte("alpha")})
+				_, err := store.SAdd(nil, key, [][]byte{[]byte("alpha")})
 				return err
 			},
 			read: func(store *Store, key string) error {
@@ -455,7 +455,7 @@ func TestStoreAccessTracking(t *testing.T) {
 		{
 			name: "ZRange refreshes sorted set last accessed",
 			write: func(store *Store, key string) error {
-				_, _, err := store.ZAdd(nil, key, []ZSetEntry{{Member: []byte("alpha"), Score: 1}})
+				_, err := store.ZAdd(nil, key, []ZSetEntry{{Member: []byte("alpha"), Score: 1}})
 				return err
 			},
 			read: func(store *Store, key string) error {
@@ -466,7 +466,7 @@ func TestStoreAccessTracking(t *testing.T) {
 		{
 			name: "XRead refreshes stream last accessed when no newer entries exist",
 			write: func(store *Store, key string) error {
-				_, _, err := store.XAdd(nil, key, "1-0", [][]byte{[]byte("field"), []byte("value")})
+				_, err := store.XAdd(nil, key, "1-0", [][]byte{[]byte("field"), []byte("value")})
 				return err
 			},
 			read: func(store *Store, key string) error {
@@ -510,16 +510,16 @@ func TestEachStoreOperationTakesOneClockReading(t *testing.T) {
 	const key = "k"
 	a, b, c := []byte("a"), []byte("b"), []byte("c")
 
-	str := func(s *Store) error { _, err := s.Set(nil, key, []byte("9"), 0); return err }
-	list := func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{a, b, c}); return err }
+	str := func(s *Store) error { err := s.Set(nil, key, []byte("9"), 0); return err }
+	list := func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{a, b, c}); return err }
 	hash := func(s *Store) error {
-		_, _, err := s.HSet(nil, key, []HashFieldValue{{Field: "f", Value: a}, {Field: "g", Value: b}})
+		_, err := s.HSet(nil, key, []HashFieldValue{{Field: "f", Value: a}, {Field: "g", Value: b}})
 		return err
 	}
-	set := func(s *Store) error { _, _, err := s.SAdd(nil, key, [][]byte{a, b}); return err }
-	zset := func(s *Store) error { _, _, err := s.ZAdd(nil, key, []ZSetEntry{{Member: a, Score: 1}}); return err }
-	stream := func(s *Store) error { _, _, err := s.XAdd(nil, key, "1-0", [][]byte{a, b}); return err }
-	hll := func(s *Store) error { _, _, err := s.PFAdd(nil, key, [][]byte{a}); return err }
+	set := func(s *Store) error { _, err := s.SAdd(nil, key, [][]byte{a, b}); return err }
+	zset := func(s *Store) error { _, err := s.ZAdd(nil, key, []ZSetEntry{{Member: a, Score: 1}}); return err }
+	stream := func(s *Store) error { _, err := s.XAdd(nil, key, "1-0", [][]byte{a, b}); return err }
+	hll := func(s *Store) error { _, err := s.PFAdd(nil, key, [][]byte{a}); return err }
 
 	tests := []struct {
 		name  string
@@ -533,19 +533,19 @@ func TestEachStoreOperationTakesOneClockReading(t *testing.T) {
 		{name: "SISMEMBER", setup: set, read: true, op: func(s *Store) error { _, err := s.SIsMember(key, a); return err }},
 		{name: "ZRANGE", setup: zset, read: true, op: func(s *Store) error { _, err := s.ZRange(key, 0, -1); return err }},
 		{name: "XREAD", setup: stream, read: true, op: func(s *Store) error { _, err := s.XRead(key, "0"); return err }},
-		{name: "SET", setup: str, op: func(s *Store) error { _, err := s.Set(nil, key, []byte("longer"), 0); return err }},
-		{name: "INCR", setup: str, op: func(s *Store) error { _, _, err := s.Increment(nil, key); return err }},
-		{name: "SETBIT", setup: str, op: func(s *Store) error { _, _, err := s.SetBit(nil, key, 30, 1); return err }},
-		{name: "PFADD", setup: hll, op: func(s *Store) error { _, _, err := s.PFAdd(nil, key, [][]byte{b}); return err }},
-		{name: "LPUSH", setup: list, op: func(s *Store) error { _, _, err := s.LeftPush(nil, key, [][]byte{a}); return err }},
-		{name: "RPUSH", setup: list, op: func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{a}); return err }},
+		{name: "SET", setup: str, op: func(s *Store) error { err := s.Set(nil, key, []byte("longer"), 0); return err }},
+		{name: "INCR", setup: str, op: func(s *Store) error { _, err := s.Increment(nil, key); return err }},
+		{name: "SETBIT", setup: str, op: func(s *Store) error { _, err := s.SetBit(nil, key, 30, 1); return err }},
+		{name: "PFADD", setup: hll, op: func(s *Store) error { _, err := s.PFAdd(nil, key, [][]byte{b}); return err }},
+		{name: "LPUSH", setup: list, op: func(s *Store) error { _, err := s.LeftPush(nil, key, [][]byte{a}); return err }},
+		{name: "RPUSH", setup: list, op: func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{a}); return err }},
 		{name: "HSET", setup: hash, op: func(s *Store) error {
-			_, _, err := s.HSet(nil, key, []HashFieldValue{{Field: "h", Value: c}})
+			_, err := s.HSet(nil, key, []HashFieldValue{{Field: "h", Value: c}})
 			return err
 		}},
-		{name: "SADD", setup: set, op: func(s *Store) error { _, _, err := s.SAdd(nil, key, [][]byte{c}); return err }},
-		{name: "ZADD", setup: zset, op: func(s *Store) error { _, _, err := s.ZAdd(nil, key, []ZSetEntry{{Member: b, Score: 2}}); return err }},
-		{name: "XADD", setup: stream, op: func(s *Store) error { _, _, err := s.XAdd(nil, key, "*", [][]byte{a, c}); return err }},
+		{name: "SADD", setup: set, op: func(s *Store) error { _, err := s.SAdd(nil, key, [][]byte{c}); return err }},
+		{name: "ZADD", setup: zset, op: func(s *Store) error { _, err := s.ZAdd(nil, key, []ZSetEntry{{Member: b, Score: 2}}); return err }},
+		{name: "XADD", setup: stream, op: func(s *Store) error { _, err := s.XAdd(nil, key, "*", [][]byte{a, c}); return err }},
 		{name: "LPOP", setup: list, op: func(s *Store) error { _, _, err := s.LeftPop(nil, key); return err }},
 		{name: "RPOP", setup: list, op: func(s *Store) error { _, _, err := s.RightPop(nil, key); return err }},
 		{name: "LPOP with a count", setup: list, op: func(s *Store) error { _, _, err := s.LeftPopN(nil, key, 2); return err }},
@@ -601,14 +601,14 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 			name: "Set updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "name", []byte("Stash"), 0)
+				_ = store.Set(nil, "name", []byte("Stash"), 0)
 			},
 		},
 		{
 			name: "Increment updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.Increment(nil, "counter"); err != nil {
+				if _, err := store.Increment(nil, "counter"); err != nil {
 					t.Fatalf("Increment() error = %v", err)
 				}
 			},
@@ -617,7 +617,7 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 			name: "RightPush updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("build")}); err != nil {
+				if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("build")}); err != nil {
 					t.Fatalf("RightPush() error = %v", err)
 				}
 			},
@@ -626,7 +626,7 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 			name: "HSet updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.HSet(nil, "profile", []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
+				if _, err := store.HSet(nil, "profile", []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
 					t.Fatalf("HSet() error = %v", err)
 				}
 			},
@@ -635,7 +635,7 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 			name: "SAdd updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.SAdd(nil, "tags", [][]byte{[]byte("fast")}); err != nil {
+				if _, err := store.SAdd(nil, "tags", [][]byte{[]byte("fast")}); err != nil {
 					t.Fatalf("SAdd() error = %v", err)
 				}
 			},
@@ -644,7 +644,7 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 			name: "ZAdd updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
+				if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
 					t.Fatalf("ZAdd() error = %v", err)
 				}
 			},
@@ -653,7 +653,7 @@ func TestStoreMaxMemoryAccountingOnLegacyMutators(t *testing.T) {
 			name: "XAdd updates approximate usage",
 			mutate: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
+				if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
 					t.Fatalf("XAdd() error = %v", err)
 				}
 			},
@@ -680,13 +680,13 @@ func TestStoreMaxMemoryAccountingReclaimsExpiredBytesOnLegacyWrite(t *testing.T)
 	store, _ := newStoreWithManualClock()
 	store.ConfigureMaxMemory(nil, 1<<30, 16)
 
-	_, _ = store.Set(nil, "stale", []byte(strings.Repeat("x", 4096)), store.deadlineAfter(-time.Millisecond))
+	_ = store.Set(nil, "stale", []byte(strings.Repeat("x", 4096)), store.deadlineAfter(-time.Millisecond))
 	before := store.UsedMemory()
 	if before == 0 {
 		t.Fatal("UsedMemory() before expired replacement = 0, want non-zero")
 	}
 
-	if _, _, err := store.ZAdd(nil, "stale", []ZSetEntry{{Member: []byte("fresh"), Score: 1}}); err != nil {
+	if _, err := store.ZAdd(nil, "stale", []ZSetEntry{{Member: []byte("fresh"), Score: 1}}); err != nil {
 		t.Fatalf("ZAdd() error = %v", err)
 	}
 
@@ -712,7 +712,7 @@ func TestStoreDropIfStillExpired(t *testing.T) {
 			name: "reclaims a key that is still expired",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "key", []byte("stale"), store.deadlineAfter(-time.Millisecond))
+				_ = store.Set(nil, "key", []byte("stale"), store.deadlineAfter(-time.Millisecond))
 			},
 			wantFound: false,
 		},
@@ -720,7 +720,7 @@ func TestStoreDropIfStillExpired(t *testing.T) {
 			name: "keeps a key rewritten without an expiry",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "key", []byte("fresh"), 0)
+				_ = store.Set(nil, "key", []byte("fresh"), 0)
 			},
 			wantFound: true,
 			wantValue: "fresh",
@@ -729,7 +729,7 @@ func TestStoreDropIfStillExpired(t *testing.T) {
 			name: "keeps a key whose expiry moved into the future",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "key", []byte("renewed"), store.deadlineAfter(time.Hour))
+				_ = store.Set(nil, "key", []byte("renewed"), store.deadlineAfter(time.Hour))
 			},
 			wantFound: true,
 			wantValue: "renewed",
@@ -787,7 +787,7 @@ func TestStoreDropIfStillExpiredNeverReclaimsALiveKey(t *testing.T) {
 	go func() {
 		defer workers.Done()
 		for i := 0; i < 2000; i++ {
-			_, _ = store.Set(nil, "key", []byte("live"), 0)
+			_ = store.Set(nil, "key", []byte("live"), 0)
 		}
 	}()
 	go func() {
@@ -816,14 +816,14 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "Set",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				_, _ = store.Set(nil, "stale", []byte("fresh"), 0)
+				_ = store.Set(nil, "stale", []byte("fresh"), 0)
 			},
 		},
 		{
 			name: "Increment",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.Increment(nil, "stale"); err != nil {
+				if _, err := store.Increment(nil, "stale"); err != nil {
 					t.Fatalf("Increment() error = %v", err)
 				}
 			},
@@ -832,7 +832,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "LeftPush",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.LeftPush(nil, "stale", [][]byte{[]byte("job")}); err != nil {
+				if _, err := store.LeftPush(nil, "stale", [][]byte{[]byte("job")}); err != nil {
 					t.Fatalf("LeftPush() error = %v", err)
 				}
 			},
@@ -841,7 +841,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "RightPush",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.RightPush(nil, "stale", [][]byte{[]byte("job")}); err != nil {
+				if _, err := store.RightPush(nil, "stale", [][]byte{[]byte("job")}); err != nil {
 					t.Fatalf("RightPush() error = %v", err)
 				}
 			},
@@ -850,7 +850,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "SetBit",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.SetBit(nil, "stale", 0, 1); err != nil {
+				if _, err := store.SetBit(nil, "stale", 0, 1); err != nil {
 					t.Fatalf("SetBit() error = %v", err)
 				}
 			},
@@ -859,7 +859,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "HSet",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.HSet(nil, "stale", []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
+				if _, err := store.HSet(nil, "stale", []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
 					t.Fatalf("HSet() error = %v", err)
 				}
 			},
@@ -868,7 +868,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "SAdd",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.SAdd(nil, "stale", [][]byte{[]byte("fast")}); err != nil {
+				if _, err := store.SAdd(nil, "stale", [][]byte{[]byte("fast")}); err != nil {
 					t.Fatalf("SAdd() error = %v", err)
 				}
 			},
@@ -877,7 +877,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "ZAdd",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.ZAdd(nil, "stale", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
+				if _, err := store.ZAdd(nil, "stale", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
 					t.Fatalf("ZAdd() error = %v", err)
 				}
 			},
@@ -886,7 +886,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 			name: "XAdd",
 			write: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.XAdd(nil, "stale", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
+				if _, err := store.XAdd(nil, "stale", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
 					t.Fatalf("XAdd() error = %v", err)
 				}
 			},
@@ -903,7 +903,7 @@ func TestStoreMaxMemoryAccountingAfterExpiredKeyOverwrite(t *testing.T) {
 
 			store, _ := newStoreWithManualClock()
 			store.ConfigureMaxMemory(nil, 1<<30, 16)
-			_, _ = store.Set(nil, "stale", []byte(strings.Repeat("x", 4096)), store.deadlineAfter(-time.Millisecond))
+			_ = store.Set(nil, "stale", []byte(strings.Repeat("x", 4096)), store.deadlineAfter(-time.Millisecond))
 			tt.write(t, store)
 
 			if got := store.UsedMemory(); got != want {
@@ -923,7 +923,7 @@ func TestStoreMaxMemoryAccountingDropsDrainedCollections(t *testing.T) {
 			name: "LeftPop subtracts the full drained list size",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
+				if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
 					t.Fatalf("RightPush() error = %v", err)
 				}
 			},
@@ -942,7 +942,7 @@ func TestStoreMaxMemoryAccountingDropsDrainedCollections(t *testing.T) {
 			name: "RightPop subtracts the full drained list size",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
+				if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
 					t.Fatalf("RightPush() error = %v", err)
 				}
 			},
@@ -961,7 +961,7 @@ func TestStoreMaxMemoryAccountingDropsDrainedCollections(t *testing.T) {
 			name: "LeftPopN subtracts the full drained list size",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one"), []byte("two")}); err != nil {
+				if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one"), []byte("two")}); err != nil {
 					t.Fatalf("RightPush() error = %v", err)
 				}
 			},
@@ -980,7 +980,7 @@ func TestStoreMaxMemoryAccountingDropsDrainedCollections(t *testing.T) {
 			name: "RightPopN subtracts the full drained list size",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one"), []byte("two")}); err != nil {
+				if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one"), []byte("two")}); err != nil {
 					t.Fatalf("RightPush() error = %v", err)
 				}
 			},
@@ -999,7 +999,7 @@ func TestStoreMaxMemoryAccountingDropsDrainedCollections(t *testing.T) {
 			name: "HDel subtracts the full drained hash size",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.HSet(nil, "hash", []HashFieldValue{{Field: "field", Value: []byte("value")}}); err != nil {
+				if _, err := store.HSet(nil, "hash", []HashFieldValue{{Field: "field", Value: []byte("value")}}); err != nil {
 					t.Fatalf("HSet() error = %v", err)
 				}
 			},
@@ -1018,7 +1018,7 @@ func TestStoreMaxMemoryAccountingDropsDrainedCollections(t *testing.T) {
 			name: "SRem subtracts the full drained set size",
 			setup: func(t *testing.T, store *Store) {
 				t.Helper()
-				if _, _, err := store.SAdd(nil, "set", [][]byte{[]byte("member")}); err != nil {
+				if _, err := store.SAdd(nil, "set", [][]byte{[]byte("member")}); err != nil {
 					t.Fatalf("SAdd() error = %v", err)
 				}
 			},
@@ -1088,7 +1088,7 @@ func TestStoreMaxMemoryConcurrentConfiguration(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 256; i++ {
-			if _, err := store.Set(nil, "key", []byte("value"), 0); err != nil {
+			if err := store.Set(nil, "key", []byte("value"), 0); err != nil {
 				errCh <- fmt.Errorf("Set() error = %w", err)
 				return
 			}
@@ -1106,8 +1106,8 @@ func TestStoreMaxMemoryConcurrentConfiguration(t *testing.T) {
 
 func TestStoreActiveEvictionRemovesExpiredKeys(t *testing.T) {
 	store, _ := newStoreWithManualClock()
-	_, _ = store.Set(nil, "a", []byte("1"), store.deadlineAfter(-time.Millisecond))
-	_, _ = store.Set(nil, "b", []byte("2"), store.deadlineAfter(-time.Millisecond))
+	_ = store.Set(nil, "a", []byte("1"), store.deadlineAfter(-time.Millisecond))
+	_ = store.Set(nil, "b", []byte("2"), store.deadlineAfter(-time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1134,7 +1134,7 @@ func TestStoreActiveEvictionKeepsUpWithAKeyspaceFullOfExpiredKeys(t *testing.T) 
 	store, _ := newStoreWithManualClock()
 	expiredAt := store.deadlineAfter(-time.Second)
 	for i := 0; i < 50_000; i++ {
-		_, _ = store.Set(nil, "key-"+strconv.Itoa(i), []byte("v"), expiredAt)
+		_ = store.Set(nil, "key-"+strconv.Itoa(i), []byte("v"), expiredAt)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1155,7 +1155,7 @@ func TestEvictionPassRepeatsWhileMostOfTheSampleHadExpiredAndStopsAtItsBudget(t 
 	store, _ := newStoreWithManualClock()
 	expiredAt := store.deadlineAfter(-time.Second)
 	for i := 0; i < 200_000; i++ {
-		_, _ = store.Set(nil, "key-"+strconv.Itoa(i), []byte("v"), expiredAt)
+		_ = store.Set(nil, "key-"+strconv.Itoa(i), []byte("v"), expiredAt)
 	}
 
 	const budget = 20 * time.Millisecond
@@ -1178,9 +1178,9 @@ func TestEvictionPassRepeatsWhileMostOfTheSampleHadExpiredAndStopsAtItsBudget(t 
 func TestEvictionPassTakesOneSampleWhenFewKeysHaveExpired(t *testing.T) {
 	store, _ := newStoreWithManualClock()
 	for i := 0; i < 5_000; i++ {
-		_, _ = store.Set(nil, "live-"+strconv.Itoa(i), []byte("v"), 0)
+		_ = store.Set(nil, "live-"+strconv.Itoa(i), []byte("v"), 0)
 	}
-	_, _ = store.Set(nil, "dead", []byte("v"), store.deadlineAfter(-time.Second))
+	_ = store.Set(nil, "dead", []byte("v"), store.deadlineAfter(-time.Second))
 
 	// At most one key in any sample of 20 can have expired, far below the quarter
 	// that would justify sampling again.
@@ -1194,8 +1194,8 @@ func TestEvictionPassTakesOneSampleWhenFewKeysHaveExpired(t *testing.T) {
 // the DEL that reaches replicas, the AOF, and WATCH.
 func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 	store, _ := newStoreWithManualClock()
-	_, _ = store.Set(nil, "gone", []byte("1"), store.deadlineAfter(-time.Millisecond))
-	_, _ = store.Set(nil, "kept", []byte("2"), 0)
+	_ = store.Set(nil, "gone", []byte("1"), store.deadlineAfter(-time.Millisecond))
+	_ = store.Set(nil, "kept", []byte("2"), 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1224,7 +1224,7 @@ func TestStoreActiveEvictionReportsExpiredKeys(t *testing.T) {
 func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
 	store, _ := newStoreWithManualClock()
 	past := store.deadlineAfter(-time.Millisecond)
-	_, _ = store.Set(nil, "first", []byte("1"), past)
+	_ = store.Set(nil, "first", []byte("1"), past)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1248,7 +1248,7 @@ func TestStoreActiveEvictionSurvivesAPanickingListener(t *testing.T) {
 		t.Fatal("active eviction did not report the first expired key")
 	}
 
-	_, _ = store.Set(nil, "second", []byte("2"), past)
+	_ = store.Set(nil, "second", []byte("2"), past)
 	select {
 	case keys := <-reported:
 		if len(keys) != 1 || keys[0] != "second" {
@@ -1281,14 +1281,14 @@ func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
 
 	// Stored while accounting is already on, so the sweep that removes it is the
 	// one the next write runs rather than anything this one did.
-	if _, err := store.Set(nil, "stale", []byte("value"), store.deadlineAfter(-time.Minute)); err != nil {
+	if err := store.Set(nil, "stale", []byte("value"), store.deadlineAfter(-time.Minute)); err != nil {
 		t.Fatalf("Set(stale) error = %v", err)
 	}
 	if len(reported) != 0 {
 		t.Fatalf("expired keys reported = %v, want none before the key is swept", <-reported)
 	}
 
-	if _, err := store.Set(nil, "live", []byte("value"), 0); err != nil {
+	if err := store.Set(nil, "live", []byte("value"), 0); err != nil {
 		t.Fatalf("Set(live) error = %v", err)
 	}
 
@@ -1304,20 +1304,20 @@ func TestStoreAccountedWriteReportsSweptExpiredKeys(t *testing.T) {
 
 func TestStoreKeyStatsTracksMutations(t *testing.T) {
 	store, _ := newStoreWithManualClock()
-	_, _ = store.Set(nil, "name", []byte("Stash"), 0)
-	if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("build")}); err != nil {
+	_ = store.Set(nil, "name", []byte("Stash"), 0)
+	if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("build")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
-	if _, _, err := store.HSet(nil, "profile", []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
+	if _, err := store.HSet(nil, "profile", []HashFieldValue{{Field: "lang", Value: []byte("go")}}); err != nil {
 		t.Fatalf("HSet() error = %v", err)
 	}
-	if _, _, err := store.SAdd(nil, "tags", [][]byte{[]byte("fast")}); err != nil {
+	if _, err := store.SAdd(nil, "tags", [][]byte{[]byte("fast")}); err != nil {
 		t.Fatalf("SAdd() error = %v", err)
 	}
-	if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
+	if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
 		t.Fatalf("ZAdd() error = %v", err)
 	}
-	if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
+	if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
 		t.Fatalf("XAdd() error = %v", err)
 	}
 
@@ -1330,7 +1330,7 @@ func TestStoreKeyStatsTracksMutations(t *testing.T) {
 		ValueKindStream: 1,
 	})
 
-	_, _ = store.Set(nil, "name", []byte("database"), 0)
+	_ = store.Set(nil, "name", []byte("database"), 0)
 	store.Delete(nil, "jobs")
 	if _, err := store.HDel(nil, "profile", []string{"lang"}); err != nil {
 		t.Fatalf("HDel() error = %v", err)
@@ -1345,7 +1345,7 @@ func TestStoreKeyStatsTracksMutations(t *testing.T) {
 		ValueKindStream: 1,
 	})
 
-	_, _ = store.Set(nil, "soon-gone", []byte("ttl"), store.deadlineAfter(-time.Millisecond))
+	_ = store.Set(nil, "soon-gone", []byte("ttl"), store.deadlineAfter(-time.Millisecond))
 	if _, ok, err := store.Get("soon-gone"); err != nil {
 		t.Fatalf("Get() error = %v", err)
 	} else if ok {
@@ -1361,13 +1361,13 @@ func TestStoreKeyStatsTracksMutations(t *testing.T) {
 
 func TestStoreKeyStatsRecalculatesAfterReplaceWith(t *testing.T) {
 	store := NewStore()
-	_, _ = store.Set(nil, "old", []byte("value"), 0)
+	_ = store.Set(nil, "old", []byte("value"), 0)
 
 	replacement := NewStore()
-	if _, _, err := replacement.RightPush(nil, "jobs", [][]byte{[]byte("build")}); err != nil {
+	if _, err := replacement.RightPush(nil, "jobs", [][]byte{[]byte("build")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
-	if _, _, err := replacement.SAdd(nil, "tags", [][]byte{[]byte("fast")}); err != nil {
+	if _, err := replacement.SAdd(nil, "tags", [][]byte{[]byte("fast")}); err != nil {
 		t.Fatalf("SAdd() error = %v", err)
 	}
 
@@ -1396,7 +1396,7 @@ func assertKeyStats(t *testing.T, store *Store, total int, byKind map[ValueKind]
 func TestStoreSnapshotStrings(t *testing.T) {
 	t.Run("returns defensive copies for supported string keys", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set(nil, "name", []byte("Stash"), 0)
+		_ = store.Set(nil, "name", []byte("Stash"), 0)
 
 		entries, stats := store.SnapshotStrings()
 		if stats.TotalKeys != 1 {
@@ -1424,9 +1424,9 @@ func TestStoreSnapshotStrings(t *testing.T) {
 
 	t.Run("skips expired and unsupported keys", func(t *testing.T) {
 		store, _ := newStoreWithManualClock()
-		_, _ = store.Set(nil, "alive", []byte("yes"), 0)
-		_, _ = store.Set(nil, "expired", []byte("gone"), store.deadlineAfter(-time.Millisecond))
-		if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
+		_ = store.Set(nil, "alive", []byte("yes"), 0)
+		_ = store.Set(nil, "expired", []byte("gone"), store.deadlineAfter(-time.Millisecond))
+		if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
@@ -1446,8 +1446,8 @@ func TestStoreSnapshotStrings(t *testing.T) {
 func TestStoreSnapshotAll(t *testing.T) {
 	t.Run("returns defensive string copies without aliasing sibling entries", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set(nil, "first", []byte("one"), 0)
-		_, _ = store.Set(nil, "second", []byte("two"), 0)
+		_ = store.Set(nil, "first", []byte("one"), 0)
+		_ = store.Set(nil, "second", []byte("two"), 0)
 
 		entries, stats := store.SnapshotAll()
 		if stats.TotalKeys != 2 || stats.ExportedKeys != 2 {
@@ -1502,7 +1502,7 @@ func TestStoreConcurrentAccess(t *testing.T) {
 
 			key := fmt.Sprintf("key-%d", i)
 			for j := 0; j < 100; j++ {
-				_, _ = store.Set(nil, key, []byte(strconv.Itoa(j)), 0)
+				_ = store.Set(nil, key, []byte(strconv.Itoa(j)), 0)
 				if _, ok, err := store.Get(key); err != nil {
 					t.Errorf("Get(%q) error = %v", key, err)
 					return
@@ -1526,9 +1526,9 @@ func TestStoreDeleteMany(t *testing.T) {
 		store, _ := newStoreWithManualClock()
 		keys := keysInDistinctShards(t, store, 3)
 
-		_, _ = store.Set(nil, keys[0], []byte("one"), 0)
-		_, _ = store.Set(nil, keys[1], []byte("two"), 0)
-		_, _ = store.Set(nil, keys[2], []byte("stale"), store.deadlineAfter(-time.Millisecond))
+		_ = store.Set(nil, keys[0], []byte("one"), 0)
+		_ = store.Set(nil, keys[1], []byte("two"), 0)
+		_ = store.Set(nil, keys[2], []byte("stale"), store.deadlineAfter(-time.Millisecond))
 
 		removed := store.DeleteMany(nil, []string{keys[0], "missing", keys[1], keys[0], keys[2]})
 		if len(removed) != 2 {
@@ -1560,7 +1560,7 @@ func TestStoreDeleteMany(t *testing.T) {
 		store := NewStore()
 		keys := keysInDistinctShards(t, store, 4)
 		for _, key := range keys {
-			_, _ = store.Set(nil, key, []byte(key), 0)
+			_ = store.Set(nil, key, []byte(key), 0)
 		}
 
 		var wg sync.WaitGroup
@@ -1587,7 +1587,7 @@ func TestStoreListBehavior(t *testing.T) {
 	t.Run("LeftPush and RightPush preserve Redis-style ordering", func(t *testing.T) {
 		store := NewStore()
 
-		length, _, err := store.LeftPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")})
+		length, err := store.LeftPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")})
 		if err != nil {
 			t.Fatalf("LeftPush() error = %v", err)
 		}
@@ -1595,7 +1595,7 @@ func TestStoreListBehavior(t *testing.T) {
 			t.Fatalf("LeftPush() length = %d, want 2", length)
 		}
 
-		length, _, err = store.RightPush(nil, "letters", [][]byte{[]byte("c"), []byte("d")})
+		length, err = store.RightPush(nil, "letters", [][]byte{[]byte("c"), []byte("d")})
 		if err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
@@ -1621,7 +1621,7 @@ func TestStoreListBehavior(t *testing.T) {
 
 	t.Run("ListRange supports negative indexes", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.RightPush(nil, "numbers", [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}); err != nil {
+		if _, err := store.RightPush(nil, "numbers", [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
@@ -1639,7 +1639,7 @@ func TestStoreListBehavior(t *testing.T) {
 
 	t.Run("ListRange returns defensive copies", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+		if _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
@@ -1665,7 +1665,7 @@ func TestStoreListBehavior(t *testing.T) {
 
 	t.Run("LeftPop removes head and clears empty list key", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
+		if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
@@ -1685,7 +1685,7 @@ func TestStoreListBehavior(t *testing.T) {
 		store := NewStore()
 		waiter := store.SubscribeListPush("events")
 
-		if _, _, err := store.RightPush(nil, "events", [][]byte{[]byte("first")}); err != nil {
+		if _, err := store.RightPush(nil, "events", [][]byte{[]byte("first")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
@@ -1697,7 +1697,7 @@ func TestStoreListBehavior(t *testing.T) {
 
 		waiter = store.SubscribeListPush("events")
 		store.UnsubscribeListPush("events", waiter)
-		if _, _, err := store.RightPush(nil, "events", [][]byte{[]byte("second")}); err != nil {
+		if _, err := store.RightPush(nil, "events", [][]byte{[]byte("second")}); err != nil {
 			t.Fatalf("RightPush() error = %v", err)
 		}
 
@@ -1713,7 +1713,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 	t.Run("ZAdd and ZRange order by score then member", func(t *testing.T) {
 		store := NewStore()
 
-		added, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{
+		added, err := store.ZAdd(nil, "leaders", []ZSetEntry{
 			{Member: []byte("beta"), Score: 2},
 			{Member: []byte("alpha"), Score: 1},
 			{Member: []byte("aardvark"), Score: 2},
@@ -1747,11 +1747,11 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZAdd updates existing members without increasing added count", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}, {Member: []byte("beta"), Score: 2}}); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}, {Member: []byte("beta"), Score: 2}}); err != nil {
 			t.Fatalf("ZAdd() initial error = %v", err)
 		}
 
-		added, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("beta"), Score: 0.5}})
+		added, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("beta"), Score: 0.5}})
 		if err != nil {
 			t.Fatalf("ZAdd() update error = %v", err)
 		}
@@ -1773,7 +1773,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZRange supports negative indexes", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{
+		if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{
 			{Member: []byte("alpha"), Score: 1},
 			{Member: []byte("beta"), Score: 2},
 			{Member: []byte("charlie"), Score: 3},
@@ -1795,7 +1795,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZRange rejects wrong value type", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set(nil, "leaders", []byte("hello"), 0)
+		_ = store.Set(nil, "leaders", []byte("hello"), 0)
 
 		if _, err := store.ZRange("leaders", 0, -1); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("ZRange() error = %v, want ErrWrongType", err)
@@ -1822,7 +1822,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		for _, encoding := range encodings {
 			t.Run(encoding.name, func(t *testing.T) {
 				store := NewStore()
-				if _, _, err := store.ZAdd(nil, "leaders", encoding.entries); err != nil {
+				if _, err := store.ZAdd(nil, "leaders", encoding.entries); err != nil {
 					t.Fatalf("ZAdd() error = %v", err)
 				}
 
@@ -1857,7 +1857,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZRangeByScores orders equal scores by member", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{
+		if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{
 			{Member: []byte("beta"), Score: 2},
 			{Member: []byte("alpha"), Score: 2},
 			{Member: []byte("omega"), Score: 3},
@@ -1886,7 +1886,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			entries = append(entries, ZSetEntry{Member: []byte{'m', byte('0' + i)}, Score: float64(i)})
 		}
-		if _, _, err := store.ZAdd(nil, "leaders", entries); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", entries); err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
 
@@ -1923,7 +1923,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZRangeByScores rejects wrong value type", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set(nil, "leaders", []byte("hello"), 0)
+		_ = store.Set(nil, "leaders", []byte("hello"), 0)
 
 		if _, err := store.ZRangeByScores("leaders", ScoreRange{Min: 0, Max: 1}); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("ZRangeByScores() error = %v, want ErrWrongType", err)
@@ -1932,7 +1932,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZScores returns scores across encodings", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1.5}}); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1.5}}); err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
 
@@ -1948,7 +1948,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		for i := 0; i <= compactZSetMaxEntries; i++ {
 			entries = append(entries, ZSetEntry{Member: []byte{'m', byte('0' + i)}, Score: float64(i)})
 		}
-		if _, _, err := store.ZAdd(nil, "leaders", entries); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", entries); err != nil {
 			t.Fatalf("ZAdd() upgrade error = %v", err)
 		}
 
@@ -1963,7 +1963,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZScores reports missing members and keys", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("alpha"), Score: 1}}); err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
 
@@ -1985,7 +1985,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZScores rejects wrong value type", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set(nil, "leaders", []byte("hello"), 0)
+		_ = store.Set(nil, "leaders", []byte("hello"), 0)
 
 		if _, _, err := store.ZScores("leaders", [][]byte{[]byte("alpha")}); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("ZScores() error = %v, want ErrWrongType", err)
@@ -1994,9 +1994,9 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("ZAdd recreates expired key", func(t *testing.T) {
 		store, _ := newStoreWithManualClock()
-		_, _ = store.Set(nil, "leaders", []byte("stale"), store.deadlineAfter(-time.Millisecond))
+		_ = store.Set(nil, "leaders", []byte("stale"), store.deadlineAfter(-time.Millisecond))
 
-		added, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("fresh"), Score: 1}})
+		added, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("fresh"), Score: 1}})
 		if err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
@@ -2015,7 +2015,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("Small sorted set uses compact encoding across commands and snapshots", func(t *testing.T) {
 		store := NewStore()
-		added, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{
+		added, err := store.ZAdd(nil, "leaders", []ZSetEntry{
 			{Member: []byte("beta"), Score: 2},
 			{Member: []byte("alpha"), Score: 1},
 			{Member: []byte("aardvark"), Score: 2},
@@ -2031,7 +2031,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 			t.Fatalf("stored zset = %#v, want compact zset", stored)
 		}
 
-		added, _, err = store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("beta"), Score: 0.5}})
+		added, err = store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("beta"), Score: 0.5}})
 		if err != nil || added != 0 {
 			t.Fatalf("ZAdd() update = (%d, %v), want (0, nil)", added, err)
 		}
@@ -2067,7 +2067,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 			entries[i] = ZSetEntry{Member: []byte("same"), Score: float64(i)}
 		}
 
-		if _, _, err := store.ZAdd(nil, "leaders", entries); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", entries); err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
 		stored := store.valueObjectForTest("leaders")
@@ -2080,7 +2080,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		store, _ := newStoreWithManualClock()
 		for i := 0; i < compactZSetMaxEntries; i++ {
 			member := fmt.Appendf(nil, "m%d", i)
-			if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: member, Score: float64(i)}}); err != nil {
+			if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: member, Score: float64(i)}}); err != nil {
 				t.Fatalf("ZAdd() seed error = %v", err)
 			}
 		}
@@ -2089,7 +2089,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 			t.Fatal("expireKeyForTest() ok = false, want true")
 		}
 
-		added, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("overflow"), Score: 99}})
+		added, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("overflow"), Score: 99}})
 		if err != nil || added != 1 {
 			t.Fatalf("ZAdd() overflow = (%d, %v), want (1, nil)", added, err)
 		}
@@ -2111,7 +2111,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 
 	t.Run("Compact sorted set upgrades when member length exceeds threshold", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("short"), Score: 1}}); err != nil {
+		if _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("short"), Score: 1}}); err != nil {
 			t.Fatalf("ZAdd() seed error = %v", err)
 		}
 		longMember := make([]byte, compactZSetMaxMemberLen+1)
@@ -2119,7 +2119,7 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 			longMember[i] = 'x'
 		}
 
-		added, _, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: longMember, Score: 2}})
+		added, err := store.ZAdd(nil, "leaders", []ZSetEntry{{Member: longMember, Score: 2}})
 		if err != nil || added != 1 {
 			t.Fatalf("ZAdd() long member = (%d, %v), want (1, nil)", added, err)
 		}
@@ -2166,7 +2166,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 	t.Run("XAdd and XRead preserve append order and field values", func(t *testing.T) {
 		store := NewStore()
 
-		firstID, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("type"), []byte("start")})
+		firstID, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("type"), []byte("start")})
 		if err != nil {
 			t.Fatalf("XAdd() first error = %v", err)
 		}
@@ -2174,7 +2174,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 			t.Fatalf("XAdd() first ID = %q, want %q", firstID, "1-0")
 		}
 
-		secondID, _, err := store.XAdd(nil, "events", "2-0", [][]byte{[]byte("type"), []byte("finish"), []byte("user"), []byte("42")})
+		secondID, err := store.XAdd(nil, "events", "2-0", [][]byte{[]byte("type"), []byte("finish"), []byte("user"), []byte("42")})
 		if err != nil {
 			t.Fatalf("XAdd() second error = %v", err)
 		}
@@ -2235,10 +2235,10 @@ func TestStoreStreamBehavior(t *testing.T) {
 
 	t.Run("XRead supports dollar special ID and bare millisecond IDs", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("one")}); err != nil {
+		if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("one")}); err != nil {
 			t.Fatalf("XAdd() first error = %v", err)
 		}
-		if _, _, err := store.XAdd(nil, "events", "2-0", [][]byte{[]byte("field"), []byte("two")}); err != nil {
+		if _, err := store.XAdd(nil, "events", "2-0", [][]byte{[]byte("field"), []byte("two")}); err != nil {
 			t.Fatalf("XAdd() second error = %v", err)
 		}
 
@@ -2262,20 +2262,20 @@ func TestStoreStreamBehavior(t *testing.T) {
 	t.Run("XAdd rejects malformed or non monotonic IDs", func(t *testing.T) {
 		store := NewStore()
 
-		if _, _, err := store.XAdd(nil, "events", "not-an-id", [][]byte{[]byte("field"), []byte("value")}); !errors.Is(err, ErrInvalidStreamID) {
+		if _, err := store.XAdd(nil, "events", "not-an-id", [][]byte{[]byte("field"), []byte("value")}); !errors.Is(err, ErrInvalidStreamID) {
 			t.Fatalf("XAdd() invalid ID error = %v, want ErrInvalidStreamID", err)
 		}
-		if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
+		if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
 			t.Fatalf("XAdd() initial error = %v", err)
 		}
-		if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); !errors.Is(err, ErrStreamIDTooSmall) {
+		if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); !errors.Is(err, ErrStreamIDTooSmall) {
 			t.Fatalf("XAdd() non monotonic error = %v, want ErrStreamIDTooSmall", err)
 		}
 	})
 
 	t.Run("XRead rejects wrong value type", func(t *testing.T) {
 		store := NewStore()
-		_, _ = store.Set(nil, "events", []byte("plain"), 0)
+		_ = store.Set(nil, "events", []byte("plain"), 0)
 
 		if _, err := store.XRead("events", "0-0"); !errors.Is(err, ErrWrongType) {
 			t.Fatalf("XRead() error = %v, want ErrWrongType", err)
@@ -2286,7 +2286,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 		store, _ := newStoreWithManualClock()
 		store.setValueObjectForTest("events", newStreamValue(newStream(), store.deadlineAfter(-time.Millisecond)))
 
-		id, _, err := store.XAdd(nil, "events", "5-0", [][]byte{[]byte("field"), []byte("value")})
+		id, err := store.XAdd(nil, "events", "5-0", [][]byte{[]byte("field"), []byte("value")})
 		if err != nil {
 			t.Fatalf("XAdd() error = %v", err)
 		}
@@ -2316,7 +2316,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				id, _, err := store.XAdd(nil, "events", "*", [][]byte{[]byte("writer"), []byte(strconv.Itoa(i))})
+				id, err := store.XAdd(nil, "events", "*", [][]byte{[]byte("writer"), []byte(strconv.Itoa(i))})
 				if err != nil {
 					errs <- err
 					return
@@ -2376,7 +2376,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for i := 0; i < 128; i++ {
-				if _, _, err := store.XAdd(nil, "events", "*", [][]byte{[]byte("field"), []byte(strconv.Itoa(i))}); err != nil {
+				if _, err := store.XAdd(nil, "events", "*", [][]byte{[]byte("field"), []byte(strconv.Itoa(i))}); err != nil {
 					errCh <- err
 					return
 				}
@@ -2410,7 +2410,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 		store := NewStore()
 		payload := [][]byte{[]byte("field"), []byte("value")}
 
-		if _, _, err := store.XAdd(nil, "events", "1-0", payload); err != nil {
+		if _, err := store.XAdd(nil, "events", "1-0", payload); err != nil {
 			t.Fatalf("XAdd() error = %v", err)
 		}
 		payload[0][0] = 'F'
@@ -2430,7 +2430,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 
 	t.Run("XRead returns defensive copies", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
+		if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
 			t.Fatalf("XAdd() error = %v", err)
 		}
 
@@ -2468,7 +2468,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 
 	t.Run("XRead rejects malformed IDs", func(t *testing.T) {
 		store := NewStore()
-		if _, _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
+		if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("field"), []byte("value")}); err != nil {
 			t.Fatalf("XAdd() error = %v", err)
 		}
 
@@ -2480,7 +2480,7 @@ func TestStoreStreamBehavior(t *testing.T) {
 
 	t.Run("XAdd returns full millisecond sequence IDs", func(t *testing.T) {
 		store := NewStore()
-		id, _, err := store.XAdd(nil, "events", "*", [][]byte{[]byte("field"), []byte("value")})
+		id, err := store.XAdd(nil, "events", "*", [][]byte{[]byte("field"), []byte("value")})
 		if err != nil {
 			t.Fatalf("XAdd() error = %v", err)
 		}
@@ -2506,12 +2506,12 @@ func TestSnapshotAllCopiesValuesIntactAcrossArenaChunks(t *testing.T) {
 				value[i] = byte(i*31 + size + round)
 			}
 			want[key] = value
-			if _, err := store.Set(nil, key, value, 0); err != nil {
+			if err := store.Set(nil, key, value, 0); err != nil {
 				t.Fatalf("Set(%s) error = %v", key, err)
 			}
 		}
 	}
-	if _, _, err := store.RightPush(nil, "list", [][]byte{[]byte("a"), make([]byte, 5000), []byte("c")}); err != nil {
+	if _, err := store.RightPush(nil, "list", [][]byte{[]byte("a"), make([]byte, 5000), []byte("c")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 

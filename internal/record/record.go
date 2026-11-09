@@ -77,6 +77,25 @@ func (w *Write) Frames(to Dest) []protocol.Value {
 	return frames
 }
 
+// KeysPerDelete bounds how many keys one DEL the server composes names. A sweep
+// or a startup eviction can remove more keys than the append-only file's
+// loader accepts in one command (1,048,576 array elements), and such a DEL
+// made a file the server could not read back. Several bounded DELs replay to
+// the same state.
+const KeysPerDelete = 1024
+
+// AddDeletes appends the DELs of keys the server removed without a client
+// asking, each naming at most KeysPerDelete keys, to go where to says.
+func (w *Write) AddDeletes(keys []string, to Dest) {
+	for start := 0; start < len(keys); start += KeysPerDelete {
+		end := start + KeysPerDelete
+		if end > len(keys) {
+			end = len(keys)
+		}
+		w.Add(DeleteFrame(keys[start:end]), to)
+	}
+}
+
 // DeleteFrame builds the DEL command frame for keys the server removed without
 // a client asking: a memory-pressure eviction during a write, an active TTL
 // eviction, or the evictions at startup.

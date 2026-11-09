@@ -146,7 +146,7 @@ func TestEvictionsAreLoggedAfterEveryEarlierWriteOfTheEvictedKey(t *testing.T) {
 
 				scratch := storage.NewStore()
 				scratch.ConfigureMaxMemory(nil, 1<<20, 0)
-				if _, err := scratch.Set(nil, string(writer), []byte(small), 0); err != nil {
+				if err := scratch.Set(nil, string(writer), []byte(small), 0); err != nil {
 					t.Fatal(err)
 				}
 				// Room for the writer only once the victim is evicted, and for
@@ -162,31 +162,16 @@ func TestEvictionsAreLoggedAfterEveryEarlierWriteOfTheEvictedKey(t *testing.T) {
 			name: "a TTL eviction by the sweep that makes room for an accounted write",
 			evictOnNextWrite: func(t *testing.T, executor *Executor, log *holdingLog) (<-chan struct{}, func()) {
 				store := executor.store
-				// Stands in for the server's listener, which records the
-				// sweep's DEL itself.
-				swept, proceed := make(chan struct{}), make(chan struct{})
-				var once sync.Once
-				store.SetExpirationListener(func(keys []string) {
-					once.Do(func() {
-						close(swept)
-						<-proceed
-					})
-					payload, err := protocol.EncodeValues([]protocol.Value{record.DeleteFrame(keys)})
-					if err == nil {
-						_, err = log.Append(payload)
-					}
-					if err != nil {
-						t.Error(err)
-					}
-				})
-
 				store.ConfigureMaxMemory(nil, 1<<20, 0)
 				expiresAt := time.Now().UnixMilli() + 1
 				if _, err := handle(clientContext(executor), executor, requestValue("SET", string(victim), big, "PXAT", strconv.FormatInt(expiresAt, 10)), true); err != nil {
 					t.Fatal(err)
 				}
 				waitFor(t, "the victim's TTL to pass", func() bool { return time.Now().UnixMilli() > expiresAt+1 })
-				return swept, func() { close(proceed) }
+
+				// As above: the sweep's DEL follows the write's own frame.
+				log.hold = []byte("DEL")
+				return log.held, func() { close(log.released) }
 			},
 		},
 	}

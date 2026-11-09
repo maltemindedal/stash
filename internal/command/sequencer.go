@@ -37,8 +37,8 @@ import (
 // While maxmemory is set, an Accounted write (a Growing write under maxmemory)
 // also holds every stripe (writeShapeOf). Making room for it can cause a
 // Memory-pressure eviction anywhere in the keyspace, and its sweep a TTL
-// eviction, and their DELs are recorded with its own frames or through the
-// expiration listener while it runs. So it no longer commutes with a write of
+// eviction, and their DEL is recorded after its own frame, in the same write
+// (executionEffects.KeyChanged). So it no longer commutes with a write of
 // an evicted key: held to its own stripe, such a write could be applied after
 // the Eviction and still be recorded before its DEL, and replay would delete a
 // live key. Shrinking writes (DEL, the pops, HDEL, SREM) never evict or sweep,
@@ -304,6 +304,10 @@ func (e *Executor) Handle(ctx context.Context, call server.Call, value protocol.
 func (e *Executor) executeAndRecord(ctx context.Context, request *Request) (server.ExecuteResult, error) {
 	result, err := e.executeRequestDetailed(ctx, request, true)
 	if err != nil {
+		// A command that failed has no frame of its own, but its write holds
+		// the DEL of any key its sweep removed, and that of the commands an
+		// EXEC ran before it was cancelled. The reply stays the command's error.
+		e.recorder.Record(&request.write)
 		return result, err
 	}
 	return e.record(request, result)

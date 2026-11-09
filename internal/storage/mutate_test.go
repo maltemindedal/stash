@@ -29,12 +29,12 @@ type shrinkingWrite struct {
 
 func shrinkingWrites() []shrinkingWrite {
 	a, b, c := []byte("a"), []byte("b"), []byte("c")
-	list := func(s *Store, key string) error { _, _, err := s.RightPush(nil, key, [][]byte{a, b, c}); return err }
+	list := func(s *Store, key string) error { _, err := s.RightPush(nil, key, [][]byte{a, b, c}); return err }
 	hash := func(s *Store, key string) error {
-		_, _, err := s.HSet(nil, key, []HashFieldValue{{Field: "f1", Value: a}, {Field: "f2", Value: b}, {Field: "f3", Value: c}})
+		_, err := s.HSet(nil, key, []HashFieldValue{{Field: "f1", Value: a}, {Field: "f2", Value: b}, {Field: "f3", Value: c}})
 		return err
 	}
-	set := func(s *Store, key string) error { _, _, err := s.SAdd(nil, key, [][]byte{a, b, c}); return err }
+	set := func(s *Store, key string) error { _, err := s.SAdd(nil, key, [][]byte{a, b, c}); return err }
 
 	return []shrinkingWrite{
 		{name: "LPOP", setup: list, write: func(s *Store, key string) (bool, error) {
@@ -110,12 +110,15 @@ func growingWrites() []growingWrite {
 		return out
 	}
 	long := strings.Repeat("l", compactHashMaxStringSize+1) // too long for a compact hash or sorted set
-	reply := func(n int64, evicted []string, err error) (string, []string, error) {
+	// reply runs a write with a Changes that keeps the keys it evicted.
+	reply := func(write func(changes Changes) (int64, error)) (string, []string, error) {
+		var evicted evictedKeys
+		n, err := write(&evicted)
 		return strconv.FormatInt(n, 10), evicted, err
 	}
 
 	rpush := func(items ...string) func(*Store, string) error {
-		return func(s *Store, key string) error { _, _, err := s.RightPush(nil, key, bulks(items...)); return err }
+		return func(s *Store, key string) error { _, err := s.RightPush(nil, key, bulks(items...)); return err }
 	}
 	hset := func(pairs ...string) func(*Store, string) error {
 		return func(s *Store, key string) error {
@@ -123,12 +126,12 @@ func growingWrites() []growingWrite {
 			for i := 0; i < len(pairs); i += 2 {
 				fields = append(fields, HashFieldValue{Field: pairs[i], Value: []byte(pairs[i+1])})
 			}
-			_, _, err := s.HSet(nil, key, fields)
+			_, err := s.HSet(nil, key, fields)
 			return err
 		}
 	}
 	sadd := func(members ...string) func(*Store, string) error {
-		return func(s *Store, key string) error { _, _, err := s.SAdd(nil, key, bulks(members...)); return err }
+		return func(s *Store, key string) error { _, err := s.SAdd(nil, key, bulks(members...)); return err }
 	}
 	zadd := func(members ...string) func(*Store, string) error {
 		return func(s *Store, key string) error {
@@ -136,7 +139,7 @@ func growingWrites() []growingWrite {
 			for i, member := range members {
 				entries[i] = ZSetEntry{Member: []byte(member), Score: float64(i)}
 			}
-			_, _, err := s.ZAdd(nil, key, entries)
+			_, err := s.ZAdd(nil, key, entries)
 			return err
 		}
 	}
@@ -161,38 +164,55 @@ func growingWrites() []growingWrite {
 		tenMembers = append(tenMembers, "m"+strconv.Itoa(i))
 	}
 
-	lpushX := func(s *Store, key string) (string, []string, error) { return reply(s.LeftPush(nil, key, bulks("x"))) }
-	rpushX := func(s *Store, key string) (string, []string, error) { return reply(s.RightPush(nil, key, bulks("x"))) }
+	lpushX := func(s *Store, key string) (string, []string, error) {
+		return reply(func(c Changes) (int64, error) { return s.LeftPush(c, key, bulks("x")) })
+	}
+	rpushX := func(s *Store, key string) (string, []string, error) {
+		return reply(func(c Changes) (int64, error) { return s.RightPush(c, key, bulks("x")) })
+	}
 	hsetX := func(field, value string) func(*Store, string) (string, []string, error) {
 		return func(s *Store, key string) (string, []string, error) {
-			return reply(s.HSet(nil, key, []HashFieldValue{{Field: field, Value: []byte(value)}}))
+			return reply(func(c Changes) (int64, error) {
+				return s.HSet(c, key, []HashFieldValue{{Field: field, Value: []byte(value)}})
+			})
 		}
 	}
 	saddX := func(member string) func(*Store, string) (string, []string, error) {
-		return func(s *Store, key string) (string, []string, error) { return reply(s.SAdd(nil, key, bulks(member))) }
+		return func(s *Store, key string) (string, []string, error) {
+			return reply(func(c Changes) (int64, error) { return s.SAdd(c, key, bulks(member)) })
+		}
 	}
 	zaddX := func(member string) func(*Store, string) (string, []string, error) {
 		return func(s *Store, key string) (string, []string, error) {
-			return reply(s.ZAdd(nil, key, []ZSetEntry{{Member: []byte(member), Score: 0.5}}))
+			return reply(func(c Changes) (int64, error) {
+				return s.ZAdd(c, key, []ZSetEntry{{Member: []byte(member), Score: 0.5}})
+			})
 		}
 	}
 	set := func(value string) func(*Store, string) error {
-		return func(s *Store, key string) error { _, err := s.Set(nil, key, []byte(value), 0); return err }
+		return func(s *Store, key string) error { return s.Set(nil, key, []byte(value), 0) }
 	}
 	setX := func(value string) func(*Store, string) (string, []string, error) {
 		return func(s *Store, key string) (string, []string, error) {
-			evicted, err := s.Set(nil, key, []byte(value), 0)
+			var evicted evictedKeys
+			err := s.Set(&evicted, key, []byte(value), 0)
 			return "OK", evicted, err
 		}
 	}
-	incr := func(s *Store, key string) (string, []string, error) { return reply(s.Increment(nil, key)) }
+	incr := func(s *Store, key string) (string, []string, error) {
+		return reply(func(c Changes) (int64, error) { return s.Increment(c, key) })
+	}
 	setbit := func(offset, bit int64) func(*Store, string) (string, []string, error) {
-		return func(s *Store, key string) (string, []string, error) { return reply(s.SetBit(nil, key, offset, bit)) }
+		return func(s *Store, key string) (string, []string, error) {
+			return reply(func(c Changes) (int64, error) { return s.SetBit(c, key, offset, bit) })
+		}
 	}
 	pfadd := func(elements ...string) func(*Store, string) error {
-		return func(s *Store, key string) error { _, _, err := s.PFAdd(nil, key, bulks(elements...)); return err }
+		return func(s *Store, key string) error { _, err := s.PFAdd(nil, key, bulks(elements...)); return err }
 	}
-	pfaddX := func(s *Store, key string) (string, []string, error) { return reply(s.PFAdd(nil, key, bulks("x"))) }
+	pfaddX := func(s *Store, key string) (string, []string, error) {
+		return reply(func(c Changes) (int64, error) { return s.PFAdd(c, key, bulks("x")) })
+	}
 
 	return []growingWrite{
 		{name: "LPUSH", setup: rpush("a", "b", "c"), write: lpushX},
@@ -212,10 +232,14 @@ func growingWrites() []growingWrite {
 		{
 			name: "XADD",
 			setup: func(s *Store, key string) error {
-				_, _, err := s.XAdd(nil, key, "1-1", bulks("f", "v"))
+				_, err := s.XAdd(nil, key, "1-1", bulks("f", "v"))
 				return err
 			},
-			write: func(s *Store, key string) (string, []string, error) { return s.XAdd(nil, key, "2-1", bulks("f", "x")) },
+			write: func(s *Store, key string) (string, []string, error) {
+				var evicted evictedKeys
+				id, err := s.XAdd(&evicted, key, "2-1", bulks("f", "x"))
+				return id, evicted, err
+			},
 		},
 		{name: "SET of a longer value", setup: set("abc"), write: setX("abcdef"), onString: true, anyKind: true},
 		{name: "INCR that adds a digit", setup: set("9"), write: incr, onString: true},
@@ -414,10 +438,10 @@ func TestAWriteToAKeyOfAnotherKindChangesNothing(t *testing.T) {
 		}
 	}
 	for _, w := range writes {
-		check(t, w, func(s *Store) error { _, err := s.Set(nil, key, []byte("text"), 0); return err })
+		check(t, w, func(s *Store) error { err := s.Set(nil, key, []byte("text"), 0); return err })
 	}
 	for _, w := range onString {
-		check(t, w, func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{[]byte("a")}); return err })
+		check(t, w, func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{[]byte("a")}); return err })
 	}
 }
 
@@ -440,45 +464,45 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 	}{
 		{
 			name:  "LPOP of the last value",
-			setup: func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{a}); return err },
+			setup: func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{a}); return err },
 			write: func(s *Store) error { _, _, err := s.LeftPop(nil, key); return err },
 		},
 		{
 			name:  "RPOP of the last value",
-			setup: func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{a}); return err },
+			setup: func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{a}); return err },
 			write: func(s *Store) error { _, _, err := s.RightPop(nil, key); return err },
 		},
 		{
 			name:  "LPOP with a count past the end",
-			setup: func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{a, b}); return err },
+			setup: func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{a, b}); return err },
 			write: func(s *Store) error { _, _, err := s.LeftPopN(nil, key, 5); return err },
 		},
 		{
 			name:  "RPOP with a count of the list's length",
-			setup: func(s *Store) error { _, _, err := s.RightPush(nil, key, [][]byte{a, b}); return err },
+			setup: func(s *Store) error { _, err := s.RightPush(nil, key, [][]byte{a, b}); return err },
 			write: func(s *Store) error { _, _, err := s.RightPopN(nil, key, 2); return err },
 		},
 		{
 			name: "HDEL of every field of a compact hash",
 			setup: func(s *Store) error {
-				_, _, err := s.HSet(nil, key, []HashFieldValue{{Field: "f1", Value: a}, {Field: "f2", Value: b}})
+				_, err := s.HSet(nil, key, []HashFieldValue{{Field: "f1", Value: a}, {Field: "f2", Value: b}})
 				return err
 			},
 			write: func(s *Store) error { _, err := s.HDel(nil, key, []string{"f1", "f2"}); return err },
 		},
 		{
 			name:  "HDEL of every field of a hash table",
-			setup: func(s *Store) error { _, _, err := s.HSet(nil, key, tenFields); return err },
+			setup: func(s *Store) error { _, err := s.HSet(nil, key, tenFields); return err },
 			write: func(s *Store) error { _, err := s.HDel(nil, key, tenNames); return err },
 		},
 		{
 			name:  "SREM of every member of an integer set",
-			setup: func(s *Store) error { _, _, err := s.SAdd(nil, key, [][]byte{[]byte("1"), []byte("2")}); return err },
+			setup: func(s *Store) error { _, err := s.SAdd(nil, key, [][]byte{[]byte("1"), []byte("2")}); return err },
 			write: func(s *Store) error { _, err := s.SRem(nil, key, [][]byte{[]byte("1"), []byte("2")}); return err },
 		},
 		{
 			name:  "SREM of every member of a hash set",
-			setup: func(s *Store) error { _, _, err := s.SAdd(nil, key, [][]byte{a, b}); return err },
+			setup: func(s *Store) error { _, err := s.SAdd(nil, key, [][]byte{a, b}); return err },
 			write: func(s *Store) error { _, err := s.SRem(nil, key, [][]byte{a, b}); return err },
 		},
 		{
@@ -490,15 +514,15 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 				return nil
 			},
 			write: func(s *Store) error {
-				_, _, err := mutateKey(s, nil, key, ValueKindZSet, shrinks, unchanged)
+				_, err := mutateKey(s, nil, key, ValueKindZSet, shrinks, unchanged)
 				return err
 			},
 		},
 		{
 			name:  "a mutation that empties a string",
-			setup: func(s *Store) error { _, err := s.Set(nil, key, []byte("text"), 0); return err },
+			setup: func(s *Store) error { err := s.Set(nil, key, []byte("text"), 0); return err },
 			write: func(s *Store) error {
-				_, _, err := mutateKey(s, nil, key, ValueKindString, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, struct{}, error) {
+				_, err := mutateKey(s, nil, key, ValueKindString, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, struct{}, error) {
 					cur.String = cur.String[:0]
 					return cur, struct{}{}, nil
 				})
@@ -545,7 +569,7 @@ func TestWritesStampTheirKeyWithTheStoreClock(t *testing.T) {
 		shrinkingWrite{
 			name: "HDEL of a missing field",
 			setup: func(s *Store, key string) error {
-				_, _, err := s.HSet(nil, key, []HashFieldValue{{Field: "f1", Value: []byte("v")}})
+				_, err := s.HSet(nil, key, []HashFieldValue{{Field: "f1", Value: []byte("v")}})
 				return err
 			},
 			write: func(s *Store, key string) (bool, error) {
@@ -555,7 +579,7 @@ func TestWritesStampTheirKeyWithTheStoreClock(t *testing.T) {
 		},
 		shrinkingWrite{
 			name:  "SREM of a missing member",
-			setup: func(s *Store, key string) error { _, _, err := s.SAdd(nil, key, [][]byte{[]byte("a")}); return err },
+			setup: func(s *Store, key string) error { _, err := s.SAdd(nil, key, [][]byte{[]byte("a")}); return err },
 			write: func(s *Store, key string) (bool, error) {
 				_, err := s.SRem(nil, key, [][]byte{[]byte("missing")})
 				return true, err
@@ -669,7 +693,7 @@ func TestGrowingWritesEvictTheStalestKeyToMakeRoom(t *testing.T) {
 		w := w
 		t.Run(w.name, func(t *testing.T) {
 			store, clock := newStoreWithManualClock()
-			if _, err := store.Set(nil, victim, bytes.Repeat([]byte("v"), 512), 0); err != nil {
+			if err := store.Set(nil, victim, bytes.Repeat([]byte("v"), 512), 0); err != nil {
 				t.Fatalf("Set(%s) error = %v", victim, err)
 			}
 			clock.advance(time.Millisecond) // so that the victim is the stalest key
@@ -712,18 +736,18 @@ func TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas(t *testing.T) {
 	}{
 		{
 			name:  "INCR of the same length",
-			setup: func(s *Store) error { _, err := s.Set(nil, key, []byte("11"), 0); return err },
-			write: func(s *Store) error { _, _, err := s.Increment(nil, key); return err },
+			setup: func(s *Store) error { err := s.Set(nil, key, []byte("11"), 0); return err },
+			write: func(s *Store) error { _, err := s.Increment(nil, key); return err },
 		},
 		{
 			name:  "SETBIT within the string",
-			setup: func(s *Store) error { _, err := s.Set(nil, key, []byte("a"), 0); return err },
-			write: func(s *Store) error { _, _, err := s.SetBit(nil, key, 7, 0); return err },
+			setup: func(s *Store) error { err := s.Set(nil, key, []byte("a"), 0); return err },
+			write: func(s *Store) error { _, err := s.SetBit(nil, key, 7, 0); return err },
 		},
 		{
 			name:  "PFADD",
-			setup: func(s *Store) error { _, _, err := s.PFAdd(nil, key, [][]byte{[]byte("a")}); return err },
-			write: func(s *Store) error { _, _, err := s.PFAdd(nil, key, [][]byte{[]byte("b")}); return err },
+			setup: func(s *Store) error { _, err := s.PFAdd(nil, key, [][]byte{[]byte("a")}); return err },
+			write: func(s *Store) error { _, err := s.PFAdd(nil, key, [][]byte{[]byte("b")}); return err },
 		},
 	}
 
@@ -805,7 +829,7 @@ func TestShrinkingWritesLockOnlyTheirOwnShardAndNeverEvict(t *testing.T) {
 			if err := w.setup(store, key); err != nil {
 				t.Fatalf("setup error = %v", err)
 			}
-			if _, err := store.Set(nil, stale, []byte("v"), 0); err != nil {
+			if err := store.Set(nil, stale, []byte("v"), 0); err != nil {
 				t.Fatalf("Set(%s) error = %v", stale, err)
 			}
 			store.ConfigureMaxMemory(nil, 1<<30, 16)

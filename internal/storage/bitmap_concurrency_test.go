@@ -44,7 +44,7 @@ func TestSetBitConcurrentWithMaxMemoryToggle(t *testing.T) {
 			defer workers.Done()
 			key := fmt.Sprintf("bitmap-%d", id)
 			for j := 0; j < 3000; j++ {
-				if _, _, err := store.SetBit(nil, key, int64(j%1024), int64(j%2)); err != nil && !errors.Is(err, ErrMemoryLimitExceeded) {
+				if _, err := store.SetBit(nil, key, int64(j%1024), int64(j%2)); err != nil && !errors.Is(err, ErrMemoryLimitExceeded) {
 					t.Errorf("SetBit error = %v", err)
 					return
 				}

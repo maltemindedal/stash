@@ -37,7 +37,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 					switch op := rng.Intn(10); {
 					case op < 3: // LPUSH
 						values := newValues(1 + rng.Intn(3))
-						length, _, err := store.LeftPush(nil, "k", values)
+						length, err := store.LeftPush(nil, "k", values)
 						if err != nil {
 							t.Fatalf("step %d: LeftPush error = %v", step, err)
 						}
@@ -49,7 +49,7 @@ func TestListOperationsMatchSliceModel(t *testing.T) {
 						}
 					case op < 6: // RPUSH
 						values := newValues(1 + rng.Intn(3))
-						length, _, err := store.RightPush(nil, "k", values)
+						length, err := store.RightPush(nil, "k", values)
 						if err != nil {
 							t.Fatalf("step %d: RightPush error = %v", step, err)
 						}
@@ -152,7 +152,7 @@ func TestLeftPushDoesNotCopyTheList(t *testing.T) {
 	for i := range values {
 		values[i] = []byte("v")
 	}
-	if _, _, err := store.RightPush(nil, "l", values); err != nil {
+	if _, err := store.RightPush(nil, "l", values); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 	one := [][]byte{[]byte("x")}
@@ -161,7 +161,7 @@ func TestLeftPushDoesNotCopyTheList(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < rounds; i++ {
-		if _, _, err := store.LeftPush(nil, "l", one); err != nil {
+		if _, err := store.LeftPush(nil, "l", one); err != nil {
 			t.Fatalf("LeftPush() error = %v", err)
 		}
 		if _, _, err := store.LeftPop(nil, "l"); err != nil {
@@ -185,7 +185,7 @@ func TestBuildingAListWithLeftPushIsLinear(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < pushes; i++ {
-		if _, _, err := store.LeftPush(nil, "l", one); err != nil {
+		if _, err := store.LeftPush(nil, "l", one); err != nil {
 			t.Fatalf("LeftPush() error = %v", err)
 		}
 	}

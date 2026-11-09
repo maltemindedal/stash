@@ -81,7 +81,8 @@ Current responsibilities:
 - support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
 - store TTLs in Unix milliseconds
 - perform passive eviction when a read or write touches an expired key
-- perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed), reporting the keys either sweep removed through one expiration listener so the server can replicate and persist those deletions
+- perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed)
+- hand each keyspace change of a write to the `storage.Changes` its caller passed, once every shard lock is released and before the write returns: the key the write changed (`Written`, and nothing when the write succeeded without changing its key, as `HDEL` of a missing field does), each key its sweep removed (`Expired`), and each key it evicted to make room (`MemoryEvicted`). The keys an accounted write removes are collected under its hold of every shard lock, so a call hands on only what it removed itself. The background loop reports the keys it sweeps through one expiration listener
 - track approximate keyspace memory when `maxmemory` is enabled
 - evict sampled least-recently-used candidates under memory pressure
 - scan several sorted-set score ranges under one lock acquisition, so `GEORADIUS` reads only the geohash cells that cover its radius, plus two guard ranges for scores outside every cell, instead of the whole set
@@ -91,6 +92,8 @@ Current responsibilities:
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
 `command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, the server's INFO snapshot and AOF rewrite, and the `record.Recorder`, whose `Records` tells the sequencer whether anything records writes. It refuses a `Services` with a collaborator missing, naming the field.
+
+A handler passes its request's effects to every Store write as the write's `storage.Changes`. Each change invalidates `WATCH` on its key while the request still holds its ordering, so no handler says which writes do. The keys the write removed on its own, by its sweep or to make room, become a `DEL` after the command's own frame in the same `record.Write`, at most 1,024 keys in each, so inside `EXEC` an eviction stays between the queued command that caused it and the next one. A command that fails, such as a write refused for memory, still records the `DEL` of the keys its sweep removed.
 
 The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (`record.Origin`: a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog, and only the Master's stream may answer `REPLCONF GETACK`. A Call without an Origin or with the server's own (`OriginServer`, for evictions the server makes outside any request), a client request without its Client state, and a Master or replay request that carries one are refused.
 

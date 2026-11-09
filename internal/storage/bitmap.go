@@ -21,14 +21,14 @@ func (s *Store) GetBit(key string, offset int64) (int64, bool, error) {
 }
 
 // SetBit sets the bit stored at offset for a string value and returns the
-// previous bit. When maxmemory is configured it first frees space and reports
-// the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) SetBit(changes Changes, key string, offset int64, bit int64) (int64, []string, error) {
+// previous bit. When maxmemory is configured it first evicts keys to make
+// room.
+func (s *Store) SetBit(changes Changes, key string, offset int64, bit int64) (int64, error) {
 	if err := validateBitmapArguments(offset, bit); err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 
-	return mutateString(s, changes, key, func(w stringWrite) (int64, []string, error) {
+	return mutateString(s, changes, key, func(w stringWrite) (int64, error) {
 		data, _ := w.Current()
 		previous := bitAt(data, offset)
 		byteIndex := int(offset / 8)
@@ -36,12 +36,12 @@ func (s *Store) SetBit(changes Changes, key string, offset int64, bit int64) (in
 
 		// Within the string the bit is set where it lies. Past its end Payload
 		// gives a longer copy, sized before it is allocated.
-		payload, evicted, err := w.Payload(max(byteIndex+1, len(data)))
+		payload, err := w.Payload(max(byteIndex+1, len(data)))
 		if err != nil {
-			return 0, nil, err
+			return 0, err
 		}
 		setBitInByte(&payload[byteIndex], mask, bit)
-		return previous, evicted, nil
+		return previous, nil
 	})
 }
 

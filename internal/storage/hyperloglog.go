@@ -38,30 +38,30 @@ var hllRankReciprocal = func() [hllMaxRank + 1]float64 {
 }()
 
 // PFAdd registers elements into a HyperLogLog value and reports whether the
-// cardinality estimate changed. When maxmemory is configured it first frees
-// space and reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) PFAdd(changes Changes, key string, elements [][]byte) (int64, []string, error) {
-	return mutateString(s, changes, key, func(w stringWrite) (int64, []string, error) {
+// cardinality estimate changed. When maxmemory is configured it first evicts
+// keys to make room.
+func (s *Store) PFAdd(changes Changes, key string, elements [][]byte) (int64, error) {
+	return mutateString(s, changes, key, func(w stringWrite) (int64, error) {
 		data, exists := w.Current()
 		if exists {
 			if _, err := hyperLogLogRegisters(data); err != nil {
-				return 0, nil, err
+				return 0, err
 			}
 		}
 		// A HyperLogLog's layout is fixed at creation, and hyperLogLogRegisters
 		// rejects a payload of any other length, so for an existing key Payload
 		// hands back the stored buffer and the registers are updated where they
 		// lie.
-		payload, evicted, err := w.Payload(hllValueSize)
+		payload, err := w.Payload(hllValueSize)
 		if err != nil {
-			return 0, nil, err
+			return 0, err
 		}
 		if !exists {
 			writeHyperLogLogHeader(payload)
 			updateHyperLogLogRegisters(payload[hllHeaderSize:], elements)
-			return 1, evicted, nil
+			return 1, nil
 		}
-		return updateHyperLogLogRegisters(payload[hllHeaderSize:], elements), evicted, nil
+		return updateHyperLogLogRegisters(payload[hllHeaderSize:], elements), nil
 	})
 }
 

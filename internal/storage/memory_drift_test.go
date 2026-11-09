@@ -61,10 +61,10 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 				switch rng.Intn(21) {
 				case 0:
 					desc = "Set"
-					_, _ = store.Set(nil, key, []byte(fmt.Sprintf("value-%d", rng.Intn(1000))), 0)
+					_ = store.Set(nil, key, []byte(fmt.Sprintf("value-%d", rng.Intn(1000))), 0)
 				case 1:
 					desc = "Set with TTL"
-					_, _ = store.Set(nil, key, []byte("ttl"), store.deadlineAfter(time.Hour))
+					_ = store.Set(nil, key, []byte("ttl"), store.deadlineAfter(time.Hour))
 				case 2:
 					desc, shrinking = "Delete", true
 					store.Delete(nil, key)
@@ -73,13 +73,13 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					store.DeleteMany(nil, []string{key, keys[rng.Intn(len(keys))]})
 				case 4:
 					desc = "Increment"
-					_, _, _ = store.Increment(nil, key)
+					_, _ = store.Increment(nil, key)
 				case 5:
 					desc = "LeftPush"
-					_, _, _ = store.LeftPush(nil, key, members())
+					_, _ = store.LeftPush(nil, key, members())
 				case 6:
 					desc = "RightPush"
-					_, _, _ = store.RightPush(nil, key, members())
+					_, _ = store.RightPush(nil, key, members())
 				case 7:
 					desc, shrinking = "LeftPop", true
 					_, _, _ = store.LeftPop(nil, key)
@@ -94,25 +94,25 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					_, _, _ = store.RightPopN(nil, key, 1+rng.Intn(3))
 				case 11:
 					desc = "ZAdd"
-					_, _, _ = store.ZAdd(nil, key, []ZSetEntry{{Member: member(), Score: float64(rng.Intn(50))}})
+					_, _ = store.ZAdd(nil, key, []ZSetEntry{{Member: member(), Score: float64(rng.Intn(50))}})
 				case 12:
 					desc = "XAdd"
-					_, _, _ = store.XAdd(nil, key, "*", [][]byte{[]byte("f"), []byte("v")})
+					_, _ = store.XAdd(nil, key, "*", [][]byte{[]byte("f"), []byte("v")})
 				case 13:
 					desc = "SetBit"
-					_, _, _ = store.SetBit(nil, key, int64(rng.Intn(4096)), int64(rng.Intn(2)))
+					_, _ = store.SetBit(nil, key, int64(rng.Intn(4096)), int64(rng.Intn(2)))
 				case 14:
 					desc = "PFAdd"
-					_, _, _ = store.PFAdd(nil, key, members())
+					_, _ = store.PFAdd(nil, key, members())
 				case 15:
 					desc = "HSet"
-					_, _, _ = store.HSet(nil, key, []HashFieldValue{{Field: string(member()), Value: []byte("hv")}})
+					_, _ = store.HSet(nil, key, []HashFieldValue{{Field: string(member()), Value: []byte("hv")}})
 				case 16:
 					desc, shrinking = "HDel", true
 					_, _ = store.HDel(nil, key, []string{string(member())})
 				case 17:
 					desc = "SAdd"
-					_, _, _ = store.SAdd(nil, key, members())
+					_, _ = store.SAdd(nil, key, members())
 				case 18:
 					desc, shrinking = "SRem", true
 					_, _ = store.SRem(nil, key, members())
@@ -121,7 +121,7 @@ func TestUsedMemoryCounterStaysExact(t *testing.T) {
 					_, _, _ = store.Get(key)
 				default:
 					desc = "Set (expired)"
-					_, _ = store.Set(nil, key, []byte("gone"), store.deadlineAfter(-time.Second))
+					_ = store.Set(nil, key, []byte("gone"), store.deadlineAfter(-time.Second))
 				}
 
 				if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {

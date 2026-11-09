@@ -1,11 +1,11 @@
 package storage
 
 // SAdd adds the supplied members to the set stored at key and returns the
-// number of newly added members. When maxmemory is configured it first frees
-// space and reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) SAdd(changes Changes, key string, members [][]byte) (int64, []string, error) {
+// number of newly added members. When maxmemory is configured it first evicts
+// keys to make room.
+func (s *Store) SAdd(changes Changes, key string, members [][]byte) (int64, error) {
 	if len(members) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
 	return mutateKey(s, changes, key, ValueKindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
@@ -34,7 +34,7 @@ func (s *Store) SRem(changes Changes, key string, members [][]byte) (int64, erro
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, changes, key, ValueKindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, err := mutateKey(s, changes, key, ValueKindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			return nil, 0, errUnchanged
 		}

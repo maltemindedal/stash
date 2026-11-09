@@ -11,6 +11,9 @@ const (
 	// Expired: an active TTL eviction removed the key. A sweep found it past
 	// its TTL deadline.
 	Expired
+	// MemoryEvicted: a memory-pressure eviction removed the key, to make room
+	// for a write under maxmemory.
+	MemoryEvicted
 )
 
 // Changes hears each keyspace change of one request or Background unit: a key
