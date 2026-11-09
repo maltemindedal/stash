@@ -1014,7 +1014,7 @@ func (a stubAddr) String() string  { return string(a) }
 type psyncLikeExecutor struct{}
 
 func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
-	if replicationCommandName(request) != "PSYNC" {
+	if commandName(request) != "PSYNC" {
 		return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 	}
 	call.Client.PromoteToReplica()

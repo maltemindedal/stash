@@ -30,6 +30,3 @@ func (o Origin) RecordsSlowlog() bool { return o == OriginClient }
 // NeedsAuth reports whether the request runs only for a client that has
 // authenticated, on a server that requires a password.
 func (o Origin) NeedsAuth() bool { return o == OriginClient }
-
-// AnswersGetAck reports whether the request may answer REPLCONF GETACK.
-func (o Origin) AnswersGetAck() bool { return o == OriginMaster }

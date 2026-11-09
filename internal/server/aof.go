@@ -183,7 +183,7 @@ func (s *Server) recordExpiredKeys(keys []string) {
 	// dropped is the worse outcome, so there the failure is logged and the
 	// deletion still goes. The sweep and an accounted write publish expiries
 	// while the sequencer orders them, but a replica's full resync publishes the
-	// ones its new dataset holds with no sequencer lock (consumeFullResync), and
+	// ones its new dataset holds with no sequencer lock (replicaStore.Replace), and
 	// the store hands every expiry to whichever of them publishes next, so the
 	// Recorder propagates the server's own writes as unordered.
 	w := record.Write{Origin: record.OriginServer}

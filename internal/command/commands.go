@@ -233,19 +233,10 @@ func (e *Executor) handleReplConf(ctx context.Context, request *Request) (server
 
 		return server.SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 	case "GETACK":
-		// The "*" argument is validated upstream; only the caller's origin,
-		// which the validator has no context for, is checked here.
-		if !request.origin.AnswersGetAck() {
-			return server.ExecuteResult{}, ErrSyntaxError()
-		}
-
-		ackOffset := e.replication.ReplicaOffset()
-		result := server.ExecuteResult{}
-		result.UpstreamReplies = []protocol.Value{propagationFrame(&Request{
-			Name: "REPLCONF",
-			Args: [][]byte{[]byte("ACK"), []byte(strconv.FormatInt(ackOffset, 10))},
-		})}
-		return result, nil
+		// A Replica's Link answers its Master's GETACK itself
+		// (server.Link.Run), so none reaches the executor from the stream, and
+		// nobody else may ask.
+		return server.ExecuteResult{}, ErrSyntaxError()
 	case "ACK":
 		ackOffset, err := parseIntegerArgument(request.Args[1])
 		if err != nil || ackOffset < 0 {

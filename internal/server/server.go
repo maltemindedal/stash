@@ -48,6 +48,10 @@ type Server struct {
 	upstreamConn   net.Conn
 	upstreamConnMu sync.Mutex
 
+	// link is the Replica's link to its Master. Only a Replica runs it
+	// (startReplicaLink); on a Master its offset stays 0.
+	link *Link
+
 	// stopLink ends a Replica's link to its Master. ListenAndServe sets it before
 	// the link or anything that can call shutdown starts, and shutdown calls it,
 	// so every way the server stops ends the link. It stays nil on a Master.
@@ -79,6 +83,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		replication:     newReplicationState(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
+	srv.link = &Link{MasterAuth: cfg.MasterAuth, Store: replicaStore{server: srv}, Logger: logger}
 	srv.replicaPeers.SetFeedErrorHandler(srv.dropReplica)
 	srv.recorder = record.New(NewReplicaStream(srv.replication, srv.replicaPeers, logger), logger)
 
@@ -548,7 +553,7 @@ func (s *Server) ServerStats() Stats {
 		Role:                role,
 		MasterReplicationID: s.replication.MasterReplicationID,
 		MasterOffset:        s.replication.MasterOffset(),
-		ReplicaOffset:       s.replication.ReplicaOffset(),
+		ReplicaOffset:       s.link.Offset(),
 		Replicas:            replicas,
 		AOFEnabled:          writer != nil,
 		AOFLastWriteOK:      writer.LastWriteOK(),

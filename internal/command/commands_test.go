@@ -1253,27 +1253,10 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 }
 
 func TestExecutorReplicationAcknowledgements(t *testing.T) {
-	t.Run("replica-origin GETACK emits upstream ACK reply", func(t *testing.T) {
-		replication := &server.ReplicationState{}
-		replication.AdvanceReplicaOffset(123)
-		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
-
-		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
-		if err != nil {
-			t.Fatalf("handle() error = %v", err)
-		}
-		if len(result.Responses) != 0 {
-			t.Fatalf("len(result.Responses) = %d, want 0", len(result.Responses))
-		}
-		if len(result.UpstreamReplies) != 1 {
-			t.Fatalf("len(result.UpstreamReplies) = %d, want 1", len(result.UpstreamReplies))
-		}
-
-		assertValueEqual(t, result.UpstreamReplies[0], requestValue("REPLCONF", "ACK", "123"))
-	})
-
-	t.Run("only the Master's stream may answer GETACK", func(t *testing.T) {
-		for _, origin := range []record.Origin{record.OriginClient, record.OriginReplay} {
+	t.Run("nobody may ask the executor for GETACK", func(t *testing.T) {
+		// A Replica's Link answers its Master's GETACK before the executor
+		// sees it.
+		for _, origin := range []record.Origin{record.OriginClient, record.OriginMaster, record.OriginReplay} {
 			executor := newTestExecutor()
 			ctx := withOrigin(context.Background(), origin)
 			if origin == record.OriginClient {
@@ -1281,8 +1264,8 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 			}
 
 			result, err := handle(ctx, executor, requestValue("REPLCONF", "GETACK", "*"), false)
-			if !errors.Is(err, ErrSyntax) || len(result.UpstreamReplies) != 0 {
-				t.Fatalf("GETACK from Origin %d = (%d upstream replies, error %v), want ErrSyntax and no reply", origin, len(result.UpstreamReplies), err)
+			if !errors.Is(err, ErrSyntax) || len(result.Responses) != 0 {
+				t.Fatalf("GETACK from Origin %d = (%d replies, error %v), want ErrSyntax and no reply", origin, len(result.Responses), err)
 			}
 		}
 	})

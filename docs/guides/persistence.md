@@ -109,7 +109,7 @@ truncate -s 88213 appendonly.aof           # drop the damaged command and everyt
 
 That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup.
 
-A command that replay refuses stops startup the same way, with the error the command returned. Stash writes only commands that replay, but a file edited by hand can hold one that does not, such as `REPLCONF GETACK`, which only a master's replication stream may send:
+A command that replay refuses stops startup the same way, with the error the command returned. Stash writes only commands that replay, but a file edited by hand can hold one that does not, such as `REPLCONF GETACK`, which a master sends its replicas and a replica answers on its link without running it as a command:
 
 ```
 server: load aof "appendonly.aof": aof: replay command 2 from "appendonly.aof": syntax error

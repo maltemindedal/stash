@@ -1,20 +1,17 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,8 +24,7 @@ import (
 
 // ExecuteResult describes the full set of RESP frames emitted by a command.
 type ExecuteResult struct {
-	Responses       []protocol.Value
-	UpstreamReplies []protocol.Value
+	Responses []protocol.Value
 	// RegisterReplica is set by PSYNC, which registered the client as a replica
 	// at its attach cut. The connection then starts the replica's feed
 	// (registerReplicaPeer) once Responses are ahead of anything it writes.
@@ -51,7 +47,6 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 type ReplicationState struct {
 	MasterReplicationID string
 	masterOffset        atomic.Int64
-	replicaOffset       atomic.Int64
 }
 
 // ReplicaPeer describes a replica connection attached to a master.
@@ -181,34 +176,6 @@ func (s *ReplicationState) AdvanceMasterOffset(delta int64) int64 {
 	}
 
 	return s.masterOffset.Add(delta)
-}
-
-// ReplicaOffset reports the replica's processed upstream replication offset.
-func (s *ReplicationState) ReplicaOffset() int64 {
-	if s == nil {
-		return 0
-	}
-
-	return s.replicaOffset.Load()
-}
-
-// ResetReplicaOffset starts the replica's processed offset again from zero, as it
-// must when a full resynchronisation begins a new stream.
-func (s *ReplicationState) ResetReplicaOffset() {
-	if s == nil {
-		return
-	}
-
-	s.replicaOffset.Store(0)
-}
-
-// AdvanceReplicaOffset increments the replica's processed upstream replication offset.
-func (s *ReplicationState) AdvanceReplicaOffset(delta int64) int64 {
-	if s == nil || delta <= 0 {
-		return s.ReplicaOffset()
-	}
-
-	return s.replicaOffset.Add(delta)
 }
 
 // NewReplicaRegistry creates an empty registry of replica peers.
@@ -716,7 +683,7 @@ func (s *ReplicaStream) Active() bool {
 // while no replica is registered (ReplicaRegistry.PropagateOrdered). Otherwise
 // it always takes the lock (ReplicaRegistry.Propagate): the server's own
 // writes, such as the expiry DELs a replica link's full resync publishes while
-// holding no sequencer lock (consumeFullResync).
+// holding no sequencer lock (replicaStore.Replace).
 func (s *ReplicaStream) Propagate(payload []byte, ordered bool) (end int64) {
 	return s.propagate(payload, ordered).endOffset
 }
@@ -858,10 +825,12 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 		s.logger.Error("failed to determine replica listening port", "address", listenerAddr, "error", err)
 		return
 	}
+	s.link.ListeningPort = listeningPort
+	s.link.Logger = s.logger.With("master_addr", masterAddr)
 
 	delay := replicaReconnectInitial
 	for {
-		synchronised := s.runReplicaLink(ctx, masterAddr, listeningPort)
+		synchronised := s.runReplicaLink(ctx, masterAddr)
 		if ctx.Err() != nil {
 			return
 		}
@@ -881,7 +850,7 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 
 // runReplicaLink makes one attempt to attach to the master and applies its
 // stream until the link ends. It reports whether the handshake completed.
-func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listeningPort int) (synchronised bool) {
+func (s *Server) runReplicaLink(ctx context.Context, masterAddr string) (synchronised bool) {
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", masterAddr)
 	if err != nil {
@@ -903,138 +872,33 @@ func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listenin
 	})
 	defer stopClose()
 
-	parser := protocol.NewParser(conn)
-	writer := bufio.NewWriter(conn)
-
-	if err := writeReplicaCommand(writer, "PING"); err != nil {
-		s.logger.Error("failed to send replica PING", "master_addr", masterAddr, "error", err)
-		return
-	}
-	if err := expectSimpleString(parser, "PONG"); err != nil {
-		s.logger.Error("invalid PING response from master", "master_addr", masterAddr, "error", err)
-		return
-	}
-
-	if s.cfg.MasterAuth != "" {
-		if err := writeReplicaCommand(writer, "AUTH", s.cfg.MasterAuth); err != nil {
-			s.logger.Error("failed to send replica AUTH", "master_addr", masterAddr, "error", err)
-			return
+	synchronised, err = s.link.Run(ctx, conn)
+	if err != nil && ctx.Err() == nil {
+		log := s.logger.Error
+		if synchronised {
+			log = s.logger.Warn
 		}
-		if err := expectReplicaAuthOK(parser); err != nil {
-			s.logger.Error("replica AUTH failed", "master_addr", masterAddr, "error", err)
-			return
-		}
+		log("the link to the master failed", "master_addr", masterAddr, "error", err)
 	}
-
-	if err := writeReplicaCommand(writer, "REPLCONF", "listening-port", strconv.Itoa(listeningPort)); err != nil {
-		s.logger.Error("failed to send replica REPLCONF", "master_addr", masterAddr, "error", err)
-		return
-	}
-	if err := expectReplicaReplConfOK(parser); err != nil {
-		s.logger.Error("replica REPLCONF failed", "master_addr", masterAddr, "error", err)
-		return
-	}
-
-	if err := writeReplicaCommand(writer, "PSYNC", "?", "-1"); err != nil {
-		s.logger.Error("failed to send replica PSYNC", "master_addr", masterAddr, "error", err)
-		return
-	}
-	if err := s.consumeFullResync(parser); err != nil {
-		s.logger.Error("failed to consume FULLRESYNC from master", "master_addr", masterAddr, "error", err)
-		return
-	}
-
-	// The stream that follows a full resynchronisation counts from zero.
-	s.replication.ResetReplicaOffset()
-	s.logger.Info("replica handshake completed", "master_addr", masterAddr, "listening_port", listeningPort)
-	synchronised = true
-
-	masterCall := Call{Origin: record.OriginMaster}
-
-	for {
-		value, err := parser.Parse()
-		if err != nil {
-			// A Master that goes away inside a frame is still a lost link: the Parser
-			// reports a bulk payload cut short as io.ErrUnexpectedEOF, not io.EOF.
-			if ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
-				return
-			}
-
-			s.logger.Warn("replication stream parse failed", "master_addr", masterAddr, "error", err)
-			return
-		}
-
-		encodedLen, err := protocol.EncodedLen(value)
-		if err != nil {
-			s.logger.Warn("failed to size replication stream value", "master_addr", masterAddr, "error", err)
-			return
-		}
-		replicaOffset := s.replication.AdvanceReplicaOffset(int64(encodedLen))
-		s.logger.Debug(
-			"replication stream command received",
-			"master_addr", masterAddr,
-			"command", replicationCommandName(value),
-			"payload_size", encodedLen,
-			"replica_offset", replicaOffset,
-		)
-
-		result, execErr := s.executor.Handle(ctx, masterCall, value)
-		if execErr != nil {
-			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
-				return
-			}
-
-			if errors.Is(execErr, ErrNotRecorded) {
-				s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", execErr)
-				return
-			}
-			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
-			return
-		}
-
-		if len(result.UpstreamReplies) > 0 {
-			if err := writeReplicaResponses(writer, result.UpstreamReplies); err != nil {
-				s.logger.Warn("failed to write replication upstream reply", "master_addr", masterAddr, "error", err)
-				return
-			}
-		}
-	}
+	return synchronised
 }
 
-func (s *Server) consumeFullResync(parser *protocol.Parser) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return fmt.Errorf("read FULLRESYNC line: %w", err)
-	}
+// replicaStore is the Store as the Replica's Link changes it: a full resync
+// replaces the keyspace, and each command of the Master's stream runs through
+// the command executor with the Master's Origin.
+type replicaStore struct{ server *Server }
 
-	line, ok := value.(protocol.SimpleString)
-	if !ok {
-		return fmt.Errorf("unexpected FULLRESYNC response type %T", value)
-	}
-	parts := strings.Fields(line.Value)
-	if len(parts) != 3 || !strings.EqualFold(parts[0], "FULLRESYNC") || parts[1] == "" || parts[2] != "0" {
-		return fmt.Errorf("invalid FULLRESYNC response %q", line.Value)
-	}
-
-	snapshotValue, err := parser.Parse()
-	if err != nil {
-		return fmt.Errorf("read replication snapshot: %w", err)
-	}
-
-	snapshot, ok := snapshotValue.(protocol.BulkString)
-	if !ok || snapshot.Null {
-		return fmt.Errorf("unexpected replication snapshot type %T", snapshotValue)
-	}
-
+func (r replicaStore) Replace(snapshot []byte) error {
+	s := r.server
 	snapshotStore := storage.NewStore()
-	stats, err := rdb.LoadReader(bytes.NewReader(snapshot.Data), snapshotStore)
+	stats, err := rdb.LoadReader(bytes.NewReader(snapshot), snapshotStore)
 	if err != nil {
-		return fmt.Errorf("load replication snapshot: %w", err)
+		return err
 	}
 	s.store.ReplaceWith(snapshotStore)
 	s.logger.Info(
 		"applied full resync snapshot",
-		"snapshot_size_bytes", len(snapshot.Data),
+		"snapshot_size_bytes", len(snapshot),
 		"loaded_keys", stats.LoadedKeys,
 		"skipped_expired_keys", stats.SkippedExpiredKeys,
 	)
@@ -1042,31 +906,12 @@ func (s *Server) consumeFullResync(parser *protocol.Parser) error {
 	return nil
 }
 
-func replicationCommandName(value protocol.Value) string {
-	request, err := commandFromValue(value)
-	if err != nil {
-		return fmt.Sprintf("%T", value)
+func (r replicaStore) Apply(ctx context.Context, command protocol.Value) error {
+	_, err := r.server.executor.Handle(ctx, Call{Origin: record.OriginMaster}, command)
+	if errors.Is(err, ErrNotRecorded) {
+		r.server.logger.Error("failed to append replicated command to AOF", "error", err)
 	}
-
-	return request.Name
-}
-
-func commandFromValue(value protocol.Value) (*protocolCommand, error) {
-	array, ok := value.(protocol.Array)
-	if !ok || array.Null || len(array.Elements) == 0 {
-		return nil, fmt.Errorf("unexpected replication value %T", value)
-	}
-
-	rawName, err := protocol.Bytes(array.Elements[0])
-	if err != nil {
-		return nil, err
-	}
-
-	return &protocolCommand{Name: strings.ToUpper(string(rawName))}, nil
-}
-
-type protocolCommand struct {
-	Name string
+	return err
 }
 
 func parseListenerPort(address string) (int, error) {
@@ -1081,105 +926,4 @@ func parseListenerPort(address string) (int, error) {
 	}
 
 	return parsed, nil
-}
-
-func writeReplicaCommand(writer *bufio.Writer, parts ...string) error {
-	if err := protocol.WriteValue(writer, replicaCommand(parts...)); err != nil {
-		return err
-	}
-
-	return writer.Flush()
-}
-
-func writeReplicaResponses(writer *bufio.Writer, values []protocol.Value) error {
-	for _, value := range values {
-		if err := protocol.WriteValue(writer, value); err != nil {
-			return err
-		}
-	}
-
-	return writer.Flush()
-}
-
-func replicaCommand(parts ...string) protocol.Array {
-	elements := make([]protocol.Value, 0, len(parts))
-	for _, part := range parts {
-		elements = append(elements, protocol.BulkString{Data: []byte(part)})
-	}
-
-	return protocol.Array{Elements: elements}
-}
-
-func expectSimpleString(parser *protocol.Parser, expected string) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return err
-	}
-
-	switch typed := value.(type) {
-	case protocol.SimpleString:
-		if typed.Value != expected {
-			return fmt.Errorf("unexpected response %q, want %q", typed.Value, expected)
-		}
-		return nil
-	case protocol.ErrorValue:
-		return fmt.Errorf("unexpected error response %q, want %q", typed.Message, expected)
-	default:
-		return fmt.Errorf("unexpected response type %T", value)
-	}
-}
-
-func expectReplicaAuthOK(parser *protocol.Parser) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return err
-	}
-
-	switch typed := value.(type) {
-	case protocol.SimpleString:
-		if typed.Value != "OK" {
-			return fmt.Errorf("unexpected AUTH response %q, want %q", typed.Value, "OK")
-		}
-		return nil
-	case protocol.ErrorValue:
-		switch respErrorCode(typed.Message) {
-		case "WRONGPASS":
-			return fmt.Errorf("replica AUTH rejected by master: %s", typed.Message)
-		case "NOAUTH":
-			return fmt.Errorf("master reported NOAUTH during replica AUTH: %s", typed.Message)
-		default:
-			return fmt.Errorf("replica AUTH failed with error response: %s", typed.Message)
-		}
-	default:
-		return fmt.Errorf("unexpected AUTH response type %T", value)
-	}
-}
-
-func expectReplicaReplConfOK(parser *protocol.Parser) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return err
-	}
-
-	switch typed := value.(type) {
-	case protocol.SimpleString:
-		if typed.Value != "OK" {
-			return fmt.Errorf("unexpected REPLCONF response %q, want %q", typed.Value, "OK")
-		}
-		return nil
-	case protocol.ErrorValue:
-		switch respErrorCode(typed.Message) {
-		case "NOAUTH":
-			return fmt.Errorf("protected master requires replica authentication (--masterauth): %s", typed.Message)
-		default:
-			return fmt.Errorf("replica REPLCONF failed with error response: %s", typed.Message)
-		}
-	default:
-		return fmt.Errorf("unexpected REPLCONF response type %T", value)
-	}
-}
-
-func respErrorCode(message string) string {
-	code, _, _ := strings.Cut(message, " ")
-	return code
 }
