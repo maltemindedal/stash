@@ -45,9 +45,6 @@ type Server struct {
 	clientStates   map[uint64]*ClientState
 	clientStatesMu sync.RWMutex
 
-	upstreamConn   net.Conn
-	upstreamConnMu sync.Mutex
-
 	// link is the Replica's link to its Master. Only a Replica runs it
 	// (startReplicaLink); on a Master its offset stays 0.
 	link *Link
@@ -393,12 +390,11 @@ const replicaShutdownGrace = time.Second
 
 func (s *Server) shutdown() {
 	s.shutdownOnce.Do(func() {
-		// Ending the link first keeps it from dialling the Master again after the
-		// upstream connection below is closed.
+		// Ends the Replica's link: Follow closes its connection to the Master
+		// and dials no more.
 		if s.stopLink != nil {
 			s.stopLink()
 		}
-		s.closeUpstreamConn()
 		// Commands already propagated are written to the replicas before their
 		// sockets are closed, as they were when propagation wrote them directly.
 		// Their connections stay open, in both networking modes, until each

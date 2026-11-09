@@ -770,47 +770,9 @@ func replicaFellBehind(cause error) bool {
 		errors.Is(cause, errResponseWriterBusy)
 }
 
-func (s *Server) setUpstreamConn(conn net.Conn) {
-	s.upstreamConnMu.Lock()
-	defer s.upstreamConnMu.Unlock()
-
-	s.upstreamConn = conn
-}
-
-func (s *Server) clearUpstreamConn(conn net.Conn) {
-	s.upstreamConnMu.Lock()
-	defer s.upstreamConnMu.Unlock()
-
-	if s.upstreamConn == conn {
-		s.upstreamConn = nil
-	}
-}
-
-func (s *Server) closeUpstreamConn() {
-	s.upstreamConnMu.Lock()
-	conn := s.upstreamConn
-	s.upstreamConn = nil
-	s.upstreamConnMu.Unlock()
-
-	if conn != nil {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close upstream connection", "error", err)
-		}
-	}
-}
-
-// How long a replica waits before trying its master again, and the most that
-// wait grows to.
-const (
-	replicaReconnectInitial = time.Second
-	replicaReconnectMax     = 30 * time.Second
-)
-
-// startReplicaLink keeps the replica attached to its master: it connects,
-// synchronises, applies the stream, and when the link ends for any reason other
-// than shutdown it waits and starts again from a full resynchronisation. The wait
-// doubles up to replicaReconnectMax and starts over after a link that got as far
-// as a completed handshake. Only an unusable configuration ends it.
+// startReplicaLink keeps the replica attached to its master (Follow) until ctx
+// is cancelled, which shutdown does. Only an unusable configuration ends it
+// before that.
 func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 	defer s.handlerWG.Done()
 
@@ -828,59 +790,11 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 	s.link.ListeningPort = listeningPort
 	s.link.Logger = s.logger.With("master_addr", masterAddr)
 
-	delay := replicaReconnectInitial
-	for {
-		synchronised := s.runReplicaLink(ctx, masterAddr)
-		if ctx.Err() != nil {
-			return
-		}
-		if synchronised {
-			delay = replicaReconnectInitial
-		}
-
-		s.logger.Warn("the link to the master ended; retrying", "master_addr", masterAddr, "retry_in", delay)
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return
-		}
-		delay = min(delay*2, replicaReconnectMax)
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", masterAddr)
 	}
-}
-
-// runReplicaLink makes one attempt to attach to the master and applies its
-// stream until the link ends. It reports whether the handshake completed.
-func (s *Server) runReplicaLink(ctx context.Context, masterAddr string) (synchronised bool) {
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", masterAddr)
-	if err != nil {
-		s.logger.Error("failed to connect to master", "master_addr", masterAddr, "error", err)
-		return
-	}
-	s.setUpstreamConn(conn)
-	defer s.clearUpstreamConn(conn)
-	defer func() {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close replica upstream connection", "master_addr", masterAddr, "error", err)
-		}
-	}()
-
-	stopClose := context.AfterFunc(ctx, func() {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close replica upstream connection after cancellation", "master_addr", masterAddr, "error", err)
-		}
-	})
-	defer stopClose()
-
-	synchronised, err = s.link.Run(ctx, conn)
-	if err != nil && ctx.Err() == nil {
-		log := s.logger.Error
-		if synchronised {
-			log = s.logger.Warn
-		}
-		log("the link to the master failed", "master_addr", masterAddr, "error", err)
-	}
-	return synchronised
+	Follow(ctx, dial, s.link, nil)
 }
 
 // replicaStore is the Store as the Replica's Link changes it: a full resync
