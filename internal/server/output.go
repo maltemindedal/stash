@@ -142,8 +142,10 @@ type outputDriver interface {
 	// connection's own executor will not flush: a Pushed message, or the ones a
 	// Reply released. It must not block.
 	schedule(o *Output)
-	// flush is Output.Flush.
-	flush(o *Output) error
+	// flush is Output.Flush, which waits for another writer while more than
+	// mark is left to write before the connection's latest Reply is out, and
+	// with a mark of zero Output.Drain.
+	flush(o *Output, mark int64) error
 	// shut closes the connection, once, without waiting for a write in
 	// progress. It is called with no Output lock held.
 	shut()
@@ -179,8 +181,8 @@ const (
 
 // Output is the Client output of one connection: its Replies and the Pushed
 // messages it receives (pub/sub messages, MONITOR events, and for a Replica
-// its stream), in the order they were produced. No method but Flush waits on
-// the peer's socket. Safe for concurrent use.
+// its stream), in the order they were produced. No method but Flush and Drain
+// waits on the peer's socket. Safe for concurrent use.
 //
 // Lock order: the lock of whoever pushes (a registry's, or the replication
 // Master's for a Replica's stream), then Output.mu, then the shared budget's.
@@ -234,8 +236,10 @@ type Output struct {
 	stall        stallPhase
 	stallWatch   *atomic.Pointer[Output]
 
-	// drained is signalled when a writer finishes and when no more than
-	// outputHighWater is left to write before the latest Reply is out.
+	// drained is signalled when a writer finishes, when the connection is
+	// closed, and after every write that leaves no more than outputHighWater to
+	// write before the latest Reply is out, the one that writes its last byte
+	// included.
 	drained *sync.Cond
 	// backlog is every byte in queued, held and inflight[sent:].
 	backlog atomic.Int64
@@ -458,7 +462,26 @@ func (o *Output) Flush() error {
 	if o == nil {
 		return nil
 	}
-	return o.driver.flush(o)
+	return o.driver.flush(o, outputHighWater)
+}
+
+// Drain returns once every Reply queued so far has been written, or the
+// connection is closed. It is for the connection's own goroutine when it has
+// run its last request: the Close that follows drops what is still queued.
+// Like Flush it writes what is queued when nobody has the socket. When another
+// goroutine has it, Drain waits until that one has written the latest Reply.
+//
+// It does not wait for what was pushed after that Reply, beyond the write that
+// carries the Reply's last byte. The goroutine of a Replica that has been sent
+// its full resync reply therefore leaves at once, however much of its stream
+// waits. A peer that never reads keeps the goroutine here until the connection
+// is closed, by shutdown or by a limit on what is pushed to it, as a Reply to
+// a peer that never reads keeps it in Flush. The Event loop writes out a
+// closing connection itself (ConnMachine.Flush), so there Drain does nothing.
+func (o *Output) Drain() {
+	// Why the connection is closed, if it is, changes nothing for a caller
+	// that is about to close it.
+	_ = o.driver.flush(o, 0)
 }
 
 // Close closes the connection from any goroutine without waiting for a write in
@@ -880,16 +903,16 @@ func (d *goroutineOutputDriver) startPump(o *Output) {
 	go d.pump()
 }
 
-func (d *goroutineOutputDriver) flush(o *Output) error {
+func (d *goroutineOutputDriver) flush(o *Output, mark int64) error {
 	o.mu.Lock()
 	// Another goroutine may have the socket, and then writes the Replies queued
-	// here with everything else. Waiting for it is only backpressure on this
-	// connection's own requests, so it lasts while more than the high-water
-	// mark is left to write before its latest Reply is out, and no longer. What
-	// is pushed after that Reply never makes it wait: its goroutine reads the
+	// here with everything else. This one waits for it while more than mark is
+	// left to write before its latest Reply is out, and no longer. For Flush
+	// that is only backpressure on the connection's own requests. What is
+	// pushed after that Reply never makes it wait: its goroutine reads the
 	// peer's requests, which for a Replica that has fallen behind are the
 	// acknowledgements that show how far.
-	for o.writing && !o.closed && o.replyBacklogLocked() > outputHighWater {
+	for o.writing && !o.closed && o.replyBacklogLocked() > mark {
 		o.drained.Wait()
 	}
 	if o.closed {
@@ -966,11 +989,11 @@ func (d *goroutineOutputDriver) retry(*Output) bool { return false }
 // itself.
 type unscheduledOutputDriver struct{}
 
-func (unscheduledOutputDriver) schedule(*Output)    {}
-func (unscheduledOutputDriver) flush(*Output) error { return nil }
-func (unscheduledOutputDriver) shut()               {}
-func (unscheduledOutputDriver) closeWrite()         {}
-func (unscheduledOutputDriver) peerClosed() bool    { return false }
-func (unscheduledOutputDriver) retry(*Output) bool  { return false }
+func (unscheduledOutputDriver) schedule(*Output)           {}
+func (unscheduledOutputDriver) flush(*Output, int64) error { return nil }
+func (unscheduledOutputDriver) shut()                      {}
+func (unscheduledOutputDriver) closeWrite()                {}
+func (unscheduledOutputDriver) peerClosed() bool           { return false }
+func (unscheduledOutputDriver) retry(*Output) bool         { return false }
 
 var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))

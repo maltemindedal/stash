@@ -808,6 +808,149 @@ func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t
 	}
 }
 
+// TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply does what a
+// connection's goroutine does when it has run its last request: Reply, Drain,
+// and then Close, which drops what is still queued. The connection is a
+// subscriber's with messages waiting, so the pump has the socket. Drain returns
+// only when the pump has written the Reply. The goroutine used to Flush
+// instead, which leaves the Reply to the pump and waits only while more than
+// the high-water mark is to be written before it, so the Close dropped the
+// last Reply of any subscriber that was behind on its messages.
+func TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply(t *testing.T) {
+	tests := []struct {
+		name  string
+		ahead int
+	}{
+		{name: "behind half the high-water mark of messages", ahead: outputHighWater / 2},
+		{name: "behind twice the high-water mark of messages", ahead: 2 * outputHighWater},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			// The peer reads the messages, and nothing of the Reply until readOn.
+			wire := newReplyReadingWire(tt.ahead)
+			out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			defer out.Close(nil)
+			defer wire.readOn()
+
+			if !out.Push(make([]byte, tt.ahead)) {
+				t.Fatalf("Push() = false, want the messages queued: %v", out.Err())
+			}
+			<-wire.writeBegun // the pump has the socket
+			if err := out.Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
+				t.Fatalf("Reply() error = %v", err)
+			}
+			drained := make(chan struct{})
+			go func() {
+				defer close(drained)
+				out.Drain()
+			}()
+
+			close(wire.proceed)
+			waitForOutput(t, "the peer to read the messages ahead of the reply", func() bool { return wire.receivedLen() == tt.ahead })
+			select {
+			case <-drained:
+				t.Fatalf("Drain() returned when the peer had read the %d bytes of messages ahead of the reply and nothing of the reply, which the Close that follows drops; want it to wait until the pump has written the reply", tt.ahead)
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			wire.readOn()
+			select {
+			case <-drained:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Drain() was still waiting 5s after the peer read on")
+			}
+			if got := wire.sent(); !strings.HasSuffix(got, "+PONG\r\n") {
+				t.Fatalf("the peer had been sent %d bytes when Drain returned, and they do not end with the reply", len(got))
+			}
+		})
+	}
+}
+
+// TestDrainDoesNotWaitForWhatWasPushedAfterTheLatestReply is a Replica that has
+// read its full resync reply and none of the stream behind it. Its goroutine,
+// done with its requests, must not wait for the stream: the Replica may never
+// read it, and the Close that follows is what drops it.
+func TestDrainDoesNotWaitForWhatWasPushedAfterTheLatestReply(t *testing.T) {
+	const reply, stream = "+FULLRESYNC\r\n", 2 * outputHighWater
+	wire := newReplyReadingWire(len(reply))
+	close(wire.proceed)
+	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	defer out.Close(nil)
+	defer wire.readOn()
+
+	out.MarkReplica()
+	out.HoldPushes()
+	if !out.Push(make([]byte, stream)) {
+		t.Fatalf("Push() = false, want the stream held: %v", out.Err())
+	}
+	if err := out.Reply(protocol.SimpleString{Value: "FULLRESYNC"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	waitForOutput(t, "the replica to read its reply", func() bool { return wire.receivedLen() == len(reply) })
+
+	within(t, "Drain() with the latest reply written and 2 MiB of the stream waiting", out.Drain)
+	if got := out.Backlog(); got != stream {
+		t.Fatalf("Backlog() = %d when Drain returned, want the %d bytes of the stream still waiting", got, stream)
+	}
+}
+
+// TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits is a peer that never
+// reads. Its connection's goroutine waits in Drain for a Reply the pump cannot
+// write, until something closes the connection.
+func TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits(t *testing.T) {
+	tests := []struct {
+		name  string
+		close func(t *testing.T, out *Output)
+		want  error
+	}{
+		{name: "by shutdown", want: net.ErrClosed, close: func(_ *testing.T, out *Output) { out.Close(nil) }},
+		{name: "by a push past its push limit", want: errPushLimitExceeded, close: func(t *testing.T, out *Output) {
+			if out.Push(make([]byte, outputHighWater)) {
+				t.Error("Push() = true past the push limit, want the connection closed")
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			shared := newOutputs()
+			shared.pushLimit = outputHighWater
+			out := newGoroutineOutput(shared, newStalledOutputWire())
+			defer out.Close(nil)
+
+			if !out.Push(make([]byte, outputHighWater/2)) {
+				t.Fatalf("Push() = false, want the messages queued: %v", out.Err())
+			}
+			if err := out.Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
+				t.Fatalf("Reply() error = %v", err)
+			}
+			drained := make(chan struct{})
+			go func() {
+				defer close(drained)
+				out.Drain()
+			}()
+			select {
+			case <-drained:
+				t.Fatalf("Drain() returned with the reply unwritten and the connection open: Err() = %v", out.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			tt.close(t, out)
+			select {
+			case <-drained:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Drain() was still waiting 5s after the connection was closed")
+			}
+			if err := out.Err(); !errors.Is(err, tt.want) {
+				t.Fatalf("Err() = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
 // TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten sends a Replica its
 // full resync reply with a write held behind it, so that the Reply hands the
 // socket to the pump, and pushes more of the stream than the high-water mark.
@@ -1265,8 +1408,8 @@ func firstDifference(a, b string) int {
 
 // TestAFlushWritesEveryReplyQueuedBeforeIt flushes a small Reply and a large
 // one behind it, with nothing pushed. The connection's own goroutine writes
-// both before Flush returns: a Reply left to another goroutine would be dropped
-// when the handler, with nothing more to read, closes the connection.
+// both before Flush returns: its batch is everything that was queued when it
+// took the socket, the Reply queued whole included.
 func TestAFlushWritesEveryReplyQueuedBeforeIt(t *testing.T) {
 	wire := newOutputWire()
 	out := newGoroutineOutput(newOutputs(), wire)

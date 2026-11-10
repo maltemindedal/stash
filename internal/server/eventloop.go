@@ -727,7 +727,7 @@ type loopOutputDriver struct {
 
 func (d *loopOutputDriver) schedule(*Output) { d.loop.markDirty(d.conn) }
 
-func (d *loopOutputDriver) flush(*Output) error { return nil }
+func (d *loopOutputDriver) flush(*Output, int64) error { return nil }
 
 func (d *loopOutputDriver) shut() { d.loop.requestClose(d.conn) }
 

@@ -47,7 +47,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	logger.Debug("client connected")
 	defer s.teardownClient(clientID, logger)
-	// Closes the connection, after the last flush below.
+	// Closes the connection, after the drain below.
 	defer out.Close(nil)
 
 	stopClose := context.AfterFunc(ctx, func() {
@@ -61,8 +61,11 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	})
 	defer stopClose()
 	// Runs before the connection is closed (deferred after it): whatever replies
-	// are still queued when the handler leaves go out first, if the socket allows.
-	defer func() { _ = out.Flush() }()
+	// are still queued when the handler leaves go out first. The handler waits
+	// here until they are written, by itself or by the pump. A peer that does
+	// not read them keeps it here until shutdown, or a limit on what is pushed
+	// to the connection, closes the Output.
+	defer out.Drain()
 
 	// On a server that requires a password, a connection gets a limited time to
 	// authenticate. The deadline covers reads, including one that is half way
