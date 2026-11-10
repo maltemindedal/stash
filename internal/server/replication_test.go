@@ -508,7 +508,11 @@ func TestWithNoReplicaRegisteredOnlyClientWritesSkipTheRegistryLock(t *testing.T
 				protocol.BulkString{Data: []byte("value")},
 			}}})
 		}},
-		{name: "an expiry DEL", propagate: func(srv *Server) { srv.recordExpiredKeys([]string{"key"}) }, takesLock: true},
+		{name: "a Background unit's DEL", propagate: func(srv *Server) {
+			w := record.Write{Origin: record.OriginServer}
+			w.AddDeletes([]string{"key"}, record.ToBoth)
+			srv.recorder.Record(&w)
+		}, takesLock: true},
 	}
 
 	for _, tt := range tests {
@@ -1016,7 +1020,7 @@ func (a stubAddr) String() string  { return string(a) }
 // psyncLikeExecutor answers PSYNC as the command executor does, making the
 // client a replica and answering with FULLRESYNC and a snapshot, and answers
 // every other request with +OK.
-type psyncLikeExecutor struct{}
+type psyncLikeExecutor struct{ unorderedBackground }
 
 func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
 	if replicationCommandName(request) != "PSYNC" {

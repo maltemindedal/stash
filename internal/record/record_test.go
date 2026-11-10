@@ -417,3 +417,29 @@ func (s *discardStream) Propagate(payload []byte, _ bool) int64 {
 }
 
 func (s *discardStream) Active() bool { return s.active }
+
+func TestAddDeletesNamesAtMostKeysPerDeleteKeysInEachDel(t *testing.T) {
+	keys := make([]string, 2*record.KeysPerDelete+1)
+	for i := range keys {
+		keys[i] = "k"
+	}
+
+	var w record.Write
+	w.AddDeletes(keys, record.ToBoth)
+
+	frames := w.Frames(record.ToBoth)
+	if len(frames) != 3 {
+		t.Fatalf("AddDeletes of %d keys added %d frames, want 3", len(keys), len(frames))
+	}
+	named := 0
+	for _, frame := range frames {
+		del := frame.(protocol.Array)
+		if len(del.Elements)-1 > record.KeysPerDelete {
+			t.Fatalf("a DEL names %d keys, want at most %d", len(del.Elements)-1, record.KeysPerDelete)
+		}
+		named += len(del.Elements) - 1
+	}
+	if named != len(keys) {
+		t.Fatalf("the DELs name %d keys, want %d", named, len(keys))
+	}
+}

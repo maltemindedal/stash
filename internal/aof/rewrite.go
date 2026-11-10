@@ -239,11 +239,10 @@ func rewriteFramesForEntry(entry storage.SnapshotEntry, now int64) ([]protocol.V
 
 // ItemsPerCommand bounds how many items one command the server composes for the
 // append-only file carries: the values (or field/value pairs) of a rewrite
-// command, or the keys of a DEL the server writes for its own evictions. The
-// loader's parser rejects a command array of more than 1,048,576 elements, so
-// one command per key made a collection of about a million values, or half that
-// many pairs, into an append-only file the server could not read back at
-// startup. Several bounded commands replay to the same state; Redis's own
+// command. The loader's parser rejects a command array of more than 1,048,576
+// elements, so one command per key made a collection of about a million values,
+// or half that many pairs, into an append-only file the server could not read
+// back at startup. Several bounded commands replay to the same state; Redis's own
 // rewrite groups items the same way.
 const ItemsPerCommand = 1024
 

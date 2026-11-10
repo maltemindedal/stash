@@ -180,7 +180,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "BITCOUNT counts full and ranged strings",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				_, _ = executor.store.Set("bitmap", []byte{0xff, 0x00, 0x0f}, 0)
+				_ = executor.store.Set(nil, "bitmap", []byte{0xff, 0x00, 0x0f}, 0)
 			},
 			request: requestValue("BITCOUNT", "bitmap", "1", "2"),
 			assert: func(t *testing.T, value protocol.Value, err error) {
@@ -381,7 +381,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "DEL ignores expired keys",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				_, _ = executor.store.Set("expired", []byte("gone"), time.Now().Add(-time.Millisecond).UnixMilli())
+				_ = executor.store.Set(nil, "expired", []byte("gone"), time.Now().Add(-time.Millisecond).UnixMilli())
 			},
 			request: requestValue("DEL", "expired"),
 			assert: func(t *testing.T, value protocol.Value, err error) {
@@ -550,7 +550,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "XREAD rejects wrong value type",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				_, _ = executor.store.Set("events", []byte("plain"), 0)
+				_ = executor.store.Set(nil, "events", []byte("plain"), 0)
 			},
 			request: requestValue("XREAD", "STREAMS", "events", "0-0"),
 			assert: func(t *testing.T, _ protocol.Value, err error) {
@@ -584,7 +584,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "LPUSH rejects wrong value type",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				_, _ = executor.store.Set("letters", []byte("hello"), 0)
+				_ = executor.store.Set(nil, "letters", []byte("hello"), 0)
 			},
 			request: requestValue("LPUSH", "letters", "a"),
 			assert: func(t *testing.T, _ protocol.Value, err error) {
@@ -609,7 +609,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "INCR increments existing integer",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				_, _ = executor.store.Set("counter", []byte("41"), 0)
+				_ = executor.store.Set(nil, "counter", []byte("41"), 0)
 			},
 			request: requestValue("INCR", "counter"),
 			assert: func(t *testing.T, value protocol.Value, err error) {
@@ -624,7 +624,7 @@ func TestExecutorExecute(t *testing.T) {
 			name: "INCR rejects non-integer strings",
 			setup: func(t *testing.T, executor *Executor) {
 				t.Helper()
-				_, _ = executor.store.Set("counter", []byte("hello"), 0)
+				_ = executor.store.Set(nil, "counter", []byte("hello"), 0)
 			},
 			request: requestValue("INCR", "counter"),
 			assert: func(t *testing.T, _ protocol.Value, err error) {
@@ -933,9 +933,9 @@ func TestExecutorMaxMemory(t *testing.T) {
 			t.Fatalf("initial SET error = %v", err)
 		}
 
-		executor.store.ConfigureMaxMemory(1<<30, 16)
+		executor.store.ConfigureMaxMemory(nil, 1<<30, 16)
 		baseline := executor.store.UsedMemory()
-		executor.store.ConfigureMaxMemory(baseline, 16)
+		executor.store.ConfigureMaxMemory(nil, baseline, 16)
 
 		if _, err := executor.Execute(clientContext(executor), requestValue("SET", "item", strings.Repeat("b", 4096))); !errors.Is(err, ErrOutOfMemory) {
 			t.Fatalf("oversized SET error = %v, want ErrOutOfMemory", err)
@@ -955,9 +955,9 @@ func TestExecutorMaxMemory(t *testing.T) {
 			t.Fatalf("initial SET error = %v", err)
 		}
 
-		executor.store.ConfigureMaxMemory(1<<30, 16)
+		executor.store.ConfigureMaxMemory(nil, 1<<30, 16)
 		baseline := executor.store.UsedMemory()
-		executor.store.ConfigureMaxMemory(baseline+baseline/2, 16)
+		executor.store.ConfigureMaxMemory(nil, baseline+baseline/2, 16)
 		time.Sleep(2 * time.Millisecond)
 
 		result, err := handle(clientContext(executor), executor, requestValue("SET", "hot!", payload), false)
@@ -1857,7 +1857,7 @@ func TestExecutorBLPop(t *testing.T) {
 		{
 			name: "unblocks when maxmemory is enabled",
 			configure: func(executor *Executor) {
-				executor.store.ConfigureMaxMemory(1<<20, 16)
+				executor.store.ConfigureMaxMemory(nil, 1<<20, 16)
 			},
 		},
 	}
@@ -2915,9 +2915,9 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 	if _, err := executor.Execute(ctx, requestValue("SET", "cold", payload)); err != nil {
 		t.Fatalf("initial SET error = %v", err)
 	}
-	executor.store.ConfigureMaxMemory(1<<30, 16)
+	executor.store.ConfigureMaxMemory(nil, 1<<30, 16)
 	baseline := executor.store.UsedMemory()
-	executor.store.ConfigureMaxMemory(baseline+baseline/2, 16)
+	executor.store.ConfigureMaxMemory(nil, baseline+baseline/2, 16)
 	time.Sleep(2 * time.Millisecond)
 
 	request, err := decodeCall(callFromContext(ctx), requestValue("SET", "hot!", payload))

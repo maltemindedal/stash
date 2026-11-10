@@ -706,9 +706,8 @@ func (s *ReplicaStream) Active() bool {
 // replica, and returns the offset at its end. When ordered, its caller holds
 // the write's sequencer locks until it returns, so it skips the registry lock
 // while no replica is registered (ReplicaRegistry.PropagateOrdered). Otherwise
-// it always takes the lock (ReplicaRegistry.Propagate): the server's own
-// writes, such as the expiry DELs a replica link's full resync publishes while
-// holding no sequencer lock (consumeFullResync).
+// it always takes the lock (ReplicaRegistry.Propagate): the Recorder never
+// passes ordered for the server's own writes, the DELs of a Background unit.
 func (s *ReplicaStream) Propagate(payload []byte, ordered bool) (end int64) {
 	return s.propagate(payload, ordered).endOffset
 }
@@ -1021,7 +1020,12 @@ func (s *Server) consumeFullResync(parser *protocol.Parser) error {
 	if err != nil {
 		return fmt.Errorf("load replication snapshot: %w", err)
 	}
-	s.store.ReplaceWith(snapshotStore)
+	// The swap is a Background unit: no write is halfway to the log while the
+	// keyspace changes under it, and the DEL of the keys the new keyspace
+	// held past their TTL is recorded. The Recorder logs an append that fails.
+	_ = s.executor.RunBackgroundUnit(func(changes storage.Changes) {
+		s.store.ReplaceWith(changes, snapshotStore)
+	})
 	s.logger.Info(
 		"applied full resync snapshot",
 		"snapshot_size_bytes", len(snapshot.Data),
