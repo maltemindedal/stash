@@ -161,6 +161,8 @@ type Output struct {
 	// ahead are whole buffers waiting to be written before queued, in order, and
 	// aheadBytes is how many bytes they hold. A large Reply is queued here
 	// without being copied (Reply), behind the buffer that was queued until then.
+	// A Flush that finds one here seals what is queued behind it too
+	// (sealBatchLocked).
 	ahead      [][]byte
 	aheadBytes int
 	// queued is what waits to be written after ahead, appended under mu.
@@ -313,13 +315,34 @@ func isLargeReply(values []protocol.Value) bool {
 // queueWholeLocked queues buffer behind everything queued without copying it.
 // What is in queued is ahead of it, so that buffer goes first.
 func (o *Output) queueWholeLocked(buffer []byte) {
-	if len(o.queued) > 0 {
-		o.ahead = append(o.ahead, o.queued)
-		o.aheadBytes += len(o.queued)
-		o.queued, o.spare = o.spare[:0], nil
-	}
+	o.sealQueuedLocked()
 	o.ahead = append(o.ahead, buffer)
 	o.aheadBytes += len(buffer)
+}
+
+// sealQueuedLocked makes what is in queued the last of the whole buffers, so
+// that what is queued from now on waits behind it in a buffer of its own.
+func (o *Output) sealQueuedLocked() {
+	if len(o.queued) == 0 {
+		return
+	}
+	o.ahead = append(o.ahead, o.queued)
+	o.aheadBytes += len(o.queued)
+	o.queued, o.spare = o.spare[:0], nil
+}
+
+// sealBatchLocked makes everything queued now the batch of a writer that
+// writes nothing queued after it began (Flush), and returns how many buffers
+// that is. Behind whole buffers, what is in queued becomes the last of them:
+// left where it is, it would grow by what is pushed while the buffers ahead of
+// it are written. With no whole buffer the batch is queued as it is, which the
+// writer takes in one piece.
+func (o *Output) sealBatchLocked() int {
+	if len(o.ahead) == 0 {
+		return 1
+	}
+	o.sealQueuedLocked()
+	return len(o.ahead)
 }
 
 // Push queues a frame another connection produced. It never waits. It returns
@@ -627,21 +650,23 @@ func (o *Output) checkStall() {
 // it would block as the Event loop's does or reports nothing (io.ErrShortWrite),
 // leaves the rest for the next call.
 func (o *Output) writeTo(w io.Writer) error {
-	return o.write(w, false)
+	return o.write(w, everyBuffer)
 }
 
+// everyBuffer, as the number of buffers write is to write, has it go on until
+// nothing is queued.
+const everyBuffer = -1
+
 // errMoreQueued is what write returns, still holding the socket (writing stays
-// set), when it was asked for one batch and more was queued meanwhile.
+// set), when it has written the buffers it was asked for and more is queued.
 var errMoreQueued = errors.New("server: more output was queued during the write")
 
-// write is writeTo. With oneBatch it stops after one batch of queued when more
-// was queued during it, and leaves writing set for the caller to hand the
-// socket on: what was queued meanwhile was pushed by other connections. The
-// buffers in ahead do not count as that batch. Only the connection's own Reply
-// puts one there, so its Flush, the caller that asks for one batch, finds no
-// new one while it writes, and writes every Reply queued before it.
-func (o *Output) write(w io.Writer, oneBatch bool) error {
-	batches := 0
+// write is writeTo for a writer that takes no more than buffers buffers of what
+// is queued: the batch that sealBatchLocked counted for it when it took the
+// socket, or everyBuffer. If more is queued once those are written, it returns
+// errMoreQueued and leaves writing set, for the caller to hand the socket on:
+// what was queued meanwhile was pushed by other connections.
+func (o *Output) write(w io.Writer, buffers int) error {
 	for {
 		o.mu.Lock()
 		if o.closed {
@@ -652,6 +677,17 @@ func (o *Output) write(w io.Writer, oneBatch bool) error {
 		}
 		if o.sent == len(o.inflight) {
 			switch {
+			case len(o.ahead) == 0 && len(o.queued) == 0:
+				end := o.ending
+				o.stopWritingLocked()
+				o.mu.Unlock()
+				if end {
+					o.driver.closeWrite()
+				}
+				return nil
+			case buffers == 0:
+				o.mu.Unlock()
+				return errMoreQueued
 			case len(o.ahead) > 0:
 				o.inflight, o.sent = o.ahead[0], 0
 				o.aheadBytes -= len(o.inflight)
@@ -660,20 +696,11 @@ func (o *Output) write(w io.Writer, oneBatch bool) error {
 				rest := copy(o.ahead, o.ahead[1:])
 				o.ahead[rest] = nil
 				o.ahead = o.ahead[:rest]
-			case len(o.queued) == 0:
-				end := o.ending
-				o.stopWritingLocked()
-				o.mu.Unlock()
-				if end {
-					o.driver.closeWrite()
-				}
-				return nil
-			case oneBatch && batches == 1:
-				o.mu.Unlock()
-				return errMoreQueued
 			default:
-				batches++
 				o.inflight, o.queued, o.spare, o.sent = o.queued, o.spare[:0], nil, 0
+			}
+			if buffers > 0 {
+				buffers--
 			}
 			if o.replica {
 				o.countStallLocked()
@@ -761,7 +788,7 @@ func (d *goroutineOutputDriver) startPump(o *Output) {
 	if d.pump == nil {
 		// A failed write closes the connection (write), which is all there is
 		// to do about it here.
-		d.pump = func() { _ = d.write(o, false) }
+		d.pump = func() { _ = d.write(o, everyBuffer) }
 	}
 	go d.pump()
 }
@@ -788,17 +815,20 @@ func (d *goroutineOutputDriver) flush(o *Output) error {
 		return nil
 	}
 	o.writing = true
+	// This goroutine writes what is queued now, which is its Replies: a push
+	// would have started the pump. What other connections push while it writes
+	// is the pump's to write. This goroutine reads the peer's requests, which
+	// for a Replica are its acknowledgements, and it would not get back to them
+	// under a steady stream of pushes, or behind the stream that was pushed
+	// while a full resync reply went out.
+	batch := o.sealBatchLocked()
 	o.mu.Unlock()
 
-	// This goroutine writes the batch its Replies are in. What other
-	// connections push meanwhile is the pump's to write: this goroutine reads
-	// the peer's requests, which for a Replica are its acknowledgements, and
-	// under a steady stream of pushes it would never get back to them.
-	return d.write(o, true)
+	return d.write(o, batch)
 }
 
-func (d *goroutineOutputDriver) write(o *Output, oneBatch bool) error {
-	err := o.write(d.wire, oneBatch)
+func (d *goroutineOutputDriver) write(o *Output, buffers int) error {
+	err := o.write(d.wire, buffers)
 	if errors.Is(err, errMoreQueued) {
 		o.mu.Lock()
 		if o.closed {

@@ -1121,6 +1121,140 @@ func TestAFlushWritesEveryReplyQueuedBeforeIt(t *testing.T) {
 	}
 }
 
+// replyReadingWire is the socket of a peer that reads the first limit bytes it
+// is sent and nothing after them until it is released. Its first write waits
+// for proceed to be closed, so that a test can queue more output while that
+// write is in progress.
+type replyReadingWire struct {
+	limit      int
+	writeBegun chan struct{}
+	beginOnce  sync.Once
+	proceed    chan struct{}
+	released   chan struct{}
+	release    sync.Once
+
+	mu       sync.Mutex
+	received bytes.Buffer
+}
+
+func newReplyReadingWire(limit int) *replyReadingWire {
+	return &replyReadingWire{
+		limit:      limit,
+		writeBegun: make(chan struct{}),
+		proceed:    make(chan struct{}),
+		released:   make(chan struct{}),
+	}
+}
+
+func (w *replyReadingWire) Write(p []byte) (int, error) {
+	w.beginOnce.Do(func() { close(w.writeBegun) })
+	<-w.proceed
+
+	taken := min(len(p), max(w.limit-w.receivedLen(), 0))
+	w.take(p[:taken])
+	if taken < len(p) {
+		<-w.released
+		w.take(p[taken:])
+	}
+	return len(p), nil
+}
+
+func (w *replyReadingWire) take(p []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.received.Write(p)
+}
+
+func (w *replyReadingWire) receivedLen() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.received.Len()
+}
+
+func (w *replyReadingWire) sent() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.received.String()
+}
+
+// readOn has the peer read everything it is sent from now on.
+func (w *replyReadingWire) readOn() {
+	w.release.Do(func() { close(w.released) })
+}
+
+// TestAFlushWritesNothingThatWasPushedDuringIt flushes Replies to a peer that
+// reads them and no further, while other connections push. The connection's own
+// goroutine writes the Replies and returns: it is the one that reads the peer's
+// requests, which for a Replica are its acknowledgements. What was pushed during
+// the flush is the pump's to write, however the Replies were queued. A Reply
+// queued whole did not count as the flush's one batch, so the goroutine went on
+// to write everything pushed while the snapshot of a full resync went out, up
+// to the 256 MiB a Replica may have waiting, before it read an acknowledgement.
+func TestAFlushWritesNothingThatWasPushedDuringIt(t *testing.T) {
+	small := protocol.SimpleString{Value: "PONG"}
+	whole := protocol.BulkString{Data: make([]byte, outputRetainedBuffer)}
+
+	tests := []struct {
+		name    string
+		replies []protocol.Value
+	}{
+		{name: "a reply queued with the small ones", replies: []protocol.Value{protocol.BulkString{Data: make([]byte, outputRetainedBuffer-1024)}}},
+		{name: "a reply queued whole", replies: []protocol.Value{whole}},
+		{name: "a small reply behind one queued whole", replies: []protocol.Value{small, whole, small}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			replies, err := protocol.EncodeValues(tt.replies)
+			if err != nil {
+				t.Fatalf("EncodeValues() error = %v", err)
+			}
+			wire := newReplyReadingWire(len(replies))
+			out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			defer out.Close(nil)
+			defer wire.readOn()
+
+			// One Reply per request, as a pipeline queues them.
+			for _, value := range tt.replies {
+				if err := out.Reply(value); err != nil {
+					t.Fatalf("Reply() error = %v", err)
+				}
+			}
+			flushed := make(chan error, 1)
+			go func() { flushed <- out.Flush() }()
+			<-wire.writeBegun
+
+			const pushed = "+pushed during the flush\r\n"
+			for i := 0; i < 8; i++ {
+				if !out.Push([]byte(pushed)) {
+					t.Fatalf("Push() = false, want it queued: %v", out.Err())
+				}
+			}
+			close(wire.proceed)
+
+			select {
+			case err := <-flushed:
+				if err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Flush() was still writing 5s after the peer read its %d bytes of replies: the connection's goroutine is writing what was pushed during the flush, to a peer that reads no further", len(replies))
+			}
+			if got := wire.sent(); got != string(replies) {
+				t.Fatalf("the peer was sent %d bytes when Flush returned, want the %d bytes of the replies and nothing pushed", len(got), len(replies))
+			}
+
+			wire.readOn()
+			want := string(replies) + strings.Repeat(pushed, 8)
+			waitForOutput(t, "the pump to write what was pushed during the flush", func() bool { return len(wire.sent()) == len(want) })
+			if got := wire.sent(); got != want {
+				t.Fatalf("sent %d bytes that differ from the replies and then the pushes at byte %d", len(got), firstDifference(got, want))
+			}
+		})
+	}
+}
+
 // lockHoldingDriver is a driver whose schedule waits until it is released. An
 // Output calls schedule with its lock held, so a Push to an Output it drives
 // stays inside that lock, where a test can keep it.
