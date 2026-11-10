@@ -195,9 +195,11 @@ type Output struct {
 	ending bool
 	// lastProgress is when the socket last accepted a byte, or when it was
 	// offered the batch that is inflight; stallArmed is set while a timer is
-	// due to check it.
+	// due to check it. The timer finds the Output through stallWatch, which
+	// Close empties.
 	lastProgress time.Time
 	stallArmed   bool
+	stallWatch   *atomic.Pointer[Output]
 
 	// drained is signalled when a writer finishes and when the backlog falls to
 	// outputHighWater.
@@ -422,6 +424,9 @@ func (o *Output) Close(cause error) {
 	waiting := o.backlog.Load()
 	o.growLocked(-int(waiting))
 	o.ahead, o.aheadBytes, o.queued, o.held = nil, 0, nil, nil
+	if o.stallWatch != nil {
+		o.stallWatch.Store(nil)
+	}
 	if o.counted {
 		o.counted = false
 		o.shared.mu.Lock()
@@ -577,7 +582,22 @@ func (o *Output) armStallLocked(wait time.Duration) {
 		return
 	}
 	o.stallArmed = true
-	time.AfterFunc(wait, o.checkStall)
+	if o.stallWatch == nil {
+		o.stallWatch = new(atomic.Pointer[Output])
+		o.stallWatch.Store(o)
+	}
+	// The timer holds the Output through stallWatch, which Close empties. A
+	// timer that held the Output itself would keep a closed connection's
+	// Output reachable until it was due, and with it the batch a writer was
+	// offering: for a Replica that left during its full resync, the snapshot.
+	// Stopping it would not do: on Go 1.21 a stopped timer can stay in the
+	// runtime's heap until its time.
+	watch := o.stallWatch
+	time.AfterFunc(wait, func() {
+		if watched := watch.Load(); watched != nil {
+			watched.checkStall()
+		}
+	})
 }
 
 // checkStall closes a Replica whose socket has taken nothing for the stall
