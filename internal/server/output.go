@@ -45,13 +45,15 @@ const outputReplicaStallTimeout = 30 * time.Second
 // bufio.Writer would.
 const outputWriteThrough = 4 << 10
 
-// outputHighWater is how many bytes of a connection's Replies may wait before
-// its own requests stop being read and run until they are written, so that a
-// client that pipelines without reading cannot turn small requests into
-// unbounded Replies. What is pushed to the connection does not count: its Push
-// limit bounds that, and a Replica with its stream waiting must still have its
-// acknowledgements read. The Event loop holds everything that waits for a
-// connection to the same mark (eventLoopOutputHighWater).
+// outputHighWater bounds what may be left to write before a connection's
+// latest Reply is out (replyBacklogLocked). Above it the connection's own
+// requests stop being read and run until the peer has read down to it, so that
+// a client that pipelines without reading cannot turn small requests into
+// unbounded Replies. What was pushed to the connection ahead of that Reply
+// counts, since it is written first. What is pushed after it does not: the
+// Push limit bounds that, and a Replica with its stream waiting must still
+// have its acknowledgements read. The Event loop holds everything that waits
+// for a connection to the same mark (eventLoopOutputHighWater).
 const outputHighWater = 1 << 20
 
 // outputWriteChunk is the most bytes handed to a socket in one write. In the
@@ -206,13 +208,16 @@ type Output struct {
 	spare []byte
 	// writing is set while a goroutine of the goroutine mode owns the socket.
 	writing bool
-	// replyWaiting is how many bytes of Replies have not been written, taking
-	// what is written to be Replies first. For a Replica that is exact: its one
-	// Reply, the full resync, is ahead of its whole stream.
-	replyWaiting int
-	holding      bool
-	closed       bool
-	cause        error
+	// written is how many bytes the socket has taken since the connection
+	// opened, and replyEnd is where the latest Reply ends, counted the same way
+	// (queueEndLocked): the Replies are all written once written has reached
+	// replyEnd. What was pushed ahead of a Reply is written before that mark is
+	// reached, and what is pushed after the latest Reply lies behind it.
+	written  int64
+	replyEnd int64
+	holding  bool
+	closed   bool
+	cause    error
 	// replica holds the connection to the Replica Push limit and stall rule,
 	// and leaves it out of the Push budget.
 	replica bool
@@ -230,7 +235,7 @@ type Output struct {
 	stallWatch   *atomic.Pointer[Output]
 
 	// drained is signalled when a writer finishes and when no more than
-	// outputHighWater of Replies is left to write.
+	// outputHighWater is left to write before the latest Reply is out.
 	drained *sync.Cond
 	// backlog is every byte in queued, held and inflight[sent:].
 	backlog atomic.Int64
@@ -291,7 +296,8 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	}
 	if added > 0 {
 		o.growLocked(added)
-		o.replyWaiting += added
+		// Before the held Pushed messages are released, which follow the Reply.
+		o.replyEnd = o.queueEndLocked()
 	}
 
 	if o.holding {
@@ -387,12 +393,13 @@ func (o *Output) Push(frame []byte) bool {
 	// client that is not reading lets pushes pile up behind its Replies. A
 	// Replica's limit is for its stream alone: the snapshot it is still being
 	// sent can be larger than the limit, and says nothing of how far behind it
-	// is.
+	// is. Its one Reply, the full resync, is ahead of its whole stream, so the
+	// stream is what waits behind that Reply.
 	limit := o.shared.pushLimit
 	waiting := o.backlog.Load() + int64(len(frame))
 	if o.replica {
 		limit = o.shared.replicaPushLimit
-		waiting -= int64(o.replyWaiting)
+		waiting -= o.replyBacklogLocked()
 	}
 	if waiting > limit {
 		o.mu.Unlock()
@@ -442,11 +449,11 @@ func (o *Output) HoldPushes() {
 // Flush writes out what is queued, for the connection's own goroutine: before
 // it waits for the next request, once outputWriteThrough is waiting, and before
 // a command blocks. When another goroutine is already writing it leaves the
-// writing to that one, and waits only while more than outputHighWater of the
-// connection's own Replies is unwritten: a client that does not read its
-// Replies stops having its requests run. It reports why the connection is
-// closed, if it is. The Event loop writes its connections itself, so there
-// Flush does nothing.
+// writing to that one, and waits only while more than outputHighWater is left
+// to write before the connection's latest Reply is out: a client that does not
+// read what it is sent stops having its requests run. It reports why the
+// connection is closed, if it is. The Event loop writes its connections
+// itself, so there Flush does nothing.
 func (o *Output) Flush() error {
 	if o == nil {
 		return nil
@@ -596,6 +603,22 @@ func (o *Output) errLocked() error {
 // held behind a Reply.
 func (o *Output) pendingLocked() int {
 	return o.aheadBytes + len(o.queued) + len(o.inflight) - o.sent
+}
+
+// queueEndLocked is where the queue ends: how many bytes have been queued for
+// writing since the connection opened, the written ones and the ones that can
+// be written now. A Pushed message that is held counts once a Reply has
+// released it.
+func (o *Output) queueEndLocked() int64 {
+	return o.written + int64(o.pendingLocked())
+}
+
+// replyBacklogLocked is how many bytes are left to write before the
+// connection's latest Reply is out: its unwritten Replies and what was pushed
+// ahead of them. It is zero once that Reply is written, however much was
+// pushed after it.
+func (o *Output) replyBacklogLocked() int64 {
+	return max(o.replyEnd-o.written, 0)
 }
 
 // growLocked adds delta, which may be negative, to the backlog and to the Push
@@ -792,8 +815,8 @@ func (o *Output) write(w io.Writer, buffers int) error {
 				o.lastProgress = time.Now()
 			}
 			o.growLocked(-n)
-			o.replyWaiting = max(o.replyWaiting-n, 0)
-			if o.replyWaiting <= outputHighWater {
+			o.written += int64(n)
+			if o.replyBacklogLocked() <= outputHighWater {
 				o.drained.Broadcast()
 			}
 		}
@@ -861,11 +884,12 @@ func (d *goroutineOutputDriver) flush(o *Output) error {
 	o.mu.Lock()
 	// Another goroutine may have the socket, and then writes the Replies queued
 	// here with everything else. Waiting for it is only backpressure on this
-	// connection's own requests, so it lasts while its Replies are unwritten and
-	// no longer. What is pushed to the connection never makes it wait: its
-	// goroutine reads the peer's requests, which for a Replica that has fallen
-	// behind are the acknowledgements that show how far.
-	for o.writing && !o.closed && o.replyWaiting > outputHighWater {
+	// connection's own requests, so it lasts while more than the high-water
+	// mark is left to write before its latest Reply is out, and no longer. What
+	// is pushed after that Reply never makes it wait: its goroutine reads the
+	// peer's requests, which for a Replica that has fallen behind are the
+	// acknowledgements that show how far.
+	for o.writing && !o.closed && o.replyBacklogLocked() > outputHighWater {
 		o.drained.Wait()
 	}
 	if o.closed {

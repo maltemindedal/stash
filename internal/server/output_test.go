@@ -192,7 +192,8 @@ func TestAPushNeverWaitsForAStalledConnection(t *testing.T) {
 		t.Fatalf("Backlog() = %d, want the %d bytes pushed still waiting", got, want)
 	}
 
-	// The connection's own goroutine does not wait behind the stuck write either.
+	// The connection's own goroutine does not wait behind the stuck write
+	// either, with less than the high-water mark to write before its reply.
 	if err := out.Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
 		t.Fatalf("Reply() error = %v", err)
 	}
@@ -671,52 +672,139 @@ func TestConcurrentPushesAndRepliesAllArriveWhole(t *testing.T) {
 	}
 }
 
-// TestAFlushBehindAStuckWriterWaitsOnlyForTheConnectionsOwnReplies is a
-// replica's connection with more than the high-water mark of its stream waiting
-// behind a stuck write. Its goroutine flushes before every read, and must not
-// wait for what was pushed to it: it would stop reading the replica's
-// acknowledgements. That holds with no Reply of its own queued and with a small
-// one. It waits only while more than the high-water mark of its own Replies is
-// unwritten, as a client that does not read its Replies must.
-func TestAFlushBehindAStuckWriterWaitsOnlyForTheConnectionsOwnReplies(t *testing.T) {
-	wire := newStalledOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
-	out.MarkReplica()
-
-	if !out.Push(make([]byte, 2*outputHighWater)) {
-		t.Fatal("Push() = false, want the stream queued")
-	}
-	<-wire.writeBegun
-	within(t, "a flush with no reply queued", func() {
-		if err := out.Flush(); err != nil {
-			t.Errorf("Flush() error = %v, want nothing to do", err)
+// TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply has a
+// connection's goroutine flush, as it does before every read, while the pump is
+// stuck on the socket. It waits while more than the high-water mark is left to
+// write before its latest Reply is out, which is backpressure on a client that
+// does not read what it is sent, and for nothing else. A Replica's stream is
+// behind its one Reply, so however much of it waits, its goroutine goes on to
+// read the Replica's acknowledgements. A subscriber's messages that were pushed
+// ahead of a Reply are written before it, so they count: the wait used to
+// count the bytes of the Reply alone, and let the goroutine go with megabytes
+// to write before the Reply was out.
+func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *testing.T) {
+	small := protocol.SimpleString{Value: "PONG"}
+	pushed := make([]byte, 2*outputHighWater)
+	push := func(t *testing.T, out *Output, frame []byte) {
+		t.Helper()
+		if !out.Push(frame) {
+			t.Fatalf("Push() = false, want it queued: %v", out.Err())
 		}
-	})
+	}
+	reply := func(t *testing.T, out *Output, value protocol.Value) {
+		t.Helper()
+		if err := out.Reply(value); err != nil {
+			t.Fatalf("Reply() error = %v", err)
+		}
+	}
 
+	tests := []struct {
+		name string
+		// queue leaves the pump stuck on the socket with output waiting.
+		queue func(t *testing.T, out *Output)
+		waits bool
+	}{
+		{name: "a replica with 2 MiB of its stream waiting and no reply", queue: func(t *testing.T, out *Output) {
+			out.MarkReplica()
+			push(t, out, pushed)
+		}},
+		{name: "a replica with a small reply ahead of 2 MiB of its stream", queue: func(t *testing.T, out *Output) {
+			out.MarkReplica()
+			out.HoldPushes()
+			push(t, out, pushed)
+			reply(t, out, small)
+		}},
+		{name: "a replica with a reply above the mark ahead of its stream", waits: true, queue: func(t *testing.T, out *Output) {
+			out.MarkReplica()
+			out.HoldPushes()
+			push(t, out, []byte("+a write made during the attach\r\n"))
+			reply(t, out, protocol.BulkString{Data: make([]byte, outputHighWater)})
+		}},
+		{name: "a subscriber with a small reply behind 2 MiB of its messages", waits: true, queue: func(t *testing.T, out *Output) {
+			push(t, out, pushed)
+			reply(t, out, small)
+		}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			wire := newStalledOutputWire()
+			out := newGoroutineOutput(newOutputs(), wire)
+			defer out.Close(nil)
+
+			tt.queue(t, out)
+			<-wire.writeBegun
+			flushed := make(chan error, 1)
+			go func() { flushed <- out.Flush() }()
+
+			if !tt.waits {
+				select {
+				case err := <-flushed:
+					if err != nil {
+						t.Fatalf("Flush() error = %v, want what is queued left to the writer", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatalf("Flush() was still waiting after 5s with no more than 1 MiB to write before the connection's latest reply is out, and %d bytes waiting in all", out.Backlog())
+				}
+				return
+			}
+
+			select {
+			case err := <-flushed:
+				t.Fatalf("Flush() returned %v with more than 1 MiB to write before the connection's latest reply is out, to a peer that is not reading, want it to wait", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			out.Close(nil)
+			select {
+			case <-flushed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Flush() still waiting after the connection was closed")
+			}
+		})
+	}
+}
+
+// TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark is
+// a subscriber with one and a half times the high-water mark of messages
+// waiting, which the pump is writing, and a Reply queued behind them. Its
+// goroutine waits in Flush until the peer has read enough of the messages that
+// no more than the mark is left to write before the Reply is out. Then Flush
+// returns, with the Reply still unwritten: the wait is backpressure, and what is
+// left is the pump's to write.
+func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t *testing.T) {
+	wire := newReplyReadingWire(outputHighWater)
+	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	defer out.Close(nil)
+	defer wire.readOn()
+
+	if !out.Push(make([]byte, outputHighWater+outputHighWater/2)) {
+		t.Fatalf("Push() = false, want the messages queued: %v", out.Err())
+	}
+	<-wire.writeBegun // the pump has the socket
 	if err := out.Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
 		t.Fatalf("Reply() error = %v", err)
 	}
-	within(t, "a flush with a small reply queued behind 2 MiB that was pushed", func() {
-		if err := out.Flush(); err != nil {
-			t.Errorf("Flush() error = %v, want the reply left to the writer", err)
-		}
-	})
 
-	if err := out.Reply(protocol.BulkString{Data: make([]byte, outputHighWater)}); err != nil {
-		t.Fatalf("Reply() error = %v", err)
-	}
 	flushed := make(chan error, 1)
 	go func() { flushed <- out.Flush() }()
 	select {
 	case err := <-flushed:
-		t.Fatalf("Flush() returned %v with more than 1 MiB of replies that the peer is not reading, want it to wait", err)
+		t.Fatalf("Flush() returned %v with %d bytes to write before the reply is out and none of them read, want it to wait", err, out.Backlog())
 	case <-time.After(50 * time.Millisecond):
 	}
-	out.Close(nil)
+
+	close(wire.proceed)
 	select {
-	case <-flushed:
+	case err := <-flushed:
+		if err != nil {
+			t.Fatalf("Flush() error = %v", err)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Flush() still waiting after the connection was closed")
+		t.Fatalf("Flush() was still waiting 5s after the peer read %d bytes, which left %d to write before the reply is out", wire.receivedLen(), out.Backlog())
+	}
+	if got := wire.receivedLen(); got != outputHighWater {
+		t.Fatalf("the peer had read %d bytes when Flush returned, want the %d that leave the reply within the mark", got, outputHighWater)
 	}
 }
 
