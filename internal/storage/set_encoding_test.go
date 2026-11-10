@@ -17,7 +17,7 @@ func TestSetUpgradesPastIntSetThreshold(t *testing.T) {
 
 	// Exactly at the threshold: still compact.
 	store := NewStore()
-	if _, _, err := store.SAdd("s", members[:intSetMaxEntries]); err != nil {
+	if _, err := store.SAdd(nil, "s", members[:intSetMaxEntries]); err != nil {
 		t.Fatalf("SAdd() error = %v", err)
 	}
 	if got := store.encodingForTest("s"); got != "set:compact" {
@@ -25,7 +25,7 @@ func TestSetUpgradesPastIntSetThreshold(t *testing.T) {
 	}
 
 	// Adding past the threshold upgrades to the general encoding.
-	if _, _, err := store.SAdd("s", members[intSetMaxEntries:]); err != nil {
+	if _, err := store.SAdd(nil, "s", members[intSetMaxEntries:]); err != nil {
 		t.Fatalf("SAdd() error = %v", err)
 	}
 	if got := store.encodingForTest("s"); got != "set:general" {
@@ -51,7 +51,7 @@ func TestLargeIntSetInitialBatchUsesGeneralEncoding(t *testing.T) {
 	}
 
 	store := NewStore()
-	if _, _, err := store.SAdd("s", members); err != nil {
+	if _, err := store.SAdd(nil, "s", members); err != nil {
 		t.Fatalf("SAdd() error = %v", err)
 	}
 	if got := store.encodingForTest("s"); got != "set:general" {

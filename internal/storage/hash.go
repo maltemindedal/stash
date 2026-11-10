@@ -192,14 +192,13 @@ func compactHashCanSet(hash *CompactHash, pairs []HashFieldValue) bool {
 
 // HSet assigns one or more field/value pairs on the hash stored at key and
 // returns the number of newly created fields. Existing fields are overwritten.
-// When maxmemory is configured it first frees space and reports the keys
-// evicted to make room; otherwise it evicts nothing.
-func (s *Store) HSet(key string, pairs []HashFieldValue) (int64, []string, error) {
+// When maxmemory is configured it first evicts keys to make room.
+func (s *Store) HSet(changes Changes, key string, pairs []HashFieldValue) (int64, error) {
 	if len(pairs) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, key, kindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, changes, key, kindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newHashValueForPairs(pairs)
 			return newKindValue(ValueObject{}, created), int64(created.len()), nil
@@ -241,20 +240,24 @@ func (s *Store) HGet(key, field string) ([]byte, bool, error) {
 
 // HDel removes the named fields from the hash stored at key and returns the
 // number of fields actually removed. An empty hash is deleted from the store.
-func (s *Store) HDel(key string, fields []string) (int64, error) {
+func (s *Store) HDel(changes Changes, key string, fields []string) (int64, error) {
 	if len(fields) == 0 {
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, key, kindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, err := mutateKey(s, changes, key, kindHash, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			return nil, 0, nil
+			return nil, 0, errUnchanged
 		}
 		hash, err := hashOf(cur)
 		if err != nil {
 			return nil, 0, err
 		}
-		return cur, hash.del(fields), nil
+		removed := hash.del(fields)
+		if removed == 0 {
+			return cur, 0, errUnchanged
+		}
+		return cur, removed, nil
 	})
 	return removed, err
 }

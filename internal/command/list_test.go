@@ -61,7 +61,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 			stripe.Unlock()
 		}
 	}()
-	if _, _, err := executor.store.RightPush("jobs", [][]byte{[]byte("job-1")}); err != nil {
+	if _, err := executor.store.RightPush(nil, "jobs", [][]byte{[]byte("job-1")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 

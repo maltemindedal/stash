@@ -369,7 +369,7 @@ func stringImage(t *testing.T, keysAndValues ...string) *storage.Image {
 
 	store := storage.NewStore()
 	for i := 0; i < len(keysAndValues); i += 2 {
-		if _, err := store.Set(keysAndValues[i], []byte(keysAndValues[i+1]), 0); err != nil {
+		if err := store.Set(nil, keysAndValues[i], []byte(keysAndValues[i+1]), 0); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 	}

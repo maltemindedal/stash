@@ -65,15 +65,17 @@ maxmemory_human:100.00M
 
 ## Evictions are replicated and made durable
 
-An eviction is a keyspace mutation, so it is not confined to the server that performed it. Whenever memory pressure or a TTL sweep removes keys, the server synthesises a `DEL` frame naming them and treats it like any other write:
+An eviction is a keyspace change, so it is not confined to the server that performed it. Whenever memory pressure or a TTL sweep removes keys, the server synthesises a `DEL` frame naming them, at most 1,024 keys in each, and treats it like any other write:
 
 - it is **propagated** to attached replicas, so a replica does not keep serving a key the master has dropped;
 - it is **appended to the AOF**, so replaying the log does not resurrect the key;
 - it **invalidates `WATCH`** on the evicted keys, so a transaction guarding one aborts.
 
+When a write causes the eviction, by making room or by the sweep that re-measures the keyspace for it, the `DEL` is part of that write. It follows the write's own command in the AOF and in the replication stream, and inside a transaction it stays between the queued command that caused it and the next one. `WAIT` after the write waits for the `DEL` too. Under `--appendfsync always`, a write whose `DEL` cannot be made durable is answered `ERR persistence failure`, like a write whose own command cannot be. A write that is refused with an out-of-memory error can still have swept expired keys; their `DEL` is recorded all the same.
+
 Each eviction's `DEL` reaches the AOF and the replicas after every earlier write of the keys it names, and before every later one, so replaying the log never deletes a key that was written again after it was evicted. To keep that order, while `--maxmemory` is set and an AOF or a replica records writes, every write except `DEL`, `LPOP`, `RPOP`, `BLPOP`, `HDEL` and `SREM` waits for every other write to reach the log, because making room for it can evict a key any other write might be writing. Under `--maxmemory` those writes already lock the whole keyspace, so they gain little parallelism from the stripes they give up.
 
-The startup pass runs before any client or replica connects, so its `DEL` goes to the AOF only. A replica that attaches later receives the keyspace without the evicted keys in its full resync.
+The startup pass runs before any client or replica connects, so its `DEL` reaches only the AOF. It still counts toward `master_repl_offset`, as the `DEL` of every eviction a master makes does. A replica that attaches later receives the keyspace without the evicted keys in its full resync.
 
 A replica runs its own `--maxmemory` enforcement and active TTL loop, so it can drop keys without an instruction from the master. If an eviction occurs while the replica applies a replicated command, the replica records the eviction in its own AOF but does not send it upstream or to other replicas. An eviction triggered by the replica itself is a local write. Set `--maxmemory` no lower on a replica than on its master, or the replica may drop keys that the master still holds.
 

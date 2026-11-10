@@ -82,35 +82,35 @@ func TestRewrittenAppendOnlyFileReplaysToTheSameKeyspace(t *testing.T) {
 	store := storage.NewStore()
 	deadline := time.Now().Add(time.Hour).UnixMilli()
 	writes := []func() error{
-		func() error { _, err := store.Set("name", []byte("Stash"), 0); return err },
-		func() error { _, err := store.Set("empty", nil, 0); return err },
-		func() error { _, err := store.Set("binary", []byte("a\r\nb\x00c"), 0); return err },
-		func() error { _, err := store.Set("expiring", []byte("soon"), deadline); return err },
-		func() error { _, _, err := store.RightPush("letters", bulk("a", "b", "a")); return err },
-		func() error { _, _, err := store.RightPush("many-values", bulk(many...)); return err },
+		func() error { err := store.Set(nil, "name", []byte("Stash"), 0); return err },
+		func() error { err := store.Set(nil, "empty", nil, 0); return err },
+		func() error { err := store.Set(nil, "binary", []byte("a\r\nb\x00c"), 0); return err },
+		func() error { err := store.Set(nil, "expiring", []byte("soon"), deadline); return err },
+		func() error { _, err := store.RightPush(nil, "letters", bulk("a", "b", "a")); return err },
+		func() error { _, err := store.RightPush(nil, "many-values", bulk(many...)); return err },
 		func() error {
-			_, _, err := store.HSet("profile", []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}, {Field: "tier", Value: []byte("senior")}})
+			_, err := store.HSet(nil, "profile", []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}, {Field: "tier", Value: []byte("senior")}})
 			return err
 		},
 		func() error {
-			_, _, err := store.HSet("wide-profile", []storage.HashFieldValue{{Field: "bio", Value: []byte(long)}, {Field: "", Value: nil}})
+			_, err := store.HSet(nil, "wide-profile", []storage.HashFieldValue{{Field: "bio", Value: []byte(long)}, {Field: "", Value: nil}})
 			return err
 		},
-		func() error { _, _, err := store.HSet("many-fields", manyPairs); return err },
-		func() error { _, _, err := store.SAdd("numbers", bulk("3", "-1", "20")); return err },
-		func() error { _, _, err := store.SAdd("tags", bulk("fast", "durable", "7")); return err },
-		func() error { _, _, err := store.SAdd("many-members", bulk(many...)); return err },
+		func() error { _, err := store.HSet(nil, "many-fields", manyPairs); return err },
+		func() error { _, err := store.SAdd(nil, "numbers", bulk("3", "-1", "20")); return err },
+		func() error { _, err := store.SAdd(nil, "tags", bulk("fast", "durable", "7")); return err },
+		func() error { _, err := store.SAdd(nil, "many-members", bulk(many...)); return err },
 		func() error {
-			_, _, err := store.ZAdd("leaders", []storage.ZSetEntry{{Member: []byte("beta"), Score: 2}, {Member: []byte("alpha"), Score: 1}, {Member: []byte("aardvark"), Score: 2}, {Member: []byte("low"), Score: -math.MaxFloat64}, {Member: []byte("tiny"), Score: 1e-7}})
+			_, err := store.ZAdd(nil, "leaders", []storage.ZSetEntry{{Member: []byte("beta"), Score: 2}, {Member: []byte("alpha"), Score: 1}, {Member: []byte("aardvark"), Score: 2}, {Member: []byte("low"), Score: -math.MaxFloat64}, {Member: []byte("tiny"), Score: 1e-7}})
 			return err
 		},
 		func() error {
-			_, _, err := store.ZAdd("wide-leaders", []storage.ZSetEntry{{Member: []byte(long), Score: 1.5}, {Member: []byte("m"), Score: -3}})
+			_, err := store.ZAdd(nil, "wide-leaders", []storage.ZSetEntry{{Member: []byte(long), Score: 1.5}, {Member: []byte("m"), Score: -3}})
 			return err
 		},
-		func() error { _, _, err := store.ZAdd("many-scores", manyScores); return err },
-		func() error { _, _, err := store.XAdd("events", "1-0", bulk("type", "start")); return err },
-		func() error { _, _, err := store.XAdd("events", "1-1", bulk("type", "stop", "code", "")); return err },
+		func() error { _, err := store.ZAdd(nil, "many-scores", manyScores); return err },
+		func() error { _, err := store.XAdd(nil, "events", "1-0", bulk("type", "start")); return err },
+		func() error { _, err := store.XAdd(nil, "events", "1-1", bulk("type", "stop", "code", "")); return err },
 	}
 	for i, write := range writes {
 		if err := write(); err != nil {
@@ -173,7 +173,7 @@ func TestGenerateRewriteOutputLoadsBackForAHugeCollection(t *testing.T) {
 	for i := range values {
 		values[i] = []byte(member(i))
 	}
-	if _, _, err := store.RightPush("big", values); err != nil {
+	if _, err := store.RightPush(nil, "big", values); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 
@@ -244,7 +244,7 @@ func TestRewriteKeepsTheAbsoluteDeadlineOfAStringKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := storage.NewStore()
-			if _, err := store.Set("k", []byte("v"), tt.expiresAt); err != nil {
+			if err := store.Set(nil, "k", []byte("v"), tt.expiresAt); err != nil {
 				t.Fatalf("Set() error = %v", err)
 			}
 			out, stats := rewriteOf(t, store)
@@ -294,9 +294,9 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 	// snapshot. So it has to replay to exactly those keys, deadlines included,
 	// and leave no temp file behind.
 	store := storage.NewStore()
-	_, _ = store.Set("name", []byte("Stash"), 0)
-	_, _ = store.Set("session", []byte("alice"), time.Now().Add(time.Hour).UnixMilli())
-	if _, _, err := store.RightPush("letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
+	_ = store.Set(nil, "name", []byte("Stash"), 0)
+	_ = store.Set(nil, "session", []byte("alice"), time.Now().Add(time.Hour).UnixMilli())
+	if _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 	want, _ := rewriteOf(t, store)
@@ -357,7 +357,7 @@ func TestSeedFileWritesThroughASymbolicLinkToTheFileItLeadsTo(t *testing.T) {
 	// renamed over the link itself would replace the link with a regular file and
 	// leave that file empty, moving the AOF off the volume the link chose.
 	store := storage.NewStore()
-	if _, err := store.Set("k", []byte("v"), 0); err != nil {
+	if err := store.Set(nil, "k", []byte("v"), 0); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	want, _ := rewriteOf(t, store)
@@ -424,7 +424,7 @@ func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
 	// commands it would lose them, and over a device such as /dev/full, which
 	// reports a size of zero, it would put a regular file in the device's place.
 	store := storage.NewStore()
-	if _, err := store.Set("k", []byte("v"), 0); err != nil {
+	if err := store.Set(nil, "k", []byte("v"), 0); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	commands := []byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nold\r\n")

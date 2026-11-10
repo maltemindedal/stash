@@ -19,16 +19,17 @@ func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
 	keys := make([]string, 20)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("key-%02d", i)
-		if _, err := store.Set(keys[i], payload, 0); err != nil {
+		if err := store.Set(nil, keys[i], payload, 0); err != nil {
 			t.Fatalf("Set(%s) error = %v", keys[i], err)
 		}
 		clock.advance(time.Millisecond) // key-00 is the stalest
 	}
-	store.ConfigureMaxMemory(1<<40, 1000)
+	store.ConfigureMaxMemory(nil, 1<<40, 1000)
 	limit := store.UsedMemory()
-	store.ConfigureMaxMemory(limit, 1000)
+	store.ConfigureMaxMemory(nil, limit, 1000)
 
-	evicted, err := store.Set("a-new-key", payload, 0)
+	var evicted evictedKeys
+	err := store.Set(&evicted, "a-new-key", payload, 0)
 	if err != nil {
 		t.Fatalf("Set() at the limit error = %v, want it to evict and succeed", err)
 	}
@@ -63,19 +64,20 @@ func TestStoreMaxMemoryEvictsLeastRecentlyUsedKeysToMakeRoom(t *testing.T) {
 // attempt to make room, and the key keeps its old value.
 func TestStoreMaxMemoryRefusesAnImpossibleWriteWithoutEvicting(t *testing.T) {
 	store := NewStore()
-	if _, err := store.Set("target", []byte("small"), 0); err != nil {
+	if err := store.Set(nil, "target", []byte("small"), 0); err != nil {
 		t.Fatalf("Set(target) error = %v", err)
 	}
 	for i := 0; i < 10; i++ {
-		if _, err := store.Set(fmt.Sprintf("bystander-%d", i), []byte("v"), 0); err != nil {
+		if err := store.Set(nil, fmt.Sprintf("bystander-%d", i), []byte("v"), 0); err != nil {
 			t.Fatalf("Set(bystander) error = %v", err)
 		}
 	}
-	store.ConfigureMaxMemory(1<<40, 1000)
-	store.ConfigureMaxMemory(store.UsedMemory(), 1000)
+	store.ConfigureMaxMemory(nil, 1<<40, 1000)
+	store.ConfigureMaxMemory(nil, store.UsedMemory(), 1000)
 	before := store.Len()
 
-	evicted, err := store.Set("target", []byte(strings.Repeat("y", 1<<16)), 0)
+	var evicted evictedKeys
+	err := store.Set(&evicted, "target", []byte(strings.Repeat("y", 1<<16)), 0)
 	if !errors.Is(err, ErrMemoryLimitExceeded) {
 		t.Fatalf("Set() error = %v, want ErrMemoryLimitExceeded", err)
 	}
@@ -96,41 +98,33 @@ func TestStoreMaxMemoryRefusesAnImpossibleWriteWithoutEvicting(t *testing.T) {
 // the deadline and not before it.
 func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	store, clock := newStoreWithManualClock()
-	store.ConfigureMaxMemory(1<<20, 16)
-	reported := make(chan []string, 4)
-	store.SetExpirationListener(func(keys []string) { reported <- keys })
+	store.ConfigureMaxMemory(nil, 1<<20, 16)
+	var swept expiredKeys
 
-	if _, err := store.Set("soon", []byte("v"), clock.now()+60); err != nil {
+	if err := store.Set(nil, "soon", []byte("v"), clock.now()+60); err != nil {
 		t.Fatalf("Set(soon) error = %v", err)
 	}
-	if _, err := store.Set("later", []byte("v"), clock.now()+time.Hour.Milliseconds()); err != nil {
+	if err := store.Set(nil, "later", []byte("v"), clock.now()+time.Hour.Milliseconds()); err != nil {
 		t.Fatalf("Set(later) error = %v", err)
 	}
 
 	// Before the deadline: still there, nothing swept.
-	if _, err := store.Set("other-1", []byte("v"), 0); err != nil {
+	if err := store.Set(&swept, "other-1", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-1) error = %v", err)
 	}
-	select {
-	case keys := <-reported:
-		t.Fatalf("a write before any deadline swept %v", keys)
-	default:
+	if len(swept) != 0 {
+		t.Fatalf("a write before any deadline swept %v", swept)
 	}
 	if !store.holdsKeyForTest("soon") {
 		t.Fatal("the key was swept before its deadline")
 	}
 
 	clock.advance(90 * time.Millisecond)
-	if _, err := store.Set("other-2", []byte("v"), 0); err != nil {
+	if err := store.Set(&swept, "other-2", []byte("v"), 0); err != nil {
 		t.Fatalf("Set(other-2) error = %v", err)
 	}
-	select {
-	case keys := <-reported:
-		if len(keys) != 1 || keys[0] != "soon" {
-			t.Fatalf("swept %v, want [soon]", keys)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("the first write after the deadline did not sweep the expired key")
+	if len(swept) != 1 || swept[0] != "soon" {
+		t.Fatalf("the first write after the deadline swept %v, want [soon]", swept)
 	}
 	if !store.holdsKeyForTest("later") {
 		t.Fatal("the swept keyspace lost a key whose deadline had not passed")
@@ -144,31 +138,30 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 // to a key whose TTL deadline passes while the write runs. Under maxmemory the
 // write sweeps expired keys to make room, and that sweep judges expiry by the
 // clock reading at which the write found its key live: the key is neither
-// reported to the expiration listener nor counted out of used memory.
+// reported to the write's Changes as expired nor counted out of used memory.
 func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 	tests := []struct {
 		name  string
-		write func(store *Store, key string) error
+		write func(store *Store, changes Changes, key string) error
 	}{
 		{
 			name: "INCR that adds a digit",
-			write: func(store *Store, key string) error {
-				_, _, err := store.Increment(key)
+			write: func(store *Store, changes Changes, key string) error {
+				_, err := store.Increment(changes, key)
 				return err
 			},
 		},
 		{
 			name: "SETBIT past the end",
-			write: func(store *Store, key string) error {
-				_, _, err := store.SetBit(key, 15, 1)
+			write: func(store *Store, changes Changes, key string) error {
+				_, err := store.SetBit(changes, key, 15, 1)
 				return err
 			},
 		},
 		{
 			name: "SET to a longer value with a TTL",
-			write: func(store *Store, key string) error {
-				_, err := store.Set(key, []byte("longer"), store.deadlineAfter(time.Hour))
-				return err
+			write: func(store *Store, changes Changes, key string) error {
+				return store.Set(changes, key, []byte("longer"), store.deadlineAfter(time.Hour))
 			},
 		},
 	}
@@ -176,10 +169,10 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			store, key, heard := writeAcrossItsKeysDeadline(t, tt.write)
+			store, key, swept := writeAcrossItsKeysDeadline(t, tt.write)
 
-			if len(heard) != 0 {
-				t.Errorf("the expiration listener heard %v, want nothing: the write found %s live", heard, key)
+			if len(swept) != 0 {
+				t.Errorf("the write reported %v as expired, want nothing: it found %s live", swept, key)
 			}
 			if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {
 				t.Errorf("UsedMemory() = %d after the write, recount = %d", used, want)
@@ -192,7 +185,7 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 // TTL deadline an hour out, under maxmemory. It runs write on that key so that
 // the write takes its clock reading at or before the key's deadline and makes
 // room after it, and returns the store, the key, and the keys the expiration
-// listener heard.
+// write reported as expired.
 //
 // An accounted write reads the clock and then takes every shard lock in
 // ascending order, so while the test holds the last shard's lock the write
@@ -201,13 +194,12 @@ func TestAWriteUnderMaxmemoryDoesNotSweepTheKeyItFoundLive(t *testing.T) {
 // to that reading, under that same lock, and moves the clock past it before it
 // lets the write go on: any reading the write took after its first would find
 // the key expired.
-func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key string) error) (*Store, string, []string) {
+func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, changes Changes, key string) error) (*Store, string, []string) {
 	t.Helper()
 
 	store, clock := newStoreWithManualClock()
-	store.ConfigureMaxMemory(1<<20, 16)
-	var heard []string
-	store.SetExpirationListener(func(keys []string) { heard = append(heard, keys...) })
+	store.ConfigureMaxMemory(nil, 1<<20, 16)
+	var swept expiredKeys
 
 	lastIndex := len(store.shards) - 1
 	key := ""
@@ -216,14 +208,14 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 			key = candidate
 		}
 	}
-	if _, err := store.Set(key, []byte("9"), store.deadlineAfter(time.Hour)); err != nil {
+	if err := store.Set(nil, key, []byte("9"), store.deadlineAfter(time.Hour)); err != nil {
 		t.Fatalf("Set(%s) error = %v", key, err)
 	}
 
 	last := &store.shards[lastIndex]
 	last.mu.Lock()
 	done := make(chan error, 1)
-	go func() { done <- write(store, key) }()
+	go func() { done <- write(store, &swept, key) }()
 	for store.shards[0].mu.TryLock() {
 		store.shards[0].mu.Unlock()
 		runtime.Gosched()
@@ -237,7 +229,7 @@ func writeAcrossItsKeysDeadline(t *testing.T, write func(store *Store, key strin
 	if err := <-done; err != nil {
 		t.Fatalf("the write failed: %v", err)
 	}
-	return store, key, heard
+	return store, key, swept
 }
 
 // TestStoreExpiryLowerBound pins how the earliest-deadline bound is kept: unknown
@@ -248,36 +240,36 @@ func TestStoreExpiryLowerBound(t *testing.T) {
 	soon := store.deadlineAfter(time.Hour)
 	later := soon + 60_000
 
-	if _, err := store.Set("off", []byte("v"), soon); err != nil {
+	if err := store.Set(nil, "off", []byte("v"), soon); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	if got := store.nextExpiry.Load(); got != 0 {
 		t.Fatalf("nextExpiry = %d with maxmemory off, want it untracked (0)", got)
 	}
 
-	store.ConfigureMaxMemory(1<<20, 16)
+	store.ConfigureMaxMemory(nil, 1<<20, 16)
 	if got := store.nextExpiry.Load(); got != soon {
 		t.Fatalf("nextExpiry = %d after enabling maxmemory, want the exact earliest deadline %d", got, soon)
 	}
-	if _, err := store.Set("later", []byte("v"), later); err != nil {
+	if err := store.Set(nil, "later", []byte("v"), later); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	if got := store.nextExpiry.Load(); got != soon {
 		t.Fatalf("nextExpiry = %d after storing a later deadline, want it unchanged at %d", got, soon)
 	}
 	earlier := soon - 1000
-	if _, err := store.Set("earlier", []byte("v"), earlier); err != nil {
+	if err := store.Set(nil, "earlier", []byte("v"), earlier); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	if got := store.nextExpiry.Load(); got != earlier {
 		t.Fatalf("nextExpiry = %d after storing an earlier deadline, want %d", got, earlier)
 	}
 
-	store.ConfigureMaxMemory(0, 16)
-	store.ConfigureMaxMemory(1<<20, 16)
-	store.Delete("earlier")
-	store.Delete("off")
-	store.ConfigureMaxMemory(1<<20, 16)
+	store.ConfigureMaxMemory(nil, 0, 16)
+	store.ConfigureMaxMemory(nil, 1<<20, 16)
+	store.Delete(nil, "earlier")
+	store.Delete(nil, "off")
+	store.ConfigureMaxMemory(nil, 1<<20, 16)
 	if got := store.nextExpiry.Load(); got != later {
 		t.Fatalf("nextExpiry = %d after a recount without the earlier keys, want %d", got, later)
 	}
@@ -291,15 +283,15 @@ func TestAccountedInsertsDoNotScanTheKeyspace(t *testing.T) {
 	store := NewStore()
 	value := []byte("value-of-about-thirty-two-bytes!")
 	for i := 0; i < 100_000; i++ {
-		if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+		if err := store.Set(nil, fmt.Sprintf("seed-%d", i), value, 0); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 	}
-	store.ConfigureMaxMemory(1<<40, 16)
+	store.ConfigureMaxMemory(nil, 1<<40, 16)
 
 	start := time.Now()
 	for i := 0; i < 300; i++ {
-		if _, err := store.Set(fmt.Sprintf("new-%d", i), value, 0); err != nil {
+		if err := store.Set(nil, fmt.Sprintf("new-%d", i), value, 0); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 	}

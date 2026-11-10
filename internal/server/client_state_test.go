@@ -19,11 +19,22 @@ import (
 )
 
 // stubExecutor is a command executor that answers every request with +OK.
-type stubExecutor struct{}
+type stubExecutor struct{ unorderedBackground }
 
 func (stubExecutor) Handle(context.Context, Call, protocol.Value) (ExecuteResult, error) {
 	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 }
+
+// unorderedBackground is the background half of a test's command executor: it
+// runs the work at once, orders nothing and records nothing.
+type unorderedBackground struct{}
+
+func (unorderedBackground) RunBackgroundUnit(work func(changes storage.Changes)) error {
+	work(nil)
+	return nil
+}
+
+func (unorderedBackground) BeginBackgroundWrite() (release func()) { return func() {} }
 
 // newTestServer builds a server around executor, or around stubExecutor when
 // executor is nil.

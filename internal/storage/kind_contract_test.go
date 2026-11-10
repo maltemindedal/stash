@@ -36,7 +36,7 @@ func kindFixtures() []kindFixture {
 			if ttl {
 				expiresAt = s.now() + 3_600_000
 			}
-			_, err := s.Set(kindFixtureKey, []byte(value), expiresAt)
+			err := s.Set(nil, kindFixtureKey, []byte(value), expiresAt)
 			return err
 		}
 	}
@@ -46,13 +46,13 @@ func kindFixtures() []kindFixture {
 			for i := 0; i < len(pairs); i += 2 {
 				fields = append(fields, HashFieldValue{Field: pairs[i], Value: []byte(pairs[i+1])})
 			}
-			_, _, err := s.HSet(kindFixtureKey, fields)
+			_, err := s.HSet(nil, kindFixtureKey, fields)
 			return err
 		}
 	}
 	sadd := func(members ...string) func(*Store) error {
 		return func(s *Store) error {
-			_, _, err := s.SAdd(kindFixtureKey, bulk(members...))
+			_, err := s.SAdd(nil, kindFixtureKey, bulk(members...))
 			return err
 		}
 	}
@@ -62,7 +62,7 @@ func kindFixtures() []kindFixture {
 			for i, member := range members {
 				entries[i] = ZSetEntry{Member: []byte(member), Score: float64(i) + 0.5}
 			}
-			_, _, err := s.ZAdd(kindFixtureKey, entries)
+			_, err := s.ZAdd(nil, kindFixtureKey, entries)
 			return err
 		}
 	}
@@ -74,27 +74,27 @@ func kindFixtures() []kindFixture {
 		many[i] = "item-" + strconv.Itoa(i)
 		manyPairs = append(manyPairs, many[i], "v")
 	}
-	setBit := func(s *Store) error { _, _, err := s.SetBit(kindFixtureKey, 7, 1); return err }
-	rpush := func(s *Store) error { _, _, err := s.RightPush(kindFixtureKey, bulk("z")); return err }
-	xadd := func(s *Store) error { _, _, err := s.XAdd(kindFixtureKey, "2-0", bulk("f", "v")); return err }
+	setBit := func(s *Store) error { _, err := s.SetBit(nil, kindFixtureKey, 7, 1); return err }
+	rpush := func(s *Store) error { _, err := s.RightPush(nil, kindFixtureKey, bulk("z")); return err }
+	xadd := func(s *Store) error { _, err := s.XAdd(nil, kindFixtureKey, "2-0", bulk("f", "v")); return err }
 
 	return []kindFixture{
 		{name: "string", build: set("hello", false), size: 54, write: setBit},
 		{name: "string with a TTL", build: set("hello", true), size: 62, write: setBit},
 		{name: "empty string", build: set("", false), size: 49, write: setBit},
 		{name: "list", size: 135, write: rpush, build: func(s *Store) error {
-			_, _, err := s.RightPush(kindFixtureKey, bulk("a", "bb", "ccc"))
+			_, err := s.RightPush(nil, kindFixtureKey, bulk("a", "bb", "ccc"))
 			return err
 		}},
 		{name: "list with dead slots at its front", size: 118, write: rpush, build: func(s *Store) error {
-			if _, _, err := s.RightPush(kindFixtureKey, bulk("a", "bb", "ccc")); err != nil {
+			if _, err := s.RightPush(nil, kindFixtureKey, bulk("a", "bb", "ccc")); err != nil {
 				return err
 			}
-			_, _, err := s.LeftPop(kindFixtureKey)
+			_, _, err := s.LeftPop(nil, kindFixtureKey)
 			return err
 		}},
 		{name: "list of more values than one command carries", size: 62671, write: rpush, build: func(s *Store) error {
-			_, _, err := s.RightPush(kindFixtureKey, bulk(many...))
+			_, err := s.RightPush(nil, kindFixtureKey, bulk(many...))
 			return err
 		}},
 		{name: "compact hash", build: hset("f", "v", "gg", "www"), size: 136, write: hset("f", "x")},
@@ -107,10 +107,10 @@ func kindFixtures() []kindFixture {
 		{name: "skip-list sorted set", build: zadd("m", "nn", long), size: 221, write: zadd("nn")},
 		{name: "sorted set of more members than one command carries", build: zadd(many...), size: 83055, write: zadd("nn")},
 		{name: "stream", size: 160, write: xadd, build: func(s *Store) error {
-			if _, _, err := s.XAdd(kindFixtureKey, "1-1", bulk("f", "v")); err != nil {
+			if _, err := s.XAdd(nil, kindFixtureKey, "1-1", bulk("f", "v")); err != nil {
 				return err
 			}
-			_, _, err := s.XAdd(kindFixtureKey, "1-2", bulk("gg", "www", "h", "x"))
+			_, err := s.XAdd(nil, kindFixtureKey, "1-2", bulk("gg", "www", "h", "x"))
 			return err
 		}},
 	}
@@ -125,7 +125,7 @@ func TestEveryValueKindKeepsItsContract(t *testing.T) {
 			built := func(t *testing.T) *Store {
 				t.Helper()
 				store, _ := newStoreWithManualClock()
-				store.ConfigureMaxMemory(1<<30, 16)
+				store.ConfigureMaxMemory(nil, 1<<30, 16)
 				if err := fixture.build(store); err != nil {
 					t.Fatalf("build error = %v", err)
 				}

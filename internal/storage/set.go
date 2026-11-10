@@ -165,14 +165,14 @@ func (img *setImage) recreate(key string, emit func(args [][]byte) error) error 
 }
 
 // SAdd adds the supplied members to the set stored at key and returns the
-// number of newly added members. When maxmemory is configured it first frees
-// space and reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) SAdd(key string, members [][]byte) (int64, []string, error) {
+// number of newly added members. When maxmemory is configured it first evicts
+// keys to make room.
+func (s *Store) SAdd(changes Changes, key string, members [][]byte) (int64, error) {
 	if len(members) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, key, kindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, changes, key, kindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newSetValueForMembers(members)
 			return newKindValue(ValueObject{}, created), int64(created.len()), nil
@@ -199,20 +199,24 @@ func (s *Store) SIsMember(key string, member []byte) (bool, error) {
 
 // SRem removes the supplied members from the set stored at key and returns the
 // number of members actually removed. An empty set is deleted from the store.
-func (s *Store) SRem(key string, members [][]byte) (int64, error) {
+func (s *Store) SRem(changes Changes, key string, members [][]byte) (int64, error) {
 	if len(members) == 0 {
 		return 0, ErrSyntax
 	}
 
-	removed, _, err := mutateKey(s, key, kindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	removed, err := mutateKey(s, changes, key, kindSet, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			return nil, 0, nil
+			return nil, 0, errUnchanged
 		}
 		set, err := setOf(cur)
 		if err != nil {
 			return nil, 0, err
 		}
-		return cur, set.remove(members), nil
+		removed := set.remove(members)
+		if removed == 0 {
+			return cur, 0, errUnchanged
+		}
+		return cur, removed, nil
 	})
 	return removed, err
 }

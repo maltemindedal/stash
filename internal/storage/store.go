@@ -33,15 +33,18 @@ var (
 
 // Store is a thread-safe in-memory key/value store.
 type Store struct {
-	shards                   []Shard
-	seed                     maphash.Seed
-	waiters                  *listWaiters
-	loggerMu                 sync.RWMutex
-	logger                   *slog.Logger
-	expirationMu             sync.Mutex
-	expirationListener       func(keys []string)
-	pendingExpired           []string
-	evictionGuard            func() (release func())
+	shards           []Shard
+	seed             maphash.Seed
+	waiters          *listWaiters
+	loggerMu         sync.RWMutex
+	logger           *slog.Logger
+	backgroundMu     sync.Mutex
+	backgroundRunner func(work func(changes Changes))
+	// removed is the keys the holder of every shard write lock has removed on
+	// its own initiative during that hold. Those locks guard it, and the holder
+	// empties it as it releases them (writeUnlockAllShardsAndReport), so one
+	// call never hands on what another removed.
+	removed                  removals
 	usedMemory               atomic.Int64
 	keyKindCounts            [kindCount]atomic.Int64
 	maxMemory                atomic.Int64
@@ -96,93 +99,73 @@ func (s *Store) SetLogger(logger *slog.Logger) {
 	s.logger = logger
 }
 
-// SetExpirationListener registers the sink for keys the store removed because
-// their TTL had passed.
+// SetBackgroundRunner registers run, which the store calls with each piece of
+// work it does on its own initiative: one sample of the active expiry loop.
 //
-// Expiry is the one keyspace mutation the store performs on its own initiative
-// rather than on a caller's instruction, which makes it the one a caller cannot
-// otherwise see. A caller that replicates and persists mutations has to see
-// it. Two paths sweep for it: the background eviction loop, and the keyspace
-// recalculation every accounted write runs. Both report here.
-//
-// A key dropped because the very operation reading it found it expired is not
-// reported: passive expiry is a conclusion any server holding the key reaches
-// from the TTL it already has. The listener runs with no shard lock held, on
-// whichever goroutine noticed the expiry.
-func (s *Store) SetExpirationListener(listener func(keys []string)) {
+// A TTL eviction by that loop is a keyspace change no caller asked for, so no
+// request's Changes hears of it, yet whoever replicates and persists writes has
+// to. run calls work with the Changes that hears it, and orders work against
+// the writes it is also recording: a key expiring and being set again must
+// reach the log in the order they happened. Without a runner the store calls
+// work with a nil Changes.
+func (s *Store) SetBackgroundRunner(run func(work func(changes Changes))) {
 	if s == nil {
 		return
 	}
 
-	s.expirationMu.Lock()
-	defer s.expirationMu.Unlock()
-	s.expirationListener = listener
+	s.backgroundMu.Lock()
+	defer s.backgroundMu.Unlock()
+	s.backgroundRunner = run
 }
 
-// SetEvictionGuard registers a function the background eviction loop calls before
-// each sample and whose result it calls once the sample's removals have been
-// handed to the expiration listener. It lets the owner of the listener order those
-// removals against the writes it is also logging: a key expiring and being set
-// again must reach the log in the order they happened.
-func (s *Store) SetEvictionGuard(guard func() (release func())) {
-	if s == nil {
+// runInBackground runs work through the background runner.
+func (s *Store) runInBackground(work func(changes Changes)) {
+	s.backgroundMu.Lock()
+	run := s.backgroundRunner
+	s.backgroundMu.Unlock()
+	if run == nil {
+		work(nil)
 		return
 	}
-
-	s.expirationMu.Lock()
-	defer s.expirationMu.Unlock()
-	s.evictionGuard = guard
+	run(work)
 }
 
-func (s *Store) acquireEvictionGuard() func() {
-	s.expirationMu.Lock()
-	guard := s.evictionGuard
-	s.expirationMu.Unlock()
-	if guard == nil {
-		return func() {}
-	}
-	return guard()
+// removals is the keys one call removed that its caller did not ask it to
+// remove.
+type removals struct {
+	// expired are active TTL evictions: keys a sweep found past their deadline.
+	expired []string
+	// evicted are memory-pressure evictions: keys removed to make room.
+	evicted []string
 }
 
-// noteExpiredKeysLocked queues keys removed for expiry while shard locks are
-// held, for publishExpiredKeys to hand on once they are released.
-func (s *Store) noteExpiredKeysLocked(keys []string) {
-	if s == nil || len(keys) == 0 {
-		return
-	}
-
-	s.expirationMu.Lock()
-	defer s.expirationMu.Unlock()
-	s.pendingExpired = append(s.pendingExpired, keys...)
+// noteExpiredLocked adds keys a sweep removed to what the caller's hold of
+// every shard write lock has removed.
+func (s *Store) noteExpiredLocked(keys []string) {
+	s.removed.expired = append(s.removed.expired, keys...)
 }
 
-// publishExpiredKeys hands every queued expiry to the listener. Callers must
-// hold no shard lock: the listener reaches replication and durability sinks,
-// which must never be entered under a store lock. It always drains the queue,
-// so an unconfigured listener cannot let it grow.
-func (s *Store) publishExpiredKeys() {
-	if s == nil {
+// writeUnlockAllShardsAndReport releases every shard write lock and then tells
+// changes which keys the hold swept and which it evicted to make room.
+func (s *Store) writeUnlockAllShardsAndReport(changes Changes) {
+	removed := s.removed
+	s.removed = removals{}
+	s.writeUnlockAllShards()
+	if changes == nil {
 		return
 	}
-
-	s.expirationMu.Lock()
-	pending := s.pendingExpired
-	s.pendingExpired = nil
-	listener := s.expirationListener
-	s.expirationMu.Unlock()
-
-	if len(pending) == 0 || listener == nil {
-		return
+	for _, key := range removed.expired {
+		changes.KeyChanged(key, Expired)
 	}
-
-	listener(pending)
+	for _, key := range removed.evicted {
+		changes.KeyChanged(key, MemoryEvicted)
+	}
 }
 
 // Set stores a byte slice under the provided key. When maxmemory is configured
-// it first frees space and reports the keys evicted to make room; otherwise it
-// evicts nothing.
-func (s *Store) Set(key string, value []byte, expiresAt int64) ([]string, error) {
-	return replaceKey(s, key, newStringValue(value, expiresAt))
+// it first evicts keys to make room.
+func (s *Store) Set(changes Changes, key string, value []byte, expiresAt int64) error {
+	return replaceKey(s, changes, key, newStringValue(value, expiresAt))
 }
 
 // Get fetches a value from the store, passively evicting it if it has expired.
@@ -215,40 +198,42 @@ func (s *Store) withStringValue(key string, fn func(data []byte) error) (bool, e
 }
 
 // Delete removes a key from the store and reports whether it held a live value.
-func (s *Store) Delete(key string) bool {
+func (s *Store) Delete(changes Changes, key string) bool {
 	// A mutation that accepts every kind and never fails cannot return an error.
-	deleted, _, _ := mutateKey(s, key, anyKind, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
-		return nil, cur != nil, nil
+	deleted, _ := mutateKey(s, changes, key, anyKind, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+		if cur == nil {
+			return nil, false, errUnchanged
+		}
+		return nil, true, nil
 	})
 	return deleted
 }
 
 // DeleteMany removes the supplied keys and returns the keys actually removed.
 // Expired keys are treated as absent. The returned key order is unspecified.
-func (s *Store) DeleteMany(keys []string) []string {
+func (s *Store) DeleteMany(changes Changes, keys []string) []string {
 	if len(keys) == 0 {
 		return nil
 	}
 	if len(keys) == 1 {
-		if s.Delete(keys[0]) {
+		if s.Delete(changes, keys[0]) {
 			return []string{keys[0]}
 		}
 		return nil
 	}
 
-	return deleteKeys(s, keys)
+	return deleteKeys(s, changes, keys)
 }
 
 // Increment atomically increments the string value stored at key by one. When
-// maxmemory is configured it first frees space and reports the keys evicted to
-// make room; otherwise it evicts nothing.
-func (s *Store) Increment(key string) (int64, []string, error) {
-	return mutateString(s, key, func(w stringWrite) (int64, []string, error) {
+// maxmemory is configured it first evicts keys to make room.
+func (s *Store) Increment(changes Changes, key string) (int64, error) {
+	return mutateString(s, changes, key, func(w stringWrite) (int64, error) {
 		parsed := int64(0)
 		if current, ok := w.Current(); ok {
 			n, err := strconv.ParseInt(string(current), 10, 64)
 			if err != nil || n == math.MaxInt64 {
-				return 0, nil, ErrValueNotInteger
+				return 0, ErrValueNotInteger
 			}
 			parsed = n
 		}
@@ -256,55 +241,58 @@ func (s *Store) Increment(key string) (int64, []string, error) {
 
 		var digits [20]byte // the longest int64, with its sign
 		next := strconv.AppendInt(digits[:0], parsed, 10)
-		payload, evicted, err := w.Payload(len(next))
+		payload, err := w.Payload(len(next))
 		if err != nil {
-			return 0, nil, err
+			return 0, err
 		}
 		copy(payload, next)
-		return parsed, evicted, nil
+		return parsed, nil
 	})
 }
 
 // LeftPush prepends one or more values to the list stored at key and returns
-// the new length. When maxmemory is configured it first frees space and reports
-// the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) LeftPush(key string, values [][]byte) (int64, []string, error) {
-	return s.pushList(key, values, true)
+// the new length. When maxmemory is configured it first evicts keys to make
+// room.
+func (s *Store) LeftPush(changes Changes, key string, values [][]byte) (int64, error) {
+	return s.pushList(changes, key, values, true)
 }
 
 // RightPush appends one or more values to the list stored at key and returns
-// the new length. When maxmemory is configured it first frees space and reports
-// the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) RightPush(key string, values [][]byte) (int64, []string, error) {
-	return s.pushList(key, values, false)
+// the new length. When maxmemory is configured it first evicts keys to make
+// room.
+func (s *Store) RightPush(changes Changes, key string, values [][]byte) (int64, error) {
+	return s.pushList(changes, key, values, false)
 }
 
 // LeftPop removes and returns the left-most value from the list stored at key.
-func (s *Store) LeftPop(key string) ([]byte, bool, error) {
-	return s.popOne(key, true)
+func (s *Store) LeftPop(changes Changes, key string) ([]byte, bool, error) {
+	return s.popOne(changes, key, true)
 }
 
 // RightPop removes and returns the right-most value from the list stored at key.
-func (s *Store) RightPop(key string) ([]byte, bool, error) {
-	return s.popOne(key, false)
+func (s *Store) RightPop(changes Changes, key string) ([]byte, bool, error) {
+	return s.popOne(changes, key, false)
 }
 
 // popOne removes one value from the left or right end of the list stored at key.
 // A pop that leaves values behind wakes the next waiting client, once the
 // shard lock is released.
-func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
+func (s *Store) popOne(changes Changes, key string, left bool) ([]byte, bool, error) {
 	// The mutation reports only whether it found a list. The popped value and
 	// the count left come back through variables it sets: a struct result
 	// carrying them was copied on every return and made a pop over 10% slower.
 	var item []byte
 	remaining := 0
-	ok, _, err := mutateKey(s, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, err := mutateKey(s, changes, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil {
-			return nil, false, nil
+			return nil, false, errUnchanged
 		}
 		list, err := listOf(cur)
-		if err != nil || list.empty() {
+		if err != nil {
 			return nil, false, err
+		}
+		if list.empty() {
+			return nil, false, errUnchanged
 		}
 		if left {
 			item, remaining = list.popFront()
@@ -321,20 +309,20 @@ func (s *Store) popOne(key string, left bool) ([]byte, bool, error) {
 
 // LeftPopN removes and returns up to count left-most values from the list stored at key.
 // Returns (nil, false, nil) when the key is missing or expired.
-func (s *Store) LeftPopN(key string, count int) ([][]byte, bool, error) {
-	return s.popN(key, count, true)
+func (s *Store) LeftPopN(changes Changes, key string, count int) ([][]byte, bool, error) {
+	return s.popN(changes, key, count, true)
 }
 
 // RightPopN removes and returns up to count right-most values from the list stored at key.
 // Returns (nil, false, nil) when the key is missing or expired.
-func (s *Store) RightPopN(key string, count int) ([][]byte, bool, error) {
-	return s.popN(key, count, false)
+func (s *Store) RightPopN(changes Changes, key string, count int) ([][]byte, bool, error) {
+	return s.popN(changes, key, count, false)
 }
 
 // popN removes up to count values from the left or right end of the list stored
 // at key. A pop that removes values and leaves values behind wakes the next
 // waiting client, once the shard lock is released.
-func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
+func (s *Store) popN(changes Changes, key string, count int, left bool) ([][]byte, bool, error) {
 	if count < 0 {
 		return nil, false, ErrSyntax
 	}
@@ -342,15 +330,21 @@ func (s *Store) popN(key string, count int, left bool) ([][]byte, bool, error) {
 	// As in popOne, the values and the count left come back through variables.
 	var values [][]byte
 	remaining := 0
-	ok, _, err := mutateKey(s, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+	ok, err := mutateKey(s, changes, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
 		if cur == nil {
-			return nil, false, nil
+			return nil, false, errUnchanged
 		}
 		list, err := listOf(cur)
-		if err != nil || list.empty() {
+		if err != nil {
 			return nil, false, err
 		}
+		if list.empty() {
+			return nil, false, errUnchanged
+		}
 		values, remaining = list.popValues(count, left)
+		if len(values) == 0 {
+			return cur, true, errUnchanged
+		}
 		return cur, true, nil
 	})
 	if len(values) > 0 && remaining > 0 {
@@ -384,14 +378,14 @@ func (s *Store) ListRange(key string, start, stop int64) ([][]byte, error) {
 }
 
 // ZAdd inserts or updates one or more sorted-set members and returns the number
-// of newly added members. When maxmemory is configured it first frees space and
-// reports the keys evicted to make room; otherwise it evicts nothing.
-func (s *Store) ZAdd(key string, entries []ZSetEntry) (int64, []string, error) {
+// of newly added members. When maxmemory is configured it first evicts keys to
+// make room.
+func (s *Store) ZAdd(changes Changes, key string, entries []ZSetEntry) (int64, error) {
 	if len(entries) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, key, kindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, changes, key, kindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newZSetValueForEntries(entries)
 			return newKindValue(ValueObject{}, created), int64(created.len()), nil
@@ -477,14 +471,13 @@ func (s *Store) ZRangeByScores(key string, scoreRanges ...ScoreRange) ([]ZSetRan
 }
 
 // XAdd appends a new stream entry to the stream stored at key and returns its
-// ID. When maxmemory is configured it first frees space and reports the keys
-// evicted to make room; otherwise it evicts nothing.
-func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, error) {
+// ID. When maxmemory is configured it first evicts keys to make room.
+func (s *Store) XAdd(changes Changes, key, rawID string, values [][]byte) (string, error) {
 	if len(values) == 0 || len(values)%2 != 0 {
-		return "", nil, ErrSyntax
+		return "", ErrSyntax
 	}
 
-	return mutateKey(s, key, kindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
+	return mutateKey(s, changes, key, kindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
 		if cur == nil {
 			cur = newKindValue(ValueObject{}, StreamValue{})
 		}
@@ -609,7 +602,7 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 //
 // The replacement is applied only after the source snapshot has already been
 // materialized, which makes it suitable for FULLRESYNC-style state replacement.
-func (s *Store) ReplaceWith(other *Store) {
+func (s *Store) ReplaceWith(changes Changes, other *Store) {
 	if s == nil || other == nil {
 		return
 	}
@@ -631,8 +624,7 @@ func (s *Store) ReplaceWith(other *Store) {
 	if s.maxMemoryEnabled() {
 		s.recalculateUsedMemoryLocked(s.now())
 	}
-	s.writeUnlockAllShards()
-	s.publishExpiredKeys()
+	s.writeUnlockAllShardsAndReport(changes)
 }
 
 func (s *Store) totalKeyCountLocked() int {
@@ -816,12 +808,12 @@ func cloneList(items [][]byte) [][]byte {
 	return cloned
 }
 
-func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []string, error) {
+func (s *Store) pushList(changes Changes, key string, values [][]byte, left bool) (int64, error) {
 	if len(values) == 0 {
-		return 0, nil, ErrSyntax
+		return 0, ErrSyntax
 	}
 
-	length, evicted, err := mutateKey(s, key, kindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	length, err := mutateKey(s, changes, key, kindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			cur = newKindValue(ValueObject{}, listValue{})
 		}
@@ -832,11 +824,11 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 		return cur, int64(list.push(cloneList(values), left)), nil
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
 
 	s.wakeNextListWaiter(key)
-	return length, evicted, nil
+	return length, nil
 }
 
 func normalizeListRange(length int, start, stop int64) (int, int, bool) {

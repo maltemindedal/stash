@@ -46,12 +46,11 @@ func (e *Executor) handleGeoAdd(ctx context.Context, request *Request) (protocol
 	}
 
 	key := string(request.Args[0])
-	added, evicted, err := e.store.ZAdd(key, entries)
+	added, err := e.store.ZAdd(&request.effects, key, entries)
 	if err != nil {
 		return nil, storageCommandError(err)
 	}
 
-	e.recordWriteEffects(request, key, evicted)
 	return protocol.Integer{Value: added}, nil
 }
 

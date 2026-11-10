@@ -25,7 +25,7 @@ func BenchmarkStore(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			_, _ = store.Set("hot", payload, 0)
+			_ = store.Set(nil, "hot", payload, 0)
 		}
 	})
 
@@ -34,7 +34,7 @@ func BenchmarkStore(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			if _, _, err := store.SetBit("bitmap", int64(i%64), 1); err != nil {
+			if _, err := store.SetBit(nil, "bitmap", int64(i%64), 1); err != nil {
 				b.Fatalf("SetBit() error = %v", err)
 			}
 		}
@@ -42,7 +42,7 @@ func BenchmarkStore(b *testing.B) {
 
 	b.Run("Get hit", func(b *testing.B) {
 		store := NewStore()
-		_, _ = store.Set("hot", payload, 0)
+		_ = store.Set(nil, "hot", payload, 0)
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
@@ -69,7 +69,7 @@ func BenchmarkStore(b *testing.B) {
 
 	b.Run("Parallel get hit", func(b *testing.B) {
 		store := NewStore()
-		_, _ = store.Set("hot", payload, 0)
+		_ = store.Set(nil, "hot", payload, 0)
 		b.ReportAllocs()
 
 		b.RunParallel(func(pb *testing.PB) {
@@ -89,14 +89,14 @@ func BenchmarkStore(b *testing.B) {
 
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
-				_, _ = store.Set("hot", payload, 0)
+				_ = store.Set(nil, "hot", payload, 0)
 			}
 		})
 	})
 
 	b.Run("Parallel mixed hot key", func(b *testing.B) {
 		store := NewStore()
-		_, _ = store.Set("hot", payload, 0)
+		_ = store.Set(nil, "hot", payload, 0)
 		b.ReportAllocs()
 
 		var op atomic.Uint64
@@ -104,11 +104,11 @@ func BenchmarkStore(b *testing.B) {
 			for pb.Next() {
 				switch op.Add(1) % 3 {
 				case 0:
-					_, _ = store.Set("hot", payload, 0)
+					_ = store.Set(nil, "hot", payload, 0)
 				case 1:
 					_, _, _ = store.Get("hot")
 				default:
-					_ = store.Delete("hot")
+					_ = store.Delete(nil, "hot")
 				}
 			}
 		})
@@ -122,7 +122,7 @@ func BenchmarkStore(b *testing.B) {
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
 				key := fmt.Sprintf("key-%d", counter.Add(1)%128)
-				_, _ = store.Set(key, payload, 0)
+				_ = store.Set(nil, key, payload, 0)
 				_, _, _ = store.Get(key)
 			}
 		})
@@ -130,7 +130,7 @@ func BenchmarkStore(b *testing.B) {
 
 	b.Run("Parallel passive eviction", func(b *testing.B) {
 		store := NewStore()
-		_, _ = store.Set("expired", payload, time.Now().Add(-time.Millisecond).UnixMilli())
+		_ = store.Set(nil, "expired", payload, time.Now().Add(-time.Millisecond).UnixMilli())
 		b.ReportAllocs()
 
 		b.RunParallel(func(pb *testing.PB) {
@@ -153,7 +153,7 @@ func BenchmarkStore(b *testing.B) {
 				index := counter.Add(1)
 				key := fmt.Sprintf("ttl-%d", index%64)
 				expiresAt := time.Now().Add(2 * time.Millisecond).UnixMilli()
-				_, _ = store.Set(key, payload, expiresAt)
+				_ = store.Set(nil, key, payload, expiresAt)
 				_, _, _ = store.Get(key)
 			}
 		})
@@ -166,11 +166,11 @@ func BenchmarkStore(b *testing.B) {
 			b.StopTimer()
 			store := NewStore()
 			for _, key := range deleteKeys {
-				_, _ = store.Set(key, payload, 0)
+				_ = store.Set(nil, key, payload, 0)
 			}
 			b.StartTimer()
 
-			removed := store.DeleteMany(deleteKeys)
+			removed := store.DeleteMany(nil, deleteKeys)
 			if len(removed) != len(deleteKeys) {
 				b.Fatalf("len(DeleteMany()) = %d, want %d", len(removed), len(deleteKeys))
 			}
@@ -180,7 +180,7 @@ func BenchmarkStore(b *testing.B) {
 	b.Run("SnapshotAll 1024 strings", func(b *testing.B) {
 		store := NewStore()
 		for _, key := range snapshotKeys {
-			_, _ = store.Set(key, payload, 0)
+			_ = store.Set(nil, key, payload, 0)
 		}
 
 		b.ReportAllocs()
@@ -202,16 +202,16 @@ func BenchmarkStoreMaxMemory(b *testing.B) {
 		b.Run(fmt.Sprintf("Insert new key with %d keys", n), func(b *testing.B) {
 			store := NewStore()
 			for i := 0; i < n; i++ {
-				if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+				if err := store.Set(nil, fmt.Sprintf("seed-%d", i), value, 0); err != nil {
 					b.Fatal(err)
 				}
 			}
-			store.ConfigureMaxMemory(1<<40, 16) // after seeding: with accounting on, each seed write is O(keys)
+			store.ConfigureMaxMemory(nil, 1<<40, 16) // after seeding: with accounting on, each seed write is O(keys)
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, err := store.Set(fmt.Sprintf("new-%d", i), value, 0); err != nil {
+				if err := store.Set(nil, fmt.Sprintf("new-%d", i), value, 0); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -222,16 +222,16 @@ func BenchmarkStoreMaxMemory(b *testing.B) {
 	b.Run("Overwrite with 10000 keys", func(b *testing.B) {
 		store := NewStore()
 		for i := 0; i < 10_000; i++ {
-			if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+			if err := store.Set(nil, fmt.Sprintf("seed-%d", i), value, 0); err != nil {
 				b.Fatal(err)
 			}
 		}
-		store.ConfigureMaxMemory(1<<40, 16)
+		store.ConfigureMaxMemory(nil, 1<<40, 16)
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			if _, err := store.Set("seed-1", value, 0); err != nil {
+			if err := store.Set(nil, "seed-1", value, 0); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -242,17 +242,17 @@ func BenchmarkStoreMaxMemory(b *testing.B) {
 		b.Run(fmt.Sprintf("Insert at the limit with %d keys", n), func(b *testing.B) {
 			store := NewStore()
 			for i := 0; i < n; i++ {
-				if _, err := store.Set(fmt.Sprintf("seed-%d", i), value, 0); err != nil {
+				if err := store.Set(nil, fmt.Sprintf("seed-%d", i), value, 0); err != nil {
 					b.Fatal(err)
 				}
 			}
-			store.ConfigureMaxMemory(1<<40, 16)
-			store.ConfigureMaxMemory(store.UsedMemory(), 16)
+			store.ConfigureMaxMemory(nil, 1<<40, 16)
+			store.ConfigureMaxMemory(nil, store.UsedMemory(), 16)
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, err := store.Set(fmt.Sprintf("new-%d", i), value, 0); err != nil {
+				if err := store.Set(nil, fmt.Sprintf("new-%d", i), value, 0); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -282,11 +282,11 @@ func imageBenchmarkStores(b *testing.B) []struct {
 		write func(s *Store, key string) error
 	}{
 		{name: "100000 strings", keys: 100_000, write: func(s *Store, key string) error {
-			_, err := s.Set(key, value, 0)
+			err := s.Set(nil, key, value, 0)
 			return err
 		}},
 		{name: "10000 lists of 16", keys: 10_000, write: func(s *Store, key string) error {
-			_, _, err := s.RightPush(key, items)
+			_, err := s.RightPush(nil, key, items)
 			return err
 		}},
 		{name: "10000 hashes of 16", keys: 10_000, write: func(s *Store, key string) error {
@@ -294,11 +294,11 @@ func imageBenchmarkStores(b *testing.B) []struct {
 			for i, item := range items {
 				pairs[i] = HashFieldValue{Field: string(item), Value: value}
 			}
-			_, _, err := s.HSet(key, pairs)
+			_, err := s.HSet(nil, key, pairs)
 			return err
 		}},
 		{name: "10000 sets of 16", keys: 10_000, write: func(s *Store, key string) error {
-			_, _, err := s.SAdd(key, items)
+			_, err := s.SAdd(nil, key, items)
 			return err
 		}},
 		{name: "10000 sorted sets of 16", keys: 10_000, write: func(s *Store, key string) error {
@@ -306,12 +306,12 @@ func imageBenchmarkStores(b *testing.B) []struct {
 			for i, item := range items {
 				entries[i] = ZSetEntry{Member: item, Score: float64(i)}
 			}
-			_, _, err := s.ZAdd(key, entries)
+			_, err := s.ZAdd(nil, key, entries)
 			return err
 		}},
 		{name: "10000 streams of 16", keys: 10_000, write: func(s *Store, key string) error {
 			for i := range items {
-				if _, _, err := s.XAdd(key, fmt.Sprintf("1-%d", i+1), [][]byte{[]byte("field"), value}); err != nil {
+				if _, err := s.XAdd(nil, key, fmt.Sprintf("1-%d", i+1), [][]byte{[]byte("field"), value}); err != nil {
 					return err
 				}
 			}
