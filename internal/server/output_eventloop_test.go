@@ -4,6 +4,8 @@ package server
 
 import (
 	"errors"
+	"net"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -252,6 +254,55 @@ func TestEventLoopClosesADrainingReplicasConnectionWhenAskedTo(t *testing.T) {
 				t.Fatalf("reading from the replica's side = (%d, %v), want the connection closed", n, err)
 			}
 		})
+	}
+}
+
+// TestEventLoopKeepsNoConnectionItClosedOnRequest closes a replica's connection
+// from outside the loop while a batch is partly written, as the stall rule and
+// the push limits do: the Output asks the loop to close the connection, and the
+// loop does. Nothing may keep the connection after that, or the batch its
+// Output was writing, which for a replica closed during its full resync is the
+// snapshot. The loop used to empty its list of such requests and leave them in
+// the array behind it, so the last connection closed this way stayed reachable
+// until another one was.
+func TestEventLoopKeepsNoConnectionItClosedOnRequest(t *testing.T) {
+	loop, _, _ := newHandDrivenEventLoop(t)
+	// The loop outlives the connection, as a server's does.
+	defer runtime.KeepAlive(loop)
+	collected := make(chan struct{})
+	func() {
+		var conn *eventConn
+		for _, registered := range loop.conns {
+			conn = registered
+		}
+		// Only the connection refers to this address, so it is collected when
+		// the connection is.
+		addr := &net.TCPAddr{Port: 1}
+		runtime.SetFinalizer(addr, func(*net.TCPAddr) { close(collected) })
+		conn.remoteAddr = addr
+
+		conn.out.MarkReplica()
+		if !conn.out.Push(make([]byte, 8<<20)) {
+			t.Fatalf("Push() = false, want the stream queued: %v", conn.out.Err())
+		}
+		loop.applyQueuedWork() // part of the batch reaches the socket
+		conn.out.Close(errPushLimitExceeded)
+		loop.applyQueuedWork() // the loop takes the request to close it
+		if len(loop.conns) != 0 {
+			t.Fatal("the loop still has the connection after it was asked to close it")
+		}
+	}()
+
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		runtime.GC()
+		select {
+		case <-collected:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the connection was still reachable 5s after the loop closed it on request, want nothing to keep it")
+		}
 	}
 }
 

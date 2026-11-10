@@ -299,8 +299,12 @@ func (l *eventLoop) applyQueuedWork() {
 	l.mu.Lock()
 	dirty := l.dirty
 	l.dirty = l.spareDirty[:0]
-	closes := append([]*eventConn(nil), l.closeReqs...)
-	l.closeReqs = l.closeReqs[:0]
+	// Taken whole and not emptied in place: the array behind an emptied list
+	// would keep each connection reachable after the loop has closed it, and
+	// with it the batch its Output was writing, until a later request
+	// overwrote the entry.
+	closes := l.closeReqs
+	l.closeReqs = nil
 	resumeAccept := l.resumeAccept
 	l.resumeAccept = false
 	l.mu.Unlock()
