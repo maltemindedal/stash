@@ -166,6 +166,10 @@ type Output struct {
 	spare []byte
 	// writing is set while a goroutine of the goroutine mode owns the socket.
 	writing bool
+	// replyWaiting is how many bytes of Replies have not been written, taking
+	// what is written to be Replies first. For a Replica that is exact: its one
+	// Reply, the full resync, is ahead of its whole stream.
+	replyWaiting int
 	// unflushed is set by a Reply and cleared by the Flush that follows it.
 	unflushed bool
 	holding   bool
@@ -229,6 +233,7 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	o.queued = queued
 	if added := len(queued) - before; added > 0 {
 		o.growLocked(added)
+		o.replyWaiting += added
 		o.unflushed = true
 	}
 
@@ -262,11 +267,18 @@ func (o *Output) Push(frame []byte) bool {
 		o.mu.Unlock()
 		return false
 	}
+	// A subscriber is held to its limit for everything waiting, since only a
+	// client that is not reading lets pushes pile up behind its Replies. A
+	// Replica's limit is for its stream alone: the snapshot it is still being
+	// sent can be larger than the limit, and says nothing of how far behind it
+	// is.
 	limit := o.shared.pushLimit
+	waiting := o.backlog.Load() + int64(len(frame))
 	if o.replica {
 		limit = o.shared.replicaPushLimit
+		waiting -= int64(o.replyWaiting)
 	}
-	if waiting := o.backlog.Load() + int64(len(frame)); waiting > limit {
+	if waiting > limit {
 		o.mu.Unlock()
 		o.Close(fmt.Errorf("%w: %d bytes against a limit of %d", errPushLimitExceeded, waiting, limit))
 		return false
@@ -500,6 +512,18 @@ func (o *Output) checkStall() {
 // it would block as the Event loop's does or reports nothing (io.ErrShortWrite),
 // leaves the rest for the next call.
 func (o *Output) writeTo(w io.Writer) error {
+	return o.write(w, false)
+}
+
+// errMoreQueued is what write returns, still holding the socket (writing stays
+// set), when it was asked for one batch and more was queued meanwhile.
+var errMoreQueued = errors.New("server: more output was queued during the write")
+
+// write is writeTo. With oneBatch it stops after the batch it began with when
+// more was queued during it, and leaves writing set for the caller to hand the
+// socket on: what was queued meanwhile was pushed by other connections.
+func (o *Output) write(w io.Writer, oneBatch bool) error {
+	batches := 0
 	for {
 		o.mu.Lock()
 		if o.closed {
@@ -518,6 +542,11 @@ func (o *Output) writeTo(w io.Writer) error {
 				}
 				return nil
 			}
+			if oneBatch && batches == 1 {
+				o.mu.Unlock()
+				return errMoreQueued
+			}
+			batches++
 			o.inflight, o.queued, o.spare, o.sent = o.queued, o.spare[:0], nil, 0
 		}
 		chunk := o.inflight[o.sent:]
@@ -553,6 +582,7 @@ func (o *Output) writeTo(w io.Writer) error {
 				o.lastProgress = time.Now()
 			}
 			o.growLocked(-n)
+			o.replyWaiting = max(o.replyWaiting-n, 0)
 			if o.backlog.Load() <= outputHighWater {
 				o.drained.Broadcast()
 			}
@@ -592,10 +622,16 @@ func (d *goroutineOutputDriver) schedule(o *Output) {
 		return
 	}
 	o.writing = true
+	d.startPump(o)
+}
+
+// startPump starts the pump goroutine. The caller holds Output.mu and has set
+// writing.
+func (d *goroutineOutputDriver) startPump(o *Output) {
 	if d.pump == nil {
 		// A failed write closes the connection (write), which is all there is
 		// to do about it here.
-		d.pump = func() { _ = d.write(o) }
+		d.pump = func() { _ = d.write(o, false) }
 	}
 	go d.pump()
 }
@@ -624,11 +660,25 @@ func (d *goroutineOutputDriver) flush(o *Output) error {
 	o.writing = true
 	o.mu.Unlock()
 
-	return d.write(o)
+	// This goroutine writes the batch its Replies are in. What other
+	// connections push meanwhile is the pump's to write: this goroutine reads
+	// the peer's requests, which for a Replica are its acknowledgements, and
+	// under a steady stream of pushes it would never get back to them.
+	return d.write(o, true)
 }
 
-func (d *goroutineOutputDriver) write(o *Output) error {
-	err := o.writeTo(d.wire)
+func (d *goroutineOutputDriver) write(o *Output, oneBatch bool) error {
+	err := o.write(d.wire, oneBatch)
+	if errors.Is(err, errMoreQueued) {
+		o.mu.Lock()
+		if o.closed {
+			o.stopWritingLocked()
+		} else {
+			d.startPump(o)
+		}
+		o.mu.Unlock()
+		return nil
+	}
 	if err != nil {
 		o.Close(err)
 	}

@@ -539,3 +539,90 @@ func TestAConnectionThatQueuedNoReplyNeverWaitsToFlush(t *testing.T) {
 		t.Fatal("Flush() still waiting after the connection was closed")
 	}
 }
+
+// TestAReplicasSnapshotReplyIsNotCountedAgainstItsStreamLimit queues a full
+// resync reply as large as the Replica Push limit and then the stream behind
+// it. The limit is for the stream: counting the snapshot closed any replica
+// whose snapshot reached the limit at its first propagated write, and it would
+// synchronise again from the start, for ever.
+func TestAReplicasSnapshotReplyIsNotCountedAgainstItsStreamLimit(t *testing.T) {
+	shared := newOutputs()
+	shared.replicaPushLimit = 1000
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(shared, wire)
+	defer out.Close(nil)
+
+	out.HoldPushes()
+	out.MarkReplica()
+	if !out.Push(make([]byte, 600)) {
+		t.Fatalf("Push() of the stream held behind the reply = false: %v", out.Err())
+	}
+	if err := out.Reply(protocol.BulkString{Data: make([]byte, 5000)}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	if !out.Push(make([]byte, 300)) {
+		t.Fatalf("Push() = false with 900 bytes of stream behind a 5000 byte snapshot, want only the stream counted: %v", out.Err())
+	}
+
+	if out.Push(make([]byte, 200)) {
+		t.Fatal("Push() = true with 1100 bytes of stream waiting against a limit of 1000")
+	}
+	if err := out.Err(); !errors.Is(err, errPushLimitExceeded) {
+		t.Fatalf("Err() = %v, want errPushLimitExceeded", err)
+	}
+}
+
+// slowOutputWire takes a moment for every write, like a socket whose peer reads
+// steadily but not fast.
+type slowOutputWire struct {
+	outputWire
+	delay time.Duration
+}
+
+func (w *slowOutputWire) Write(p []byte) (int, error) {
+	time.Sleep(w.delay)
+	return w.outputWire.Write(p)
+}
+
+// TestAFlushLeavesWhatIsPushedMeanwhileToThePump flushes a reply while other
+// connections keep pushing. The connection's own goroutine writes the batch its
+// reply is in and returns. It used to go on writing for as long as pushes kept
+// arriving, and so never read the peer's next request: for a replica under
+// steady writes, its acknowledgements.
+func TestAFlushLeavesWhatIsPushedMeanwhileToThePump(t *testing.T) {
+	wire := &slowOutputWire{outputWire: *newOutputWire(), delay: 2 * time.Millisecond}
+	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	defer out.Close(nil)
+
+	if err := out.Reply(protocol.BulkString{Data: make([]byte, 8<<10)}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	stop := make(chan struct{})
+	var pusher sync.WaitGroup
+	pusher.Add(1)
+	go func() {
+		defer pusher.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				out.Push([]byte("+message\r\n"))
+				time.Sleep(200 * time.Microsecond)
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		pusher.Wait()
+	}()
+
+	within(t, "a flush while pushes keep arriving", func() {
+		if err := out.Flush(); err != nil {
+			t.Errorf("Flush() error = %v", err)
+		}
+	})
+	// The pushes are still written, by the pump.
+	sent := len(wire.sent())
+	waitForOutput(t, "the pump to write what was pushed after the flush", func() bool { return len(wire.sent()) > sent })
+}

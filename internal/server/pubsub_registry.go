@@ -104,6 +104,9 @@ func (r *PubSubRegistry) Subscribers(channel string) []*ClientState {
 	return subscribers
 }
 
+// maxPooledPublishFrame is the largest buffer publishFrames keeps.
+const maxPooledPublishFrame = 64 << 10
+
 // publishFrames pools the buffers Publish encodes a message into, so that a
 // PUBLISH allocates nothing for it.
 var publishFrames = sync.Pool{New: func() any { return new([]byte) }}
@@ -127,9 +130,12 @@ func (r *PubSubRegistry) Publish(channel, message []byte) int {
 	}
 
 	pooled := publishFrames.Get().(*[]byte)
-	defer publishFrames.Put(pooled)
 	frame := appendPubSubMessage((*pooled)[:0], channel, message)
-	*pooled = frame
+	// A buffer that one large message grew is not kept for the small ones.
+	if cap(frame) <= maxPooledPublishFrame {
+		*pooled = frame
+		defer publishFrames.Put(pooled)
+	}
 
 	queued := 0
 	for _, state := range subscribers {

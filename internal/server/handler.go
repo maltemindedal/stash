@@ -44,8 +44,9 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	// Replies are queued while requests keep arriving and are sent when the
 	// handler is about to wait for more input.
 	parser := protocol.NewParser(flushBeforeRead{conn: conn, out: out})
-	// What the registries are given as the connection: closing it or ending its
-	// stream goes through the Output, which owns the socket's write side.
+	// What the replica registry is given as the connection: ending its stream
+	// goes through the Output, which writes what is queued first. Closing it
+	// closes the socket, which fails the Output's next write and so closes it.
 	client := &outputConn{Conn: conn, out: out}
 
 	logger.Debug("client connected")
@@ -135,9 +136,9 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	}
 }
 
-// outputConn is a goroutine-mode connection as the registries see it: closing
-// it and ending its stream go through its Output, so that neither cuts off
-// output that is still queued for another goroutine to write.
+// outputConn is a goroutine-mode connection as the replica registry sees it:
+// ending its stream goes through its Output, so that it does not cut off output
+// still queued for another goroutine to write.
 type outputConn struct {
 	net.Conn
 	out *Output
