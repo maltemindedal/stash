@@ -59,7 +59,7 @@ func (e *Executor) appendInfoMemory(buf *bytes.Buffer) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
-	keyStats := storage.KeyStats{ByKind: make(map[storage.ValueKind]int)}
+	keyStats := storage.KeyStats{}
 	if e.store != nil {
 		keyStats = e.store.KeyStats()
 	}
@@ -81,16 +81,8 @@ func (e *Executor) appendInfoMemory(buf *bytes.Buffer) {
 	appendInfoField(buf, "go_heap_idle", mem.HeapIdle)
 	appendInfoField(buf, "key_count", keyStats.TotalKeys)
 
-	kinds := []storage.ValueKind{
-		storage.ValueKindString,
-		storage.ValueKindList,
-		storage.ValueKindHash,
-		storage.ValueKindSet,
-		storage.ValueKindZSet,
-		storage.ValueKindStream,
-	}
-	for _, kind := range kinds {
-		appendInfoField(buf, "key_count_"+string(kind), keyStats.ByKind[kind])
+	for _, kind := range storage.ValueKinds() {
+		appendInfoField(buf, "key_count_"+string(kind), keyStats.Count(kind))
 	}
 }
 

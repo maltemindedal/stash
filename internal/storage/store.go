@@ -46,7 +46,7 @@ type Store struct {
 	// call never hands on what another removed.
 	removed                  removals
 	usedMemory               atomic.Int64
-	keyKindCounts            [keyStatsKindCount]atomic.Int64
+	keyKindCounts            [kindCount]atomic.Int64
 	maxMemory                atomic.Int64
 	memoryEvictionSampleSize int
 	// nextExpiry is a lower bound on the earliest TTL deadline in the store, kept
@@ -73,8 +73,9 @@ type Store struct {
 // read no clock: they leave a new value unstamped, and the write that stores it
 // stamps it with its own reading. Code outside the store takes its own
 // reading of the system clock to judge TTLs: SET for its relative EX or PX
-// (ParseExpiryMillis is handed it), RDB loading and snapshot building, and the
-// AOF rewrite.
+// (ParseExpiryMillis is handed it), and RDB loading and snapshot building. An
+// AOF rewrite reads none: the keyspace image it is generated from was judged by
+// the store's reading, and its deadlines are written as they are.
 func (s *Store) now() int64 {
 	if s.clock != nil {
 		return s.clock()
@@ -282,14 +283,21 @@ func (s *Store) popOne(changes Changes, key string, left bool) ([]byte, bool, er
 	// carrying them was copied on every return and made a pop over 10% slower.
 	var item []byte
 	remaining := 0
-	ok, err := mutateKey(s, changes, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
-		if cur == nil || len(cur.liveList()) == 0 {
+	ok, err := mutateKey(s, changes, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+		if cur == nil {
+			return nil, false, errUnchanged
+		}
+		list, err := listOf(cur)
+		if err != nil {
+			return nil, false, err
+		}
+		if list.empty() {
 			return nil, false, errUnchanged
 		}
 		if left {
-			item, remaining = cur.popListFront()
+			item, remaining = list.popFront()
 		} else {
-			item, remaining = cur.popListBack()
+			item, remaining = list.popBack()
 		}
 		return cur, true, nil
 	})
@@ -322,11 +330,18 @@ func (s *Store) popN(changes Changes, key string, count int, left bool) ([][]byt
 	// As in popOne, the values and the count left come back through variables.
 	var values [][]byte
 	remaining := 0
-	ok, err := mutateKey(s, changes, key, ValueKindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
-		if cur == nil || len(cur.liveList()) == 0 {
+	ok, err := mutateKey(s, changes, key, kindList, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, bool, error) {
+		if cur == nil {
 			return nil, false, errUnchanged
 		}
-		values, remaining = cur.popListValues(count, left)
+		list, err := listOf(cur)
+		if err != nil {
+			return nil, false, err
+		}
+		if list.empty() {
+			return nil, false, errUnchanged
+		}
+		values, remaining = list.popValues(count, left)
 		if len(values) == 0 {
 			return cur, true, errUnchanged
 		}
@@ -341,16 +356,17 @@ func (s *Store) popN(changes Changes, key string, count int, left bool) ([][]byt
 // ListRange returns an inclusive range of values from the list stored at key.
 func (s *Store) ListRange(key string, start, stop int64) ([][]byte, error) {
 	values, found, err := readKey(s, key, func(value *ValueObject) ([][]byte, error) {
-		list, err := value.ListValue()
+		list, err := listOf(value)
 		if err != nil {
 			return nil, err
 		}
 
-		from, to, ok := normalizeListRange(len(list), start, stop)
+		live := list.live()
+		from, to, ok := normalizeListRange(len(live), start, stop)
 		if !ok {
 			return [][]byte{}, nil
 		}
-		return cloneList(list[from : to+1]), nil
+		return cloneList(live[from : to+1]), nil
 	})
 	if err != nil {
 		return nil, err
@@ -369,14 +385,16 @@ func (s *Store) ZAdd(changes Changes, key string, entries []ZSetEntry) (int64, e
 		return 0, ErrSyntax
 	}
 
-	return mutateKey(s, changes, key, ValueKindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	return mutateKey(s, changes, key, kindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			created := newZSetValueForEntries(entries, 0)
-			n, err := created.zsetLen()
-			return created, int64(n), err
+			created := newZSetValueForEntries(entries)
+			return newKindValue(ValueObject{}, created), int64(created.len()), nil
 		}
-		added, err := cur.zsetAdd(entries)
-		return cur, added, err
+		zset, err := zsetOf(cur)
+		if err != nil {
+			return nil, 0, err
+		}
+		return cur, zset.add(entries), nil
 	})
 }
 
@@ -387,13 +405,12 @@ func (s *Store) ZScores(key string, members [][]byte) ([]float64, []bool, error)
 	found := make([]bool, len(members))
 
 	_, _, err := readKey(s, key, func(value *ValueObject) (struct{}, error) {
+		zset, err := zsetOf(value)
+		if err != nil {
+			return struct{}{}, err
+		}
 		for i, member := range members {
-			score, exists, err := value.zsetScore(member)
-			if err != nil {
-				return struct{}{}, err
-			}
-			scores[i] = score
-			found[i] = exists
+			scores[i], found[i] = zset.score(member)
 		}
 		return struct{}{}, nil
 	})
@@ -407,16 +424,16 @@ func (s *Store) ZScores(key string, members [][]byte) ([]float64, []bool, error)
 // ZRange returns an inclusive rank range from the sorted set stored at key.
 func (s *Store) ZRange(key string, start, stop int64) ([]ZSetRangeEntry, error) {
 	entries, found, err := readKey(s, key, func(value *ValueObject) ([]ZSetRangeEntry, error) {
-		setLen, err := value.zsetLen()
+		zset, err := zsetOf(value)
 		if err != nil {
 			return nil, err
 		}
 
-		from, to, ok := normalizeListRange(setLen, start, stop)
+		from, to, ok := normalizeListRange(zset.len(), start, stop)
 		if !ok {
 			return []ZSetRangeEntry{}, nil
 		}
-		return value.zsetRangeByRank(from, to)
+		return zset.rangeByRank(from, to), nil
 	})
 	if err != nil {
 		return nil, err
@@ -434,13 +451,13 @@ func (s *Store) ZRange(key string, start, stop int64) ([]ZSetRangeEntry, error) 
 // so the result reflects one consistent snapshot of the set.
 func (s *Store) ZRangeByScores(key string, scoreRanges ...ScoreRange) ([]ZSetRangeEntry, error) {
 	entries, found, err := readKey(s, key, func(value *ValueObject) ([]ZSetRangeEntry, error) {
+		zset, err := zsetOf(value)
+		if err != nil {
+			return nil, err
+		}
 		var entries []ZSetRangeEntry
 		for _, scoreRange := range scoreRanges {
-			ranged, err := value.zsetRangeByScore(scoreRange)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, ranged...)
+			entries = append(entries, zset.rangeByScore(scoreRange)...)
 		}
 		return entries, nil
 	})
@@ -460,11 +477,11 @@ func (s *Store) XAdd(changes Changes, key, rawID string, values [][]byte) (strin
 		return "", ErrSyntax
 	}
 
-	return mutateKey(s, changes, key, ValueKindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
+	return mutateKey(s, changes, key, kindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
 		if cur == nil {
-			cur = newStreamValue(newStream(), 0)
+			cur = newKindValue(ValueObject{}, StreamValue{})
 		}
-		stream, err := cur.StreamValue()
+		stream, err := streamOf(cur)
 		if err != nil {
 			return nil, "", err
 		}
@@ -476,7 +493,7 @@ func (s *Store) XAdd(changes Changes, key, rawID string, values [][]byte) (strin
 // XRead returns stream entries whose IDs are greater than the supplied ID.
 func (s *Store) XRead(key, rawID string) ([]StreamEntry, error) {
 	entries, found, err := readKey(s, key, func(value *ValueObject) ([]StreamEntry, error) {
-		stream, err := value.StreamValue()
+		stream, err := streamOf(value)
 		if err != nil {
 			return nil, err
 		}
@@ -561,7 +578,7 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 				stats.SkippedExpiredKeys++
 				continue
 			}
-			if value.Kind != ValueKindString {
+			if value.data != nil {
 				stats.SkippedUnsupportedKeys++
 				continue
 			}
@@ -576,28 +593,6 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 			})
 			stats.ExportedKeys++
 		}
-	}
-
-	return entries, stats
-}
-
-// SnapshotAll returns defensive copies of every currently supported non-expired value.
-func (s *Store) SnapshotAll() ([]SnapshotEntry, SnapshotStats) {
-	s.readLockAllShards()
-	defer s.readUnlockAllShards()
-
-	return s.snapshotAllLocked(s.now())
-}
-
-// SnapshotAllWithWriteBarrier snapshots the full keyspace while holding the store's
-// write locks, invoking barrier immediately before write traffic resumes.
-func (s *Store) SnapshotAllWithWriteBarrier(barrier func()) ([]SnapshotEntry, SnapshotStats) {
-	s.writeLockAllShards()
-	defer s.writeUnlockAllShards()
-
-	entries, stats := s.snapshotAllLocked(s.now())
-	if barrier != nil {
-		barrier()
 	}
 
 	return entries, stats
@@ -630,93 +625,6 @@ func (s *Store) ReplaceWith(changes Changes, other *Store) {
 		s.recalculateUsedMemoryLocked(s.now())
 	}
 	s.writeUnlockAllShardsAndReport(changes)
-}
-
-func (s *Store) snapshotAllLocked(now int64) ([]SnapshotEntry, SnapshotStats) {
-	stats := SnapshotStats{}
-	entries := make([]SnapshotEntry, 0, s.totalKeyCountLocked())
-	valueArena := make([]byte, 0)
-	for i := range s.shards {
-		shard := &s.shards[i]
-		stats.TotalKeys += len(shard.data)
-		for key, value := range shard.data {
-			if isExpired(value, now) {
-				stats.SkippedExpiredKeys++
-				continue
-			}
-
-			entry := SnapshotEntry{Key: key, Kind: value.Kind, ExpiresAt: value.ExpiresAt}
-			switch value.Kind {
-			case ValueKindString:
-				valueArena, entry.String = appendClonedBytesArena(valueArena, value.String)
-			case ValueKindList:
-				list := value.liveList()
-				entry.List = make([][]byte, len(list))
-				for j, item := range list {
-					valueArena, entry.List[j] = appendClonedBytesArena(valueArena, item)
-				}
-			case ValueKindZSet:
-				setLen, err := value.zsetLen()
-				if err != nil {
-					continue
-				}
-				if setLen > 0 {
-					entry.ZSet, err = value.zsetRangeByRank(0, setLen-1)
-					if err != nil {
-						continue
-					}
-				}
-			case ValueKindStream:
-				if value.Stream != nil {
-					entry.Stream = make([]StreamEntry, 0, len(value.Stream.entries))
-					for _, record := range value.Stream.entries {
-						clonedValues := make([][]byte, len(record.values))
-						for j, item := range record.values {
-							valueArena, clonedValues[j] = appendClonedBytesArena(valueArena, item)
-						}
-						entry.Stream = append(entry.Stream, StreamEntry{ID: record.idText, Values: clonedValues})
-					}
-				}
-			case ValueKindHash:
-				hashEntries, err := value.hashEntries()
-				if err != nil {
-					continue
-				}
-				entry.Hash = make([]HashFieldValue, 0, len(hashEntries))
-				for _, hashEntry := range hashEntries {
-					var clonedValue []byte
-					valueArena, clonedValue = appendClonedBytesArena(valueArena, hashEntry.Value)
-					entry.Hash = append(entry.Hash, HashFieldValue{Field: hashEntry.Field, Value: clonedValue})
-				}
-			case ValueKindSet:
-				if value.SetEncoding == ValueEncodingCompact {
-					setMembers, err := value.setMembers()
-					if err != nil {
-						continue
-					}
-					entry.Set = make([][]byte, len(setMembers))
-					for j, member := range setMembers {
-						valueArena, entry.Set[j] = appendClonedBytesArena(valueArena, member)
-					}
-					break
-				}
-				if value.Set == nil {
-					continue
-				}
-				entry.Set = make([][]byte, 0, len(value.Set))
-				for member := range value.Set {
-					var clonedMember []byte
-					valueArena, clonedMember = appendClonedStringBytesArena(valueArena, member)
-					entry.Set = append(entry.Set, clonedMember)
-				}
-			}
-
-			entries = append(entries, entry)
-			stats.ExportedKeys++
-		}
-	}
-
-	return entries, stats
 }
 
 func (s *Store) totalKeyCountLocked() int {
@@ -905,27 +813,15 @@ func (s *Store) pushList(changes Changes, key string, values [][]byte, left bool
 		return 0, ErrSyntax
 	}
 
-	length, err := mutateKey(s, changes, key, ValueKindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
+	length, err := mutateKey(s, changes, key, kindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			cur = newListValue(nil, 0)
+			cur = newKindValue(ValueObject{}, listValue{})
 		}
-		full, head := cur.List, int(cur.ListHead) // the array the list lives in, and the dead slots ahead of it
-		list := full[head:]
-		additions := cloneList(values)
-		if left {
-			full, head = prependList(full, head, list, additions)
-		} else {
-			grown := append(list, additions...)
-			if len(list) > 0 && &grown[0] == &list[0] {
-				// It fitted: the list still lives in the same array, and so do the
-				// dead slots ahead of it.
-				full = full[:head+len(grown)]
-			} else {
-				full, head = grown, 0
-			}
+		list, err := listOf(cur)
+		if err != nil {
+			return nil, 0, err
 		}
-		cur.List, cur.ListHead = full, int32(head)
-		return cur, int64(len(full) - head), nil
+		return cur, int64(list.push(cloneList(values), left)), nil
 	})
 	if err != nil {
 		return 0, err
@@ -933,32 +829,6 @@ func (s *Store) pushList(changes Changes, key string, values [][]byte, left bool
 
 	s.wakeNextListWaiter(key)
 	return length, nil
-}
-
-// prependList puts additions in front of list, the last addition first, and
-// returns the array the result lives in and how many dead slots precede it. full
-// and head describe where list currently lives (see ValueObject.liveList); full
-// is nil when there is nothing to reuse. When the dead slots ahead of list are
-// enough it fills them and copies nothing. Otherwise it moves the list into a new
-// array with as much headroom as the list has values, so pushing to the front
-// copies the list once per doubling instead of once per push.
-func prependList(full [][]byte, head int, list, additions [][]byte) ([][]byte, int) {
-	k := len(additions)
-	if head >= k {
-		start := head - k
-		for i, item := range additions {
-			full[start+k-1-i] = item
-		}
-		return full, start
-	}
-
-	headroom := min(len(list), math.MaxInt32-k)
-	grown := make([][]byte, headroom+k+len(list))
-	for i, item := range additions {
-		grown[headroom+k-1-i] = item
-	}
-	copy(grown[headroom+k:], list)
-	return grown, headroom
 }
 
 func normalizeListRange(length int, start, stop int64) (int, int, bool) {

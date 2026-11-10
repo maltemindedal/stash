@@ -23,14 +23,6 @@ type CompactZSet struct {
 	arena   []byte
 }
 
-func newCompactZSet(entries []ZSetEntry) *CompactZSet {
-	set := &CompactZSet{entries: make([]compactZSetEntry, 0, len(entries))}
-	for _, entry := range entries {
-		set.add(entry.Member, entry.Score)
-	}
-	return set
-}
-
 func cloneCompactZSet(src *CompactZSet) *CompactZSet {
 	if src == nil {
 		return nil

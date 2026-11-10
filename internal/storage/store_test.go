@@ -202,7 +202,7 @@ func TestStoreValueBehavior(t *testing.T) {
 					if got, _, err := store.Get("bitmap"); err != nil || !bytes.Equal(got, []byte{'a', 'b', 0, 1}) {
 						t.Fatalf("Get() with maxmemory %d = %q, %v, want %q", maxMemory, got, err, []byte{'a', 'b', 0, 1})
 					}
-					if got := store.valueObjectForTest("bitmap").ExpiresAt; got != deadline {
+					if got := store.expiresAtForTest("bitmap"); got != deadline {
 						t.Fatalf("SetBit() with maxmemory %d left the TTL deadline at %d, want %d", maxMemory, got, deadline)
 					}
 				}
@@ -1386,9 +1386,9 @@ func assertKeyStats(t *testing.T, store *Store, total int, byKind map[ValueKind]
 	if stats.TotalKeys != total {
 		t.Fatalf("KeyStats().TotalKeys = %d, want %d", stats.TotalKeys, total)
 	}
-	for _, kind := range keyStatsKinds {
-		if stats.ByKind[kind] != byKind[kind] {
-			t.Fatalf("KeyStats().ByKind[%s] = %d, want %d (all stats: %+v)", kind, stats.ByKind[kind], byKind[kind], stats.ByKind)
+	for _, kind := range ValueKinds() {
+		if stats.Count(kind) != byKind[kind] {
+			t.Fatalf("KeyStats().Count(%s) = %d, want %d (all stats: %+v)", kind, stats.Count(kind), byKind[kind], stats)
 		}
 	}
 }
@@ -1443,38 +1443,31 @@ func TestStoreSnapshotStrings(t *testing.T) {
 	})
 }
 
-func TestStoreSnapshotAll(t *testing.T) {
-	t.Run("returns defensive string copies without aliasing sibling entries", func(t *testing.T) {
+func TestStoreImage(t *testing.T) {
+	t.Run("holds detached string copies that do not alias their neighbours", func(t *testing.T) {
 		store := NewStore()
 		_ = store.Set(nil, "first", []byte("one"), 0)
 		_ = store.Set(nil, "second", []byte("two"), 0)
 
-		entries, stats := store.SnapshotAll()
-		if stats.TotalKeys != 2 || stats.ExportedKeys != 2 {
-			t.Fatalf("SnapshotAll() stats = %+v, want total/exported 2", stats)
+		img := store.Image(nil)
+		if stats := img.Stats(); stats.TotalKeys != 2 || stats.ExportedKeys != 2 {
+			t.Fatalf("Image().Stats() = %+v, want total/exported 2", stats)
 		}
 
-		var firstSnapshot []byte
-		var secondSnapshot []byte
-		for _, entry := range entries {
-			if entry.Kind != ValueKindString {
-				continue
-			}
-			switch entry.Key {
-			case "first":
-				firstSnapshot = entry.String
-			case "second":
-				secondSnapshot = entry.String
-			}
+		commands := map[string][]byte{}
+		if _, err := img.Recreate(func(args [][]byte) error {
+			commands[string(args[1])] = args[2]
+			return nil
+		}); err != nil {
+			t.Fatalf("Recreate() error = %v", err)
+		}
+		if string(commands["first"]) != "one" || string(commands["second"]) != "two" {
+			t.Fatalf("recreated strings = %q, want first=one and second=two", commands)
 		}
 
-		if string(firstSnapshot) != "one" || string(secondSnapshot) != "two" {
-			t.Fatalf("SnapshotAll() string entries = %q, %q, want %q, %q", string(firstSnapshot), string(secondSnapshot), "one", "two")
-		}
-
-		firstSnapshot[0] = 'O'
-		if got := string(secondSnapshot); got != "two" {
-			t.Fatalf("second snapshot after first mutation = %q, want %q", got, "two")
+		commands["first"][0] = 'O'
+		if got := string(commands["second"]); got != "two" {
+			t.Fatalf("second value after editing the first = %q, want %q", got, "two")
 		}
 
 		got, ok, err := store.Get("first")
@@ -1488,6 +1481,66 @@ func TestStoreSnapshotAll(t *testing.T) {
 			t.Fatalf("Get(first) value = %q, want %q", string(got), "one")
 		}
 	})
+
+	t.Run("runs the barrier before writes resume and leaves expired keys out", func(t *testing.T) {
+		store, _ := newStoreWithManualClock()
+		_ = store.Set(nil, "live", []byte("v"), store.deadlineAfter(time.Hour))
+		_ = store.Set(nil, "stale", []byte("v"), store.deadlineAfter(-time.Millisecond))
+
+		ran := false
+		img := store.Image(func() { ran = true })
+		if !ran {
+			t.Fatal("Image() did not run its barrier")
+		}
+		if stats := img.Stats(); stats.TotalKeys != 2 || stats.ExportedKeys != 1 || stats.SkippedExpiredKeys != 1 {
+			t.Fatalf("Image().Stats() = %+v, want 2 keys, 1 exported, 1 expired", stats)
+		}
+		assertRecreationCommands(t, store, fmt.Sprintf("SET live v PXAT %d", store.deadlineAfter(time.Hour)))
+	})
+}
+
+// TestRecreateRefusesACollectionWithATTL covers a state no command reaches
+// today. Recreate has no command that gives a collection a TTL, and dropping the
+// TTL without a word would bring the key back for good after a rewrite.
+func TestRecreateRefusesACollectionWithATTL(t *testing.T) {
+	bulk := [][]byte{[]byte("a"), []byte("b")}
+	tests := []struct {
+		name  string
+		write func(s *Store, key string) error
+	}{
+		{name: "list", write: func(s *Store, key string) error { _, err := s.RightPush(nil, key, bulk); return err }},
+		{name: "hash", write: func(s *Store, key string) error {
+			_, err := s.HSet(nil, key, []HashFieldValue{{Field: "f", Value: []byte("v")}})
+			return err
+		}},
+		{name: "set", write: func(s *Store, key string) error { _, err := s.SAdd(nil, key, bulk); return err }},
+		{name: "sorted set", write: func(s *Store, key string) error {
+			_, err := s.ZAdd(nil, key, []ZSetEntry{{Member: []byte("m"), Score: 1}})
+			return err
+		}},
+		{name: "stream", write: func(s *Store, key string) error { _, err := s.XAdd(nil, key, "1-0", bulk); return err }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const key = "collection"
+			store, _ := newStoreWithManualClock()
+			if err := tt.write(store, key); err != nil {
+				t.Fatalf("write error = %v", err)
+			}
+			if !store.expireKeyForTest(key, store.deadlineAfter(time.Hour)) {
+				t.Fatal("the key was not stored")
+			}
+
+			_, err := store.Image(nil).Recreate(func([][]byte) error { return nil })
+			if err == nil {
+				t.Fatalf("Recreate() error = nil, want a refusal to recreate the TTL of key %q", key)
+			}
+			if !strings.HasPrefix(err.Error(), "storage: ") || !strings.Contains(err.Error(), strconv.Quote(key)) {
+				t.Fatalf("Recreate() error = %q, want a storage: error naming key %q", err, key)
+			}
+		})
+	}
 }
 
 func TestStoreConcurrentAccess(t *testing.T) {
@@ -2026,9 +2079,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if added != 3 {
 			t.Fatalf("ZAdd() added = %d, want 3", added)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.Kind != ValueKindZSet || stored.ZSetEncoding != ValueEncodingCompact || stored.CompactZSet == nil {
-			t.Fatalf("stored zset = %#v, want compact zset", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:compact" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:compact", got)
 		}
 
 		added, err = store.ZAdd(nil, "leaders", []ZSetEntry{{Member: []byte("beta"), Score: 0.5}})
@@ -2046,18 +2098,10 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 			}
 		}
 
-		snapshot, stats := store.SnapshotAll()
-		if stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
-			t.Fatalf("SnapshotAll() stats = %+v, want total/exported 1", stats)
+		if stats := store.Image(nil).Stats(); stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
+			t.Fatalf("Image().Stats() = %+v, want total/exported 1", stats)
 		}
-		if len(snapshot) != 1 || snapshot[0].Kind != ValueKindZSet || len(snapshot[0].ZSet) != 3 {
-			t.Fatalf("SnapshotAll() = %#v, want one logical sorted set", snapshot)
-		}
-		for i, entry := range snapshot[0].ZSet {
-			if entry.Member != want[i] {
-				t.Fatalf("SnapshotAll().ZSet[%d].Member = %q, want %q", i, entry.Member, want[i])
-			}
-		}
+		assertRecreationCommands(t, store, "ZADD leaders 0.5 beta 1 alpha 2 aardvark")
 	})
 
 	t.Run("Sorted set creation chooses compact encoding by distinct members", func(t *testing.T) {
@@ -2070,9 +2114,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if _, err := store.ZAdd(nil, "leaders", entries); err != nil {
 			t.Fatalf("ZAdd() error = %v", err)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.ZSetEncoding != ValueEncodingCompact {
-			t.Fatalf("stored zset = %#v, want compact zset for one distinct member", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:compact" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:compact", got)
 		}
 	})
 
@@ -2093,12 +2136,11 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("ZAdd() overflow = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.Kind != ValueKindZSet || stored.ZSetEncoding != ValueEncodingGeneral || stored.ZSet == nil {
-			t.Fatalf("stored zset = %#v, want upgraded general zset", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:general" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:general", got)
 		}
-		if stored.ExpiresAt != expiresAt {
-			t.Fatalf("upgraded zset ExpiresAt = %d, want %d", stored.ExpiresAt, expiresAt)
+		if got := store.expiresAtForTest("leaders"); got != expiresAt {
+			t.Fatalf("upgraded zset expires at %d, want %d", got, expiresAt)
 		}
 		values, err := store.ZRange("leaders", 0, -1)
 		if err != nil {
@@ -2123,9 +2165,8 @@ func TestStoreSortedSetBehavior(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("ZAdd() long member = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("leaders")
-		if stored == nil || stored.ZSetEncoding != ValueEncodingGeneral || stored.ZSet == nil {
-			t.Fatalf("stored zset = %#v, want upgraded general zset", stored)
+		if got := store.encodingForTest("leaders"); got != "zset:general" {
+			t.Fatalf("encodingForTest(leaders) = %q, want zset:general", got)
 		}
 		values, err := store.ZRange("leaders", 0, -1)
 		if err != nil {
@@ -2284,7 +2325,10 @@ func TestStoreStreamBehavior(t *testing.T) {
 
 	t.Run("XAdd recreates expired stream key", func(t *testing.T) {
 		store, _ := newStoreWithManualClock()
-		store.setValueObjectForTest("events", newStreamValue(newStream(), store.deadlineAfter(-time.Millisecond)))
+		if _, err := store.XAdd(nil, "events", "9-0", [][]byte{[]byte("old"), []byte("entry")}); err != nil {
+			t.Fatalf("XAdd() error = %v", err)
+		}
+		store.expireKeyForTest("events", store.deadlineAfter(-time.Millisecond))
 
 		id, err := store.XAdd(nil, "events", "5-0", [][]byte{[]byte("field"), []byte("value")})
 		if err != nil {
@@ -2490,10 +2534,10 @@ func TestStoreStreamBehavior(t *testing.T) {
 	})
 }
 
-// TestSnapshotAllCopiesValuesIntactAcrossArenaChunks snapshots values of every
+// TestImageCopiesValuesIntactAcrossArenaChunks images values of every
 // size around the arena's chunk boundaries and checks each comes back byte for
 // byte, and that entries do not share room to grow into one another.
-func TestSnapshotAllCopiesValuesIntactAcrossArenaChunks(t *testing.T) {
+func TestImageCopiesValuesIntactAcrossArenaChunks(t *testing.T) {
 	sizes := []int{0, 1, 7, snapshotArenaMinChunk - 1, snapshotArenaMinChunk, snapshotArenaMinChunk + 1, 3000, 9000, 70_000, snapshotArenaMaxChunk - 1, snapshotArenaMaxChunk, snapshotArenaMaxChunk + 1, 2*snapshotArenaMaxChunk + 5}
 
 	store := NewStore()
@@ -2515,28 +2559,32 @@ func TestSnapshotAllCopiesValuesIntactAcrossArenaChunks(t *testing.T) {
 		t.Fatalf("RightPush() error = %v", err)
 	}
 
-	entries, _ := store.SnapshotAll()
 	seen := 0
-	for _, entry := range entries {
-		if entry.Kind == ValueKindList {
-			if len(entry.List) != 3 || string(entry.List[0]) != "a" || len(entry.List[1]) != 5000 || string(entry.List[2]) != "c" {
-				t.Fatalf("list entry = %d values, want the three pushed", len(entry.List))
+	_, err := store.Image(nil).Recreate(func(args [][]byte) error {
+		key, value := string(args[1]), args[2]
+		if key == "list" {
+			if len(args) != 5 || string(args[2]) != "a" || len(args[3]) != 5000 || string(args[4]) != "c" {
+				t.Fatalf("list command carries %d values, want the three pushed", len(args)-2)
 			}
-			continue
+			return nil
 		}
-		expected, ok := want[entry.Key]
+		expected, ok := want[key]
 		if !ok {
-			t.Fatalf("snapshot has unexpected key %q", entry.Key)
+			t.Fatalf("the image has unexpected key %q", key)
 		}
 		seen++
-		if !bytes.Equal(entry.String, expected) {
-			t.Fatalf("value of %q differs from what was stored (%d bytes, want %d)", entry.Key, len(entry.String), len(expected))
+		if !bytes.Equal(value, expected) {
+			t.Fatalf("value of %q differs from what was stored (%d bytes, want %d)", key, len(value), len(expected))
 		}
-		if cap(entry.String) != len(entry.String) {
-			t.Fatalf("value of %q has spare capacity %d, so appending to it would overwrite a neighbour", entry.Key, cap(entry.String)-len(entry.String))
+		if cap(value) != len(value) {
+			t.Fatalf("value of %q has spare capacity %d, so appending to it would overwrite a neighbour", key, cap(value)-len(value))
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Recreate() error = %v", err)
 	}
 	if seen != len(want) {
-		t.Fatalf("snapshot has %d string entries, want %d", seen, len(want))
+		t.Fatalf("the image has %d string keys, want %d", seen, len(want))
 	}
 }

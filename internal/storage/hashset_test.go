@@ -251,9 +251,8 @@ func TestStoreHash(t *testing.T) {
 		if added != 2 {
 			t.Fatalf("HSet() added = %d, want 2", added)
 		}
-		stored := store.valueObjectForTest("h")
-		if stored == nil || stored.Kind != ValueKindHash || stored.HashEncoding != ValueEncodingCompact || stored.CompactHash == nil {
-			t.Fatalf("stored hash = %#v, want compact hash", stored)
+		if got := store.encodingForTest("h"); got != "hash:compact" {
+			t.Fatalf("encodingForTest(h) = %q, want hash:compact", got)
 		}
 
 		added, err = store.HSet(nil, "h", []HashFieldValue{{Field: "a", Value: []byte("one")}})
@@ -276,16 +275,10 @@ func TestStoreHash(t *testing.T) {
 			t.Fatalf("HGetAll() = %#v, want a/one", entries)
 		}
 
-		snapshot, stats := store.SnapshotAll()
-		if stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
-			t.Fatalf("SnapshotAll() stats = %+v, want total/exported 1", stats)
+		if stats := store.Image(nil).Stats(); stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
+			t.Fatalf("Image().Stats() = %+v, want total/exported 1", stats)
 		}
-		if len(snapshot) != 1 || snapshot[0].Kind != ValueKindHash || len(snapshot[0].Hash) != 1 {
-			t.Fatalf("SnapshotAll() = %#v, want one logical hash", snapshot)
-		}
-		if snapshot[0].Hash[0].Field != "a" || string(snapshot[0].Hash[0].Value) != "one" {
-			t.Fatalf("SnapshotAll() hash = %#v, want a/one", snapshot[0].Hash)
-		}
+		assertRecreationCommands(t, store, "HSET h a one")
 	})
 
 	t.Run("Hash creation chooses compact encoding by distinct fields", func(t *testing.T) {
@@ -298,9 +291,8 @@ func TestStoreHash(t *testing.T) {
 		if _, err := store.HSet(nil, "h", pairs); err != nil {
 			t.Fatalf("HSet() error = %v", err)
 		}
-		stored := store.valueObjectForTest("h")
-		if stored == nil || stored.HashEncoding != ValueEncodingCompact {
-			t.Fatalf("stored hash = %#v, want compact hash for one distinct field", stored)
+		if got := store.encodingForTest("h"); got != "hash:compact" {
+			t.Fatalf("encodingForTest(h) = %q, want hash:compact", got)
 		}
 	})
 
@@ -320,12 +312,11 @@ func TestStoreHash(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("HSet() overflow = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("h")
-		if stored == nil || stored.Kind != ValueKindHash || stored.HashEncoding != ValueEncodingGeneral || stored.Hash == nil {
-			t.Fatalf("stored hash = %#v, want upgraded general hash", stored)
+		if got := store.encodingForTest("h"); got != "hash:general" {
+			t.Fatalf("encodingForTest(h) = %q, want hash:general", got)
 		}
-		if stored.ExpiresAt != expiresAt {
-			t.Fatalf("upgraded hash ExpiresAt = %d, want %d", stored.ExpiresAt, expiresAt)
+		if got := store.expiresAtForTest("h"); got != expiresAt {
+			t.Fatalf("upgraded hash expires at %d, want %d", got, expiresAt)
 		}
 		got, ok, err := store.HGet("h", "a")
 		if err != nil || !ok || string(got) != "v" {
@@ -380,9 +371,8 @@ func TestStoreHash(t *testing.T) {
 				if err != nil || added != tt.wantAdded {
 					t.Fatalf("HSet() long update = (%d, %v), want (%d, nil)", added, err, tt.wantAdded)
 				}
-				stored := store.valueObjectForTest("h")
-				if stored == nil || stored.HashEncoding != ValueEncodingGeneral || stored.Hash == nil {
-					t.Fatalf("stored hash = %#v, want upgraded general hash", stored)
+				if got := store.encodingForTest("h"); got != "hash:general" {
+					t.Fatalf("encodingForTest(h) = %q, want hash:general", got)
 				}
 				got, ok, err := store.HGet("h", tt.wantField)
 				if err != nil || !ok || len(got) != tt.wantLen {
@@ -500,9 +490,8 @@ func TestStoreSet(t *testing.T) {
 		if added != 3 {
 			t.Fatalf("SAdd() added = %d, want 3", added)
 		}
-		stored := store.valueObjectForTest("s")
-		if stored == nil || stored.Kind != ValueKindSet || stored.SetEncoding != ValueEncodingCompact || stored.IntSet == nil {
-			t.Fatalf("stored set = %#v, want compact intset", stored)
+		if got := store.encodingForTest("s"); got != "set:compact" {
+			t.Fatalf("encodingForTest(s) = %q, want set:compact", got)
 		}
 
 		exists, err := store.SIsMember("s", []byte("1"))
@@ -528,17 +517,10 @@ func TestStoreSet(t *testing.T) {
 			t.Fatalf("SMembers() = %v, want %v", got, want)
 		}
 
-		snapshot, stats := store.SnapshotAll()
-		if stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
-			t.Fatalf("SnapshotAll() stats = %+v, want total/exported 1", stats)
+		if stats := store.Image(nil).Stats(); stats.TotalKeys != 1 || stats.ExportedKeys != 1 {
+			t.Fatalf("Image().Stats() = %+v, want total/exported 1", stats)
 		}
-		if len(snapshot) != 1 || snapshot[0].Kind != ValueKindSet {
-			t.Fatalf("SnapshotAll() = %#v, want one logical set", snapshot)
-		}
-		got = sortedStrings(snapshot[0].Set)
-		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-			t.Fatalf("SnapshotAll().Set = %v, want %v", got, want)
-		}
+		assertRecreationCommands(t, store, "SADD s -5 1")
 	})
 
 	t.Run("Non-integer and mixed sets use general encoding", func(t *testing.T) {
@@ -554,9 +536,8 @@ func TestStoreSet(t *testing.T) {
 		}
 
 		for _, key := range []string{"strings", "mixed", "noncanonical"} {
-			stored := store.valueObjectForTest(key)
-			if stored == nil || stored.SetEncoding != ValueEncodingGeneral || stored.Set == nil {
-				t.Fatalf("stored set %q = %#v, want general set", key, stored)
+			if got := store.encodingForTest(key); got != "set:general" {
+				t.Fatalf("encodingForTest(%s) = %q, want set:general", key, got)
 			}
 		}
 	})
@@ -589,12 +570,11 @@ func TestStoreSet(t *testing.T) {
 		if err != nil || added != 1 {
 			t.Fatalf("SAdd() mixed update = (%d, %v), want (1, nil)", added, err)
 		}
-		stored := store.valueObjectForTest("s")
-		if stored == nil || stored.Kind != ValueKindSet || stored.SetEncoding != ValueEncodingGeneral || stored.Set == nil {
-			t.Fatalf("stored set = %#v, want upgraded general set", stored)
+		if got := store.encodingForTest("s"); got != "set:general" {
+			t.Fatalf("encodingForTest(s) = %q, want set:general", got)
 		}
-		if stored.ExpiresAt != expiresAt {
-			t.Fatalf("upgraded set ExpiresAt = %d, want %d", stored.ExpiresAt, expiresAt)
+		if got := store.expiresAtForTest("s"); got != expiresAt {
+			t.Fatalf("upgraded set expires at %d, want %d", got, expiresAt)
 		}
 		for _, member := range []string{"1", "2", "three"} {
 			exists, err := store.SIsMember("s", []byte(member))

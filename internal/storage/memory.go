@@ -83,77 +83,11 @@ func (s *Store) approximateValueObjectSize(key string, value *ValueObject) int64
 		return 0
 	}
 
-	switch value.Kind {
-	case ValueKindString:
-		return s.approximateStringValueObjectSize(key, len(value.String), value.ExpiresAt)
-	case ValueKindList:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		list := value.liveList()
-		size += approxCollectionOverhead + int64(len(list))*approxListEntryOverhead
-		for _, item := range list {
-			size += int64(len(item))
-		}
-		return size
-	case ValueKindHash:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.HashEncoding == ValueEncodingCompact {
-			if value.CompactHash != nil {
-				size += int64(len(value.CompactHash.entries))*approxHashEntryOverhead + int64(len(value.CompactHash.arena))
-			}
-			return size
-		}
-		size += int64(len(value.Hash)) * approxHashEntryOverhead
-		for field, raw := range value.Hash {
-			size += int64(len(field) + len(raw))
-		}
-		return size
-	case ValueKindSet:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.SetEncoding == ValueEncodingCompact {
-			if value.IntSet != nil {
-				size += int64(value.IntSet.len()) * 8
-			}
-			return size
-		}
-		size += int64(len(value.Set)) * approxSetEntryOverhead
-		for member := range value.Set {
-			size += int64(len(member))
-		}
-		return size
-	case ValueKindZSet:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.ZSetEncoding == ValueEncodingCompact {
-			if value.CompactZSet != nil {
-				size += int64(len(value.CompactZSet.entries))*approxZSetEntryOverhead + int64(len(value.CompactZSet.arena))
-			}
-			return size
-		}
-		if value.ZSet != nil {
-			size += int64(len(value.ZSet.index)) * approxZSetEntryOverhead
-			for member := range value.ZSet.index {
-				size += int64(len(member))
-			}
-		}
-		return size
-	case ValueKindStream:
-		size := approximateBaseValueObjectSize(key, value.ExpiresAt)
-		size += approxCollectionOverhead
-		if value.Stream != nil {
-			size += int64(len(value.Stream.entries)) * approxStreamEntryOverhead
-			for _, record := range value.Stream.entries {
-				size += int64(len(record.idText))
-				for _, item := range record.values {
-					size += int64(len(item))
-				}
-			}
-		}
-		return size
+	if value.data != nil {
+		return approximateBaseValueObjectSize(key, value.ExpiresAt) + value.data.approxSize()
 	}
 
-	return approximateBaseValueObjectSize(key, value.ExpiresAt)
+	return s.approximateStringValueObjectSize(key, len(value.String), value.ExpiresAt)
 }
 
 func (s *Store) approximateStringValueObjectSize(key string, length int, expiresAt int64) int64 {

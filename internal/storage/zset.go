@@ -2,12 +2,177 @@ package storage
 
 import (
 	"math/rand"
+	"strconv"
 )
 
 const (
 	zsetMaxLevel = 16
 	zsetP        = 0.25
 )
+
+// zsetValue is a sorted set in one of its two encodings. Exactly one of compact
+// and general is set: a small sorted set of short members is compact, and it
+// becomes general, for good, when a ZADD outgrows that.
+type zsetValue struct {
+	compact *CompactZSet
+	general *SortedSet
+}
+
+// zsetOf returns the sorted set v holds, or ErrWrongType when v holds a value
+// of another kind.
+func zsetOf(v *ValueObject) (*zsetValue, error) {
+	if zset, ok := v.data.(*zsetValue); ok {
+		return zset, nil
+	}
+	return nil, ErrWrongType
+}
+
+// newZSetValueForEntries returns a sorted set of entries, compact when they
+// allow it. A member given twice keeps its last score.
+func newZSetValueForEntries(entries []ZSetEntry) zsetValue {
+	members := make(map[string]float64, len(entries))
+	compactEligible := true
+	for _, entry := range entries {
+		if len(entry.Member) > compactZSetMaxMemberLen {
+			compactEligible = false
+		}
+		members[string(entry.Member)] = entry.Score
+	}
+
+	if compactEligible && len(members) <= compactZSetMaxEntries {
+		compact := &CompactZSet{entries: make([]compactZSetEntry, 0, len(members))}
+		for member, score := range members {
+			compact.add([]byte(member), score)
+		}
+		return zsetValue{compact: compact}
+	}
+
+	general := newSortedSet()
+	for member, score := range members {
+		general.add(member, score)
+	}
+	return zsetValue{general: general}
+}
+
+func (z *zsetValue) len() int {
+	if z.compact != nil {
+		return z.compact.len()
+	}
+	return z.general.len()
+}
+
+// add inserts or updates entries and returns how many members are new. A
+// compact sorted set that the entries outgrow becomes general first.
+func (z *zsetValue) add(entries []ZSetEntry) int64 {
+	if z.compact != nil && !compactZSetCanAdd(z.compact, entries) {
+		general := newSortedSet()
+		for _, entry := range z.compact.entries {
+			general.add(z.compact.member(entry), entry.score)
+		}
+		z.compact, z.general = nil, general
+	}
+
+	added := int64(0)
+	for _, entry := range entries {
+		if z.addOne(entry) {
+			added++
+		}
+	}
+	return added
+}
+
+// addOne inserts or updates one entry in the current encoding, and reports
+// whether its member is new.
+func (z *zsetValue) addOne(entry ZSetEntry) bool {
+	if z.compact != nil {
+		return z.compact.add(entry.Member, entry.Score)
+	}
+	return z.general.add(string(entry.Member), entry.Score)
+}
+
+func (z *zsetValue) score(member []byte) (float64, bool) {
+	if z.compact != nil {
+		return z.compact.score(member)
+	}
+	return z.general.score(string(member))
+}
+
+func (z *zsetValue) rangeByRank(start, stop int) []ZSetRangeEntry {
+	if z.compact != nil {
+		return z.compact.rangeByRank(start, stop)
+	}
+	return z.general.rangeByRank(start, stop)
+}
+
+func (z *zsetValue) rangeByScore(scoreRange ScoreRange) []ZSetRangeEntry {
+	if z.compact != nil {
+		return z.compact.rangeByScore(scoreRange)
+	}
+	return z.general.rangeByScore(scoreRange)
+}
+
+func (z *zsetValue) kind() kindID { return kindZSet }
+
+func (z *zsetValue) approxSize() int64 {
+	size := approxCollectionOverhead
+	if z.compact != nil {
+		return size + int64(len(z.compact.entries))*approxZSetEntryOverhead + int64(len(z.compact.arena))
+	}
+	size += int64(len(z.general.index)) * approxZSetEntryOverhead
+	for member := range z.general.index {
+		size += int64(len(member))
+	}
+	return size
+}
+
+// clone copies the index and skip list, or the compact entries and their arena.
+func (z *zsetValue) clone(header ValueObject) *ValueObject {
+	return newKindValue(header, zsetValue{compact: cloneCompactZSet(z.compact), general: cloneSortedSet(z.general)})
+}
+
+func (z *zsetValue) empty() bool { return z.len() == 0 }
+
+// image copies the members in rank order. A member is an immutable string, so
+// the image shares it with the stored set and copies no bytes.
+func (z *zsetValue) image(a *arena) kindImage {
+	return a.zsets.hold(z.rangeByRank(0, z.len()-1))
+}
+
+// zsetImage is a sorted set in a keyspace image: its members in rank order.
+type zsetImage []ZSetRangeEntry
+
+// recreate emits ZADD commands of score and member pairs, in rank order.
+func (img *zsetImage) recreate(key string, emit func(args [][]byte) error) error {
+	entries := *img
+	return emitChunked(emit, "ZADD", key, len(entries), 2, func(args [][]byte, i int) [][]byte {
+		return append(args, strconv.AppendFloat(nil, entries[i].Score, 'g', -1, 64), []byte(entries[i].Member))
+	})
+}
+
+// compactZSetCanAdd reports whether set stays within the compact encoding's
+// limits after entries are added to it.
+func compactZSetCanAdd(set *CompactZSet, entries []ZSetEntry) bool {
+	projectedLen := set.len()
+	newMembers := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if len(entry.Member) > compactZSetMaxMemberLen {
+			return false
+		}
+		if _, exists := set.score(entry.Member); exists {
+			continue
+		}
+		member := string(entry.Member)
+		if _, exists := newMembers[member]; exists {
+			continue
+		}
+		newMembers[member] = struct{}{}
+		projectedLen++
+		if projectedLen > compactZSetMaxEntries {
+			return false
+		}
+	}
+	return true
+}
 
 // SortedSet is the map-backed sorted set encoding: index gives O(1) score
 // lookup by member, and order is a skip list keyed by (score, member) so range

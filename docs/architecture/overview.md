@@ -43,8 +43,8 @@ Current responsibilities:
 - replay RESP command streams on startup before the listener opens
 - append successful mutating commands in RESP form
 - apply `appendfsync` policies (`always`, `everysec`, `no`)
-- rewrite the current durable state in the background for `BGREWRITEAOF`
-- write a snapshot of the keyspace into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
+- rewrite the current durable state in the background for `BGREWRITEAOF`: it takes a keyspace image from the store (`storage.Image`) and writes the image's recreation commands as RESP, without knowing a value kind, how a collection is split into commands, or how a TTL is written
+- write a keyspace image into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
 
 ### `internal/record`
 
@@ -78,12 +78,13 @@ Current responsibilities:
 
 - route keys to a fixed shard set and protect each shard with its own `sync.RWMutex`
 - apply each single-key write, and a `DEL` of several keys, through a primitive that owns its locking, expiry and memory accounting: `mutateKey`, which the write tells whether it is shrinking (a pop, `HDEL`, `SREM`, `DEL`) and so takes only its key's shard lock even under `maxmemory` and never evicts or sweeps, or growing, and so under `maxmemory` edits a copy of the key's container and locks every shard to make room, leaving the stored value as it was if the write is refused; `mutateString` for `INCR`, `SETBIT` and `PFADD`, which edit a string in place while its length stays the same and otherwise write a resized copy, sized under `maxmemory` before it is allocated; `replaceKey` for `SET`, which replaces a value without copying it; and `deleteKeys` for a `DEL` of several keys, which like any shrinking write locks only its keys' shards
-- support strings, hashes, lists, sets, sorted sets, and streams through a unified value model
+- support strings, hashes, lists, sets, sorted sets, and streams. A stored value is a TTL, an access stamp, and either a string's bytes or the payload of a collection kind. Each collection kind is one type in its own file (`list.go`, `hash.go`, `set.go`, `zset.go`, `stream.go`) that implements `kindValue`: it reports its kind and its accounted size, copies itself for a write that may be refused, says when it is empty and its key is deleted, and takes its own image, which emits its recreation commands. A hash, set or sorted set holds exactly one of its two encodings and upgrades on its own. No code outside those files switches on a kind, so a kind that lacks one of these does not compile, and `ValueKinds` is the one list of kinds, which `INFO` reads
 - store TTLs in Unix milliseconds
 - perform passive eviction when a read or write touches an expired key
 - perform active eviction in a background loop, and again when an accounted write re-measures the keyspace (the first one after a TTL deadline has passed)
 - hand each keyspace change of a write to the `storage.Changes` its caller passed, once every shard lock is released and before the write returns: the key the write changed (`Written`, and nothing when the write succeeded without changing its key, as `HDEL` of a missing field does), each key its sweep removed (`Expired`), and each key it evicted to make room (`MemoryEvicted`). The keys an accounted write removes are collected under its hold of every shard lock, so a call hands on only what it removed itself
 - run each sample of the background loop through the background runner the server registers (`SetBackgroundRunner`), and tell the `Changes` the runner hands it which keys the sample removed
+- copy every live key into a keyspace image (`Image`) under every shard write lock, and emit the image's recreation commands (`Recreate`) with no lock held: in key order, at most 1,024 items per command, each TTL as the absolute deadline it had, and an error for a collection with a TTL, which no command recreates. The store names the commands and their argument order (`SET`, `RPUSH`, `HSET`, `SADD`, `ZADD`, `XADD`); parsing and validating them stays in `internal/command`
 - track approximate keyspace memory when `maxmemory` is enabled
 - evict sampled least-recently-used candidates under memory pressure
 - scan several sorted-set score ranges under one lock acquisition, so `GEORADIUS` reads only the geohash cells that cover its radius, plus two guard ranges for scores outside every cell, instead of the whole set

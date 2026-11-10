@@ -72,7 +72,7 @@ func readKey[T any](s *Store, key string, fn func(value *ValueObject) (T, error)
 
 // anyKind is the want of a mutation that accepts a value of every kind, as DEL
 // does.
-const anyKind ValueKind = ""
+const anyKind = kindCount
 
 // growth is whether a write may add bytes to its key's value. It is a property
 // of the operation, not of the store's mode, and decides what a mutation locks
@@ -115,7 +115,7 @@ const (
 // after it returns. mutateKey releases the locks on every path and calls nothing
 // outside the store while it holds them: changes hears of the write once they
 // are released, and a caller that wakes a list waiter does so after it returns.
-func mutateKey[T any](s *Store, changes Changes, key string, want ValueKind, g growth, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
+func mutateKey[T any](s *Store, changes Changes, key string, want kindID, g growth, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
 	if g == mayGrow {
 		return mutateGrowing(s, changes, key, want, fn)
 	}
@@ -138,7 +138,7 @@ func mutateKey[T any](s *Store, changes Changes, key string, want ValueKind, g g
 		s.deleteKeyLocked(shard, key)
 		cur = nil
 	}
-	if cur != nil && want != anyKind && cur.Kind != want {
+	if cur != nil && want != anyKind && cur.kind() != want {
 		return zero, ErrWrongType
 	}
 	if s.maxMemoryEnabled() {
@@ -205,7 +205,7 @@ func mutateShrinkingAccounted[T any](s *Store, shard *Shard, key string, cur *Va
 }
 
 // mutateGrowing is mutateKey for a growing write.
-func mutateGrowing[T any](s *Store, changes Changes, key string, want ValueKind, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
+func mutateGrowing[T any](s *Store, changes Changes, key string, want kindID, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
 	var zero T
 
 	now := s.now()
@@ -229,7 +229,7 @@ func mutateGrowing[T any](s *Store, changes Changes, key string, want ValueKind,
 		s.deleteKeyLocked(shard, key)
 		cur = nil
 	}
-	if cur != nil && want != anyKind && cur.Kind != want {
+	if cur != nil && want != anyKind && cur.kind() != want {
 		return zero, ErrWrongType
 	}
 
@@ -258,7 +258,7 @@ func mutateGrowing[T any](s *Store, changes Changes, key string, want ValueKind,
 // before it stores it. The one clock reading decides every expiry the write
 // sees: its own key's and those in the sweep that makes room for it, so the
 // sweep cannot remove a key fn was handed as live.
-func mutateGrowingAccounted[T any](s *Store, changes Changes, key string, want ValueKind, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
+func mutateGrowingAccounted[T any](s *Store, changes Changes, key string, want kindID, now int64, fn func(cur *ValueObject, now int64) (*ValueObject, T, error)) (T, error) {
 	var zero T
 
 	// An accounted write recalculates the keyspace, sweeps expired keys out of
@@ -270,7 +270,7 @@ func mutateGrowingAccounted[T any](s *Store, changes Changes, key string, want V
 	defer s.writeUnlockAllShardsAndReport(changes)
 
 	shard, stored := s.prepareExistingValueLocked(key, now)
-	if stored != nil && want != anyKind && stored.Kind != want {
+	if stored != nil && want != anyKind && stored.kind() != want {
 		return zero, ErrWrongType
 	}
 	var (
@@ -383,7 +383,7 @@ func mutateString[T any](s *Store, changes Changes, key string, fn func(w string
 	}
 
 	shard, cur := s.prepareExistingValueLocked(key, now)
-	if cur != nil && cur.Kind != ValueKindString {
+	if cur != nil && cur.data != nil {
 		return zero, ErrWrongType
 	}
 	result, err := fn(stringWrite{store: s, shard: shard, key: key, cur: cur, now: now, accounting: accounting})

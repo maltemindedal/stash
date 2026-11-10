@@ -262,35 +262,39 @@ func describeValueForTest(store *Store, key string) string {
 		return "absent"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s, expires at %d: ", v.Kind, v.ExpiresAt)
-	switch v.Kind {
+	kind := kindNames[v.kind()]
+	fmt.Fprintf(&b, "%s, expires at %d: ", kind, v.ExpiresAt)
+	switch kind {
 	case ValueKindString:
 		fmt.Fprintf(&b, "%q", v.String)
 	case ValueKindList:
-		fmt.Fprintf(&b, "%q", v.liveList())
+		list, _ := listOf(v)
+		fmt.Fprintf(&b, "%q", list.live())
 	case ValueKindHash:
-		entries, _ := v.hashEntries()
+		hash, _ := hashOf(v)
+		entries := hash.entries()
 		pairs := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			pairs = append(pairs, entry.Field+"="+string(entry.Value))
 		}
 		sort.Strings(pairs)
-		fmt.Fprintf(&b, "encoding %d %q", v.HashEncoding, pairs)
+		fmt.Fprintf(&b, "compact %v %q", hash.compact != nil, pairs)
 	case ValueKindSet:
-		members, _ := v.setMembers()
+		set, _ := setOf(v)
+		members := set.members()
 		names := make([]string, 0, len(members))
 		for _, member := range members {
 			names = append(names, string(member))
 		}
 		sort.Strings(names)
-		fmt.Fprintf(&b, "encoding %d %q", v.SetEncoding, names)
+		fmt.Fprintf(&b, "integers %v %q", set.ints != nil, names)
 	case ValueKindZSet:
-		n, _ := v.zsetLen()
-		entries, _ := v.zsetRangeByRank(0, n-1)
-		fmt.Fprintf(&b, "encoding %d %v", v.ZSetEncoding, entries)
+		zset, _ := zsetOf(v)
+		fmt.Fprintf(&b, "compact %v %v", zset.compact != nil, zset.rangeByRank(0, zset.len()-1))
 	case ValueKindStream:
-		fmt.Fprintf(&b, "last ID %s", v.Stream.lastID)
-		for _, record := range v.Stream.entries {
+		stream, _ := streamOf(v)
+		fmt.Fprintf(&b, "last ID %s", stream.lastID)
+		for _, record := range stream.entries {
 			fmt.Fprintf(&b, ", %s %q", record.idText, record.values)
 		}
 	}
@@ -332,7 +336,7 @@ func TestAWriteToAnExpiredKeySeesNoValue(t *testing.T) {
 				if found {
 					t.Fatalf("%s found a value under a key whose TTL had passed", w.name)
 				}
-				if store.valueObjectForTest(key) != nil {
+				if store.holdsKeyForTest(key) {
 					t.Fatalf("%s left the expired key stored", w.name)
 				}
 				requireExactUsedMemory(t, store)
@@ -510,11 +514,11 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 			// sorted set and runs a mutation that leaves it as it is.
 			name: "a mutation of an empty sorted set",
 			setup: func(s *Store) error {
-				s.setValueObjectForTest(key, newZSetValueForEntries(nil, 0))
+				s.setValueObjectForTest(key, newKindValue(ValueObject{}, newZSetValueForEntries(nil)))
 				return nil
 			},
 			write: func(s *Store) error {
-				_, err := mutateKey(s, nil, key, ValueKindZSet, shrinks, unchanged)
+				_, err := mutateKey(s, nil, key, kindZSet, shrinks, unchanged)
 				return err
 			},
 		},
@@ -522,7 +526,7 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 			name:  "a mutation that empties a string",
 			setup: func(s *Store) error { err := s.Set(nil, key, []byte("text"), 0); return err },
 			write: func(s *Store) error {
-				_, err := mutateKey(s, nil, key, ValueKindString, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, struct{}, error) {
+				_, err := mutateKey(s, nil, key, kindString, shrinks, func(cur *ValueObject, _ int64) (*ValueObject, struct{}, error) {
 					cur.String = cur.String[:0]
 					return cur, struct{}{}, nil
 				})
@@ -711,7 +715,7 @@ func TestGrowingWritesEvictTheStalestKeyToMakeRoom(t *testing.T) {
 			if len(evicted) != 1 || evicted[0] != victim {
 				t.Fatalf("%s at the limit evicted %v, want [%s]", w.name, evicted, victim)
 			}
-			if store.valueObjectForTest(victim) != nil {
+			if store.holdsKeyForTest(victim) {
 				t.Fatalf("%s reported evicting %s but left it stored", w.name, victim)
 			}
 			if used := store.UsedMemory(); used > limit {
@@ -759,11 +763,14 @@ func TestAStringEditedInPlaceLeavesWhatWasReadBeforeAsItWas(t *testing.T) {
 				fromStrings = entry.Value
 			}
 		}
-		all, _ := store.SnapshotAll()
-		for _, entry := range all {
-			if entry.Key == key {
-				fromAll = entry.String
+		_, err := store.Image(nil).Recreate(func(args [][]byte) error {
+			if string(args[1]) == key {
+				fromAll = args[2]
 			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Recreate() error = %v", err)
 		}
 		return fromStrings, fromAll
 	}
@@ -859,7 +866,7 @@ func TestShrinkingWritesLockOnlyTheirOwnShardAndNeverEvict(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s error = %v", w.name, err)
 			}
-			if store.valueObjectForTest(stale) == nil {
+			if !store.holdsKeyForTest(stale) {
 				t.Fatalf("%s swept %s from another shard; a shrinking write sweeps nothing", w.name, stale)
 			}
 			requireExactUsedMemory(t, store)

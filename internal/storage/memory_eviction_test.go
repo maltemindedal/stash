@@ -115,7 +115,7 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	if len(swept) != 0 {
 		t.Fatalf("a write before any deadline swept %v", swept)
 	}
-	if store.valueObjectForTest("soon") == nil {
+	if !store.holdsKeyForTest("soon") {
 		t.Fatal("the key was swept before its deadline")
 	}
 
@@ -126,7 +126,7 @@ func TestStoreAccountedWriteSweepsAKeyOnceItsDeadlinePasses(t *testing.T) {
 	if len(swept) != 1 || swept[0] != "soon" {
 		t.Fatalf("the first write after the deadline swept %v, want [soon]", swept)
 	}
-	if store.valueObjectForTest("later") == nil {
+	if !store.holdsKeyForTest("later") {
 		t.Fatal("the swept keyspace lost a key whose deadline had not passed")
 	}
 	if used, want := store.UsedMemory(), recountUsedMemory(store); used != want {

@@ -1012,6 +1012,10 @@ func TestExecutorInfo(t *testing.T) {
 			t.Fatalf("INFO memory = %q, missing %q", text, want)
 		}
 	}
+	// The per-kind counts close the section, in this order.
+	if want := "key_count:2\r\nkey_count_string:1\r\nkey_count_list:1\r\nkey_count_hash:0\r\nkey_count_set:0\r\nkey_count_zset:0\r\nkey_count_stream:0\r\n"; !strings.HasSuffix(text, want) {
+		t.Fatalf("INFO memory = %q, want it to end with %q", text, want)
+	}
 
 	value, err = executor.Execute(clientContext(executor), requestValue("INFO"))
 	if err != nil {
@@ -3221,16 +3225,31 @@ func acknowledgeGetAck(conn net.Conn, registry *server.ReplicaRegistry, id uint6
 	return nil
 }
 
+// storedExpiryMillis returns the TTL deadline stored for a string key, or 0 for
+// a key without one, read from the recreation commands of the keyspace image.
 func storedExpiryMillis(t *testing.T, executor *Executor, key string) int64 {
 	t.Helper()
-	entries, _ := executor.store.SnapshotAll()
-	for _, entry := range entries {
-		if entry.Key == key {
-			return entry.ExpiresAt
+
+	found, deadline := false, int64(0)
+	_, err := executor.store.Image(nil).Recreate(func(args [][]byte) error {
+		if string(args[1]) != key {
+			return nil
 		}
+		found = true
+		if len(args) == 5 && string(args[0]) == "SET" && string(args[3]) == "PXAT" {
+			parsed, err := strconv.ParseInt(string(args[4]), 10, 64)
+			deadline = parsed
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Recreate() error = %v", err)
 	}
-	t.Fatalf("key %q not found in store snapshot", key)
-	return 0
+	if !found {
+		t.Fatalf("key %q not found in the keyspace image", key)
+	}
+	return deadline
 }
 
 func requestValue(parts ...string) protocol.Value {
