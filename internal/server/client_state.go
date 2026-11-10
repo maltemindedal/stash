@@ -164,21 +164,6 @@ func (s *ClientState) Disconnected() bool {
 	return s.Output().PeerClosed()
 }
 
-// WriteEncoded queues a stretch of the replication stream for the Replica this
-// connection is. It never waits for the socket, and fails once the connection
-// is closed, with the reason: a Replica that fell behind was closed for passing
-// its Push limit or for the Replica stall rule.
-func (s *ClientState) WriteEncoded(payload []byte) error {
-	out := s.Output()
-	if out == nil {
-		return errOutputClosed
-	}
-	if !out.Push(payload) {
-		return out.Err()
-	}
-	return nil
-}
-
 // SetReplicaListeningPort records the port announced during REPLCONF listening-port.
 func (s *ClientState) SetReplicaListeningPort(port int) {
 	s.mu.Lock()

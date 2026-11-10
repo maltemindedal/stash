@@ -83,7 +83,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		clientStates:    make(map[uint64]*ClientState),
 	}
 	srv.link = &replication.Link{MasterAuth: cfg.MasterAuth, Store: replicaStore{server: srv}, Logger: logger}
-	srv.master = replication.NewMaster(store, srv.dropReplica, logger)
+	srv.master = replication.NewMaster(store, srv.replicaDropped, logger)
 	srv.recorder = record.New(srv.master, logger)
 
 	executor, err := newExecutor(Services{
@@ -193,9 +193,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// replica connections, so it has to be finished before they are torn down.
 	stopEviction()
 	<-evictionDone
-	// Every connection is closed by now, so every replica's feed has ended or
-	// is ending; nothing it logs may come after ListenAndServe returns.
-	s.master.WaitFeeds()
 
 	var errs []error
 	if serveErr != nil {
@@ -378,7 +375,7 @@ func (s *Server) setListener(listener net.Listener) {
 }
 
 // replicaShutdownGrace is how long shutdown waits for replicas to take the
-// propagated commands still queued for them.
+// propagated commands still queued for them and close their connections.
 const replicaShutdownGrace = time.Second
 
 func (s *Server) shutdown() {
@@ -390,18 +387,17 @@ func (s *Server) shutdown() {
 		}
 		// Commands already propagated are written to the replicas before their
 		// sockets are closed, as they were when propagation wrote them directly.
-		// Their connections stay open, in both networking modes, until each
-		// replica has closed its own side after the end of its stream, or until
-		// CloseAll below once the grace has passed. A write made from here on
-		// reaches no replica.
-		deadline := time.Now().Add(replicaShutdownGrace)
+		// Each replica's Output writes what is queued for it and then shuts the
+		// sending side. The connections stay open, in both networking modes,
+		// until each replica has closed its own side after the end of its
+		// stream, or until CloseAll below once the grace has passed. A write
+		// made from here on reaches no replica.
 		if replicas := s.master.StopPropagating(); replicas > 0 {
 			s.logger.Info("sending the replicas what is queued for them before shutting down", "replicas", replicas, "grace", replicaShutdownGrace)
 		}
-		if unfinished := s.master.StopFeeds(time.Until(deadline)); unfinished > 0 {
-			s.logger.Warn("some replicas did not receive the last propagated commands before shutdown", "replicas", unfinished)
+		if remaining := s.master.EndStreams(time.Now().Add(replicaShutdownGrace)); remaining > 0 {
+			s.logger.Warn("some replicas had not closed their connection when the shutdown grace ended; they may not have the end of the stream", "replicas", remaining, "grace", replicaShutdownGrace)
 		}
-		s.master.EndStreams(deadline)
 
 		s.listenerMu.RLock()
 		listener := s.listener

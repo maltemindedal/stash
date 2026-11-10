@@ -16,7 +16,6 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
-	"github.com/maltemindedal/stash/internal/replication"
 )
 
 // pollerEventBatch bounds how many readiness events one Wait call returns.
@@ -190,8 +189,6 @@ type eventConn struct {
 	// authTimer closes the connection if it has not authenticated in time; nil
 	// where no password is required.
 	authTimer *time.Timer
-	// replica is set once the connection has become a replica peer.
-	replica atomic.Bool
 	// dirty is set while the connection is on eventLoop.dirty.
 	dirty atomic.Bool
 	// endStream is set when the stream to the peer is to end, as shutdown ends
@@ -335,13 +332,13 @@ func (l *eventLoop) applyQueuedWork() {
 
 // beginDrain starts the loop's end, when the server shuts down (cause is nil) or
 // accepting fails (cause, which run then returns). It stops accepting and closes
-// every connection but the replicas'. The replicas' feeds go on pushing until
-// shutdown stops them (replication.Master.StopFeeds) and then ends their streams
-// (replication.Master.EndStreams): each connection is sent what it holds, has its
-// write side shut, and is closed once the replica closes its own
-// (finishConnEvent). The loop keeps no time itself. Shutdown closes whatever is
-// still open when its grace has passed (ClientRegistry.CloseAll), and run
-// returns when no connection is left.
+// every connection but the replicas'. The Master goes on pushing to those until
+// shutdown stops it and ends their streams (replication.Master.EndStreams):
+// each connection is sent what is queued for it, has its write side shut, and
+// is closed once the replica closes its own (finishConnEvent). The loop keeps
+// no time itself. Shutdown closes whatever is still open when its grace has
+// passed (ClientRegistry.CloseAll), and run returns when no connection is
+// left.
 func (l *eventLoop) beginDrain(cause error) {
 	l.draining = true
 	l.drainErr = cause
@@ -349,7 +346,7 @@ func (l *eventLoop) beginDrain(cause error) {
 		l.srv.logger.Debug("failed to stop accepting connections for shutdown", "error", err)
 	}
 	for _, conn := range l.conns {
-		if !conn.replica.Load() {
+		if !conn.out.isReplica() {
 			l.closeConn(conn, nil)
 		}
 	}
@@ -741,9 +738,9 @@ func (d *loopOutputDriver) closeWrite() {
 func (d *loopOutputDriver) peerClosed() bool { return false }
 
 // eventConnHandle implements the ClientConn operations registered with the client
-// registry so shutdown, INFO connected-client counts, and replica bookkeeping
-// keep working for event-loop connections. Close hands the actual teardown to
-// the loop goroutine, which owns all socket I/O.
+// registry so shutdown and INFO connected-client counts keep working for
+// event-loop connections. Close hands the actual teardown to the loop
+// goroutine, which owns all socket I/O.
 type eventConnHandle struct {
 	loop *eventLoop
 	conn *eventConn
@@ -758,29 +755,6 @@ func (h *eventConnHandle) Close() error {
 
 // RemoteAddr returns the peer address captured when the connection was accepted.
 func (h *eventConnHandle) RemoteAddr() net.Addr { return h.conn.remoteAddr }
-
-// CloseWrite ends the stream to a replica once everything queued for it has
-// been written (replication.Master.EndStreams), through the connection's
-// Output as the goroutine mode does (outputConn.CloseWrite).
-func (h *eventConnHandle) CloseWrite() error {
-	h.conn.out.EndStream()
-	return nil
-}
-
-// markReplica tells the loop the connection is a replica's, which shutdown
-// drains instead of closing. registerReplicaPeer calls it before the replica's
-// feed starts pushing.
-func (h *eventConnHandle) markReplica() { h.conn.replica.Store(true) }
-
-// Asserted, since registerReplicaPeer finds markReplica by type assertion: a
-// renamed method would compile, and shutdown would close replicas undrained.
-var _ replicaMarker = (*eventConnHandle)(nil)
-
-// Asserted, since replication.Master.EndStreams finds CloseWrite by type assertion:
-// a renamed method would compile, and shutdown would skip an event-loop
-// replica's half-close and the wait for the replica to close, leaving its end of
-// stream to CloseAll's close request.
-var _ replication.StreamEnder = (*eventConnHandle)(nil)
 
 func sockaddrTCPAddr(sa syscall.Sockaddr) net.Addr {
 	switch sa := sa.(type) {

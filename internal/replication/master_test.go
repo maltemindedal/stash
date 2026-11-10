@@ -5,9 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -30,11 +28,7 @@ func encodeFrame(t testing.TB, frame protocol.Value) []byte {
 
 func TestAnAcknowledgementWakesWhoeverWaitsForIt(t *testing.T) {
 	master := newTestMaster()
-	serverConn, replicaConn := net.Pipe()
-	defer func() { _ = serverConn.Close() }()
-	defer func() { _ = replicaConn.Close() }()
-
-	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(serverConn)}, serverConn)
+	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: &fakeOutput{}})
 
 	count, changed := master.ackedWithNotify(10)
 	if count != 0 {
@@ -57,17 +51,6 @@ func TestAnAcknowledgementWakesWhoeverWaitsForIt(t *testing.T) {
 	}
 }
 
-func TestDetachingAndClosingAReplicaReturnsItsCloseError(t *testing.T) {
-	master := newTestMaster()
-	conn := &closeCounter{closeErr: errors.New("close boom")}
-	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)}, conn)
-
-	err := master.detachAndClose(1)
-	if err == nil || err.Error() != "close boom" {
-		t.Fatalf("detachAndClose() error = %v, want close boom", err)
-	}
-}
-
 // TestConcurrentWritesReachEveryReplicaInOffsetOrder has writers propagate at the
 // same time, as writers on different stripes do, and checks that every replica
 // receives each frame at the stream position the master counted for it. A replica
@@ -87,11 +70,10 @@ func TestConcurrentWritesReachEveryReplicaInOffsetOrder(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			master := newTestMaster()
-			conns := make([]*streamRecorder, tt.replicas)
-			for i := range conns {
-				id := uint64(i + 1)
-				conns[i] = &streamRecorder{}
-				master.Add(Candidate{ID: id, ListeningPort: 6380 + i, Out: outTo(conns[i])}, conns[i])
+			outs := make([]*fakeOutput, tt.replicas)
+			for i := range outs {
+				outs[i] = &fakeOutput{}
+				master.Add(Candidate{ID: uint64(i + 1), ListeningPort: 6380 + i, Out: outs[i]})
 			}
 
 			const writers, perWriter = 8, 2000
@@ -121,14 +103,9 @@ func TestConcurrentWritesReachEveryReplicaInOffsetOrder(t *testing.T) {
 			}
 			wg.Wait()
 
-			// Stopping the feeds waits for each to write everything queued for it.
-			if unfinished := master.StopFeeds(10 * time.Second); unfinished != 0 {
-				t.Fatalf("%d replica feeds had not finished writing after 10s", unfinished)
-			}
-
 			counted := master.Offset()
-			for i, conn := range conns {
-				stream := conn.Bytes()
+			for i, out := range outs {
+				stream := out.Bytes()
 				if int64(len(stream)) != counted {
 					t.Fatalf("replica %d received %d bytes, want the %d the master counted", i+1, len(stream), counted)
 				}
@@ -175,135 +152,151 @@ func framesAwayFromTheirOffsets(t *testing.T, stream []byte, ends map[string]int
 	return frames, misplaced, first
 }
 
-// TestAReplicaThatRefusesAFrameIsDroppedOnce checks that a replica whose feed
-// refuses a frame is dropped by one path, once: the drop handler, called
-// after the master lock is released so that it can take the lock as
-// dropReplica does, or the master's detachAndClose when no handler is set. The
-// other replicas still receive the frame, and its offset is counted once.
-func TestAReplicaThatRefusesAFrameIsDroppedOnce(t *testing.T) {
+// TestAReplicaWhoseOutputRefusesAFrameIsDetachedAndPushedNothingMore has one
+// Replica's Output refuse a large frame it would not refuse a smaller one
+// after, as an Output with a byte limit would if it stayed open. The Master
+// detaches the Replica before it counts another frame, so the smaller frame
+// is not pushed to it: it would arrive at the stream position of the refused
+// frame instead of at the offset counted for it. The dropped handler hears of
+// the Replica once, with why its Output was closed, on the propagating
+// goroutine after the Master's lock is released, and finds the Replica
+// detached already. The other Replica receives both frames, and each offset is
+// counted once.
+func TestAReplicaWhoseOutputRefusesAFrameIsDetachedAndPushedNothingMore(t *testing.T) {
+	large := []byte("*1\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n")
+	small := []byte("*1\r\n$4\r\nPING\r\n")
+	cause := errors.New("closed by the test")
+
+	type report struct {
+		id            uint64
+		listeningPort int
+		cause         error
+		// registered is how many Replicas the Master counted when the handler
+		// ran, and found is whether Detach still found the reported one.
+		registered int
+		found      bool
+	}
 	tests := []struct {
 		name        string
 		withHandler bool
+		wantReports []report
 	}{
-		{name: "through the drop handler", withHandler: true},
-		{name: "by the master when no handler is set", withHandler: false},
+		{name: "the dropped handler is told once", withHandler: true, wantReports: []report{{id: 2, listeningPort: 6381, cause: cause, registered: 1}}},
+		{name: "with no handler nobody is told"},
 	}
 
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			master := newTestMaster()
-			healthy := &streamRecorder{}
-			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(healthy)}, healthy)
-			// A replica with no writer refuses every frame queued for it.
-			refusing := &closeCounter{}
-			master.Add(Candidate{ID: 2, ListeningPort: 6381, Out: nil}, refusing)
+			healthy := &fakeOutput{}
+			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: healthy})
+			refusing := &fakeOutput{refuse: func(frame []byte) error {
+				if len(frame) > len(small) {
+					return cause
+				}
+				return nil
+			}}
+			master.Add(Candidate{ID: 2, ListeningPort: 6381, Out: refusing})
 
-			var handled sync.Mutex
-			var dropped []uint64
+			// Appended without a lock: the handler runs on this goroutine.
+			var reports []report
 			if tt.withHandler {
-				master.drop = func(id uint64, _ error) {
-					handled.Lock()
-					dropped = append(dropped, id)
-					handled.Unlock()
-					// Takes the master lock, as the server's handler does.
-					master.Detach(id)
+				master.dropped = func(replica *Replica, cause error) {
+					reports = append(reports, report{
+						id: replica.ID, listeningPort: replica.ListeningPort, cause: cause,
+						// Both take the Master's lock, as a handler may.
+						registered: master.Count(), found: master.Detach(replica.ID) != nil,
+					})
 				}
 			}
-			payload := []byte("*1\r\n$4\r\nPING\r\n")
-			for round := 1; round <= 2; round++ {
-				type outcome struct {
-					end             int64
-					queued, refused int
-				}
-				done := make(chan outcome, 1)
-				go func() {
-					end, queued, refused := master.countAndQueue(payload)
-					done <- outcome{end, queued, refused}
-				}()
 
+			type outcome struct {
+				end             int64
+				queued, refused int
+			}
+			steps := []struct {
+				frame []byte
+				want  outcome
+			}{
+				{frame: large, want: outcome{end: int64(len(large)), queued: 1, refused: 1}},
+				{frame: small, want: outcome{end: int64(len(large) + len(small)), queued: 1}},
+			}
+			for _, step := range steps {
 				var got outcome
-				select {
-				case got = <-done:
-				case <-time.After(5 * time.Second):
-					t.Fatalf("round %d: Propagate did not return; dropping the replica waited for the master lock", round)
-				}
-
-				want := outcome{end: int64(round * len(payload)), queued: 1}
-				if round == 1 {
-					want.refused = 1
-				}
-				if got != want {
-					t.Fatalf("round %d: Propagate() = %+v, want %+v", round, got, want)
+				got.end, got.queued, got.refused = master.countAndQueue(step.frame)
+				if got != step.want {
+					t.Fatalf("propagating %q = %+v, want %+v", step.frame, got, step.want)
 				}
 			}
 
 			if got := master.Count(); got != 1 {
-				t.Fatalf("Count() = %d, want 1: the refusing replica is still registered", got)
+				t.Fatalf("Count() = %d, want 1: the refusing Replica is still registered", got)
 			}
-			handled.Lock()
-			gotDropped := append([]uint64(nil), dropped...)
-			handled.Unlock()
-			wantDropped, wantCloses := []uint64{2}, int32(1)
-			if tt.withHandler {
-				// Closing the socket is the handler's job; the master must not
-				// drop the replica a second way.
-				wantCloses = 0
-			} else {
-				wantDropped = nil
+			if got := refusing.Bytes(); len(got) != 0 {
+				t.Fatalf("the Replica was pushed %q after the frame it refused, want nothing", got)
 			}
-			if fmt.Sprint(gotDropped) != fmt.Sprint(wantDropped) {
-				t.Fatalf("handler dropped %v, want %v", gotDropped, wantDropped)
+			if got, want := healthy.Bytes(), append(bytes.Clone(large), small...); !bytes.Equal(got, want) {
+				t.Fatalf("the healthy Replica received %q, want %q", got, want)
 			}
-			if got := refusing.closes.Load(); got != wantCloses {
-				t.Fatalf("refusing replica's connection closed %d times, want %d", got, wantCloses)
-			}
-
-			if unfinished := master.StopFeeds(5 * time.Second); unfinished != 0 {
-				t.Fatalf("%d replica feeds had not finished writing after 5s", unfinished)
-			}
-			if got, want := healthy.Bytes(), bytes.Repeat(payload, 2); !bytes.Equal(got, want) {
-				t.Fatalf("healthy replica received %q, want %q", got, want)
+			if fmt.Sprint(reports) != fmt.Sprint(tt.wantReports) {
+				t.Fatalf("the dropped handler was told %+v, want %+v", reports, tt.wantReports)
 			}
 		})
 	}
 }
 
-// TestAReplicaIsSentNoFrameAfterOneItRefused has a replica's backlog refuse a
-// frame, and then propagates a smaller frame that would still fit before the
-// replica is dropped. Queueing it would put it at the stream position of the
-// refused frame instead of at the offset counted for it, so it must be refused too.
-func TestAReplicaIsSentNoFrameAfterOneItRefused(t *testing.T) {
+// TestWritersThatRaceARefusalPushNothingToItsReplicaAfterIt has eight writers
+// propagate to 200 Replicas whose Outputs each refuse one frame, a different
+// one for each, and would take every frame after it. The Master detaches a
+// Replica under the same hold of its lock as the push that was refused, so no
+// writer finds it registered afterwards and each Replica holds exactly the
+// frames before the one it refused. Detached once that lock was released, as
+// a handler that takes the lock would do it, a writer waiting for the lock
+// gets in first for some of the 200.
+func TestWritersThatRaceARefusalPushNothingToItsReplicaAfterIt(t *testing.T) {
 	master := newTestMaster()
-	conn := &streamRecorder{}
-	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)}, conn)
-	// A backlog limit the first frame passes and the second does not.
-	master.mu.RLock()
-	feed := master.replicas[1].feed
-	master.mu.RUnlock()
-	feed.mu.Lock()
-	feed.limit = 16
-	feed.mu.Unlock()
+	frame := []byte("*1\r\n$4\r\nPING\r\n")
+	cause := errors.New("closed by the test")
 
-	// The handler keeps the replica registered, as it is between a refusal and
-	// the drop that follows it.
-	master.drop = func(uint64, error) {}
-	large := []byte("*1\r\n$20\r\nxxxxxxxxxxxxxxxxxxxx\r\n")
-	small := []byte("*1\r\n$4\r\nPING\r\n")
-	for _, payload := range [][]byte{large, small} {
-		if _, queued, refused := master.countAndQueue(payload); queued != 0 || refused != 1 {
-			t.Fatalf("Propagate(%q) queued %d and refused %d, want 0 and 1", payload, queued, refused)
+	const replicas = 200
+	refusedFrame := func(replica int) int { return 10 * (replica + 1) }
+	outs := make([]*fakeOutput, replicas)
+	for i := range outs {
+		refuseAt, offered := refusedFrame(i), 0 // offered is guarded by the Output's lock
+		outs[i] = &fakeOutput{refuse: func([]byte) error {
+			offered++
+			if offered == refuseAt {
+				return cause
+			}
+			return nil
+		}}
+		master.Add(Candidate{ID: uint64(i + 1), ListeningPort: 6380, Out: outs[i]})
+	}
+
+	const writers, perWriter = 8, 500 // twice the frames the last Replica refuses at
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				master.Propagate(frame, false)
+			}
+		}()
+	}
+	wg.Wait()
+
+	for i, out := range outs {
+		if got, want := len(out.Bytes())/len(frame), refusedFrame(i)-1; got != want {
+			t.Errorf("replica %d was pushed %d frames, want only the %d before the one it refused", i+1, got, want)
 		}
 	}
-
-	if got, want := master.Offset(), int64(len(large)+len(small)); got != want {
-		t.Fatalf("MasterOffset() = %d, want %d", got, want)
+	if got := master.Count(); got != 0 {
+		t.Fatalf("Count() = %d, want every Replica detached", got)
 	}
-	if unfinished := master.StopFeeds(5 * time.Second); unfinished != 0 {
-		t.Fatalf("%d replica feeds had not finished writing after 5s", unfinished)
-	}
-	if got := conn.Bytes(); len(got) != 0 {
-		t.Fatalf("replica received %q after refusing a frame, want nothing", got)
+	if got, want := master.Offset(), int64(writers*perWriter*len(frame)); got != want {
+		t.Fatalf("Offset() = %d, want every frame counted: %d", got, want)
 	}
 }
 
@@ -331,9 +324,7 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			master := newTestMaster()
 			master.offset.Add(100)
-			conn := &closeCounter{}
-			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)}, conn)
-			defer master.StopFeeds(time.Second)
+			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: &fakeOutput{}})
 
 			if tt.acknowledged > 0 && !master.Ack(1, tt.acknowledged) {
 				t.Fatal("Ack() = false, want true")
@@ -358,8 +349,8 @@ func TestAReplicaCountsFromTheOffsetItAttachedAt(t *testing.T) {
 // write it has not acknowledged. Each replica attaches at a different moment,
 // since one attach does not always land between two frames.
 //
-// The replicas register as PSYNC registers them, through beginAttach, reserve and
-// Start, but outside an attach cut, which is the command sequencer's. A client
+// The replicas register as PSYNC registers them, through beginAttach and
+// reserve, but outside an attach cut, which is the command sequencer's. A client
 // write skips the master lock while no replica is registered and relies on the
 // cut instead, so it is covered where the cut is, by
 // TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt in the
@@ -410,26 +401,18 @@ func TestAReplicaAttachedWhileWritesArePropagatedCountsAtTheMasterOffset(t *test
 	// Each replica attaches after frames were counted without it, and frames are
 	// counted after it, so both sides of its base are exercised.
 	const replicas = 5
-	conns := make([]*streamRecorder, replicas)
-	for i := range conns {
+	outs := make([]*fakeOutput, replicas)
+	for i := range outs {
 		waitForPropagated(propagated.Load() + 500)
-		id := uint64(i + 1)
-		conns[i] = &streamRecorder{}
+		outs[i] = &fakeOutput{}
 		master.beginAttach()
-		master.reserve(Candidate{ID: id, ListeningPort: 6380 + i, Out: outTo(conns[i])})
-		if !master.Start(id, conns[i]) {
-			t.Fatalf("Start(%d) = false, want true", id)
-		}
+		master.reserve(Candidate{ID: uint64(i + 1), ListeningPort: 6380 + i, Out: outs[i]})
 	}
 	waitForPropagated(propagated.Load() + 500)
 	stopWriters()
 
-	// Stopping the feeds waits for each to write everything queued for it.
-	if unfinished := master.StopFeeds(10 * time.Second); unfinished != 0 {
-		t.Fatalf("%d replica feeds had not finished writing after 10s", unfinished)
-	}
-	for i, conn := range conns {
-		if !master.Ack(uint64(i+1), int64(len(conn.Bytes()))) {
+	for i, out := range outs {
+		if !master.Ack(uint64(i+1), int64(len(out.Bytes()))) {
 			t.Fatalf("Ack(%d) = false, want true", i+1)
 		}
 	}
@@ -507,13 +490,13 @@ func TestWithNoReplicaRegisteredOnlyOrderedFramesSkipTheMastersLock(t *testing.T
 	}
 }
 
-// TestAReplicaAttachesInThreeSteps walks a replica through beginAttach, reserve
-// and Start, as PSYNC takes them, and checks what each step makes visible: the
-// master is active from beginAttach, so writes are ordered; reserve registers
-// the replica at the master offset of that moment with a feed that queues every
-// frame counted after it without writing; Start writes what was queued and what
-// follows, in order.
-func TestAReplicaAttachesInThreeSteps(t *testing.T) {
+// TestAReplicaAttachesInTwoSteps walks a replica through beginAttach and
+// reserve, as PSYNC takes them, and checks what each step makes visible: the
+// master is active from beginAttach, so writes are ordered; reserve marks the
+// replica's Output a replica's, tells it to hold, and registers the replica at
+// the master offset of that moment, so that every frame counted after it is
+// pushed to that Output and none counted before it is.
+func TestAReplicaAttachesInTwoSteps(t *testing.T) {
 	master := newTestMaster()
 	payload := []byte("*1\r\n$4\r\nPING\r\n")
 
@@ -526,32 +509,21 @@ func TestAReplicaAttachesInThreeSteps(t *testing.T) {
 	}
 	master.countAndQueue(payload) // before the cut: in the snapshot, not the stream
 
-	conn := &streamRecorder{}
-	master.reserve(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)})
+	out := &fakeOutput{}
+	master.reserve(Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	if !master.Active() || master.Count() != 1 {
 		t.Fatalf("after reserve: Active() = %v and Count() = %d, want true and 1", master.Active(), master.Count())
 	}
-	if _, queued, _ := master.countAndQueue(payload); queued != 1 {
-		t.Fatalf("Propagate() during the transfer queued for %d replicas, want 1", queued)
+	if marks, holds := out.asked("MarkReplica"), out.asked("HoldPushes"); marks != 1 || holds != 1 {
+		t.Fatalf("after reserve: the Output was marked a replica's %d times and told to hold %d times, want once each", marks, holds)
 	}
-	// The feed holds the frame: it has no flusher yet to take it.
-	feed := peerFeed(master, 1)
-	if feedStarted(feed) || feed.backlog() != len(payload) {
-		t.Fatalf("before Start: the feed started = %v with %d bytes waiting, want not started with %d", feedStarted(feed), feed.backlog(), len(payload))
+	for i := 0; i < 2; i++ {
+		if _, queued, _ := master.countAndQueue(payload); queued != 1 {
+			t.Fatalf("a frame counted after reserve was queued for %d replicas, want 1", queued)
+		}
 	}
-	if got := conn.Bytes(); len(got) != 0 {
-		t.Fatalf("the replica was sent %q before its feed started", got)
-	}
-
-	if !master.Start(1, conn) {
-		t.Fatal("Start() = false for a reserved replica, want true")
-	}
-	master.countAndQueue(payload)
-	if unfinished := master.StopFeeds(5 * time.Second); unfinished != 0 {
-		t.Fatalf("%d replica feeds had not finished writing after 5s", unfinished)
-	}
-	if got, want := conn.Bytes(), bytes.Repeat(payload, 2); !bytes.Equal(got, want) {
-		t.Fatalf("the replica received %q, want the two frames counted after its base, %q", got, want)
+	if got, want := out.Bytes(), bytes.Repeat(payload, 2); !bytes.Equal(got, want) {
+		t.Fatalf("the replica was pushed %q, want the two frames counted after its base, %q", got, want)
 	}
 
 	// Acknowledging both frames puts it at the master's offset, since its base
@@ -564,9 +536,18 @@ func TestAReplicaAttachesInThreeSteps(t *testing.T) {
 		t.Fatalf("Acked(%d) = %d, want 0", master.Offset()+1, got)
 	}
 
-	master.Detach(1)
+	if detached := master.Detach(1); detached == nil || detached.ID != 1 || detached.ListeningPort != 6380 {
+		t.Fatalf("Detach(1) = %+v, want the replica", detached)
+	}
+	if again := master.Detach(1); again != nil {
+		t.Fatalf("a second Detach(1) = %+v, want nil: only the first finds it", again)
+	}
 	if master.Active() {
 		t.Fatal("Active() = true after the only replica was removed, want false")
+	}
+	master.countAndQueue(payload)
+	if got, want := out.Bytes(), bytes.Repeat(payload, 2); !bytes.Equal(got, want) {
+		t.Fatalf("a detached replica was pushed a frame: it holds %q, want %q", got, want)
 	}
 }
 
@@ -587,311 +568,259 @@ func TestAnAttachThatEndsWithoutAReplicaLeavesTheMasterInactive(t *testing.T) {
 	}
 }
 
-// TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted drops a reserved
-// replica before its feed starts, as a disconnect or a backlog past the limit
-// during the transfer does. The drop paths must cope with a replica that has no
-// connection yet, Start must then report false so that the caller closes the
-// connection, the feed must never write, and stopping feeds must not wait for it.
-func TestAReplicaDroppedWhileItsFullResyncIsSentIsNeverStarted(t *testing.T) {
+// TestAFrameCountedAfterPropagationStopsIsPushedToNoReplica stops propagation,
+// as shutdown does before it ends the Replicas' streams, and then propagates.
+// The frame is counted and reaches no Replica: an ended stream must not be
+// written past. A Replica whose Output is closed by then is left for its
+// connection's teardown: nothing is pushed to it, so nothing is refused and
+// nobody is told it was dropped.
+func TestAFrameCountedAfterPropagationStopsIsPushedToNoReplica(t *testing.T) {
+	master := newTestMaster()
+	drops := 0
+	master.dropped = func(*Replica, error) { drops++ }
+	open, closed := &fakeOutput{}, &fakeOutput{}
+	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: open})
+	master.Add(Candidate{ID: 2, ListeningPort: 6381, Out: closed})
+
+	before := []byte("before the shutdown")
+	if _, queued, _ := master.countAndQueue(before); queued != 2 {
+		t.Fatalf("a frame propagated before the stop was queued for %d Replicas, want 2", queued)
+	}
+	if got := master.StopPropagating(); got != 2 {
+		t.Fatalf("StopPropagating() = %d, want the 2 Replicas registered", got)
+	}
+	closed.close(errors.New("closed by the test"))
+
+	after := []byte("after the stop")
+	end, queued, refused := master.countAndQueue(after)
+	if want := int64(len(before) + len(after)); end != want || queued != 0 || refused != 0 {
+		t.Fatalf("a frame propagated after the stop: ends at %d, queued for %d, refused by %d; want it counted to %d and neither", end, queued, refused, want)
+	}
+	for name, out := range map[string]*fakeOutput{"open": open, "closed": closed} {
+		if got := out.Bytes(); !bytes.Equal(got, before) {
+			t.Fatalf("the Replica whose Output is %s holds %q, want only what was propagated before the stop", name, got)
+		}
+		if got := out.asked("Push"); got != 1 {
+			t.Fatalf("the Replica whose Output is %s was pushed to %d times, want once, before the stop", name, got)
+		}
+	}
+	if got := master.Count(); got != 2 || drops != 0 {
+		t.Fatalf("after the stop: %d Replicas registered and %d reported dropped, want 2 and none", got, drops)
+	}
+}
+
+// TestEndStreamsEndsEveryReplicasStreamAndWaitsForThemToLeave ends the streams
+// of the Replicas at shutdown. Each Replica's Output is told once to end its
+// stream, which shuts the write side after what is queued and leaves the
+// connection open, so the end of the stream still reaches the Replica.
+// EndStreams then waits until every Replica has closed its own side, which
+// detaches it, or until the deadline, and stops propagation first, so nothing
+// is pushed past the end.
+func TestEndStreamsEndsEveryReplicasStreamAndWaitsForThemToLeave(t *testing.T) {
 	tests := []struct {
 		name string
-		drop func(t *testing.T, master *Master)
-	}{
-		{name: "detached when the client disconnects", drop: func(_ *testing.T, master *Master) { master.Detach(1) }},
-		{name: "detached and closed by the Master", drop: func(t *testing.T, master *Master) {
-			if err := master.detachAndClose(1); err != nil {
-				t.Fatalf("detachAndClose() error = %v", err)
-			}
-		}},
-		{name: "dropped for a backlog past the limit", drop: func(_ *testing.T, master *Master) {
-			feed := peerFeed(master, 1)
-			feed.mu.Lock()
-			feed.limit = 4
-			feed.mu.Unlock()
-			// Refused by the feed, so the Master drops the Replica.
-			master.Propagate([]byte("*1\r\n$4\r\nPING\r\n"), true)
-		}},
-		{name: "stopped by a shutdown", drop: func(t *testing.T, master *Master) {
-			done := make(chan int, 1)
-			go func() { done <- master.StopFeeds(time.Minute) }()
-			select {
-			case unfinished := <-done:
-				if unfinished != 0 {
-					t.Fatalf("StopFeeds() = %d unfinished, want 0: a feed that never started has nothing to finish", unfinished)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("StopFeeds() waited for a feed that never started")
-			}
-		}},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			master := newTestMaster()
-			conn := &closeCounter{}
-			written := &streamRecorder{}
-			master.beginAttach()
-			master.reserve(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(written)})
-
-			tt.drop(t, master)
-
-			if master.Start(1, conn) {
-				t.Fatal("Start() = true for a dropped replica, want false")
-			}
-			if got := conn.closes.Load(); got != 0 {
-				t.Fatalf("the Master closed the connection %d times, want never: it was not the Master's yet, and Start's caller closes it", got)
-			}
-			master.StopFeeds(time.Second)
-			if got := written.Bytes(); len(got) != 0 {
-				t.Fatalf("a dropped replica was sent %q", got)
-			}
-		})
-	}
-}
-
-// TestAFrameCountedWhileShutdownDrainsAFeedDoesNotDropItsReplica propagates a
-// frame while StopFeeds waits for a replica that is slow to read to take what is
-// queued for it. The frame reaches no replica, and the replica keeps its socket
-// until it has taken everything queued before the shutdown. Its feed, closed for
-// the drain, used to refuse the frame, and the refusal dropped the replica and
-// closed its socket in the middle of the drain.
-func TestAFrameCountedWhileShutdownDrainsAFeedDoesNotDropItsReplica(t *testing.T) {
-	master := newTestMaster()
-	var drops atomic.Int32
-	master.drop = (func(uint64, error) { drops.Add(1) })
-
-	serverConn, replicaConn := net.Pipe()
-	defer func() { _ = serverConn.Close() }()
-	defer func() { _ = replicaConn.Close() }()
-	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(serverConn)}, serverConn)
-
-	// The replica reads nothing yet, so the feed's write waits on the pipe.
-	queued := bytes.Repeat([]byte("q"), 1<<10)
-	if _, queuedFor, _ := master.countAndQueue(queued); queuedFor != 1 {
-		t.Fatalf("Propagate() before the shutdown queued for %d replicas, want 1", queuedFor)
-	}
-
-	stopped := make(chan int, 1)
-	go func() { stopped <- master.StopFeeds(10 * time.Second) }()
-	master.mu.RLock()
-	feed := master.replicas[1].feed
-	master.mu.RUnlock()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		feed.mu.Lock()
-		closed := feed.closed
-		feed.mu.Unlock()
-		if closed {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("StopFeeds() had not closed the feed after 5s")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	if _, queuedFor, refused := master.countAndQueue([]byte("during the drain")); queuedFor != 0 || refused != 0 {
-		t.Fatalf("Propagate() during the drain: queued for %d replicas, refused by %d; want neither", queuedFor, refused)
-	}
-
-	received := make([]byte, len(queued))
-	if _, err := io.ReadFull(replicaConn, received); err != nil {
-		t.Fatalf("reading what was queued before the shutdown: %v", err)
-	}
-	if !bytes.Equal(received, queued) {
-		t.Fatalf("the replica received %q, want what was queued before the shutdown", received)
-	}
-	if unfinished := <-stopped; unfinished != 0 {
-		t.Fatalf("StopFeeds() = %d unfinished, want 0", unfinished)
-	}
-	if got := drops.Load(); got != 0 {
-		t.Fatalf("the replica was dropped %d times, want never", got)
-	}
-}
-
-// halfClosingConn is a replica connection that records CloseWrite.
-type halfClosingConn struct {
-	closeCounter
-	closeWrites atomic.Int32
-}
-
-func (c *halfClosingConn) CloseWrite() error {
-	c.closeWrites.Add(1)
-	return nil
-}
-
-// TestEndStreamsHalfClosesEachReplicaAndWaitsForItToLeave ends the streams of
-// the replicas at shutdown. Each started replica's connection is half-closed,
-// never closed, so the end of its stream still reaches it, and EndStreams waits
-// until the replica has closed its own side, which removes it from the
-// master, or until the deadline.
-func TestEndStreamsHalfClosesEachReplicaAndWaitsForItToLeave(t *testing.T) {
-	tests := []struct {
-		name          string
-		replicaCloses bool
+		// leaving are the Replicas that close their side once their stream ends.
+		leaving       []uint64
+		wait          time.Duration
 		wantRemaining int
 	}{
-		{name: "the replica closes its side", replicaCloses: true, wantRemaining: 0},
-		{name: "the replica does not close its side before the deadline", wantRemaining: 1},
+		{name: "every replica closes its side", leaving: []uint64{1, 2}, wait: time.Minute},
+		{name: "one replica does not close its side before the deadline", leaving: []uint64{1}, wait: 100 * time.Millisecond, wantRemaining: 1},
 	}
 
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			master := newTestMaster()
-			conn := &halfClosingConn{}
-			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(&streamRecorder{})}, conn)
-			if tt.replicaCloses {
-				// As the replica's connection handler does when it reads the
-				// replica's close.
-				go func() {
-					for conn.closeWrites.Load() == 0 {
-						time.Sleep(time.Millisecond)
-					}
-					master.Detach(1)
-				}()
+			outs := map[uint64]*fakeOutput{1: {}, 2: {}}
+			for id, out := range outs {
+				master.Add(Candidate{ID: id, ListeningPort: 6380, Out: out})
+			}
+			for _, id := range tt.leaving {
+				id, out := id, outs[id]
+				// As the Replica's connection is torn down when the server reads
+				// the Replica's close.
+				out.ended = func() { go master.Detach(id) }
 			}
 
-			remaining := master.EndStreams(time.Now().Add(200 * time.Millisecond))
-			if remaining != tt.wantRemaining {
-				t.Fatalf("EndStreams() = %d remaining, want %d", remaining, tt.wantRemaining)
+			done := make(chan int, 1)
+			go func() { done <- master.EndStreams(time.Now().Add(tt.wait)) }()
+			select {
+			case remaining := <-done:
+				if remaining != tt.wantRemaining {
+					t.Fatalf("EndStreams() = %d remaining, want %d", remaining, tt.wantRemaining)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("EndStreams() had not returned after 10s: it did not notice the Replicas leaving")
 			}
-			if got := conn.closeWrites.Load(); got != 1 {
-				t.Fatalf("CloseWrite() called %d times, want once", got)
+
+			for id, out := range outs {
+				if got := out.asked("EndStream"); got != 1 {
+					t.Fatalf("Replica %d's stream was ended %d times, want once", id, got)
+				}
 			}
-			if got := conn.closes.Load(); got != 0 {
-				t.Fatalf("Close() called %d times, want never: closing would reset a replica still acknowledging", got)
+			if _, queued, refused := master.countAndQueue([]byte("past the end")); queued != 0 || refused != 0 {
+				t.Fatalf("a frame propagated after EndStreams was queued for %d Replicas and refused by %d, want neither", queued, refused)
 			}
-			master.StopFeeds(time.Second)
+			for id, out := range outs {
+				if got := out.Bytes(); len(got) != 0 {
+					t.Fatalf("Replica %d was pushed %q past the end of its stream", id, got)
+				}
+			}
 		})
 	}
-}
-
-// TestWaitFeedsWaitsForTheDropHandler stops a replica's feed with a failed
-// write while the drop handler is held up. WaitFeeds must not return until
-// the handler has, so that nothing a feed logs comes after ListenAndServe, which
-// calls it, has returned. The feed's goroutine used to outlive the server.
-func TestWaitFeedsWaitsForTheDropHandler(t *testing.T) {
-	master := newTestMaster()
-	handling := make(chan struct{})
-	release := make(chan struct{})
-	master.drop = func(uint64, error) {
-		close(handling)
-		<-release
-	}
-	conn := &closeCounter{writeErr: io.ErrClosedPipe}
-	master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(conn)}, conn)
-	master.countAndQueue([]byte("frame"))
-	<-handling
-
-	waited := make(chan struct{})
-	go func() {
-		master.WaitFeeds()
-		close(waited)
-	}()
-	select {
-	case <-waited:
-		t.Fatal("WaitFeeds() returned while the drop handler was still running")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	select {
-	case <-waited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("WaitFeeds() had not returned 5s after the drop handler did")
-	}
-}
-
-// peerFeed returns the feed of the registered replica id.
-func peerFeed(master *Master, id uint64) *replicaFeed {
-	master.mu.RLock()
-	defer master.mu.RUnlock()
-	return master.replicas[id].feed
-}
-
-func feedStarted(feed *replicaFeed) bool {
-	feed.mu.Lock()
-	defer feed.mu.Unlock()
-	return feed.started
 }
 
 func newTestMaster() *Master {
 	return NewMaster(storage.NewStore(), nil, nil)
 }
 
-// connOutput is a Replica's Output that writes its stream to w.
-type connOutput struct{ w io.Writer }
+// fakeOutput is a Replica's Output in memory: it keeps the stream pushed to it
+// and counts what the Master asked of it.
+type fakeOutput struct {
+	mu     sync.Mutex
+	calls  map[string]int
+	stream []byte
+	// closed is why the Output refuses every frame, nil while it is open.
+	closed error
+	// last is why the latest frame was refused.
+	last error
 
-func (o connOutput) WriteEncoded(payload []byte) error {
-	_, err := o.w.Write(payload)
-	return err
+	// refuse, when set, decides for each frame offered to an open Output: the
+	// frame it returns an error for is refused with that cause. Unlike a real
+	// Output it accepts the frames after it again, so a test can tell whether
+	// the Master offered it one. It is called under the Output's lock.
+	refuse func(frame []byte) error
+	// before, when set, runs at the start of every call, with the method's name.
+	before func(method string)
+	// pushed and ended, when set, run after a frame was accepted and after the
+	// stream was ended.
+	pushed func()
+	ended  func()
 }
 
-func outTo(w io.Writer) Output { return connOutput{w: w} }
-
-// closeCounter is a Replica's connection that counts how often it is closed,
-// and whose writes and closes fail when told to.
-type closeCounter struct {
-	writeErr error
-	closeErr error
-	closes   atomic.Int32
-}
-
-func (c *closeCounter) Write(p []byte) (int, error) {
-	if c.writeErr != nil {
-		return 0, c.writeErr
+func (o *fakeOutput) called(method string) {
+	if o.before != nil {
+		o.before(method)
 	}
-	return len(p), nil
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.calls == nil {
+		o.calls = make(map[string]int)
+	}
+	o.calls[method]++
 }
 
-func (c *closeCounter) Close() error {
-	c.closes.Add(1)
-	return c.closeErr
+func (o *fakeOutput) MarkReplica() { o.called("MarkReplica") }
+func (o *fakeOutput) HoldPushes()  { o.called("HoldPushes") }
+
+func (o *fakeOutput) Push(frame []byte) bool {
+	o.called("Push")
+	if !o.accept(frame) {
+		return false
+	}
+	if o.pushed != nil {
+		o.pushed()
+	}
+	return true
 }
 
-// streamRecorder is a Replica's connection that keeps the stream written to it.
-type streamRecorder struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+func (o *fakeOutput) accept(frame []byte) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.last = o.closed
+	if o.last == nil && o.refuse != nil {
+		o.last = o.refuse(frame)
+	}
+	if o.last != nil {
+		return false
+	}
+	o.stream = append(o.stream, frame...)
+	return true
 }
 
-func (c *streamRecorder) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.buf.Write(p)
+func (o *fakeOutput) Err() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.last
 }
 
-func (c *streamRecorder) Close() error { return nil }
-
-func (c *streamRecorder) Bytes() []byte {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return bytes.Clone(c.buf.Bytes())
+func (o *fakeOutput) EndStream() {
+	o.called("EndStream")
+	if o.ended != nil {
+		o.ended()
+	}
 }
 
-// TestAttachCopiesTheSnapshotAndRegistersTheReplicaInsideItsCut attaches a
-// Replica to a Master whose Store holds a key. The cut is told to switch
-// recording on before it takes its locks, the Replica is registered before the
-// cut is released, and the Master's lock is free while the cut runs: the cut
-// here asks the Master whether it is active, which takes that lock. The reply
-// is FULLRESYNC with the Master's replication ID and an RDB snapshot that holds
-// the key. A frame propagated after the cut is held by the feed until Start.
-func TestAttachCopiesTheSnapshotAndRegistersTheReplicaInsideItsCut(t *testing.T) {
+// close closes the Output, as the server's does when the connection ends or
+// the Replica falls behind.
+func (o *fakeOutput) close(cause error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed, o.last = cause, cause
+}
+
+// asked reports how often method was called.
+func (o *fakeOutput) asked(method string) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.calls[method]
+}
+
+// Bytes is the stream the Output accepted, in the order it was pushed.
+func (o *fakeOutput) Bytes() []byte {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return bytes.Clone(o.stream)
+}
+
+// TestAttachHoldsTheReplicasOutputAndRegistersItInsideItsCut attaches a Replica
+// to a Master whose Store holds a key. The cut is told to switch recording on
+// before it takes its locks, and the Master's lock is free while the cut runs:
+// the cut here asks the Master whether it is active, which takes that lock.
+//
+// Inside the cut the Replica's Output is marked a Replica's and told to hold
+// what is pushed to it, both before the Replica is registered, and the Replica
+// is registered before the cut is released. The first frame propagated after
+// the cut is therefore pushed to an Output that already holds it behind the
+// reply and counts it against a Replica's limit. Told after the Replica was
+// registered, a frame could reach the Output first and leave ahead of the
+// reply.
+//
+// The reply is FULLRESYNC with the Master's replication ID and an RDB snapshot
+// that holds the key.
+func TestAttachHoldsTheReplicasOutputAndRegistersItInsideItsCut(t *testing.T) {
 	store := storage.NewStore()
 	if err := store.Set(nil, "key", []byte("value"), 0); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 	master := NewMaster(store, nil, nil)
-	stream := &streamRecorder{}
+
+	// What was true each time the Master called the Output. Everything here
+	// runs on the test's goroutine.
+	type moment struct {
+		method     string
+		inCut      bool
+		registered int64
+	}
+	var moments []moment
+	inCut := false
+	out := &fakeOutput{before: func(method string) {
+		// Read as an ordered Propagate reads it, without the Master's lock.
+		moments = append(moments, moment{method: method, inCut: inCut, registered: master.registered.Load()})
+	}}
 
 	var activeInCut, registeredAtRelease bool
 	cut := func(startRecording func()) (release func()) {
 		startRecording()
 		activeInCut = master.Active()
-		return func() { registeredAtRelease = master.Count() == 1 }
+		inCut = true
+		return func() {
+			inCut = false
+			registeredAtRelease = master.Count() == 1
+		}
 	}
-	attachment := master.Attach(Candidate{ID: 1, ListeningPort: 6380, Out: outTo(stream)}, cut)
+	attachment := master.Attach(Candidate{ID: 1, ListeningPort: 6380, Out: out}, cut)
 
 	if !activeInCut {
 		t.Fatal("Active() = false inside the cut after startRecording, want true: writes must be ordered from then on")
@@ -921,26 +850,37 @@ func TestAttachCopiesTheSnapshotAndRegistersTheReplicaInsideItsCut(t *testing.T)
 
 	frame := []byte("*1\r\n$4\r\nPING\r\n")
 	master.Propagate(frame, true)
-	if got := stream.Bytes(); len(got) != 0 {
-		t.Fatalf("the Replica was sent %q before Start", got)
+	if got := out.Bytes(); !bytes.Equal(got, frame) {
+		t.Fatalf("the Replica's Output was pushed %q, want the frame propagated after its cut, %q", got, frame)
 	}
-	if !master.Start(1, stream) {
-		t.Fatal("Start() = false for an attached Replica, want true")
+
+	seen := make(map[string]int)
+	for _, m := range moments {
+		seen[m.method]++
+		switch m.method {
+		case "MarkReplica", "HoldPushes":
+			if !m.inCut || m.registered != 0 {
+				t.Fatalf("%s: called inside the cut = %v with %d Replicas registered, want inside it and before the Replica is registered", m.method, m.inCut, m.registered)
+			}
+		case "Push":
+			if seen["MarkReplica"] != 1 || seen["HoldPushes"] != 1 {
+				t.Fatalf("a frame was pushed to an Output marked %d times and told to hold %d times, want once each first", seen["MarkReplica"], seen["HoldPushes"])
+			}
+		}
 	}
-	if unfinished := master.StopFeeds(5 * time.Second); unfinished != 0 {
-		t.Fatalf("%d feeds had not finished writing after 5s", unfinished)
-	}
-	if got := stream.Bytes(); !bytes.Equal(got, frame) {
-		t.Fatalf("the Replica received %q, want the frame propagated after its cut, %q", got, frame)
+	if fmt.Sprint(seen) != fmt.Sprint(map[string]int{"MarkReplica": 1, "HoldPushes": 1, "Push": 1}) {
+		t.Fatalf("the Master called the Output %v, want it marked, told to hold and pushed to once each", seen)
 	}
 }
 
 // TestAnAttachWhoseCopyPanicsLeavesTheMasterInactive has the snapshot copy
 // panic inside the cut. The attach ends, so Active reports what it did before
 // and writes stop being ordered for a Replica that never registered, and the
-// cut's locks are released.
+// cut's locks are released. The client's Output is not told to hold: no reply
+// of an attach would release it.
 func TestAnAttachWhoseCopyPanicsLeavesTheMasterInactive(t *testing.T) {
 	master := NewMaster(nil, nil, nil) // copying a nil Store panics
+	out := &fakeOutput{}
 	released := false
 	cut := func(startRecording func()) (release func()) {
 		startRecording()
@@ -953,7 +893,7 @@ func TestAnAttachWhoseCopyPanicsLeavesTheMasterInactive(t *testing.T) {
 				t.Fatal("Attach() did not panic on a nil Store")
 			}
 		}()
-		master.Attach(Candidate{ID: 1, Out: outTo(io.Discard)}, cut)
+		master.Attach(Candidate{ID: 1, Out: out}, cut)
 	}()
 
 	if master.Active() || master.Count() != 0 {
@@ -961,6 +901,9 @@ func TestAnAttachWhoseCopyPanicsLeavesTheMasterInactive(t *testing.T) {
 	}
 	if !released {
 		t.Fatal("the cut was not released")
+	}
+	if got := out.asked("HoldPushes"); got != 0 {
+		t.Fatalf("the Output was told to hold %d times by an attach that failed, want never", got)
 	}
 }
 
@@ -993,9 +936,9 @@ func TestAwaitAsksForAcknowledgementsAndWaitsForThem(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			master := newTestMaster()
 			asked := make(chan struct{})
-			out := &notifyingOutput{wrote: asked}
-			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: out}, &closeCounter{})
-			defer master.StopFeeds(time.Second)
+			// Await pushes its GETACK once.
+			out := &fakeOutput{pushed: func() { close(asked) }}
+			master.Add(Candidate{ID: 1, ListeningPort: 6380, Out: out})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -1033,8 +976,7 @@ func TestAwaitAsksForAcknowledgementsAndWaitsForThem(t *testing.T) {
 func TestInfoReportsEachReplicaInTheMastersOffsets(t *testing.T) {
 	master := newTestMaster()
 	master.offset.Add(100)
-	master.Add(Candidate{ID: 7, ListeningPort: 6380, Out: outTo(io.Discard)}, &closeCounter{})
-	defer master.StopFeeds(time.Second)
+	master.Add(Candidate{ID: 7, ListeningPort: 6380, Out: &fakeOutput{}})
 
 	info := master.Info()
 	want := MasterInfo{ReplicationID: master.ReplicationID(), Offset: 100, Replicas: []ReplicaInfo{{ID: 7, ListeningPort: 6380}}}
@@ -1047,18 +989,4 @@ func TestInfoReportsEachReplicaInTheMastersOffsets(t *testing.T) {
 	if info := master.Info(); fmt.Sprint(info) != fmt.Sprint(want) {
 		t.Fatalf("Info() = %+v after acknowledging 31, want %+v", info, want)
 	}
-}
-
-// notifyingOutput is a Replica's Output that keeps its stream and reports its
-// first write.
-type notifyingOutput struct {
-	streamRecorder
-	once  sync.Once
-	wrote chan struct{}
-}
-
-func (o *notifyingOutput) WriteEncoded(payload []byte) error {
-	_, err := o.Write(payload)
-	o.once.Do(func() { close(o.wrote) })
-	return err
 }

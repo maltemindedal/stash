@@ -213,7 +213,6 @@ func newDrainingEventLoopWithAReplica(t *testing.T) (*eventLoop, *eventConn, int
 
 	loop, conn, clientFD := newHandDrivenEventLoop(t)
 	conn.out.MarkReplica()
-	conn.replica.Store(true)
 	loop.beginDrain(nil)
 	if loop.conns[conn.fd] != conn {
 		t.Fatal("the drain closed the replica's connection, want it kept to be sent what is queued for it")
