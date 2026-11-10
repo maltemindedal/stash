@@ -161,11 +161,11 @@ func (l *listValue) empty() bool { return len(l.items) == int(l.head) }
 
 func (l *listValue) image(a *arena) kindImage {
 	list := l.live()
-	values := make(listImage, len(list))
+	values := make([][]byte, len(list))
 	for i, item := range list {
 		values[i] = a.bytes(item)
 	}
-	return values
+	return a.lists.hold(values)
 }
 
 // listImage is a list in a keyspace image: its values from left to right.
@@ -173,7 +173,8 @@ type listImage [][]byte
 
 // recreate emits RPUSH commands of the values in list order. RPUSH appends, so
 // the commands rebuild the order.
-func (values listImage) recreate(key string, emit func(args [][]byte) error) error {
+func (img *listImage) recreate(key string, emit func(args [][]byte) error) error {
+	values := *img
 	return emitChunked(emit, "RPUSH", key, len(values), 1, func(args [][]byte, i int) [][]byte {
 		return append(args, values[i])
 	})

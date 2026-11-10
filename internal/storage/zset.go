@@ -133,16 +133,17 @@ func (z *zsetValue) clone() kindValue {
 func (z *zsetValue) empty() bool { return z.len() == 0 }
 
 // image copies the members in rank order. A member is an immutable string, so
-// the image shares it with the stored set and needs nothing from the arena.
-func (z *zsetValue) image(*arena) kindImage {
-	return zsetImage(z.rangeByRank(0, z.len()-1))
+// the image shares it with the stored set and copies no bytes.
+func (z *zsetValue) image(a *arena) kindImage {
+	return a.zsets.hold(z.rangeByRank(0, z.len()-1))
 }
 
 // zsetImage is a sorted set in a keyspace image: its members in rank order.
 type zsetImage []ZSetRangeEntry
 
 // recreate emits ZADD commands of score and member pairs, in rank order.
-func (entries zsetImage) recreate(key string, emit func(args [][]byte) error) error {
+func (img *zsetImage) recreate(key string, emit func(args [][]byte) error) error {
+	entries := *img
 	return emitChunked(emit, "ZADD", key, len(entries), 2, func(args [][]byte, i int) [][]byte {
 		return append(args, strconv.AppendFloat(nil, entries[i].Score, 'g', -1, 64), []byte(entries[i].Member))
 	})

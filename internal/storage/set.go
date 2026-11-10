@@ -140,14 +140,14 @@ func (s *setValue) empty() bool { return s.len() == 0 }
 func (s *setValue) image(a *arena) kindImage {
 	if s.ints != nil {
 		// members formats each integer into bytes of its own.
-		return setImage(s.ints.members())
+		return a.sets.hold(s.ints.members())
 	}
 
-	members := make(setImage, 0, len(s.table))
+	members := make([][]byte, 0, len(s.table))
 	for member := range s.table {
 		members = append(members, a.string(member))
 	}
-	return members
+	return a.sets.hold(members)
 }
 
 // setImage is a set in a keyspace image: its members, in no order until the
@@ -156,7 +156,8 @@ type setImage [][]byte
 
 // recreate emits SADD commands of the members in byte order, so that the same
 // set always recreates with the same commands.
-func (members setImage) recreate(key string, emit func(args [][]byte) error) error {
+func (img *setImage) recreate(key string, emit func(args [][]byte) error) error {
+	members := *img
 	sort.Slice(members, func(i, j int) bool { return string(members[i]) < string(members[j]) })
 	return emitChunked(emit, "SADD", key, len(members), 1, func(args [][]byte, i int) [][]byte {
 		return append(args, members[i])

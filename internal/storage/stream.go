@@ -67,7 +67,7 @@ func (s *StreamValue) clone() kindValue {
 func (s *StreamValue) empty() bool { return false }
 
 func (s *StreamValue) image(a *arena) kindImage {
-	entries := make(streamImage, len(s.entries))
+	entries := make([]StreamEntry, len(s.entries))
 	for i, record := range s.entries {
 		values := make([][]byte, len(record.values))
 		for j, item := range record.values {
@@ -75,16 +75,16 @@ func (s *StreamValue) image(a *arena) kindImage {
 		}
 		entries[i] = StreamEntry{ID: record.idText, Values: values}
 	}
-	return entries
+	return a.streams.hold(entries)
 }
 
 // streamImage is a stream in a keyspace image: its entries in ID order.
 type streamImage []StreamEntry
 
 // recreate emits one XADD per entry, with the entry's own ID.
-func (entries streamImage) recreate(key string, emit func(args [][]byte) error) error {
+func (entries *streamImage) recreate(key string, emit func(args [][]byte) error) error {
 	var args [][]byte
-	for _, entry := range entries {
+	for _, entry := range *entries {
 		args = append(args[:0], []byte("XADD"), []byte(key), []byte(entry.ID))
 		args = append(args, entry.Values...)
 		if err := emit(args); err != nil {

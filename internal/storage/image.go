@@ -31,11 +31,18 @@ type imageEntry struct {
 	data      kindImage
 }
 
-// arena hands out the copies an image holds of the bytes it is taken from. It
-// packs them into large chunks, so that an image of many small values is a few
-// allocations.
+// arena hands out the memory an image holds: copies of the bytes it is taken
+// from, packed into large chunks, and the header of each collection's image,
+// from a slab per kind. An image of many small values is therefore a few
+// allocations. A kind without a slab here still works, at one allocation more
+// per key.
 type arena struct {
-	chunk []byte
+	chunk   []byte
+	lists   slab[listImage]
+	hashes  slab[hashImage]
+	sets    slab[setImage]
+	zsets   slab[zsetImage]
+	streams slab[streamImage]
 }
 
 // bytes returns a copy of src that shares no room to grow with its neighbours.

@@ -145,11 +145,11 @@ func (h *hashValue) clone() kindValue {
 func (h *hashValue) empty() bool { return h.len() == 0 }
 
 func (h *hashValue) image(a *arena) kindImage {
-	entries := hashImage(h.entries())
+	entries := h.entries()
 	for i := range entries {
 		entries[i].Value = a.bytes(entries[i].Value)
 	}
-	return entries
+	return a.hashes.hold(entries)
 }
 
 // hashImage is a hash in a keyspace image: its fields and values, in no order
@@ -158,7 +158,8 @@ type hashImage []HashFieldValue
 
 // recreate emits HSET commands of the field and value pairs in field order, so
 // that the same hash always recreates with the same commands.
-func (entries hashImage) recreate(key string, emit func(args [][]byte) error) error {
+func (img *hashImage) recreate(key string, emit func(args [][]byte) error) error {
+	entries := *img
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Field < entries[j].Field })
 	return emitChunked(emit, "HSET", key, len(entries), 2, func(args [][]byte, i int) [][]byte {
 		return append(args, []byte(entries[i].Field), entries[i].Value)
