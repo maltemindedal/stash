@@ -154,7 +154,12 @@ type outputDriver interface {
 // Output.mu is never held across a socket write.
 type Output struct {
 	mu sync.Mutex
-	// queued is what waits to be written, appended under mu.
+	// ahead are whole buffers waiting to be written before queued, in order, and
+	// aheadBytes is how many bytes they hold. A large Reply is queued here
+	// without being copied (Reply), behind the buffer that was queued until then.
+	ahead      [][]byte
+	aheadBytes int
+	// queued is what waits to be written after ahead, appended under mu.
 	queued []byte
 	// held are the Pushed messages waiting behind the current request's Reply.
 	held []byte
@@ -217,22 +222,39 @@ func NewOutput(w io.Writer) *Output {
 
 // Reply queues the Replies to the request the connection just ran (none is
 // allowed) and releases the Pushed messages held since HoldPushes. Only the
-// connection's own executor calls it. It never waits.
+// connection's own executor calls it. It never waits. A Push to the connection
+// takes the lock Reply holds, so a large Reply is encoded before that lock is
+// taken and queued whole (isLargeReply).
 func (o *Output) Reply(values ...protocol.Value) error {
+	var whole []byte
+	if isLargeReply(values) {
+		encoded, err := protocol.EncodeValues(values)
+		if err != nil {
+			return err
+		}
+		whole = encoded
+	}
+
 	o.mu.Lock()
 	if o.closed {
 		err := o.errLocked()
 		o.mu.Unlock()
 		return err
 	}
-	before := len(o.queued)
-	queued, err := protocol.AppendValues(o.queued, values)
-	if err != nil {
-		o.mu.Unlock()
-		return err
+	added := len(whole)
+	if whole != nil {
+		o.queueWholeLocked(whole)
+	} else {
+		before := len(o.queued)
+		queued, err := protocol.AppendValues(o.queued, values)
+		if err != nil {
+			o.mu.Unlock()
+			return err
+		}
+		o.queued = queued
+		added = len(queued) - before
 	}
-	o.queued = queued
-	if added := len(queued) - before; added > 0 {
+	if added > 0 {
 		o.growLocked(added)
 		o.replyWaiting += added
 		o.unflushed = true
@@ -241,10 +263,15 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	if o.holding {
 		o.holding = false
 		if len(o.held) > 0 {
-			o.queued = append(o.queued, o.held...)
-			o.held = o.held[:0]
-			if cap(o.held) > outputRetainedBuffer {
+			if len(o.held) >= outputRetainedBuffer {
+				o.queueWholeLocked(o.held)
 				o.held = nil
+			} else {
+				o.queued = append(o.queued, o.held...)
+				o.held = o.held[:0]
+				if cap(o.held) > outputRetainedBuffer {
+					o.held = nil
+				}
 			}
 			// The connection's goroutine must not be the one that writes a stream
 			// of Pushed messages to a peer that may have stopped reading.
@@ -253,6 +280,39 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	}
 	o.mu.Unlock()
 	return nil
+}
+
+// isLargeReply reports whether values hold at least outputRetainedBuffer bytes
+// of bulk strings. Reply encodes such a Reply before it takes the lock, into a
+// buffer of its own. A buffer that size is never kept for the next batch, so
+// the Reply costs no allocation it would not have cost in queued.
+//
+// Only the bulk strings that are Replies themselves count, not those inside an
+// array, so an ordinary Reply pays one type check per value and no walk. That
+// covers the connection that matters: the one that is pushed to while it is
+// sent a large Reply is a Replica during its full resync, whose stream writers
+// push under the replication Master's lock, and its snapshot is one bulk
+// string. A large array is still encoded under the lock.
+func isLargeReply(values []protocol.Value) bool {
+	size := 0
+	for _, value := range values {
+		if bulk, ok := value.(protocol.BulkString); ok {
+			size += len(bulk.Data)
+		}
+	}
+	return size >= outputRetainedBuffer
+}
+
+// queueWholeLocked queues buffer behind everything queued without copying it.
+// What is in queued is ahead of it, so that buffer goes first.
+func (o *Output) queueWholeLocked(buffer []byte) {
+	if len(o.queued) > 0 {
+		o.ahead = append(o.ahead, o.queued)
+		o.aheadBytes += len(o.queued)
+		o.queued, o.spare = o.spare[:0], nil
+	}
+	o.ahead = append(o.ahead, buffer)
+	o.aheadBytes += len(buffer)
 }
 
 // Push queues a frame another connection produced. It never waits. It returns
@@ -355,7 +415,7 @@ func (o *Output) Close(cause error) {
 	o.cause = cause
 	waiting := o.backlog.Load()
 	o.growLocked(-int(waiting))
-	o.queued, o.held = nil, nil
+	o.ahead, o.aheadBytes, o.queued, o.held = nil, 0, nil, nil
 	if o.counted {
 		o.counted = false
 		o.shared.mu.Lock()
@@ -457,7 +517,7 @@ func (o *Output) errLocked() error {
 // pendingLocked is how many bytes can be written now: everything but what is
 // held behind a Reply.
 func (o *Output) pendingLocked() int {
-	return len(o.queued) + len(o.inflight) - o.sent
+	return o.aheadBytes + len(o.queued) + len(o.inflight) - o.sent
 }
 
 // growLocked adds delta, which may be negative, to the backlog and to the Push
@@ -520,9 +580,12 @@ func (o *Output) writeTo(w io.Writer) error {
 // set), when it was asked for one batch and more was queued meanwhile.
 var errMoreQueued = errors.New("server: more output was queued during the write")
 
-// write is writeTo. With oneBatch it stops after the batch it began with when
-// more was queued during it, and leaves writing set for the caller to hand the
-// socket on: what was queued meanwhile was pushed by other connections.
+// write is writeTo. With oneBatch it stops after one batch of queued when more
+// was queued during it, and leaves writing set for the caller to hand the
+// socket on: what was queued meanwhile was pushed by other connections. The
+// buffers in ahead do not count as that batch. Only the connection's own Reply
+// puts one there, so its Flush, the caller that asks for one batch, finds no
+// new one while it writes, and writes every Reply queued before it.
 func (o *Output) write(w io.Writer, oneBatch bool) error {
 	batches := 0
 	for {
@@ -534,7 +597,16 @@ func (o *Output) write(w io.Writer, oneBatch bool) error {
 			return err
 		}
 		if o.sent == len(o.inflight) {
-			if len(o.queued) == 0 {
+			switch {
+			case len(o.ahead) > 0:
+				o.inflight, o.sent = o.ahead[0], 0
+				o.aheadBytes -= len(o.inflight)
+				// Moved down, not resliced, so that the list keeps its array for
+				// the next large Reply.
+				rest := copy(o.ahead, o.ahead[1:])
+				o.ahead[rest] = nil
+				o.ahead = o.ahead[:rest]
+			case len(o.queued) == 0:
 				end := o.ending
 				o.stopWritingLocked()
 				o.mu.Unlock()
@@ -542,13 +614,13 @@ func (o *Output) write(w io.Writer, oneBatch bool) error {
 					o.driver.closeWrite()
 				}
 				return nil
-			}
-			if oneBatch && batches == 1 {
+			case oneBatch && batches == 1:
 				o.mu.Unlock()
 				return errMoreQueued
+			default:
+				batches++
+				o.inflight, o.queued, o.spare, o.sent = o.queued, o.spare[:0], nil, 0
 			}
-			batches++
-			o.inflight, o.queued, o.spare, o.sent = o.queued, o.spare[:0], nil, 0
 		}
 		chunk := o.inflight[o.sent:]
 		if len(chunk) > outputWriteChunk {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -814,5 +815,279 @@ func TestPushesHeldWhenTheConnectionClosesAreNeverWritten(t *testing.T) {
 	}
 	if got := wire.sent(); got != "" {
 		t.Fatalf("sent %q, want nothing written for a connection closed before its reply", got)
+	}
+}
+
+// outputDrivers are the two ways an Output's bytes reach a socket, for a test
+// of what both must write: fill queues output on out, and send returns once
+// want bytes of it have reached wire.
+var outputDrivers = []struct {
+	name string
+	open func(t *testing.T, wire *outputWire) (out *Output, send func(want int))
+}{
+	{name: "by the goroutine mode's driver", open: func(t *testing.T, wire *outputWire) (*Output, func(int)) {
+		out := newGoroutineOutput(newOutputs(), wire)
+		t.Cleanup(func() { out.Close(nil) })
+		return out, func(want int) {
+			if err := out.Flush(); err != nil {
+				t.Fatalf("Flush() error = %v", err)
+			}
+			waitForOutput(t, "everything queued to be written", func() bool { return len(wire.sent()) >= want })
+		}
+	}},
+	{name: "by the Event loop's flush", open: func(t *testing.T, wire *outputWire) (*Output, func(int)) {
+		state := &ClientState{ID: 1}
+		machine := NewConnMachine(state)
+		return state.Output(), func(int) {
+			if err := machine.Flush(wire); err != nil {
+				t.Fatalf("Flush() error = %v", err)
+			}
+		}
+	}},
+}
+
+// TestALargeReplyKeepsItsPlaceAmongWhatIsQueued queues Replies of
+// outputRetainedBuffer and more, which an Output takes whole instead of
+// copying them behind what is already queued, between small Replies and Pushed
+// messages. Everything is written in the order it was queued: what was queued
+// before a large Reply, the Reply, the Pushed messages it released, and what
+// was pushed after it.
+func TestALargeReplyKeepsItsPlaceAmongWhatIsQueued(t *testing.T) {
+	large := func(fill byte) protocol.BulkString {
+		return protocol.BulkString{Data: bytes.Repeat([]byte{fill}, outputRetainedBuffer)}
+	}
+	encoded := func(values ...protocol.Value) string {
+		payload, err := protocol.EncodeValues(values)
+		if err != nil {
+			t.Fatalf("EncodeValues() error = %v", err)
+		}
+		return string(payload)
+	}
+	reply := func(t *testing.T, out *Output, values ...protocol.Value) {
+		t.Helper()
+		if err := out.Reply(values...); err != nil {
+			t.Fatalf("Reply() error = %v", err)
+		}
+	}
+	push := func(t *testing.T, out *Output, frame string) {
+		t.Helper()
+		if !out.Push([]byte(frame)) {
+			t.Fatalf("Push() = false, want it queued: %v", out.Err())
+		}
+	}
+
+	tests := []struct {
+		name string
+		fill func(t *testing.T, out *Output)
+		want string
+	}{
+		{
+			name: "between small replies, with pushes held behind it and pushed after it",
+			fill: func(t *testing.T, out *Output) {
+				reply(t, out, protocol.SimpleString{Value: "first"})
+				out.HoldPushes()
+				push(t, out, "+held\r\n")
+				reply(t, out, large('a'))
+				push(t, out, "+pushed\r\n")
+				reply(t, out, protocol.SimpleString{Value: "last"})
+			},
+			want: "+first\r\n" + encoded(large('a')) + "+held\r\n+pushed\r\n+last\r\n",
+		},
+		{
+			name: "with other values in the same reply, as a full resync reply has",
+			fill: func(t *testing.T, out *Output) {
+				out.HoldPushes()
+				push(t, out, "+stream\r\n")
+				reply(t, out, protocol.SimpleString{Value: "FULLRESYNC"}, large('s'))
+				push(t, out, "+more\r\n")
+			},
+			want: "+FULLRESYNC\r\n" + encoded(large('s')) + "+stream\r\n+more\r\n",
+		},
+		{
+			name: "one after another",
+			fill: func(t *testing.T, out *Output) {
+				push(t, out, "+before\r\n")
+				reply(t, out, large('a'))
+				reply(t, out, large('b'))
+				push(t, out, "+between\r\n")
+				reply(t, out, large('c'))
+			},
+			want: "+before\r\n" + encoded(large('a'), large('b')) + "+between\r\n" + encoded(large('c')),
+		},
+		{
+			name: "small, releasing that much of held pushes",
+			fill: func(t *testing.T, out *Output) {
+				reply(t, out, protocol.SimpleString{Value: "first"})
+				out.HoldPushes()
+				push(t, out, strings.Repeat("h", outputRetainedBuffer))
+				push(t, out, "+held last\r\n")
+				reply(t, out, protocol.SimpleString{Value: "OK"})
+				push(t, out, "+pushed\r\n")
+			},
+			want: "+first\r\n+OK\r\n" + strings.Repeat("h", outputRetainedBuffer) + "+held last\r\n+pushed\r\n",
+		},
+	}
+
+	for _, driver := range outputDrivers {
+		driver := driver
+		t.Run(driver.name, func(t *testing.T) {
+			for _, tt := range tests {
+				tt := tt
+				t.Run(tt.name, func(t *testing.T) {
+					wire := newOutputWire()
+					out, send := driver.open(t, wire)
+
+					tt.fill(t, out)
+					send(len(tt.want))
+
+					if got := wire.sent(); got != tt.want {
+						t.Fatalf("sent %d bytes that differ from the %d queued, in the order they were queued, at byte %d", len(got), len(tt.want), firstDifference(got, tt.want))
+					}
+					waitForOutput(t, "the backlog to count everything as written", func() bool { return out.Backlog() == 0 })
+				})
+			}
+		})
+	}
+}
+
+// firstDifference is the index of the first byte at which a and b differ.
+func firstDifference(a, b string) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return min(len(a), len(b))
+}
+
+// TestAFlushWritesEveryReplyQueuedBeforeIt flushes a small Reply and a large
+// one behind it, with nothing pushed. The connection's own goroutine writes
+// both before Flush returns: a Reply left to another goroutine would be dropped
+// when the handler, with nothing more to read, closes the connection.
+func TestAFlushWritesEveryReplyQueuedBeforeIt(t *testing.T) {
+	wire := newOutputWire()
+	out := newGoroutineOutput(newOutputs(), wire)
+	defer out.Close(nil)
+
+	large := protocol.BulkString{Data: make([]byte, outputRetainedBuffer)}
+	want, err := protocol.EncodeValues([]protocol.Value{protocol.SimpleString{Value: "PONG"}, large, protocol.SimpleString{Value: "PONG"}})
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	for _, value := range []protocol.Value{protocol.SimpleString{Value: "PONG"}, large, protocol.SimpleString{Value: "PONG"}} {
+		if err := out.Reply(value); err != nil {
+			t.Fatalf("Reply() error = %v", err)
+		}
+	}
+	if err := out.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	if got := len(wire.sent()); got != len(want) {
+		t.Fatalf("%d bytes were written when Flush returned, want all %d of the replies", got, len(want))
+	}
+}
+
+// lockHoldingDriver is a driver whose schedule waits until it is released. An
+// Output calls schedule with its lock held, so a Push to an Output it drives
+// stays inside that lock, where a test can keep it.
+type lockHoldingDriver struct {
+	unscheduledOutputDriver
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (d *lockHoldingDriver) schedule(*Output) {
+	close(d.entered)
+	<-d.release
+}
+
+// allocatedBytes is how many bytes the process has allocated so far.
+func allocatedBytes() uint64 {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats.TotalAlloc
+}
+
+// TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock sends a full resync
+// reply to an Output whose lock a Push holds, and waits for the snapshot's
+// buffer to be allocated while that Push still holds it. A Reply that needs
+// the lock to encode would also keep every Push out while it does, and the
+// replication Master pushes a Replica's stream under its own lock, where every
+// writer waits: a write waited two seconds for a 384 MiB snapshot.
+func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
+	driver := &lockHoldingDriver{entered: make(chan struct{}), release: make(chan struct{})}
+	out := newOutput(newOutputs(), driver, discardLogger)
+
+	pushed := make(chan bool, 1)
+	go func() { pushed <- out.Push([]byte("+write\r\n")) }()
+	<-driver.entered
+
+	snapshot := protocol.BulkString{Data: make([]byte, 16<<20)}
+	before := allocatedBytes()
+	replied := make(chan error, 1)
+	go func() { replied <- out.Reply(protocol.SimpleString{Value: "FULLRESYNC"}, snapshot) }()
+
+	waitForOutput(t, "the Reply to encode its snapshot while a Push holds the Output's lock", func() bool {
+		return allocatedBytes()-before >= uint64(len(snapshot.Data))
+	})
+	select {
+	case err := <-replied:
+		t.Fatalf("Reply() returned %v while a Push held the Output's lock, want it to queue what it encoded after that Push", err)
+	default:
+	}
+
+	close(driver.release)
+	if !<-pushed {
+		t.Fatal("Push() = false, want it queued")
+	}
+	if err := <-replied; err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	want, err := protocol.EncodeValues([]protocol.Value{protocol.SimpleString{Value: "FULLRESYNC"}, snapshot})
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	wire := newOutputWire()
+	if err := out.writeTo(wire); err != nil {
+		t.Fatalf("writeTo() error = %v", err)
+	}
+	if got := wire.sent(); got != "+write\r\n"+string(want) {
+		t.Fatalf("sent %d bytes, want the push and then the %d bytes of the reply", len(got), len(want))
+	}
+}
+
+// TestAReplyReleasesLargeHeldPushesWithoutCopyingThem holds 8 MiB of a
+// Replica's stream behind a Reply. Releasing them is done under the Output's
+// lock, so they are queued as the buffer they are in: copying them behind the
+// Reply would keep every Push out for the time of the copy.
+func TestAReplyReleasesLargeHeldPushesWithoutCopyingThem(t *testing.T) {
+	const held = 8 << 20
+	wire := newOutputWire()
+	state := &ClientState{ID: 1}
+	machine := NewConnMachine(state)
+	out := state.Output()
+
+	out.HoldPushes()
+	frame := bytes.Repeat([]byte("s"), 1<<20)
+	for pushed := 0; pushed < held; pushed += len(frame) {
+		if !out.Push(frame) {
+			t.Fatalf("Push() = false, want the stream held: %v", out.Err())
+		}
+	}
+
+	before := allocatedBytes()
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	if allocated := allocatedBytes() - before; allocated >= held {
+		t.Fatalf("the Reply allocated %d bytes to release %d bytes of held pushes, want them queued without a copy", allocated, held)
+	}
+
+	if err := machine.Flush(wire); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if got, want := wire.sent(), "+OK\r\n"+strings.Repeat("s", held); got != want {
+		t.Fatalf("sent %d bytes, want the reply and then the %d bytes held behind it", len(got), held)
 	}
 }
