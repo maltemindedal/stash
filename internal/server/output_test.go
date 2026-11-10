@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ type outputWire struct {
 	mu         sync.Mutex
 	received   bytes.Buffer
 	writes     int
+	largest    int
 	writeShuts int
 	stalled    bool
 	writeBegun chan struct{}
@@ -54,6 +56,7 @@ func (w *outputWire) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.writes++
+	w.largest = max(w.largest, len(p))
 	return w.received.Write(p)
 }
 
@@ -79,6 +82,13 @@ func (w *outputWire) writeCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.writes
+}
+
+// largestWrite is the most bytes one write handed to the socket.
+func (w *outputWire) largestWrite() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.largest
 }
 
 func (w *outputWire) writeShutCount() int {
@@ -625,4 +635,184 @@ func TestAFlushLeavesWhatIsPushedMeanwhileToThePump(t *testing.T) {
 	// The pushes are still written, by the pump.
 	sent := len(wire.sent())
 	waitForOutput(t, "the pump to write what was pushed after the flush", func() bool { return len(wire.sent()) > sent })
+}
+
+// heldOutputWire is a socket that takes nothing until it is released and
+// everything after that, like a peer that was slow for a while.
+type heldOutputWire struct {
+	*outputWire
+	released chan struct{}
+}
+
+func (w *heldOutputWire) Write(p []byte) (int, error) {
+	<-w.released
+	return w.outputWire.Write(p)
+}
+
+// TestPushesBehindASlowSocketArriveInOrderInFewWrites pushes a thousand frames
+// while the socket takes nothing, as a burst of writes reaches a Replica that
+// is slow to read. No push waits for the socket. Once it takes bytes again,
+// the frames arrive in the order they were pushed, and in two writes at most:
+// the batch that was being written, then everything queued behind it.
+func TestPushesBehindASlowSocketArriveInOrderInFewWrites(t *testing.T) {
+	wire := &heldOutputWire{outputWire: newOutputWire(), released: make(chan struct{})}
+	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	defer out.Close(nil)
+
+	var want strings.Builder
+	within(t, "a thousand pushes behind a socket that takes nothing", func() {
+		for i := 0; i < 1000; i++ {
+			frame := fmt.Sprintf("+message-%04d\r\n", i)
+			want.WriteString(frame)
+			if !out.Push([]byte(frame)) {
+				t.Errorf("Push() %d = false, want it queued", i)
+				return
+			}
+		}
+	})
+	if got := wire.sent(); got != "" {
+		t.Fatalf("sent %q before the socket took anything", got)
+	}
+
+	close(wire.released)
+	waitForOutput(t, "everything pushed to be written", func() bool { return len(wire.sent()) == want.Len() })
+	if got := wire.sent(); got != want.String() {
+		t.Fatal("the frames did not arrive in the order they were pushed")
+	}
+	if got := wire.writeCount(); got > 2 {
+		t.Fatalf("the socket was written %d times for 1000 frames, want at most 2", got)
+	}
+}
+
+// TestOutputIsWrittenInChunksSoTheStallRuleBoundsEachStretch queues more than
+// three chunks at once. In the goroutine mode a write returns only when the
+// socket has taken all of it, so the Replica stall rule can only see progress
+// between writes: one write of the whole backlog would have to finish within
+// the stall timeout, however much was waiting.
+func TestOutputIsWrittenInChunksSoTheStallRuleBoundsEachStretch(t *testing.T) {
+	const total = 3*outputWriteChunk + 10
+
+	tests := []struct {
+		name  string
+		write func(t *testing.T, wire *outputWire)
+	}{
+		{name: "by the goroutine mode's pump", write: func(t *testing.T, wire *outputWire) {
+			out := newGoroutineOutput(newOutputs(), wire)
+			t.Cleanup(func() { out.Close(nil) })
+			if !out.Push(make([]byte, total)) {
+				t.Fatalf("Push() = false, want it queued: %v", out.Err())
+			}
+			waitForOutput(t, "everything pushed to be written", func() bool { return len(wire.sent()) == total })
+		}},
+		{name: "by the Event loop's flush", write: func(t *testing.T, wire *outputWire) {
+			state := &ClientState{ID: 1}
+			machine := NewConnMachine(state)
+			if !state.Output().Push(make([]byte, total)) {
+				t.Fatalf("Push() = false, want it queued: %v", state.Output().Err())
+			}
+			if err := machine.Flush(wire); err != nil {
+				t.Fatalf("Flush() error = %v", err)
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			wire := newOutputWire()
+			tt.write(t, wire)
+
+			if got := len(wire.sent()); got != total {
+				t.Fatalf("wrote %d bytes, want %d", got, total)
+			}
+			if got := wire.largestWrite(); got != outputWriteChunk {
+				t.Fatalf("the largest write was %d bytes, want the %d byte chunk", got, outputWriteChunk)
+			}
+			if got := wire.writeCount(); got != 4 {
+				t.Fatalf("the socket was written %d times, want three chunks and the 10 bytes left", got)
+			}
+		})
+	}
+}
+
+// TestAPushKeepsNoReferenceToItsFrame overwrites a frame once Push has
+// returned. The Recorder hands the stream a buffer it reuses for the next
+// write as soon as Propagate returns, so the Output must have copied it,
+// whether the frame is queued or held behind a Reply.
+func TestAPushKeepsNoReferenceToItsFrame(t *testing.T) {
+	tests := []struct {
+		name string
+		held bool
+		want string
+	}{
+		{name: "a frame that is queued", want: "+one\r\n"},
+		{name: "a frame held behind a reply", held: true, want: "+OK\r\n+one\r\n"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			wire := newOutputWire()
+			out := newGoroutineOutput(newOutputs(), wire)
+			defer out.Close(nil)
+
+			if tt.held {
+				out.HoldPushes()
+			}
+			frame := []byte("+one\r\n")
+			if !out.Push(frame) {
+				t.Fatal("Push() = false, want it queued")
+			}
+			copy(frame, "+XXX")
+			if tt.held {
+				if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+					t.Fatalf("Reply() error = %v", err)
+				}
+				if err := out.Flush(); err != nil {
+					t.Fatalf("Flush() error = %v", err)
+				}
+			}
+
+			waitForOutput(t, "the frame to be written", func() bool { return len(wire.sent()) == len(tt.want) })
+			if got := wire.sent(); got != tt.want {
+				t.Fatalf("sent %q, want %q: the frame as it was when it was pushed", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPushesHeldWhenTheConnectionClosesAreNeverWritten closes a connection
+// while Pushed messages wait behind a Reply that has not come, as a Replica is
+// closed for falling behind while its full resync is still being produced.
+// Closing does not wait for the Reply, what was held is dropped, and the Reply
+// that comes afterwards is refused, so nothing of it reaches the socket.
+func TestPushesHeldWhenTheConnectionClosesAreNeverWritten(t *testing.T) {
+	wire := newOutputWire()
+	out := newGoroutineOutput(newOutputs(), wire)
+
+	out.HoldPushes()
+	if !out.Push([]byte("+held\r\n")) {
+		t.Fatal("Push() = false, want it held")
+	}
+	cause := errors.New("closed by the test")
+	within(t, "Close with pushes held behind a reply", func() { out.Close(cause) })
+
+	if !wire.isClosed() {
+		t.Fatal("the socket is open, want it closed with the Output")
+	}
+	if got := out.Backlog(); got != 0 {
+		t.Fatalf("Backlog() = %d after the close, want what was held dropped", got)
+	}
+	if out.Push([]byte("+late\r\n")) {
+		t.Fatal("Push() after Close = true, want it refused")
+	}
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); !errors.Is(err, cause) {
+		t.Fatalf("Reply() after the close error = %v, want why it was closed", err)
+	}
+	if err := out.Flush(); !errors.Is(err, cause) {
+		t.Fatalf("Flush() after the close error = %v, want why it was closed", err)
+	}
+	if got := wire.sent(); got != "" {
+		t.Fatalf("sent %q, want nothing written for a connection closed before its reply", got)
+	}
 }
