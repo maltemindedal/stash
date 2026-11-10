@@ -63,7 +63,9 @@ func TestEventLoopIsWokenOnlyWhileItWaits(t *testing.T) {
 // TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime queues more
 // of the stream for a replica than its socket takes and never reads it. The
 // loop used to keep such a replica until 256 MiB was waiting for it: the 30 s
-// stall rule was a write deadline, and the loop's sockets have none.
+// stall rule was a write deadline, and the loop's sockets have none. When the
+// stall time has passed the rule asks the loop to try the socket once more, and
+// the loop closes the replica when that try takes nothing either.
 func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.T) {
 	loop, conn, _ := newHandDrivenEventLoop(t)
 	loop.srv.outputs.stallTimeout = 250 * time.Millisecond
@@ -80,14 +82,62 @@ func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.
 		t.Fatal("the connection was closed before the stall time passed")
 	}
 
-	waitForOutput(t, "the stalled replica's output to be closed", func() bool { return conn.out.Err() != nil })
+	waitForOutput(t, "the stall rule to give the loop work once the stall time has passed", loop.hasQueuedWork)
+	loop.applyQueuedWork() // the loop's next iteration
 	if err := conn.out.Err(); !errors.Is(err, errReplicaStalled) {
 		t.Fatalf("Err() = %v, want errReplicaStalled", err)
 	}
-	waitForOutput(t, "the loop to be asked to close the connection", loop.hasQueuedWork)
-	loop.applyQueuedWork() // the loop's next iteration takes the close request
 	if loop.conns[conn.fd] != nil {
 		t.Fatal("the loop still has the connection, want it closed")
+	}
+}
+
+// TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway offers a
+// replica more of its stream than its socket takes at once, as any burst
+// larger than the socket's buffer does. The replica reads everything the socket
+// holds and goes on reading, and the loop does not come back to the connection
+// for longer than the stall time, as it does not while it runs one long request
+// inline: a long pipeline, the snapshot of another replica's full resync. The
+// socket could take more the whole time and nothing offered it more. The stall
+// rule's timer used to close such a replica. It cannot tell a socket that is
+// full from one that nobody tried, so it leaves the verdict to the loop's next
+// try, which finds room, and the count starts again.
+func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.T) {
+	loop, conn, clientFD := newHandDrivenEventLoop(t)
+	loop.srv.outputs.stallTimeout = 50 * time.Millisecond
+	conn.out.MarkReplica()
+
+	const stream = 8 << 20
+	if !conn.out.Push(make([]byte, stream)) {
+		t.Fatalf("Push() = false, want the stream queued: %v", conn.out.Err())
+	}
+	loop.applyQueuedWork() // the loop offers the batch, and the socket takes what fits
+	if taken := stream - conn.out.Backlog(); taken == 0 || taken == stream {
+		t.Fatalf("the socket took %d of %d bytes, want part of them", taken, stream)
+	}
+
+	received := 0
+	for away := 1; away <= 3; away++ {
+		// The replica reads all the while. The loop is busy elsewhere until
+		// the stall time has passed, and then comes back.
+		waitForOutput(t, "the stall rule to ask the loop to try the socket again", func() bool {
+			received += len(readSent(t, clientFD))
+			return loop.hasQueuedWork()
+		})
+		if err := conn.out.Err(); err != nil {
+			t.Fatalf("Err() = %v the %d. time the loop stayed away for the stall time of %v, after the replica read all %d bytes its socket was given; want the replica kept until the loop has tried its socket", err, away, loop.srv.outputs.stallTimeout, received)
+		}
+		before := conn.out.Backlog()
+		loop.applyQueuedWork()
+		if err := conn.out.Err(); err != nil {
+			t.Fatalf("Err() = %v after the loop came back to a socket with room, want the replica kept", err)
+		}
+		if loop.conns[conn.fd] != conn {
+			t.Fatal("the loop closed the connection of a replica that reads everything it is sent")
+		}
+		if conn.out.Backlog() == before {
+			t.Fatalf("the loop's try wrote nothing to a socket the replica had emptied, with %d bytes waiting", before)
+		}
 	}
 }
 

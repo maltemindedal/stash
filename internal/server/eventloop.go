@@ -163,8 +163,9 @@ type eventLoop struct {
 	waiting atomic.Bool
 
 	mu sync.Mutex
-	// dirty are the connections whose Output was given bytes the loop has not
-	// been asked to write yet, each listed once (eventConn.dirty).
+	// dirty are the connections the loop has been asked to write and has not
+	// written since, each listed once (eventConn.dirty): their Output was given
+	// bytes, their stream is to end, or the stall rule wants their socket tried.
 	dirty        []*eventConn
 	spareDirty   []*eventConn
 	closeReqs    []*eventConn
@@ -277,8 +278,9 @@ func (l *eventLoop) wakeIfWaiting() {
 	}
 }
 
-// markDirty lists conn as having output the loop has not been asked to write,
-// or a stream the loop has not been asked to end. Safe for concurrent use; it
+// markDirty lists conn for the loop to write: it has output the loop has not
+// been asked to write, a stream the loop has not been asked to end, or a batch
+// the stall rule wants its socket offered again. Safe for concurrent use; it
 // may be called with the connection's Output locked.
 func (l *eventLoop) markDirty(conn *eventConn) {
 	if !conn.dirty.CompareAndSwap(false, true) {
@@ -713,7 +715,7 @@ func (w fdWriter) Write(p []byte) (int, error) {
 // loopOutputDriver is the Event loop's side of a connection's Output: the loop
 // writes every connection itself (ConnMachine.Flush), so the driver only tells
 // it which connections were given output from elsewhere, and asks it to close
-// one or to end its stream.
+// one, to end its stream, or to try its socket again.
 type loopOutputDriver struct {
 	loop *eventLoop
 	conn *eventConn
@@ -737,6 +739,13 @@ func (d *loopOutputDriver) closeWrite() {
 }
 
 func (d *loopOutputDriver) peerClosed() bool { return false }
+
+// retry lists the connection for the loop, which writes every connection on
+// its list (applyQueuedWork).
+func (d *loopOutputDriver) retry(*Output) bool {
+	d.loop.markDirty(d.conn)
+	return true
+}
 
 // eventConnHandle implements the ClientConn operations registered with the client
 // registry so shutdown and INFO connected-client counts keep working for

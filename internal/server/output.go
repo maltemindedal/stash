@@ -35,7 +35,9 @@ const outputPushBudget = 128 << 20
 // a batch of output it is offered before the Replica is dropped. Output that no
 // writer has offered to the socket does not count, since the Replica is not
 // failing to take it: Replies that are not flushed yet, and Pushed messages
-// held behind a Reply that has not come.
+// held behind a Reply that has not come. Nor does the time the Event loop
+// spends away from the socket: there the Replica is dropped when the loop's
+// next try after that time takes nothing either (checkStall).
 const outputReplicaStallTimeout = 30 * time.Second
 
 // outputWriteThrough is how much Client output a connection's goroutine lets
@@ -149,7 +151,29 @@ type outputDriver interface {
 	// peerClosed reports whether the peer has closed its side, when the driver
 	// can tell without reading.
 	peerClosed() bool
+	// retry asks the driver's writer to offer the socket the batch that is
+	// inflight once more, and reports whether it will. The Event loop does: its
+	// writes return at once, and it comes back to a socket that took part of a
+	// batch only when the socket can take more or when it is asked to. A writer
+	// of the goroutine mode stays inside its write for as long as a batch is on
+	// offer, so there is nothing to ask of it. It is called with Output.mu held
+	// and must not block.
+	retry(o *Output) bool
 }
+
+// stallPhase is where the Replica stall rule stands for an Output.
+type stallPhase uint8
+
+const (
+	// stallIdle is the rule at rest: nothing is on offer to a Replica's socket.
+	stallIdle stallPhase = iota
+	// stallCounting has a timer due to look at lastProgress (checkStall).
+	stallCounting
+	// stallDue is the stall timeout passed with nothing taken, on a driver
+	// whose writer was asked to try the socket once more (retry). What that
+	// try takes is the verdict (write).
+	stallDue
+)
 
 // Output is the Client output of one connection: its Replies and the Pushed
 // messages it receives (pub/sub messages, MONITOR events, and for a Replica
@@ -198,11 +222,11 @@ type Output struct {
 	// written (EndStream).
 	ending bool
 	// lastProgress is when the socket last accepted a byte, or when it was
-	// offered the batch that is inflight; stallArmed is set while a timer is
-	// due to check it. The timer finds the Output through stallWatch, which
+	// offered the batch that is inflight, and stall is where the stall rule
+	// stands on it. The rule's timer finds the Output through stallWatch, which
 	// Close empties.
 	lastProgress time.Time
-	stallArmed   bool
+	stall        stallPhase
 	stallWatch   *atomic.Pointer[Output]
 
 	// drained is signalled when a writer finishes and when no more than
@@ -602,10 +626,10 @@ func (o *Output) countStallLocked() {
 // armStallLocked has checkStall run after wait, unless it is due to run
 // already.
 func (o *Output) armStallLocked(wait time.Duration) {
-	if o.stallArmed {
+	if o.stall == stallCounting {
 		return
 	}
-	o.stallArmed = true
+	o.stall = stallCounting
 	if o.stallWatch == nil {
 		o.stallWatch = new(atomic.Pointer[Output])
 		o.stallWatch.Store(o)
@@ -624,13 +648,23 @@ func (o *Output) armStallLocked(wait time.Duration) {
 	})
 }
 
-// checkStall closes a Replica whose socket has taken nothing for the stall
-// timeout of the batch it is offered, and otherwise looks again when that could
-// next be true. With no batch on offer it stops looking: the next batch starts
-// the count again (write).
+// checkStall is the stall rule's timer. When a Replica's socket has taken
+// nothing for the stall timeout of the batch it is offered, it closes the
+// Replica, or leaves that to the writer where the writer has to try the socket
+// first. Otherwise it looks again when the timeout could next have passed.
+// With no batch on offer it stops looking: the next batch starts the count
+// again (write).
+//
+// Only the writer can say whether the socket takes anything. In the goroutine
+// mode it has been inside a blocking write since lastProgress, so the socket
+// took nothing in that time. The Event loop tried the socket when the batch
+// went on offer and then went on to other work, which can be one request that
+// runs longer than the timeout. The socket may have had room for most of that
+// time, so the loop is asked to try it now, and closes the Replica if that try
+// takes nothing (write).
 func (o *Output) checkStall() {
 	o.mu.Lock()
-	o.stallArmed = false
+	o.stall = stallIdle
 	if o.closed || !o.offeredLocked() {
 		o.mu.Unlock()
 		return
@@ -640,16 +674,27 @@ func (o *Output) checkStall() {
 		o.mu.Unlock()
 		return
 	}
+	if o.driver.retry(o) {
+		o.stall = stallDue
+		o.mu.Unlock()
+		return
+	}
 	o.mu.Unlock()
 
-	o.Close(fmt.Errorf("%w of %v", errReplicaStalled, o.shared.stallTimeout))
+	o.Close(o.stalledErr())
+}
+
+func (o *Output) stalledErr() error {
+	return fmt.Errorf("%w of %v", errReplicaStalled, o.shared.stallTimeout)
 }
 
 // writeTo writes what is queued to w until nothing is left or w fails, and
 // returns w's error. The caller is the only writer: the goroutine that set
 // writing, or the Event loop. A w that accepts part of a chunk, and reports that
 // it would block as the Event loop's does or reports nothing (io.ErrShortWrite),
-// leaves the rest for the next call.
+// leaves the rest for the next call. When the stall rule asked for this try
+// (checkStall) and w takes nothing, the error is errReplicaStalled, for the
+// caller to close the connection with.
 func (o *Output) writeTo(w io.Writer) error {
 	return o.write(w, everyBuffer)
 }
@@ -743,6 +788,17 @@ func (o *Output) write(w io.Writer, buffers int) error {
 			o.replyWaiting = max(o.replyWaiting-n, 0)
 			if o.replyWaiting <= outputHighWater {
 				o.drained.Broadcast()
+			}
+		}
+		if o.stall == stallDue && !o.closed {
+			// This was the try the stall rule asked for. A socket that took
+			// some of the batch has the stall timeout again for the rest.
+			o.stall = stallIdle
+			switch {
+			case n == 0:
+				err = o.stalledErr()
+			case o.offeredLocked():
+				o.countStallLocked()
 			}
 		}
 		if err == nil && n < len(chunk) {
@@ -871,8 +927,12 @@ func (d *goroutineOutputDriver) peerClosed() bool {
 	return ok && peerClosed(conn)
 }
 
+func (d *goroutineOutputDriver) retry(*Output) bool { return false }
+
 // unscheduledOutputDriver is the driver of an Output that only its owner
-// writes, by calling writeTo: a ConnMachine built without an Event loop.
+// writes, by calling writeTo: a ConnMachine built without an Event loop. It has
+// no writer to ask for anything, so the stall rule's timer closes its Output
+// itself.
 type unscheduledOutputDriver struct{}
 
 func (unscheduledOutputDriver) schedule(*Output)    {}
@@ -880,5 +940,6 @@ func (unscheduledOutputDriver) flush(*Output) error { return nil }
 func (unscheduledOutputDriver) shut()               {}
 func (unscheduledOutputDriver) closeWrite()         {}
 func (unscheduledOutputDriver) peerClosed() bool    { return false }
+func (unscheduledOutputDriver) retry(*Output) bool  { return false }
 
 var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
