@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
-	"github.com/maltemindedal/stash/internal/replication"
 )
 
 // outputPushLimit is how much Client output may wait for a connection that
@@ -152,8 +151,10 @@ type outputDriver interface {
 // its stream), in the order they were produced. No method but Flush waits on
 // the peer's socket. Safe for concurrent use.
 //
-// Lock order: a registry's lock, then Output.mu, then the shared budget's.
-// Output.mu is never held across a socket write.
+// Lock order: the lock of whoever pushes (a registry's, or the replication
+// Master's for a Replica's stream), then Output.mu, then the shared budget's.
+// Output.mu is never held across a socket write, and nothing called under it
+// takes a pusher's lock.
 type Output struct {
 	mu sync.Mutex
 	// queued is what waits to be written, appended under mu.
@@ -319,8 +320,9 @@ func (o *Output) Push(frame []byte) bool {
 
 // HoldPushes makes Pushed messages queued from now on wait until the current
 // request has replied. A request that changes which Pushed messages reach its
-// own connection (SUBSCRIBE, UNSUBSCRIBE, MONITOR, a Replica's attach) calls it
-// at that change, so that what the change lets in follows the request's Reply.
+// own connection (SUBSCRIBE, UNSUBSCRIBE, MONITOR, the attach cut of a PSYNC)
+// calls it at that change, so that what the change lets in follows the
+// request's Reply.
 func (o *Output) HoldPushes() {
 	if o == nil {
 		return
@@ -380,8 +382,13 @@ func (o *Output) Close(cause error) {
 
 // EndStream ends the stream to the peer once everything queued has been
 // written: the write side is shut and the connection stays open for the peer to
-// close. Shutdown ends a Replica's stream this way.
+// close. Shutdown ends a Replica's stream this way
+// (replication.Master.EndStreams).
 func (o *Output) EndStream() {
+	if o == nil {
+		return
+	}
+
 	o.mu.Lock()
 	if o.closed || o.ending {
 		o.mu.Unlock()
@@ -400,7 +407,8 @@ func (o *Output) EndStream() {
 }
 
 // MarkReplica makes the connection a Replica's: held to the Replica Push limit
-// and stall rule, and outside the Push budget.
+// and stall rule, and outside the Push budget. The attach cut calls it before
+// the Replica's stream is pushed here (replication.Master.Attach).
 func (o *Output) MarkReplica() {
 	if o == nil {
 		return
@@ -428,8 +436,13 @@ func (o *Output) Backlog() int {
 	return int(o.backlog.Load())
 }
 
-// Err reports why the connection was closed, or nil while it is open.
+// Err reports why the connection was closed, or nil while it is open. A nil
+// Output, which refuses every Push, is closed.
 func (o *Output) Err() error {
+	if o == nil {
+		return errOutputClosed
+	}
+
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if !o.closed {
@@ -452,6 +465,13 @@ func (o *Output) isClosed() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.closed
+}
+
+// isReplica reports whether the connection is a Replica's (MarkReplica).
+func (o *Output) isReplica() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.replica
 }
 
 func (o *Output) errLocked() error {
@@ -709,10 +729,16 @@ func (d *goroutineOutputDriver) shut() {
 	})
 }
 
+// writeCloser is a socket whose write side can be shut on its own, as a TCP
+// connection's can.
+type writeCloser interface {
+	CloseWrite() error
+}
+
 func (d *goroutineOutputDriver) closeWrite() {
-	if ender, ok := d.wire.(replication.StreamEnder); ok {
+	if wire, ok := d.wire.(writeCloser); ok {
 		// One that fails is closed with every other connection afterwards.
-		_ = ender.CloseWrite()
+		_ = wire.CloseWrite()
 	}
 }
 

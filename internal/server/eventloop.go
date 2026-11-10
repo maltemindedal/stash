@@ -16,7 +16,6 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
-	"github.com/maltemindedal/stash/internal/replication"
 )
 
 // pollerEventBatch bounds how many readiness events one Wait call returns.
@@ -151,9 +150,9 @@ type eventLoop struct {
 	acceptPaused bool
 	// draining is set once the server shuts down or accepting fails
 	// (beginDrain). The loop then serves only the replicas, to send them what is
-	// queued for them, and returns drainErr once shutdown has stopped their feeds
-	// and each replica has received the end of its stream and closed its
-	// connection, or once drainExpired is set, replicaShutdownGrace later.
+	// queued for them, and returns drainErr once shutdown has ended their
+	// streams and each replica has received the end of its stream and closed
+	// its connection, or once drainExpired is set, replicaShutdownGrace later.
 	draining     bool
 	drainErr     error
 	drainExpired atomic.Bool
@@ -190,14 +189,12 @@ type eventConn struct {
 	// authTimer closes the connection if it has not authenticated in time; nil
 	// where no password is required.
 	authTimer *time.Timer
-	// replica is set once the connection has become a replica peer.
-	replica atomic.Bool
 	// dirty is set while the connection is on eventLoop.dirty.
 	dirty atomic.Bool
-	// endStream is set when shutdown asks for a replica's connection to be
-	// closed while the loop drains: once its output has reached the kernel, the
-	// loop shuts the write side (writeShut) and closes the connection when the
-	// replica closes its own.
+	// endStream is set when shutdown ends a replica's stream while the loop
+	// drains (loopOutputDriver.closeWrite): once its output has reached the
+	// kernel, the loop shuts the write side (writeShut) and closes the
+	// connection when the replica closes its own.
 	endStream bool
 	writeShut bool
 
@@ -305,8 +302,8 @@ func (l *eventLoop) applyQueuedWork() {
 	l.mu.Unlock()
 
 	// Checked after the queues are taken: shutdown, which the cancellation
-	// starts, asks for the replicas to be closed only after it has stopped
-	// their feeds, and those requests must find the loop draining.
+	// starts, ends the replicas' streams only after that cancellation, and the
+	// requests that makes must find the loop draining.
 	if l.ctx.Err() != nil && !l.draining {
 		l.beginDrain(nil)
 	}
@@ -326,9 +323,9 @@ func (l *eventLoop) applyQueuedWork() {
 		if l.conns[conn.fd] != conn {
 			continue
 		}
-		if l.draining && conn.replica.Load() {
-			// Shutdown has stopped the replica's feed, whose last frames the
-			// pushes above buffered: send them and end the stream
+		if l.draining && conn.out.isReplica() {
+			// Shutdown is ending the replica's stream, whose last frames the
+			// pushes above queued: send them and shut the write side
 			// (finishConnEvent).
 			conn.endStream = true
 			l.finishConnEvent(conn)
@@ -348,13 +345,12 @@ func (l *eventLoop) applyQueuedWork() {
 
 // beginDrain starts the loop's end, when the server shuts down (cause is nil) or
 // accepting fails (cause, which run then returns). It stops accepting and closes
-// every connection but the replicas'. The replicas' feeds go on pushing until
-// shutdown stops them (replication.Master.StopFeeds) and then ends their streams
-// (replication.Master.EndStreams): each connection is sent what it holds, has its
-// write side shut, and is closed once the replica closes its own
-// (applyQueuedWork, finishConnEvent). Whatever is left when
-// replicaShutdownGrace has passed is dropped with the connections when run
-// returns.
+// every connection but the replicas'. The Master goes on pushing to those until
+// shutdown stops it and ends their streams (replication.Master.EndStreams):
+// each connection is sent what is queued for it, has its write side shut, and
+// is closed once the replica closes its own (applyQueuedWork,
+// finishConnEvent). Whatever is left when replicaShutdownGrace has passed is
+// dropped with the connections when run returns.
 func (l *eventLoop) beginDrain(cause error) {
 	l.draining = true
 	l.drainErr = cause
@@ -362,7 +358,7 @@ func (l *eventLoop) beginDrain(cause error) {
 		l.srv.logger.Debug("failed to stop accepting connections for shutdown", "error", err)
 	}
 	for _, conn := range l.conns {
-		if !conn.replica.Load() {
+		if !conn.out.isReplica() {
 			l.closeConn(conn, nil)
 		}
 	}
@@ -730,7 +726,7 @@ func (w fdWriter) Write(p []byte) (int, error) {
 // loopOutputDriver is the Event loop's side of a connection's Output: the loop
 // writes every connection itself (ConnMachine.Flush), so the driver only tells
 // it which connections were given output from elsewhere, and asks it to close
-// one.
+// one or to end its stream.
 type loopOutputDriver struct {
 	loop *eventLoop
 	conn *eventConn
@@ -742,16 +738,19 @@ func (d *loopOutputDriver) flush(*Output) error { return nil }
 
 func (d *loopOutputDriver) shut() { d.loop.requestClose(d.conn) }
 
-// closeWrite does nothing: the loop ends a Replica's stream itself
-// (eventConnHandle.CloseWrite).
-func (d *loopOutputDriver) closeWrite() {}
+// closeWrite asks the loop to end the stream to a Replica, whose output has
+// all been written (Output.EndStream): to shut the connection's write side and
+// close it once the Replica has closed its own. Shutdown ends a Replica's
+// stream, and by then the loop is draining, where a request to close a
+// Replica's connection means that (applyQueuedWork).
+func (d *loopOutputDriver) closeWrite() { d.loop.requestClose(d.conn) }
 
 func (d *loopOutputDriver) peerClosed() bool { return false }
 
 // eventConnHandle implements the ClientConn operations registered with the client
-// registry so shutdown, INFO connected-client counts, and replica bookkeeping
-// keep working for event-loop connections. Close hands the actual teardown to
-// the loop goroutine, which owns all socket I/O.
+// registry so shutdown and INFO connected-client counts keep working for
+// event-loop connections. Close hands the actual teardown to the loop
+// goroutine, which owns all socket I/O.
 type eventConnHandle struct {
 	loop *eventLoop
 	conn *eventConn
@@ -766,30 +765,6 @@ func (h *eventConnHandle) Close() error {
 
 // RemoteAddr returns the peer address captured when the connection was accepted.
 func (h *eventConnHandle) RemoteAddr() net.Addr { return h.conn.remoteAddr }
-
-// CloseWrite asks the loop to end the stream to a replica (replication.Master.EndStreams):
-// to send what the connection holds, shut its write side, and close it once
-// the replica has closed its own. The loop, draining by then, does that for a
-// replica asked to close at all (applyQueuedWork).
-func (h *eventConnHandle) CloseWrite() error {
-	h.loop.requestClose(h.conn)
-	return nil
-}
-
-// markReplica tells the loop the connection is a replica's, which shutdown
-// drains instead of closing. registerReplicaPeer calls it before the replica's
-// feed starts pushing.
-func (h *eventConnHandle) markReplica() { h.conn.replica.Store(true) }
-
-// Asserted, since registerReplicaPeer finds markReplica by type assertion: a
-// renamed method would compile, and shutdown would close replicas undrained.
-var _ replicaMarker = (*eventConnHandle)(nil)
-
-// Asserted, since replication.Master.EndStreams finds CloseWrite by type assertion:
-// a renamed method would compile, and shutdown would skip an event-loop
-// replica's half-close and the wait for the replica to close, leaving its end of
-// stream to CloseAll's close request.
-var _ replication.StreamEnder = (*eventConnHandle)(nil)
 
 func sockaddrTCPAddr(sa syscall.Sockaddr) net.Addr {
 	switch sa := sa.(type) {

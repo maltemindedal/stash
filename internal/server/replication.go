@@ -18,10 +18,6 @@ import (
 // ExecuteResult describes the full set of RESP frames emitted by a command.
 type ExecuteResult struct {
 	Responses []protocol.Value
-	// RegisterReplica is set by PSYNC, which registered the client as a replica
-	// at its attach cut. The connection then starts the replica's feed
-	// (registerReplicaPeer) once Responses are ahead of anything it writes.
-	RegisterReplica bool
 }
 
 // SingleResponse wraps a standard single RESP value as an execution result.
@@ -36,82 +32,34 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 	return ExecuteResult{Responses: responses}
 }
 
-// replicaMarker is a connection that is told when it becomes a replica's: the
-// event loop's, which drains a replica on shutdown instead of closing it.
-type replicaMarker interface {
-	markReplica()
-}
+// A connection's Output is the Master's port to it once PSYNC has made the
+// connection a Replica's: a method renamed on either side is a compile error.
+var _ replication.Output = (*Output)(nil)
 
-// registerReplicaPeer starts the feed of the replica that PSYNC registered at its
-// attach cut (replication.Master.Start), once the full resync reply is ahead of
-// anything the feed writes on conn. The feed has queued every write since the
-// snapshot. When the replica was dropped while its reply was sent (its feed
-// refused a frame, past the backlog limit), it closes conn instead.
-func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
-	// Before the feed starts, so that the first frame it pushes is held to the
-	// replica's output limit, not a subscriber's.
-	s.getClientState(clientID).Output().MarkReplica()
-	if marker, ok := conn.(replicaMarker); ok {
-		marker.markReplica()
-	}
-	if !s.master.Start(clientID, conn) {
-		s.logger.Info("closing a replica dropped while its full resync was sent", "replica_id", clientID)
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close dropped replica", "replica_id", clientID, "error", err)
-		}
-		return
-	}
-
-	listeningPort := 0
-	if state := s.getClientState(clientID); state != nil {
-		listeningPort = state.ReplicaListeningPort()
-	}
-	s.logger.Info(
-		"replica registered",
-		"replica_id", clientID,
-		"remote_addr", conn.RemoteAddr().String(),
-		"listening_port", listeningPort,
-		"master_offset", s.master.Offset(),
-	)
-}
-
-// dropReplica removes a replica that can no longer be fed, logs why, and closes
-// it. It has to synchronise again from the start. It is the Master's drop
-// handler, so it is called with the Master's lock not held, and takes it. A
-// replica dropped while its full resync reply is being sent has no connection
-// here yet; its feed never starts, and registerReplicaPeer closes the
-// connection once the reply is sent.
+// replicaDropped logs a Replica the Master detached because its Output refused
+// a frame of the stream. It is the Master's dropped handler, so it is called
+// with the Master's lock not held. It closes nothing: the Output refused
+// because the connection is closed already, and the connection's teardown,
+// which then finds the Replica detached, follows.
 //
-// Only a replica that fell behind (replicaFellBehind) is logged as dropped. Any
-// other cause means its connection ended, because the replica left or the
+// Only a Replica that fell behind (replicaFellBehind) is logged as dropped. Any
+// other cause means its connection ended, because the Replica left or the
 // connection is being torn down, and it is logged as the connection's teardown
-// logs it (teardownClient), which finds it removed already.
-func (s *Server) dropReplica(id uint64, cause error) {
-	peer := s.master.Detach(id)
-	if peer == nil {
-		return
-	}
+// logs one it detaches itself (teardownClient).
+func (s *Server) replicaDropped(replica *replication.Replica, cause error) {
 	if replicaFellBehind(cause) {
-		s.logger.Warn("dropping a replica: it can no longer be fed the propagated stream", "replica_id", id, "error", cause)
-	} else {
-		s.logger.Info("replica disconnected", "replica_id", id, "listening_port", peer.ListeningPort, "error", cause)
-	}
-	if peer.Conn == nil {
+		s.logger.Warn("dropping a replica: it can no longer be fed the propagated stream", "replica_id", replica.ID, "error", cause)
 		return
 	}
-	if err := peer.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		s.logger.Debug("failed to close replica after propagation failure", "replica_id", id, "error", err)
-	}
+	s.logger.Info("replica disconnected", "replica_id", replica.ID, "listening_port", replica.ListeningPort, "error", cause)
 }
 
-// replicaFellBehind reports whether a replica's feed stopped because the replica
-// did not keep up: its queue passed its limit (replication.ErrReplicaBacklog, or
-// its connection's Push limit), or it accepted nothing for the stall timeout.
-// Anything else means its connection ended.
+// replicaFellBehind reports whether a Replica's Output was closed because the
+// Replica did not keep up: more of the stream waited for it than the Replica
+// Push limit allows, or it accepted nothing for the stall timeout. Anything
+// else means its connection ended.
 func replicaFellBehind(cause error) bool {
-	return errors.Is(cause, replication.ErrReplicaBacklog) ||
-		errors.Is(cause, errPushLimitExceeded) ||
-		errors.Is(cause, errReplicaStalled)
+	return errors.Is(cause, errPushLimitExceeded) || errors.Is(cause, errReplicaStalled)
 }
 
 // startReplicaLink keeps the replica attached to its master (replication.Follow) until ctx

@@ -2030,8 +2030,9 @@ func TestReplicationStructuredLogs(t *testing.T) {
 	}
 
 	// Two paths remove a replica that leaves, the connection's teardown and the
-	// replica's feed when a write finds the connection ended, and whichever runs
-	// first logs it as disconnected. Both have run when ListenAndServe returns.
+	// Master when a frame it pushes finds the connection closed, and whichever
+	// runs first logs it as disconnected. Both have run when ListenAndServe
+	// returns.
 	masterOutput := masterLogs.String()
 	for _, fragment := range []string{"replica registered", "requested replica acknowledgements", "replica acknowledged offset", "WAIT completed", "replica disconnected"} {
 		if !strings.Contains(masterOutput, fragment) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -143,6 +144,34 @@ func TestEventLoopSendsAPushHeldByARequestAfterItsReply(t *testing.T) {
 	want := "+OK\r\n" + pushOrderMessage
 	if got := readSent(t, clientFD); got != want {
 		t.Fatalf("client received %q, want %q", got, want)
+	}
+}
+
+// TestEventLoopSendsAWritePropagatedDuringAFullResyncAfterItsReply runs a
+// request that attaches its connection as a Replica, as PSYNC does on the
+// loop, and has a write propagated before the request has replied, as an
+// expiry DEL is from the goroutine that sweeps. The attach cut told the
+// connection's Output to hold what is pushed to it, so the write reaches the
+// socket after the FULLRESYNC reply and the snapshot.
+func TestEventLoopSendsAWritePropagatedDuringAFullResyncAfterItsReply(t *testing.T) {
+	loop, conn, clientFD := newHandDrivenEventLoop(t)
+
+	var reply []protocol.Value
+	conn.run = func(context.Context, protocol.Value) ([]protocol.Value, error) {
+		attachment := attachWithoutCut(loop.srv.master, replication.Candidate{ID: conn.clientID, Out: conn.out})
+		loop.srv.master.Propagate([]byte(fullResyncStreamFrame), false)
+		reply = attachment.Reply()
+		return reply, nil
+	}
+	if err := conn.machine.Feed([]byte(pingFrame)); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	loop.processConn(conn)
+	loop.applyQueuedWork() // the loop's next iteration
+
+	want := encodedReply(t, reply) + fullResyncStreamFrame
+	if got := readSent(t, clientFD); got != want {
+		t.Fatalf("the replica was sent %q, want the full resync reply and then the write: %q", got, want)
 	}
 }
 

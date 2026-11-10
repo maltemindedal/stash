@@ -5,6 +5,7 @@ package server
 import (
 	"errors"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -113,5 +114,58 @@ func TestEventLoopKeepsAReplicaThatTakesItsStream(t *testing.T) {
 	}
 	if received == 0 {
 		t.Fatal("the replica received nothing")
+	}
+}
+
+// TestEventLoopEndsAReplicasStreamOnceWhatIsQueuedIsWritten ends a Replica's
+// stream through its Output while the loop drains, as shutdown does
+// (replication.Master.EndStreams). The loop writes what is queued for the
+// Replica, shuts only the write side, so that the Replica reads the end of
+// the stream, and keeps the connection until the Replica closes its own side.
+// Closed outright, an acknowledgement the Replica sent meanwhile would draw a
+// reset that discards what it had not read yet.
+func TestEventLoopEndsAReplicasStreamOnceWhatIsQueuedIsWritten(t *testing.T) {
+	tests := []struct {
+		name   string
+		queued string
+	}{
+		{name: "with output still queued", queued: pushOrderMessage},
+		{name: "with nothing queued"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			loop, conn, clientFD := newHandDrivenEventLoop(t)
+			conn.out.MarkReplica()
+			loop.draining = true // the server is shutting down
+
+			if tt.queued != "" && !conn.out.Push([]byte(tt.queued)) {
+				t.Fatalf("Push() = false, want the stream queued: %v", conn.out.Err())
+			}
+			conn.out.EndStream()
+			// One iteration writes what is queued and finds the stream ended,
+			// the next shuts the write side.
+			loop.applyQueuedWork()
+			loop.applyQueuedWork()
+
+			if got := readSent(t, clientFD); got != tt.queued {
+				t.Fatalf("the replica was sent %q before the end of its stream, want %q", got, tt.queued)
+			}
+			if n, err := syscall.Read(clientFD, make([]byte, 1)); n != 0 || err != nil {
+				t.Fatalf("reading past the stream = (%d, %v), want its end: the write side was not shut", n, err)
+			}
+			if loop.conns[conn.fd] != conn {
+				t.Fatal("the loop closed the connection before the replica closed its own side")
+			}
+
+			if err := syscall.Shutdown(clientFD, syscall.SHUT_WR); err != nil {
+				t.Fatalf("Shutdown(client) error = %v", err)
+			}
+			loop.connReadable(conn)
+			if loop.conns[conn.fd] != nil {
+				t.Fatal("the loop still has the connection after the replica closed its side, want it closed")
+			}
+		})
 	}
 }
