@@ -386,7 +386,7 @@ func (s *benchStream) Active() bool { return true }
 // append-only file under everysec, through Handle: ordered, its command frames
 // recorded to the file and handed to the replicas, and its locks given back.
 // "stream" hands the frames to a stand-in for one attached replica; "no stream"
-// to a replica registry with no replica, which only counts them. Each goroutine
+// to a Master with no replica, which only counts them. Each goroutine
 // writes its own key, so writers spread over the stripes.
 func BenchmarkSequencedWrite(b *testing.B) {
 	for _, withStream := range []bool{false, true} {
@@ -405,7 +405,7 @@ func BenchmarkSequencedWrite(b *testing.B) {
 				}
 			}()
 			executor := newTestExecutorWith(func(s *server.Services) {
-				var stream record.Stream = server.NewReplicaStream(s.Replication, s.Replicas, s.Logger)
+				var stream record.Stream = s.Master
 				if withStream {
 					stream = &benchStream{buf: make([]byte, 0, 1<<20)}
 				}

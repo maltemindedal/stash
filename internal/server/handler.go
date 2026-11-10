@@ -11,6 +11,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 )
 
 func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net.Conn) {
@@ -56,7 +57,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	stopClose := context.AfterFunc(ctx, func() {
 		// A replica's connection stays open while shutdown sends it what is
-		// queued for it (ReplicaRegistry.StopFeeds, EndStreams), and shutdown
+		// queued for it (replication.Master.StopFeeds, EndStreams), and shutdown
 		// closes it after that (ClientRegistry.CloseAll).
 		if state.IsReplica() {
 			return
@@ -145,13 +146,13 @@ type outputConn struct {
 }
 
 // CloseWrite ends the stream to a replica once everything queued for it has
-// been written (ReplicaRegistry.EndStreams).
+// been written (replication.Master.EndStreams).
 func (c *outputConn) CloseWrite() error {
 	c.out.EndStream()
 	return nil
 }
 
-var _ streamEnder = (*outputConn)(nil)
+var _ replication.StreamEnder = (*outputConn)(nil)
 
 // authTimeoutApplies reports whether a new connection must authenticate within
 // the configured time: only where a password is required and a timeout is set.

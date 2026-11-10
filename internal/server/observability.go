@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/replication"
 )
 
 // Stats is a snapshot of server-level state used by INFO.
@@ -17,23 +18,12 @@ type Stats struct {
 	MasterReplicationID string
 	MasterOffset        int64
 	ReplicaOffset       int64
-	Replicas            []ReplicaInfo
+	Replicas            []replication.ReplicaInfo
 	// AOFEnabled reports whether an append-only file is being written, and
 	// AOFLastWriteOK whether its most recent write and fsync succeeded (true when
 	// there is no AOF).
 	AOFEnabled     bool
 	AOFLastWriteOK bool
-}
-
-// ReplicaInfo describes one connected replica peer for INFO replication.
-type ReplicaInfo struct {
-	ID            uint64
-	ListeningPort int
-	// AckedMasterOffset is how far the replica has acknowledged the stream, in
-	// the master's offsets as Redis reports it: 0 until it first acknowledges.
-	// The replica's own acknowledged offset, which counts from zero when it
-	// attached, is ReplicaPeer.AckOffset.
-	AckedMasterOffset int64
 }
 
 type observedCommand struct {

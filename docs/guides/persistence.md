@@ -44,6 +44,8 @@ Background append only file rewriting started
 
 The rewrite runs in the background. It snapshots live durable state, writes the smallest equivalent command stream, and atomically swaps the new file into place. Writes continue during the rewrite. A list, set, hash, or sorted set with more than 1,024 values is written as several commands, so the rewritten file stays loadable however large the collection grows.
 
+A replica rewrites its file on its own after every full resync, because the resync replaces the dataset the file describes. See [A replica with an append-only file](replication.md#a-replica-with-an-append-only-file).
+
 ## Understand the AOF/RDB precedence
 
 When both `--aof` and `--rdb` are set and the AOF file exists and is non-empty, the AOF wins and RDB loading is skipped. The server logs this decision:
@@ -109,7 +111,7 @@ truncate -s 88213 appendonly.aof           # drop the damaged command and everyt
 
 That loses every write from the damaged command onward. If they matter, repair the copy by hand instead, or restore from a backup.
 
-A command that replay refuses stops startup the same way, with the error the command returned. Stash writes only commands that replay, but a file edited by hand can hold one that does not, such as `REPLCONF GETACK`, which only a master's replication stream may send:
+A command that replay refuses stops startup the same way, with the error the command returned. Stash writes only commands that replay, but a file edited by hand can hold one that does not, such as `REPLCONF GETACK`, which a master sends its replicas and a replica answers on its link without running it as a command:
 
 ```
 server: load aof "appendonly.aof": aof: replay command 2 from "appendonly.aof": syntax error

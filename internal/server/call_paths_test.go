@@ -35,7 +35,7 @@ type recordedCall struct {
 
 func (r *recordingExecutor) Handle(_ context.Context, call Call, request protocol.Value) (ExecuteResult, error) {
 	r.mu.Lock()
-	r.calls = append(r.calls, recordedCall{command: replicationCommandName(request), call: call})
+	r.calls = append(r.calls, recordedCall{command: commandName(request), call: call})
 	r.mu.Unlock()
 
 	return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
@@ -246,4 +246,17 @@ func sendPing(t *testing.T, addr string) {
 	if _, err := protocol.NewParser(conn).Parse(); err != nil {
 		t.Fatalf("Parse(PING reply) error = %v", err)
 	}
+}
+
+// commandName is the name of a request, in upper case.
+func commandName(request protocol.Value) string {
+	array, ok := request.(protocol.Array)
+	if !ok || len(array.Elements) == 0 {
+		return ""
+	}
+	name, err := protocol.Bytes(array.Elements[0])
+	if err != nil {
+		return ""
+	}
+	return strings.ToUpper(string(name))
 }

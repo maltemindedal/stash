@@ -12,7 +12,7 @@ flowchart LR
     X -->|read/write| ST[internal/storage]
     X -->|Write| REC[internal/record]
     REC -->|command frames| A[internal/aof]
-    REC -->|command frames| R[Replicas]
+    REC -->|command frames| R[internal/replication]
     ST -->|snapshot| D[internal/rdb]
 ```
 
@@ -43,12 +43,12 @@ Current responsibilities:
 - replay RESP command streams on startup before the listener opens
 - append successful mutating commands in RESP form
 - apply `appendfsync` policies (`always`, `everysec`, `no`)
-- rewrite the current durable state in the background for `BGREWRITEAOF`: it takes a keyspace image from the store (`storage.Image`) and writes the image's recreation commands as RESP, without knowing a value kind, how a collection is split into commands, or how a TTL is written
+- rewrite the current durable state in the background for `BGREWRITEAOF`: it takes a keyspace image from the store (`storage.Image`) and writes the image's recreation commands as RESP, without knowing a value kind, how a collection is split into commands, or how a TTL is written. A Replica asks for one after a full resync (`RequestRewrite`), which runs once more after a rewrite that was already in flight
 - write a keyspace image into a missing or empty file (`SeedFile`), or the file a symbolic link at the path leads to, by the same temp-file, fsync and rename steps as the rewrite
 
 ### `internal/record`
 
-Decides where the command frames of an applied write go, and what a failed append does. It is a leaf: it imports `internal/protocol` and the standard library, and reaches the AOF and the replicas only through two ports, `Log` (`*aof.Writer`) and `Stream` (`server.ReplicaStream`).
+Decides where the command frames of an applied write go, and what a failed append does. It is a leaf: it imports `internal/protocol` and the standard library, and reaches the AOF and the replicas only through two ports, `Log` (`*aof.Writer`) and `Stream` (`*replication.Master`).
 
 Current responsibilities:
 
@@ -57,6 +57,21 @@ Current responsibilities:
 - apply one table to a failed append: under `always` a client's write is withheld (answered `ERR persistence failure`, not propagated) and so is the server's own; under `everysec` and `no` the failure is logged and the write still propagated; for the Master's frames it is returned, and the link ends
 - report whether anything records writes (`Records`): an AOF open, or a replica attached or attaching
 - encode each command frame once, into a pooled buffer: when every frame goes to the same places, the AOF and the stream are handed the same bytes, and otherwise each payload is assembled from the frames already encoded. `Log` and `Stream` copy what they keep, so the buffer is reused as soon as `Record` returns
+
+### `internal/replication`
+
+Both ends of a replication link. It imports `internal/protocol`, `internal/rdb` and `internal/storage`, and knows nothing of the server's connections or the command executor: a replica's connection is an `Output` to write the stream to and an `io.Closer`, the sequencer's attach cut is a function `Attach` is given, and a Replica's Store is the two-method `ReplicaStore`.
+
+Current responsibilities:
+
+- `Master`, the component through which a Master serves its Replicas: it counts the replication offset and queues each frame for every Replica as one step (`Propagate`, which makes it the `record.Stream`), and gives each Replica a feed of its own, a queue a goroutine writes to the Replica's connection, so that a slow Replica holds up no writer. A Replica more than 256 MiB behind, counting the writes made while its full resync was sent, is dropped
+- attach a Replica at one attach cut (`Attach`): switch recording on, copy the string keyspace and register the Replica under the sequencer's cut, encode the RDB after it, and return the `FULLRESYNC` reply; the feed queues from the cut and writes from `Start`, which the server calls once the reply is ahead of it
+- keep each Replica's base offset, the Master's offset at its cut, and translate what it acknowledges, which counts from zero, into the Master's offsets (`Ack`, `Acked`, `Info`)
+- run `WAIT`'s wait (`Await`): send `REPLCONF GETACK *`, then wait, holding no lock, for enough acknowledgements, the timeout or the caller's context
+- detach a Replica by one path (`Detach`), whoever notices first that it left
+- drain at shutdown: stop queueing, let each feed write what it holds, shut the sending side and wait for the Replica to close (`StopFeeds`, `EndStreams`, `WaitFeeds`)
+- `Link`, a Replica's side, over any `io.ReadWriter`: the handshake (`PING`, `AUTH`, `REPLCONF listening-port`, `PSYNC`), the full resync into the Store, then each command of the stream. It counts the Replica's offset and answers `REPLCONF GETACK` itself
+- `Follow`, which keeps a `Link` attached: it dials, runs the link, and redials after a wait that doubles from one second to thirty and starts over after a completed handshake, until its context is cancelled. The dial and the wait are parameters, so its tests take no time
 
 ### `internal/protocol`
 
@@ -93,11 +108,11 @@ Current responsibilities:
 
 Translates RESP arrays into executable requests and dispatches them to handlers.
 
-`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog, replicas), the replication offsets, the password `AUTH` verifies, the server's INFO snapshot and AOF rewrite, and the `record.Recorder`, whose `Records` tells the sequencer whether anything records writes. It refuses a `Services` with a collaborator missing, naming the field.
+`command.New` builds the executor from the `server.Services` the server passes it: the store, the logger, the registries the server owns (WATCH, pub/sub, Slowlog), the `replication.Master` that serves the replicas, the password `AUTH` verifies, the server's INFO snapshot and AOF rewrite, and the `record.Recorder`, whose `Records` tells the sequencer whether anything records writes. It refuses a `Services` with a collaborator missing, naming the field.
 
 A handler passes its request's effects to every Store write as the write's `storage.Changes`. Each change invalidates `WATCH` on its key while the request still holds its ordering, so no handler says which writes do. The keys the write removed on its own, by its sweep or to make room, become a `DEL` after the command's own frame in the same `record.Write`, at most 1,024 keys in each, so inside `EXEC` an eviction stays between the queued command that caused it and the next one. A command that fails, such as a write refused for memory, still records the `DEL` of the keys its sweep removed.
 
-The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (`record.Origin`: a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog, and only the Master's stream may answer `REPLCONF GETACK`. A Call without an Origin or with the server's own (`OriginServer`, for evictions the server makes outside any request), a client request without its Client state, and a Master or replay request that carries one are refused.
+The server runs each request through `Handle` with a `server.Call`: the request's **Origin** (`record.Origin`: a client, the Master's replication stream, or AOF replay), the client's Client state, and whether it runs inline on the event loop. The executor copies the Call onto the request, where handlers read it; no request state travels in the context. The Origin alone decides what a request may do: only a client's request needs `AUTH`, is propagated to replicas and is recorded in the Slowlog. A Replica's link answers its Master's `REPLCONF GETACK` itself, before the executor sees it, so the executor refuses that subcommand from every Origin. A Call without an Origin or with the server's own (`OriginServer`, for evictions the server makes outside any request), a client request without its Client state, and a Master or replay request that carries one are refused.
 
 Implemented commands cover strings, bitmaps, HyperLogLog, hashes, lists, sets, sorted sets, geospatial data, streams, transactions, pub/sub, replication handshakes, `WAIT`, `BGREWRITEAOF`, `INFO`, `SLOWLOG`, and `MONITOR`. The `commandSpecs` table registers each command with its handler, argument validator, and replication and durability flags. The [command reference](../reference/commands.md) documents that table for users.
 
@@ -112,7 +127,7 @@ Current responsibilities:
 - accept client connections in a loop
 - spawn one goroutine per client (default networking mode), which queues each reply in the connection's Client output and sends the queue just before it would wait for more input, or once 4 KiB is waiting, so a client that pipelines requests gets its replies in as few writes as the requests arrived in
 - send everything a connection receives through its one Client output (`Output` in `output.go`), in both networking modes: the replies to its own requests and what other connections push to it (below)
-- parse → execute → respond for each request, with a `Call` each networking mode builds once per connection (an event-loop connection's runs inline); the replica link passes the Master's Origin, and AOF replay the replay Origin, ordered like any request
+- parse → execute → respond for each request, with a `Call` each networking mode builds once per connection (an event-loop connection's runs inline); a Replica runs its link to the Master through `replication.Follow`, adapting the Store and the executor to the link's `ReplicaStore`, so each command of the stream runs with the Master's Origin, and AOF replay the replay Origin, ordered like any request
 - answer a request it cannot parse with one error and close the connection, because the byte stream cannot be resynchronized (both networking modes)
 - close a connection that has not authenticated within `--auth-timeout` when a password is required (a read deadline in the default mode, a timer that asks the loop to close in event-loop mode)
 - hold a client that has not authenticated to small frames (arrays of at most 10 elements, bulk strings of at most 16 KiB) when a password is required; in event-loop mode the connection decodes one request at a time until then, so a request behind an `AUTH` is decoded under the limits in force after it
@@ -121,11 +136,12 @@ Current responsibilities:
 - maintain an active connection registry for shutdown
 - load startup persistence (RDB and/or AOF) before accepting TCP connections, and write the keys an RDB snapshot loaded into a missing or empty AOF before opening it, since every later start loads the AOF and skips the RDB snapshot
 - append a `DEL` of the keys the startup `--maxmemory` pass evicts to the AOF, fsynced, before accepting TCP connections, and refuse to start if that append fails
-- build the `record.Recorder`, give it the AOF writer once the file is open and a `ReplicaStream` over the replica registry, and pass it to the executor, which records each write through it, a Background unit's `DEL`s included, as the server's own writes
+- build the `record.Recorder`, give it the AOF writer once the file is open and the `replication.Master` as its stream, and pass it to the executor, which records each write through it, a Background unit's `DEL`s included, as the server's own writes
 - maintain monitor and slowlog registries for operational visibility
 - expose server stats used by `INFO`
 - stop cleanly when the process receives `SIGINT` or `SIGTERM`; a second signal ends the process immediately with the default action, which abandons a shutdown that is stuck
-- on shutdown, stop handing writes to the replicas and give them up to a second to take what is queued for them: the default mode's handlers leave a replica's connection open when the context is cancelled, and the event loop keeps serving the replicas (below). Once a replica's stream has reached its socket, shutdown shuts only the sending side (`ReplicaRegistry.EndStreams`) and waits for the replica to close its own, because closing the socket with data still in the kernel's send queue lets the replica's next acknowledgement reset the connection and discard that data. `ListenAndServe` returns only once every replica's feed goroutine has ended (`ReplicaRegistry.WaitFeeds`), so nothing a feed logs comes after it
+- on shutdown, stop handing writes to the replicas and give them up to a second to take what is queued for them: the default mode's handlers leave a replica's connection open when the context is cancelled, and the event loop keeps serving the replicas (below). Once a replica's stream has reached its socket, shutdown shuts only the sending side (`replication.Master.EndStreams`) and waits for the replica to close its own, because closing the socket with data still in the kernel's send queue lets the replica's next acknowledgement reset the connection and discard that data. `ListenAndServe` returns only once every replica's feed goroutine has ended (`replication.Master.WaitFeeds`), so nothing a feed logs comes after it
+- on a Replica, replace the keyspace with each full resync's snapshot as a Background unit, and then have the AOF rewritten from it (`aof.Writer.RequestRewrite`), since the file holds the history of the keyspace it replaced
 - stop, returning the error, when the accept loop fails with an error that is not temporary; a Replica's link to its Master ends with the server
 
 ### `test`
@@ -177,7 +193,7 @@ The command executor therefore has a sequencer. Every request holds a read-write
 
 `PSYNC` attaches a replica at one moment, its attach cut, so that every write is in exactly one of the snapshot the replica is sent and the stream that follows it. It switches ordering on while holding the read-write lock exclusive for a moment, which waits for any write that skipped its stripes, and then holds the lock shared and every stripe while it copies the snapshot and registers the replica. Writers wait for the copy, as they already waited for the store's shard locks it takes, and readers keep running; encoding the RDB happens after. The new replica's queue collects every write from then on, but its connection starts sending them only once the full resync reply is ahead of them. Because `EXEC` holds the lock exclusive, which the cut would wait for, `PSYNC` is refused inside `MULTI`. After `PSYNC`, the connection carries the stream alone: the request pipeline both networking modes share runs what the replica sends, such as its acknowledgements, and drops the replies, and a frame that cannot be parsed closes the connection without an error reply, so that no reply can land among the stream's frames. No push can either: `MONITOR` from a replica is ignored, and `SUBSCRIBE` from one makes the executor return `server.ErrCloseConnection`, on which both networking modes close the connection.
 
-Writers on different stripes, and the `REPLCONF GETACK` that `WAIT` sends, still hand frames to the replicas at the same time. Counting a frame's replication offset and queueing it for every replica therefore happen under one replica registry lock, taken after the stripes, so that each replica receives the stream in the order its offsets were counted: a replica that acknowledges an offset has every frame that ends at or before it, which `WAIT` relies on. The lock covers adding to the offset and copying the frame into each replica's queue, not executing the command or writing to a socket. Registering a replica, at its attach cut, reads the master offset under the same lock, as the replica's base: the replica is sent exactly the frames counted after it and counts its own offset from zero, so its base plus what it acknowledges is its position in the master's offsets, which `WAIT` compares with a client's last write. While no replica is registered, a client write's frames are only counted, without the registry lock: the attach cut registers a replica only when no write sits between being applied and having its frames counted, so each write is counted either at or below the new replica's base, with its effect in the snapshot, or after the replica is registered, when it takes the lock. The `GETACK`, which holds no sequencer lock, always takes it, and so do the `DEL`s of a Background unit, which the Recorder never propagates as ordered.
+Writers on different stripes, and the `REPLCONF GETACK` that `WAIT` sends, still hand frames to the replicas at the same time. Counting a frame's replication offset and queueing it for every replica therefore happen under one lock, the `Master`'s, taken after the stripes, so that each replica receives the stream in the order its offsets were counted: a replica that acknowledges an offset has every frame that ends at or before it, which `WAIT` relies on. The lock covers adding to the offset and copying the frame into each replica's queue, not executing the command or writing to a socket. Registering a replica, at its attach cut, reads the master offset under the same lock, as the replica's base: the replica is sent exactly the frames counted after it and counts its own offset from zero, so its base plus what it acknowledges is its position in the master's offsets, which `WAIT` compares with a client's last write. While no replica is registered, a client write's frames are only counted, without the `Master`'s lock: the attach cut registers a replica only when no write sits between being applied and having its frames counted, so each write is counted either at or below the new replica's base, with its effect in the snapshot, or after the replica is registered, when it takes the lock. The `GETACK`, which holds no sequencer lock, always takes it, and so do the `DEL`s of a Background unit, which the Recorder never propagates as ordered.
 
 A blocking command (`BLPOP`, `WAIT`) waits with nothing held and takes the locks only for each attempt; inside a transaction it does not wait at all.
 

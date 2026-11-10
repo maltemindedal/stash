@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -359,6 +360,93 @@ func TestLastWriteOKOnNilWriter(t *testing.T) {
 	var writer *Writer
 	if !writer.LastWriteOK() {
 		t.Fatal("(*Writer)(nil).LastWriteOK() = false, want true: no AOF is not a failing AOF")
+	}
+}
+
+// TestARewriteRequestedWhileOneIsInFlightRunsAgainOnTheNewKeyspace replaces the
+// keyspace, as a Replica's full resync does, after a running rewrite has copied
+// the old one, and then requests a rewrite. The running rewrite would leave the
+// old keyspace in the file, and BeginRewrite would refuse to start another, so
+// RequestRewrite has one start when it ends: the file ends up holding the new
+// keyspace alone. A request with no rewrite in flight starts one at once.
+func TestARewriteRequestedWhileOneIsInFlightRunsAgainOnTheNewKeyspace(t *testing.T) {
+	tests := []struct {
+		name     string
+		inFlight bool
+	}{
+		{name: "a rewrite has already copied the old keyspace", inFlight: true},
+		{name: "no rewrite is in flight"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "appendonly.aof")
+			writer, err := OpenWriter(context.Background(), path, PolicyAlways, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatalf("OpenWriter() error = %v", err)
+			}
+			defer func() {
+				if err := writer.Close(); err != nil {
+					t.Errorf("Close() error = %v", err)
+				}
+			}()
+
+			store := storage.NewStore()
+			if err := store.Set(nil, "old", []byte("1"), 0); err != nil {
+				t.Fatalf("Set() error = %v", err)
+			}
+			if _, err := writer.Append([]byte("*3\r\n$3\r\nSET\r\n$3\r\nold\r\n$1\r\n1\r\n")); err != nil {
+				t.Fatalf("Append() error = %v", err)
+			}
+
+			// The guard's release runs right after a rewrite's snapshot. The first
+			// one waits there until the test lets it go.
+			copied := make(chan struct{})
+			proceed := make(chan struct{})
+			var first sync.Once
+			writer.SetRewriteGuard(func() (release func()) {
+				return func() {
+					first.Do(func() {
+						close(copied)
+						<-proceed
+					})
+				}
+			})
+
+			if tt.inFlight {
+				if err := writer.BeginRewrite(context.Background(), store); err != nil {
+					t.Fatalf("BeginRewrite() error = %v", err)
+				}
+				<-copied
+			}
+
+			replacement := storage.NewStore()
+			if err := replacement.Set(nil, "fresh", []byte("2"), 0); err != nil {
+				t.Fatalf("Set() error = %v", err)
+			}
+			store.ReplaceWith(nil, replacement)
+			if err := writer.RequestRewrite(context.Background(), store); err != nil {
+				t.Fatalf("RequestRewrite() error = %v", err)
+			}
+			close(proceed)
+
+			want := "*3\r\n$3\r\nSET\r\n$5\r\nfresh\r\n$1\r\n2\r\n"
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("ReadFile() error = %v", err)
+				}
+				if string(got) == want {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("append-only file after the requested rewrite = %q, want the new keyspace alone, %q", got, want)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
 	}
 }
 

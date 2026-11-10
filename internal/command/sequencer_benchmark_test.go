@@ -48,7 +48,7 @@ func BenchmarkSequencedSetUnderMaxMemory(b *testing.B) {
 					log = writer
 				}
 				executor := newTestExecutorWith(func(s *server.Services) {
-					var stream record.Stream = server.NewReplicaStream(s.Replication, s.Replicas, s.Logger)
+					var stream record.Stream = s.Master
 					if !sink.aof {
 						stream = &benchStream{buf: make([]byte, 0, 1<<20)}
 					}

@@ -17,7 +17,7 @@ import (
 // newLoggingExecutor builds an executor that records to log.
 func newLoggingExecutor(log record.Log) *Executor {
 	return newTestExecutorWith(func(s *server.Services) {
-		s.Recorder = record.New(server.NewReplicaStream(s.Replication, s.Replicas, s.Logger), s.Logger)
+		s.Recorder = record.New(s.Master, s.Logger)
 		s.Recorder.SetLog(log)
 	})
 }

@@ -71,7 +71,9 @@ internal/
   protocol/         RESP parsing and encoding
   storage/          sharded key/value store, TTL and memory-pressure eviction
   command/          command decoding, validation, and dispatch
-  server/           TCP listener, connection lifecycle, replication
+  record/           where an applied write's command frames go
+  replication/      the Master's replicas and stream, and the Replica's link
+  server/           TCP listener, connection lifecycle, and request loop
   aof/              append-only-file replay, writing, and rewrite
   rdb/              RDB loading and snapshot writing
 test/               end-to-end integration tests over real TCP

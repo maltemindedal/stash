@@ -1,33 +1,23 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	cryptorand "crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"math"
 	"net"
 	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
 // ExecuteResult describes the full set of RESP frames emitted by a command.
 type ExecuteResult struct {
-	Responses       []protocol.Value
-	UpstreamReplies []protocol.Value
+	Responses []protocol.Value
 	// RegisterReplica is set by PSYNC, which registered the client as a replica
 	// at its attach cut. The connection then starts the replica's feed
 	// (registerReplicaPeer) once Responses are ahead of anything it writes.
@@ -46,603 +36,6 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 	return ExecuteResult{Responses: responses}
 }
 
-// ReplicationState stores process-wide replication metadata.
-type ReplicationState struct {
-	MasterReplicationID string
-	masterOffset        atomic.Int64
-	replicaOffset       atomic.Int64
-}
-
-// ReplicaPeer describes a replica connection attached to a master.
-type ReplicaPeer struct {
-	ID uint64
-	// Conn is the replica's connection. It is nil from the attach cut until the
-	// replica's feed starts (ReplicaRegistry.Start), while its full resync reply
-	// is being sent; Start sets it under the registry lock while the peer is
-	// registered, so a peer that Remove returned is read without the lock.
-	Conn          ClientConn
-	ListeningPort int
-	// AckOffset is the latest replication offset the replica acknowledged, in its
-	// own count: the bytes of the stream it has processed since it was registered.
-	// It is written under the registry lock but read through the peers Snapshot
-	// returns, so it is atomic.
-	AckOffset atomic.Int64
-
-	// baseOffset is the master's replication offset when the replica was
-	// registered. The replica is sent every frame counted after that and counts
-	// from zero, so its acknowledged offset in the master's count is
-	// baseOffset+AckOffset. It is set before the peer enters the registry and
-	// never changes.
-	baseOffset int64
-
-	writer encodedReplicaWriter
-	feed   *replicaFeed
-}
-
-type encodedReplicaWriter interface {
-	WriteEncoded([]byte) error
-}
-
-type propagationReport struct {
-	attempted   int
-	succeeded   int
-	failed      int
-	payloadSize int
-	endOffset   int64
-}
-
-// WriteEncoded queues a pre-encoded RESP payload for the replica, which the peer's
-// feed writes to its socket in order. It does not wait for the socket, and fails
-// only if the replica is gone or has fallen too far behind.
-func (p *ReplicaPeer) WriteEncoded(payload []byte) error {
-	if p == nil || p.writer == nil || p.feed == nil {
-		return fmt.Errorf("replica response writer unavailable")
-	}
-
-	return p.feed.enqueue(payload)
-}
-
-// send hands one stretch of the stream to the replica's connection, whose
-// Output writes it and drops a replica that does not take it in time.
-func (p *ReplicaPeer) send(chunk []byte) error {
-	return p.writer.WriteEncoded(chunk)
-}
-
-// ReplicaRegistry tracks replica peers connected to a master server.
-//
-// Its lock comes after the command sequencer's gate and write stripes, and before
-// a replica feed's lock: lock order is gate, stripes, mu, feed. While holding mu
-// the registry takes no gate, stripe or shard lock, and calls no handler, since
-// the feed-error handler takes mu itself. PSYNC's attach cut takes mu under the
-// gate (BeginAttach) and under every stripe (Reserve), in that order.
-//
-// A client write's frames skip mu while no replica is registered
-// (PropagateOrdered): the attach cut orders them against Reserve instead. Every
-// other frame takes it (Propagate).
-type ReplicaRegistry struct {
-	mu       sync.RWMutex
-	replicas map[uint64]*ReplicaPeer
-	// feeds counts the feed goroutines Start started and that have not yet
-	// returned from their feed-error handler (WaitFeeds).
-	feeds sync.WaitGroup
-	// registered is len(replicas), stored under mu whenever it changes, so that
-	// PropagateOrdered can find out without mu that no replica is registered.
-	registered atomic.Int64
-	changed    chan struct{}
-	// attaching counts the replicas between BeginAttach and their Reserve or
-	// EndAttach, which Active counts as replicas already.
-	attaching int
-	// stopping is set by StopPropagating once the server is shutting down and
-	// drains what each feed holds. Propagate then counts frames but queues them
-	// for no replica: a feed closed for the drain would refuse them, and the
-	// refusal would drop the replica and close its socket in the middle of the
-	// drain.
-	stopping bool
-
-	// onFeedError is called, with mu not held, when a replica can no longer be
-	// fed: on the feed's own goroutine when a write to its socket fails, and on
-	// the propagating goroutine when its feed refuses a frame (Propagate).
-	onFeedError func(id uint64, err error)
-}
-
-// replicaRefusal is a replica that refused a frame Propagate queued, kept until
-// the registry lock is released so that it can be dropped.
-type replicaRefusal struct {
-	id  uint64
-	err error
-}
-
-func newReplicationState() *ReplicationState {
-	return &ReplicationState{MasterReplicationID: randomReplicationID()}
-}
-
-// MasterOffset reports the master's current logical replication offset.
-func (s *ReplicationState) MasterOffset() int64 {
-	if s == nil {
-		return 0
-	}
-
-	return s.masterOffset.Load()
-}
-
-// AdvanceMasterOffset increments the master's logical replication offset.
-func (s *ReplicationState) AdvanceMasterOffset(delta int64) int64 {
-	if s == nil || delta <= 0 {
-		return s.MasterOffset()
-	}
-
-	return s.masterOffset.Add(delta)
-}
-
-// ReplicaOffset reports the replica's processed upstream replication offset.
-func (s *ReplicationState) ReplicaOffset() int64 {
-	if s == nil {
-		return 0
-	}
-
-	return s.replicaOffset.Load()
-}
-
-// ResetReplicaOffset starts the replica's processed offset again from zero, as it
-// must when a full resynchronisation begins a new stream.
-func (s *ReplicationState) ResetReplicaOffset() {
-	if s == nil {
-		return
-	}
-
-	s.replicaOffset.Store(0)
-}
-
-// AdvanceReplicaOffset increments the replica's processed upstream replication offset.
-func (s *ReplicationState) AdvanceReplicaOffset(delta int64) int64 {
-	if s == nil || delta <= 0 {
-		return s.ReplicaOffset()
-	}
-
-	return s.replicaOffset.Add(delta)
-}
-
-// NewReplicaRegistry creates an empty registry of replica peers.
-func NewReplicaRegistry() *ReplicaRegistry {
-	return &ReplicaRegistry{replicas: make(map[uint64]*ReplicaPeer), changed: make(chan struct{})}
-}
-
-// BeginAttach records that a replica is attaching, so Active reports true until
-// the matching Reserve or EndAttach. A replica attaches in three steps, which
-// PSYNC takes:
-//
-//  1. BeginAttach, which PSYNC's attach cut calls while it holds the sequencer's
-//     gate exclusively. From then on Active is true, so every write that begins
-//     after it takes its write stripes, and the cut can wait for it.
-//  2. Reserve, inside the cut, right after the snapshot is copied: the replica is
-//     registered with a feed that queues every write after the snapshot, but does
-//     not write yet. It ends the attach; EndAttach ends one that fails before.
-//  3. Start, once the full resync reply is ahead of anything the feed writes on
-//     the connection: the feed starts writing.
-func (r *ReplicaRegistry) BeginAttach() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.attaching++
-}
-
-// EndAttach ends an attach that BeginAttach began and that will not reach Reserve.
-func (r *ReplicaRegistry) EndAttach() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.attaching--
-}
-
-// Active reports whether a replica is attached or attaching: whether anything
-// will send a write made now to a replica.
-func (r *ReplicaRegistry) Active() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.attaching > 0 || len(r.replicas) > 0
-}
-
-// Reserve registers a replica that BeginAttach began attaching, and ends that
-// attach. Its feed queues every frame Propagate counts from now on, so its base
-// offset is the master offset that offsets holds now, but writes nothing until
-// Start. PSYNC calls it inside its attach cut, right after copying the snapshot,
-// so every write is in exactly one of the snapshot and the replica's stream.
-func (r *ReplicaRegistry) Reserve(offsets *ReplicationState, id uint64, listeningPort int, writer encodedReplicaWriter) {
-	r.register(offsets, id, listeningPort, writer, true)
-}
-
-// Add registers a replica and starts its feed at once, outside any attach cut:
-// Reserve and Start in one step, for a replica that has no snapshot to order its
-// stream against, as in tests. The server attaches replicas through BeginAttach,
-// Reserve and Start. Outside the cut nothing orders Add against PropagateOrdered,
-// which may count a frame without the lock while no replica is registered, so Add
-// must not run while frames are propagated that way.
-func (r *ReplicaRegistry) Add(offsets *ReplicationState, id uint64, conn ClientConn, listeningPort int, writer encodedReplicaWriter) {
-	r.register(offsets, id, listeningPort, writer, false)
-	r.Start(id, conn)
-}
-
-func (r *ReplicaRegistry) register(offsets *ReplicationState, id uint64, listeningPort int, writer encodedReplicaWriter, endsAttach bool) {
-	peer := &ReplicaPeer{ID: id, ListeningPort: listeningPort, writer: writer, feed: newReplicaFeed(replicaFeedLimit)}
-
-	r.mu.Lock()
-	// Propagate counts and queues each frame under this lock, so the base splits
-	// the stream exactly: no frame counted before it is sent to the replica, and
-	// every frame counted after it is. Read before the lock, a frame counted in
-	// between would lie above the base without being sent, and the replica would
-	// fall that many bytes short of every later write; read after it, a frame
-	// could be sent and still lie below the base, and WAIT would count the
-	// replica for a write it has not acknowledged.
-	peer.baseOffset = offsets.MasterOffset()
-	previous := r.replicas[id]
-	r.replicas[id] = peer
-	r.registered.Store(int64(len(r.replicas)))
-	if endsAttach {
-		r.attaching--
-	}
-	r.notifyChangedLocked()
-	r.mu.Unlock()
-
-	if previous != nil {
-		previous.feed.close(0)
-	}
-}
-
-// Start sets the connection of a replica that Reserve registered and starts its
-// feed, which then writes what it queued since the attach cut and everything
-// after. The caller calls it once the full resync reply is ahead of anything the
-// feed writes on the connection. It reports false when the replica is no longer
-// registered, or its feed was closed, because it was dropped while its reply was
-// sent; the caller then closes conn.
-func (r *ReplicaRegistry) Start(id uint64, conn ClientConn) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	peer := r.replicas[id]
-	if peer == nil {
-		return false
-	}
-	onFeedError := r.onFeedError
-	r.feeds.Add(1)
-	stopped := func(err error) {
-		defer r.feeds.Done()
-		if err != nil && onFeedError != nil {
-			onFeedError(id, err)
-		}
-	}
-	// Set before the feed starts, so that a drop caused by its first write
-	// finds the connection to close.
-	peer.Conn = conn
-	if !peer.feed.start(peer.send, stopped) {
-		r.feeds.Done()
-		peer.Conn = nil
-		return false
-	}
-	return true
-}
-
-// WaitFeeds waits until the goroutine of every feed Start started has ended,
-// including the feed-error handler it called, so that nothing a feed does, such
-// as logging why its replica was dropped, comes after it returns. A feed ends
-// once its replica is removed or its connection closes, so the server calls it
-// once every connection has been torn down, before ListenAndServe returns.
-func (r *ReplicaRegistry) WaitFeeds() {
-	r.feeds.Wait()
-}
-
-// Propagate counts payload into the master's replication offset and queues it
-// for every replica, as one step under the registry lock. Two calls therefore
-// reach every replica in the order their offsets were counted, so a replica that
-// acknowledges offset N has every frame that ends at or before N, which WAIT
-// relies on. It returns the offset at which payload ends, how many replicas it
-// was queued for, and how many refused it.
-//
-// The lock is taken even when no replica is registered, so Propagate is safe
-// from any goroutine: a frame counted without it could lie above the base of a
-// replica registering at that moment and never be queued for it. A caller that
-// the command sequencer orders against PSYNC's attach cut uses PropagateOrdered,
-// which skips the lock then.
-//
-// Queueing only appends to each replica's feed, so the lock is held for copies,
-// never for a socket write. A replica whose feed refuses payload (it is closed,
-// or too far behind) is sent nothing after it, and is dropped once the lock is
-// released, through the feed-error handler, or by RemoveAndClose when none is
-// set. Once shutdown has begun (StopPropagating), Propagate only counts payload.
-func (r *ReplicaRegistry) Propagate(offsets *ReplicationState, payload []byte) (end int64, queued, refused int) {
-	// Refusals are rare, so the slice is only allocated when one happens.
-	var refusals []replicaRefusal
-
-	r.mu.Lock()
-	end = offsets.AdvanceMasterOffset(int64(len(payload)))
-	if r.stopping {
-		r.mu.Unlock()
-		return end, 0, 0
-	}
-	for id, peer := range r.replicas {
-		if err := peer.WriteEncoded(payload); err != nil {
-			// Close the feed so that it refuses every later frame as well. A
-			// smaller frame could otherwise still fit under the backlog limit
-			// before the replica is dropped, and reach the replica at a position
-			// other than the offset counted for it.
-			if peer.feed != nil {
-				peer.feed.close(0)
-			}
-			refusals = append(refusals, replicaRefusal{id: id, err: err})
-			continue
-		}
-		queued++
-	}
-	onFeedError := r.onFeedError
-	r.mu.Unlock()
-
-	// Both drop paths take the registry lock, so they run after it is released.
-	for _, refusal := range refusals {
-		if onFeedError != nil {
-			onFeedError(refusal.id, refusal.err)
-			continue
-		}
-		// With no handler there is nowhere to report a failed close; the server
-		// always sets one (dropReplica), which logs it.
-		_ = r.RemoveAndClose(refusal.id)
-	}
-
-	return end, queued, len(refusals)
-}
-
-// PropagateOrdered is Propagate for a client write's frames, whose caller the
-// command sequencer orders against PSYNC's attach cut: it holds the sequencer's
-// gate, and the stripes of the write whenever anything records writes, from
-// before the write is applied until this returns (the command executor records
-// a write before it releases them). While
-// no replica is registered it only counts payload into the master offset, without
-// the registry lock, and returns 0 for queued and refused.
-//
-// That is safe because a replica is registered (Reserve) only inside the attach
-// cut, which first waits, holding gate exclusively, for every write that skipped
-// its stripes, so that every later write takes them, and then holds every stripe.
-// Such a call therefore either returned before the cut, so its frame lies at or
-// below the replica's base and its write is in the snapshot, or begins after the
-// cut and finds the replica registered, taking the lock. A frame the sequencer
-// does not order that way, such as WAIT's REPLCONF GETACK or an expiry DEL that a
-// replica's full resync publishes, goes through Propagate.
-func (r *ReplicaRegistry) PropagateOrdered(offsets *ReplicationState, payload []byte) (end int64, queued, refused int) {
-	if r.registered.Load() == 0 {
-		return offsets.AdvanceMasterOffset(int64(len(payload))), 0, 0
-	}
-	return r.Propagate(offsets, payload)
-}
-
-// SetFeedErrorHandler registers what happens when writing a replica's stream
-// fails: the server drops the replica.
-func (r *ReplicaRegistry) SetFeedErrorHandler(handler func(id uint64, err error)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.onFeedError = handler
-}
-
-// StopPropagating makes Propagate queue nothing more for any replica, and
-// returns how many replicas are registered. Frames are still counted. The server
-// calls it when shutdown begins: a write made from then on reaches no replica,
-// which has to synchronise again from the start anyway, and no replica is
-// dropped for it while its feed drains.
-func (r *ReplicaRegistry) StopPropagating() (replicas int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.stopping = true
-	return len(r.replicas)
-}
-
-// StopFeeds stops propagating (StopPropagating), gives every replica's feed up to
-// grace to write what is queued for it and then stops them, returning how many
-// had not finished. The server calls it on shutdown, before it closes the
-// sockets, so that commands already propagated are not lost to a graceful stop.
-// A feed that has not started, because its replica is still being sent its full
-// resync, is stopped without waiting: that replica has to synchronise again from
-// the start anyway.
-func (r *ReplicaRegistry) StopFeeds(grace time.Duration) (unfinished int) {
-	r.StopPropagating()
-	peers := r.Snapshot()
-	deadline := time.Now().Add(grace)
-	for _, peer := range peers {
-		if peer.feed != nil && !peer.feed.close(time.Until(deadline)) {
-			unfinished++
-		}
-	}
-	return unfinished
-}
-
-// streamEnder is a replica connection whose write side can be shut on its own:
-// a TCP connection in the default networking mode, the event loop's handle in
-// the other.
-type streamEnder interface {
-	CloseWrite() error
-}
-
-// EndStreams shuts the write side of every started replica's connection, once
-// StopFeeds has sent them what was queued, and waits until deadline for those
-// replicas to close their own side, which removes them from the registry. It
-// returns how many had not. Closing a replica's socket outright while the end of
-// its stream is still in the kernel's send queue would let the replica's next
-// acknowledgement draw a reset that discards it.
-func (r *ReplicaRegistry) EndStreams(deadline time.Time) (remaining int) {
-	r.mu.RLock()
-	enders := make(map[uint64]streamEnder, len(r.replicas))
-	for id, peer := range r.replicas {
-		if ender, ok := peer.Conn.(streamEnder); ok {
-			enders[id] = ender
-		}
-	}
-	r.mu.RUnlock()
-
-	for id, ender := range enders {
-		// One that fails is closed with every other connection afterwards.
-		if err := ender.CloseWrite(); err != nil {
-			delete(enders, id)
-		}
-	}
-
-	for {
-		r.mu.RLock()
-		remaining = 0
-		for id := range enders {
-			if _, ok := r.replicas[id]; ok {
-				remaining++
-			}
-		}
-		changed := r.changed
-		r.mu.RUnlock()
-
-		wait := time.Until(deadline)
-		if remaining == 0 || wait <= 0 {
-			return remaining
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-changed:
-		case <-timer.C:
-		}
-		timer.Stop()
-	}
-}
-
-// UpdateAck records the latest replication offset a replica peer acknowledged,
-// in the replica's own count from when it was registered.
-func (r *ReplicaRegistry) UpdateAck(id uint64, offset int64) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	peer, ok := r.replicas[id]
-	if !ok {
-		return false
-	}
-	if offset > peer.AckOffset.Load() {
-		peer.AckOffset.Store(offset)
-		r.notifyChangedLocked()
-	}
-
-	return true
-}
-
-// CountReplicasAtOrAbove reports how many replicas have acknowledged at least
-// targetOffset, an offset in the master's count.
-func (r *ReplicaRegistry) CountReplicasAtOrAbove(targetOffset int64) int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.countReplicasAtOrAboveLocked(targetOffset)
-}
-
-// CountReplicasAtOrAboveWithNotify returns the current matching replica count and a
-// notification channel that is closed whenever replica acknowledgement state changes.
-func (r *ReplicaRegistry) CountReplicasAtOrAboveWithNotify(targetOffset int64) (int, <-chan struct{}) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.countReplicasAtOrAboveLocked(targetOffset), r.changed
-}
-
-func (r *ReplicaRegistry) countReplicasAtOrAboveLocked(targetOffset int64) int {
-	count := 0
-	for _, peer := range r.replicas {
-		if peer.acknowledgedMasterOffset() >= targetOffset {
-			count++
-		}
-	}
-
-	return count
-}
-
-// acknowledgedMasterOffset is how far the replica has acknowledged the stream, in
-// the master's count: its base plus what it acknowledged. WAIT counts replicas by
-// it and INFO reports it, as Redis does with repl_ack_off. Until the replica
-// acknowledges something it is 0, as repl_ack_off starts, so it counts only for a
-// target of 0; the base alone would count a replica that may not have loaded the
-// snapshot yet.
-func (p *ReplicaPeer) acknowledgedMasterOffset() int64 {
-	acknowledged := p.AckOffset.Load()
-	if acknowledged <= 0 {
-		return 0
-	}
-	// A replica that claims more than the master could have sent it is placed at
-	// the largest offset instead of wrapping negative.
-	if acknowledged > math.MaxInt64-p.baseOffset {
-		return math.MaxInt64
-	}
-
-	return p.baseOffset + acknowledged
-}
-
-// Remove deletes a replica peer from the registry.
-func (r *ReplicaRegistry) Remove(id uint64) *ReplicaPeer {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	peer := r.replicas[id]
-	delete(r.replicas, id)
-	r.registered.Store(int64(len(r.replicas)))
-	if peer != nil {
-		r.notifyChangedLocked()
-		if peer.feed != nil {
-			peer.feed.close(0)
-		}
-	}
-	return peer
-}
-
-// RemoveAndClose deletes a replica peer from the registry and closes its socket.
-// A replica whose feed has not started has no connection here yet; Start then
-// reports that it was dropped, and its caller closes the connection.
-func (r *ReplicaRegistry) RemoveAndClose(id uint64) error {
-	peer := r.Remove(id)
-	if peer != nil && peer.Conn != nil {
-		if err := peer.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Snapshot returns the currently tracked replica peers.
-func (r *ReplicaRegistry) Snapshot() []*ReplicaPeer {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	peers := make([]*ReplicaPeer, 0, len(r.replicas))
-	for _, peer := range r.replicas {
-		peers = append(peers, peer)
-	}
-
-	return peers
-}
-
-// Count reports the number of tracked replica peers.
-func (r *ReplicaRegistry) Count() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return len(r.replicas)
-}
-
-func (r *ReplicaRegistry) notifyChangedLocked() {
-	close(r.changed)
-	r.changed = make(chan struct{})
-}
-
-func randomReplicationID() string {
-	var raw [20]byte
-	if _, err := cryptorand.Read(raw[:]); err != nil {
-		// crypto/rand only fails when the OS entropy source is broken. A
-		// replication ID must be unpredictable, so fail loudly at startup rather
-		// than fall back to a guessable time-derived value.
-		panic(fmt.Sprintf("server: read crypto/rand for replication ID: %v", err))
-	}
-
-	return hex.EncodeToString(raw[:])
-}
-
 // replicaMarker is a connection that is told when it becomes a replica's: the
 // event loop's, which drains a replica on shutdown instead of closing it.
 type replicaMarker interface {
@@ -650,7 +43,7 @@ type replicaMarker interface {
 }
 
 // registerReplicaPeer starts the feed of the replica that PSYNC registered at its
-// attach cut (ReplicaRegistry.Start), once the full resync reply is ahead of
+// attach cut (replication.Master.Start), once the full resync reply is ahead of
 // anything the feed writes on conn. The feed has queued every write since the
 // snapshot. When the replica was dropped while its reply was sent (its feed
 // refused a frame, past the backlog limit), it closes conn instead.
@@ -661,7 +54,7 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 	if marker, ok := conn.(replicaMarker); ok {
 		marker.markReplica()
 	}
-	if !s.replicaPeers.Start(clientID, conn) {
+	if !s.master.Start(clientID, conn) {
 		s.logger.Info("closing a replica dropped while its full resync was sent", "replica_id", clientID)
 		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.logger.Debug("failed to close dropped replica", "replica_id", clientID, "error", err)
@@ -678,86 +71,15 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 		"replica_id", clientID,
 		"remote_addr", conn.RemoteAddr().String(),
 		"listening_port", listeningPort,
-		"master_offset", s.replication.MasterOffset(),
+		"master_offset", s.master.Offset(),
 	)
 }
 
-// ReplicaStream is the replication stream the Recorder propagates to: the
-// master offset and the replica registry. Each payload is counted into the
-// offset and queued for every replica (ReplicaRegistry.Propagate).
-type ReplicaStream struct {
-	offsets  *ReplicationState
-	replicas *ReplicaRegistry
-	logger   *slog.Logger
-}
-
-// NewReplicaStream returns the stream that counts into offsets and queues for
-// replicas, logging refusals to logger.
-func NewReplicaStream(offsets *ReplicationState, replicas *ReplicaRegistry, logger *slog.Logger) *ReplicaStream {
-	return &ReplicaStream{offsets: offsets, replicas: replicas, logger: logger}
-}
-
-// Active reports whether a replica is attached or attaching.
-func (s *ReplicaStream) Active() bool {
-	return s.replicas.Active()
-}
-
-// Propagate counts payload into the master offset, queues it for every
-// replica, and returns the offset at its end. When ordered, its caller holds
-// the write's sequencer locks until it returns, so it skips the registry lock
-// while no replica is registered (ReplicaRegistry.PropagateOrdered). Otherwise
-// it always takes the lock (ReplicaRegistry.Propagate): the Recorder never
-// passes ordered for the server's own writes, the DELs of a Background unit.
-func (s *ReplicaStream) Propagate(payload []byte, ordered bool) (end int64) {
-	return s.propagate(payload, ordered).endOffset
-}
-
-func (s *ReplicaStream) propagate(payload []byte, ordered bool) propagationReport {
-	if len(payload) == 0 {
-		return propagationReport{}
-	}
-
-	report := propagationReport{payloadSize: len(payload)}
-	if ordered {
-		report.endOffset, report.succeeded, report.failed = s.replicas.PropagateOrdered(s.offsets, payload)
-	} else {
-		report.endOffset, report.succeeded, report.failed = s.replicas.Propagate(s.offsets, payload)
-	}
-	report.attempted = report.succeeded + report.failed
-	if report.attempted > 0 {
-		s.logger.Debug(
-			"propagated command to replicas",
-			"attempted", report.attempted,
-			"succeeded", report.succeeded,
-			"failed", report.failed,
-			"payload_size", report.payloadSize,
-			"end_offset", report.endOffset,
-		)
-	}
-
-	if report.failed > 0 {
-		log := s.logger.Warn
-		message := "propagation to replicas was partially successful"
-		if report.succeeded == 0 && report.attempted > 0 {
-			log = s.logger.Error
-			message = "propagation to replicas failed for every replica"
-		}
-		log(message,
-			"attempted", report.attempted,
-			"succeeded", report.succeeded,
-			"failed", report.failed,
-			"payload_size", report.payloadSize,
-		)
-	}
-
-	return report
-}
-
 // dropReplica removes a replica that can no longer be fed, logs why, and closes
-// it. It has to synchronise again from the start. It is the registry's
-// feed-error handler, so it is called with the registry lock not held, and
-// takes it. A replica dropped while its full resync reply is being sent has no
-// connection here yet; its feed never starts, and registerReplicaPeer closes the
+// it. It has to synchronise again from the start. It is the Master's drop
+// handler, so it is called with the Master's lock not held, and takes it. A
+// replica dropped while its full resync reply is being sent has no connection
+// here yet; its feed never starts, and registerReplicaPeer closes the
 // connection once the reply is sent.
 //
 // Only a replica that fell behind (replicaFellBehind) is logged as dropped. Any
@@ -765,7 +87,7 @@ func (s *ReplicaStream) propagate(payload []byte, ordered bool) propagationRepor
 // connection is being torn down, and it is logged as the connection's teardown
 // logs it (teardownClient), which finds it removed already.
 func (s *Server) dropReplica(id uint64, cause error) {
-	peer := s.replicaPeers.Remove(id)
+	peer := s.master.Detach(id)
 	if peer == nil {
 		return
 	}
@@ -783,56 +105,18 @@ func (s *Server) dropReplica(id uint64, cause error) {
 }
 
 // replicaFellBehind reports whether a replica's feed stopped because the replica
-// did not keep up: its queue passed its limit (errReplicaBacklog, or its
-// connection's Push limit), or it accepted nothing for the stall timeout.
+// did not keep up: its queue passed its limit (replication.ErrReplicaBacklog, or
+// its connection's Push limit), or it accepted nothing for the stall timeout.
 // Anything else means its connection ended.
 func replicaFellBehind(cause error) bool {
-	return errors.Is(cause, errReplicaBacklog) ||
+	return errors.Is(cause, replication.ErrReplicaBacklog) ||
 		errors.Is(cause, errPushLimitExceeded) ||
 		errors.Is(cause, errReplicaStalled)
 }
 
-func (s *Server) setUpstreamConn(conn net.Conn) {
-	s.upstreamConnMu.Lock()
-	defer s.upstreamConnMu.Unlock()
-
-	s.upstreamConn = conn
-}
-
-func (s *Server) clearUpstreamConn(conn net.Conn) {
-	s.upstreamConnMu.Lock()
-	defer s.upstreamConnMu.Unlock()
-
-	if s.upstreamConn == conn {
-		s.upstreamConn = nil
-	}
-}
-
-func (s *Server) closeUpstreamConn() {
-	s.upstreamConnMu.Lock()
-	conn := s.upstreamConn
-	s.upstreamConn = nil
-	s.upstreamConnMu.Unlock()
-
-	if conn != nil {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close upstream connection", "error", err)
-		}
-	}
-}
-
-// How long a replica waits before trying its master again, and the most that
-// wait grows to.
-const (
-	replicaReconnectInitial = time.Second
-	replicaReconnectMax     = 30 * time.Second
-)
-
-// startReplicaLink keeps the replica attached to its master: it connects,
-// synchronises, applies the stream, and when the link ends for any reason other
-// than shutdown it waits and starts again from a full resynchronisation. The wait
-// doubles up to replicaReconnectMax and starts over after a link that got as far
-// as a completed handshake. Only an unusable configuration ends it.
+// startReplicaLink keeps the replica attached to its master (replication.Follow) until ctx
+// is cancelled, which shutdown does. Only an unusable configuration ends it
+// before that.
 func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 	defer s.handlerWG.Done()
 
@@ -847,179 +131,39 @@ func (s *Server) startReplicaLink(ctx context.Context, listenerAddr string) {
 		s.logger.Error("failed to determine replica listening port", "address", listenerAddr, "error", err)
 		return
 	}
+	s.link.ListeningPort = listeningPort
+	s.link.Logger = s.logger.With("master_addr", masterAddr)
 
-	delay := replicaReconnectInitial
-	for {
-		synchronised := s.runReplicaLink(ctx, masterAddr, listeningPort)
-		if ctx.Err() != nil {
-			return
-		}
-		if synchronised {
-			delay = replicaReconnectInitial
-		}
-
-		s.logger.Warn("the link to the master ended; retrying", "master_addr", masterAddr, "retry_in", delay)
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return
-		}
-		delay = min(delay*2, replicaReconnectMax)
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", masterAddr)
 	}
+	replication.Follow(ctx, dial, s.link, nil)
 }
 
-// runReplicaLink makes one attempt to attach to the master and applies its
-// stream until the link ends. It reports whether the handshake completed.
-func (s *Server) runReplicaLink(ctx context.Context, masterAddr string, listeningPort int) (synchronised bool) {
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", masterAddr)
-	if err != nil {
-		s.logger.Error("failed to connect to master", "master_addr", masterAddr, "error", err)
-		return
-	}
-	s.setUpstreamConn(conn)
-	defer s.clearUpstreamConn(conn)
-	defer func() {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close replica upstream connection", "master_addr", masterAddr, "error", err)
-		}
-	}()
+// replicaStore is the Store as the Replica's Link changes it: a full resync
+// replaces the keyspace, and each command of the Master's stream runs through
+// the command executor with the Master's Origin.
+type replicaStore struct{ server *Server }
 
-	stopClose := context.AfterFunc(ctx, func() {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.logger.Debug("failed to close replica upstream connection after cancellation", "master_addr", masterAddr, "error", err)
-		}
-	})
-	defer stopClose()
-
-	parser := protocol.NewParser(conn)
-	writer := bufio.NewWriter(conn)
-
-	if err := writeReplicaCommand(writer, "PING"); err != nil {
-		s.logger.Error("failed to send replica PING", "master_addr", masterAddr, "error", err)
-		return
-	}
-	if err := expectSimpleString(parser, "PONG"); err != nil {
-		s.logger.Error("invalid PING response from master", "master_addr", masterAddr, "error", err)
-		return
-	}
-
-	if s.cfg.MasterAuth != "" {
-		if err := writeReplicaCommand(writer, "AUTH", s.cfg.MasterAuth); err != nil {
-			s.logger.Error("failed to send replica AUTH", "master_addr", masterAddr, "error", err)
-			return
-		}
-		if err := expectReplicaAuthOK(parser); err != nil {
-			s.logger.Error("replica AUTH failed", "master_addr", masterAddr, "error", err)
-			return
-		}
-	}
-
-	if err := writeReplicaCommand(writer, "REPLCONF", "listening-port", strconv.Itoa(listeningPort)); err != nil {
-		s.logger.Error("failed to send replica REPLCONF", "master_addr", masterAddr, "error", err)
-		return
-	}
-	if err := expectReplicaReplConfOK(parser); err != nil {
-		s.logger.Error("replica REPLCONF failed", "master_addr", masterAddr, "error", err)
-		return
-	}
-
-	if err := writeReplicaCommand(writer, "PSYNC", "?", "-1"); err != nil {
-		s.logger.Error("failed to send replica PSYNC", "master_addr", masterAddr, "error", err)
-		return
-	}
-	if err := s.consumeFullResync(parser); err != nil {
-		s.logger.Error("failed to consume FULLRESYNC from master", "master_addr", masterAddr, "error", err)
-		return
-	}
-
-	// The stream that follows a full resynchronisation counts from zero.
-	s.replication.ResetReplicaOffset()
-	s.logger.Info("replica handshake completed", "master_addr", masterAddr, "listening_port", listeningPort)
-	synchronised = true
-
-	masterCall := Call{Origin: record.OriginMaster}
-
-	for {
-		value, err := parser.Parse()
-		if err != nil {
-			// A Master that goes away inside a frame is still a lost link: the Parser
-			// reports a bulk payload cut short as io.ErrUnexpectedEOF, not io.EOF.
-			if ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
-				return
-			}
-
-			s.logger.Warn("replication stream parse failed", "master_addr", masterAddr, "error", err)
-			return
-		}
-
-		encodedLen, err := protocol.EncodedLen(value)
-		if err != nil {
-			s.logger.Warn("failed to size replication stream value", "master_addr", masterAddr, "error", err)
-			return
-		}
-		replicaOffset := s.replication.AdvanceReplicaOffset(int64(encodedLen))
-		s.logger.Debug(
-			"replication stream command received",
-			"master_addr", masterAddr,
-			"command", replicationCommandName(value),
-			"payload_size", encodedLen,
-			"replica_offset", replicaOffset,
-		)
-
-		result, execErr := s.executor.Handle(ctx, masterCall, value)
-		if execErr != nil {
-			if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
-				return
-			}
-
-			if errors.Is(execErr, ErrNotRecorded) {
-				s.logger.Error("failed to append replicated command to AOF", "master_addr", masterAddr, "error", execErr)
-				return
-			}
-			s.logger.Warn("replication stream command failed", "master_addr", masterAddr, "error", execErr)
-			return
-		}
-
-		if len(result.UpstreamReplies) > 0 {
-			if err := writeReplicaResponses(writer, result.UpstreamReplies); err != nil {
-				s.logger.Warn("failed to write replication upstream reply", "master_addr", masterAddr, "error", err)
-				return
-			}
-		}
-	}
-}
-
-func (s *Server) consumeFullResync(parser *protocol.Parser) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return fmt.Errorf("read FULLRESYNC line: %w", err)
-	}
-
-	line, ok := value.(protocol.SimpleString)
-	if !ok {
-		return fmt.Errorf("unexpected FULLRESYNC response type %T", value)
-	}
-	parts := strings.Fields(line.Value)
-	if len(parts) != 3 || !strings.EqualFold(parts[0], "FULLRESYNC") || parts[1] == "" || parts[2] != "0" {
-		return fmt.Errorf("invalid FULLRESYNC response %q", line.Value)
-	}
-
-	snapshotValue, err := parser.Parse()
-	if err != nil {
-		return fmt.Errorf("read replication snapshot: %w", err)
-	}
-
-	snapshot, ok := snapshotValue.(protocol.BulkString)
-	if !ok || snapshot.Null {
-		return fmt.Errorf("unexpected replication snapshot type %T", snapshotValue)
-	}
-
+// Replace loads the RDB snapshot of a full resync and swaps it in for the
+// whole keyspace, and has the append-only file follow: the file holds the
+// history of the keyspace the Replica had before, so it is rewritten from the
+// new one. Until that rewrite has replaced the file, a restart still replays
+// the old history.
+//
+// The swap runs as a Background unit, ordered against client requests and
+// against the copy an AOF rewrite takes, so a rewrite copies the keyspace from
+// before the swap or from after it, never half of each, and RequestRewrite
+// runs another after one that copied the old keyspace.
+func (r replicaStore) Replace(snapshot []byte) error {
+	s := r.server
 	snapshotStore := storage.NewStore()
-	stats, err := rdb.LoadReader(bytes.NewReader(snapshot.Data), snapshotStore)
+	stats, err := rdb.LoadReader(bytes.NewReader(snapshot), snapshotStore)
 	if err != nil {
-		return fmt.Errorf("load replication snapshot: %w", err)
+		return err
 	}
+
 	// The swap is a Background unit: no write is halfway to the log while the
 	// keyspace changes under it, and the DEL of the keys the new keyspace
 	// held past their TTL is recorded. The Recorder logs an append that fails.
@@ -1028,39 +172,30 @@ func (s *Server) consumeFullResync(parser *protocol.Parser) error {
 	})
 	s.logger.Info(
 		"applied full resync snapshot",
-		"snapshot_size_bytes", len(snapshot.Data),
+		"snapshot_size_bytes", len(snapshot),
 		"loaded_keys", stats.LoadedKeys,
 		"skipped_expired_keys", stats.SkippedExpiredKeys,
 	)
 
+	if s.aofWriter != nil {
+		runtimeCtx := s.runtimeCtx
+		if runtimeCtx == nil {
+			runtimeCtx = context.Background()
+		}
+		if err := s.aofWriter.RequestRewrite(runtimeCtx, s.store); err != nil {
+			return fmt.Errorf("rewrite the append-only file from the full resync: %w", err)
+		}
+	}
+
 	return nil
 }
 
-func replicationCommandName(value protocol.Value) string {
-	request, err := commandFromValue(value)
-	if err != nil {
-		return fmt.Sprintf("%T", value)
+func (r replicaStore) Apply(ctx context.Context, command protocol.Value) error {
+	_, err := r.server.executor.Handle(ctx, Call{Origin: record.OriginMaster}, command)
+	if errors.Is(err, ErrNotRecorded) {
+		r.server.logger.Error("failed to append replicated command to AOF", "error", err)
 	}
-
-	return request.Name
-}
-
-func commandFromValue(value protocol.Value) (*protocolCommand, error) {
-	array, ok := value.(protocol.Array)
-	if !ok || array.Null || len(array.Elements) == 0 {
-		return nil, fmt.Errorf("unexpected replication value %T", value)
-	}
-
-	rawName, err := protocol.Bytes(array.Elements[0])
-	if err != nil {
-		return nil, err
-	}
-
-	return &protocolCommand{Name: strings.ToUpper(string(rawName))}, nil
-}
-
-type protocolCommand struct {
-	Name string
+	return err
 }
 
 func parseListenerPort(address string) (int, error) {
@@ -1075,105 +210,4 @@ func parseListenerPort(address string) (int, error) {
 	}
 
 	return parsed, nil
-}
-
-func writeReplicaCommand(writer *bufio.Writer, parts ...string) error {
-	if err := protocol.WriteValue(writer, replicaCommand(parts...)); err != nil {
-		return err
-	}
-
-	return writer.Flush()
-}
-
-func writeReplicaResponses(writer *bufio.Writer, values []protocol.Value) error {
-	for _, value := range values {
-		if err := protocol.WriteValue(writer, value); err != nil {
-			return err
-		}
-	}
-
-	return writer.Flush()
-}
-
-func replicaCommand(parts ...string) protocol.Array {
-	elements := make([]protocol.Value, 0, len(parts))
-	for _, part := range parts {
-		elements = append(elements, protocol.BulkString{Data: []byte(part)})
-	}
-
-	return protocol.Array{Elements: elements}
-}
-
-func expectSimpleString(parser *protocol.Parser, expected string) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return err
-	}
-
-	switch typed := value.(type) {
-	case protocol.SimpleString:
-		if typed.Value != expected {
-			return fmt.Errorf("unexpected response %q, want %q", typed.Value, expected)
-		}
-		return nil
-	case protocol.ErrorValue:
-		return fmt.Errorf("unexpected error response %q, want %q", typed.Message, expected)
-	default:
-		return fmt.Errorf("unexpected response type %T", value)
-	}
-}
-
-func expectReplicaAuthOK(parser *protocol.Parser) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return err
-	}
-
-	switch typed := value.(type) {
-	case protocol.SimpleString:
-		if typed.Value != "OK" {
-			return fmt.Errorf("unexpected AUTH response %q, want %q", typed.Value, "OK")
-		}
-		return nil
-	case protocol.ErrorValue:
-		switch respErrorCode(typed.Message) {
-		case "WRONGPASS":
-			return fmt.Errorf("replica AUTH rejected by master: %s", typed.Message)
-		case "NOAUTH":
-			return fmt.Errorf("master reported NOAUTH during replica AUTH: %s", typed.Message)
-		default:
-			return fmt.Errorf("replica AUTH failed with error response: %s", typed.Message)
-		}
-	default:
-		return fmt.Errorf("unexpected AUTH response type %T", value)
-	}
-}
-
-func expectReplicaReplConfOK(parser *protocol.Parser) error {
-	value, err := parser.Parse()
-	if err != nil {
-		return err
-	}
-
-	switch typed := value.(type) {
-	case protocol.SimpleString:
-		if typed.Value != "OK" {
-			return fmt.Errorf("unexpected REPLCONF response %q, want %q", typed.Value, "OK")
-		}
-		return nil
-	case protocol.ErrorValue:
-		switch respErrorCode(typed.Message) {
-		case "NOAUTH":
-			return fmt.Errorf("protected master requires replica authentication (--masterauth): %s", typed.Message)
-		default:
-			return fmt.Errorf("replica REPLCONF failed with error response: %s", typed.Message)
-		}
-	default:
-		return fmt.Errorf("unexpected REPLCONF response type %T", value)
-	}
-}
-
-func respErrorCode(message string) string {
-	code, _, _ := strings.Cut(message, " ")
-	return code
 }

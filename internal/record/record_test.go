@@ -142,7 +142,7 @@ func TestAServerWriteIsPropagatedWithoutClaimingTheWritesOrdering(t *testing.T) 
 	assertPayloads(t, "AOF", log.Payloads(), encoded(t, del))
 	assertPayloads(t, "stream", stream.Payloads(), encoded(t, del))
 	if got := stream.Ordered(); len(got) != 1 || got[0] {
-		t.Fatalf("stream ordered = %v, want [false]: a Replica's full resync publishes expiries holding no sequencer lock", got)
+		t.Fatalf("stream ordered = %v, want [false]: the server's own writes are never propagated as ordered", got)
 	}
 }
 

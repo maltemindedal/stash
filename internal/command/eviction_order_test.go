@@ -181,7 +181,7 @@ func TestEvictionsAreLoggedAfterEveryEarlierWriteOfTheEvictedKey(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			log := newHoldingLog()
 			executor := newTestExecutorWith(func(s *server.Services) {
-				s.Recorder = record.New(server.NewReplicaStream(s.Replication, s.Replicas, s.Logger), s.Logger)
+				s.Recorder = record.New(s.Master, s.Logger)
 				s.Recorder.SetLog(log)
 			})
 			held, release := tt.evictOnNextWrite(t, executor, log)

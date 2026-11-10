@@ -16,6 +16,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/record/recordtest"
+	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
 	"github.com/maltemindedal/stash/internal/storage"
 )
@@ -1255,27 +1256,10 @@ func TestSlowlogTruncatesLargeCommands(t *testing.T) {
 }
 
 func TestExecutorReplicationAcknowledgements(t *testing.T) {
-	t.Run("replica-origin GETACK emits upstream ACK reply", func(t *testing.T) {
-		replication := &server.ReplicationState{}
-		replication.AdvanceReplicaOffset(123)
-		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
-
-		result, err := handle(withOrigin(context.Background(), record.OriginMaster), executor, requestValue("REPLCONF", "GETACK", "*"), false)
-		if err != nil {
-			t.Fatalf("handle() error = %v", err)
-		}
-		if len(result.Responses) != 0 {
-			t.Fatalf("len(result.Responses) = %d, want 0", len(result.Responses))
-		}
-		if len(result.UpstreamReplies) != 1 {
-			t.Fatalf("len(result.UpstreamReplies) = %d, want 1", len(result.UpstreamReplies))
-		}
-
-		assertValueEqual(t, result.UpstreamReplies[0], requestValue("REPLCONF", "ACK", "123"))
-	})
-
-	t.Run("only the Master's stream may answer GETACK", func(t *testing.T) {
-		for _, origin := range []record.Origin{record.OriginClient, record.OriginReplay} {
+	t.Run("nobody may ask the executor for GETACK", func(t *testing.T) {
+		// A Replica's Link answers its Master's GETACK before the executor
+		// sees it.
+		for _, origin := range []record.Origin{record.OriginClient, record.OriginMaster, record.OriginReplay} {
 			executor := newTestExecutor()
 			ctx := withOrigin(context.Background(), origin)
 			if origin == record.OriginClient {
@@ -1283,21 +1267,20 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 			}
 
 			result, err := handle(ctx, executor, requestValue("REPLCONF", "GETACK", "*"), false)
-			if !errors.Is(err, ErrSyntax) || len(result.UpstreamReplies) != 0 {
-				t.Fatalf("GETACK from Origin %d = (%d upstream replies, error %v), want ErrSyntax and no reply", origin, len(result.UpstreamReplies), err)
+			if !errors.Is(err, ErrSyntax) || len(result.Responses) != 0 {
+				t.Fatalf("GETACK from Origin %d = (%d replies, error %v), want ErrSyntax and no reply", origin, len(result.Responses), err)
 			}
 		}
 	})
 
 	t.Run("ACK updates tracked replica offset", func(t *testing.T) {
-		registry := server.NewReplicaRegistry()
-		executor := newTestExecutorWith(func(s *server.Services) { s.Replicas = registry })
+		executor := newTestExecutor()
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
 		state := newReplicaPeerStateForExecutor(executor, 7, serverConn)
-		registry.Add(nil, 7, serverConn, 6380, state)
+		executor.master.Add(replication.Candidate{ID: 7, ListeningPort: 6380, Out: state}, serverConn)
 
 		ctx := withClient(context.Background(), state)
 
@@ -1308,34 +1291,30 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		if len(result.Responses) != 0 {
 			t.Fatalf("len(result.Responses) = %d, want 0", len(result.Responses))
 		}
-		if got := registry.CountReplicasAtOrAbove(42); got != 1 {
-			t.Fatalf("CountReplicasAtOrAbove(42) = %d, want 1", got)
+		if got := executor.master.Acked(42); got != 1 {
+			t.Fatalf("Acked(42) = %d, want 1", got)
 		}
-		if got := registry.CountReplicasAtOrAbove(43); got != 0 {
-			t.Fatalf("CountReplicasAtOrAbove(43) = %d, want 0", got)
+		if got := executor.master.Acked(43); got != 0 {
+			t.Fatalf("Acked(43) = %d, want 0", got)
 		}
 	})
 }
 
 func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT requests ACKs and returns once enough replicas catch up", func(t *testing.T) {
-		replication := &server.ReplicationState{}
-		registry := server.NewReplicaRegistry()
-		executor := newTestExecutorWith(func(s *server.Services) {
-			s.Replication = replication
-			s.Replicas = registry
-		})
+		executor := newTestExecutor()
 
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		registry.Add(replication, 11, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 11, serverConn))
-		// The client wrote 50 bytes after the replica attached, which the replica
-		// acknowledges below.
-		replication.AdvanceMasterOffset(50)
+		// The replica attaches at offset 50 and the client's last write ends at
+		// 60, so only an acknowledgement of 10 bytes or more of the replica's own
+		// count reaches it. The replica acknowledges exactly 10 below.
+		executor.master.Propagate(make([]byte, 50), true)
+		executor.master.Add(replication.Candidate{ID: 11, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 11, serverConn)}, serverConn)
 		writer := newTestClientState(executor, 1)
-		writer.SetLastWriteReplicationOffset(50)
+		writer.SetLastWriteReplicationOffset(60)
 		// This WAIT ends when the replica acknowledges, not when a clock says so: the
 		// replica acknowledges the moment GETACK reaches it, and WAIT's own timeout
 		// is an hour, so a replica goroutine that the machine does not schedule for a
@@ -1350,7 +1329,7 @@ func TestExecutorWait(t *testing.T) {
 		go func() {
 			defer close(replicaDone)
 
-			replicaErr = acknowledgeGetAck(replicaConn, registry, 11, 50)
+			replicaErr = acknowledgeGetAck(replicaConn, executor.master, 11, 10)
 			if replicaErr != nil {
 				cancel()
 			}
@@ -1375,9 +1354,9 @@ func TestExecutorWait(t *testing.T) {
 	})
 
 	t.Run("WAIT times out when replicas do not acknowledge", func(t *testing.T) {
-		replication := &server.ReplicationState{}
-		replication.AdvanceMasterOffset(5)
-		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
+		executor := newTestExecutor()
+
+		executor.master.Propagate(make([]byte, 5), true)
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(5)
 		ctx := withClient(context.Background(), writer)
@@ -1399,9 +1378,9 @@ func TestExecutorWait(t *testing.T) {
 	t.Run("WAIT with a timeout past what a duration can hold keeps waiting", func(t *testing.T) {
 		// 9223372036855 ms overflows time.Duration; it used to wrap negative, so the
 		// timer fired at once and WAIT answered without waiting at all.
-		replication := &server.ReplicationState{}
-		replication.AdvanceMasterOffset(5)
-		executor := newTestExecutorWith(func(s *server.Services) { s.Replication = replication })
+		executor := newTestExecutor()
+
+		executor.master.Propagate(make([]byte, 5), true)
 
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(5)
@@ -1431,19 +1410,15 @@ func TestExecutorWait(t *testing.T) {
 	})
 
 	t.Run("WAIT uses the calling client's last write offset", func(t *testing.T) {
-		replication := &server.ReplicationState{}
-		replication.AdvanceMasterOffset(50)
-		registry := server.NewReplicaRegistry()
-		executor := newTestExecutorWith(func(s *server.Services) {
-			s.Replication = replication
-			s.Replicas = registry
-		})
+		executor := newTestExecutor()
+
+		executor.master.Propagate(make([]byte, 50), true)
 
 		serverConn, replicaConn := net.Pipe()
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		registry.Add(replication, 12, serverConn, 6380, newReplicaPeerStateForExecutor(executor, 12, serverConn))
+		executor.master.Add(replication.Candidate{ID: 12, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 12, serverConn)}, serverConn)
 
 		state := &server.ClientState{ID: 99, Authenticated: true}
 		state.SetLastWriteReplicationOffset(0)
@@ -1594,7 +1569,6 @@ func TestExecutorAuth(t *testing.T) {
 	t.Run("unauthenticated clients cannot start replica handshake when password protection is enabled", func(t *testing.T) {
 		executor := newTestExecutorWith(func(s *server.Services) {
 			s.RequirePass = "secret"
-			s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
 		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
 		state, ok := clientOfContext(ctx)
@@ -1614,11 +1588,8 @@ func TestExecutorAuth(t *testing.T) {
 	})
 
 	t.Run("authenticated clients may perform replica handshake on protected masters", func(t *testing.T) {
-		registry := server.NewReplicaRegistry()
 		executor := newTestExecutorWith(func(s *server.Services) {
 			s.RequirePass = "secret"
-			s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
-			s.Replicas = registry
 		})
 		ctx := withUnauthenticatedClientStateForExecutor(context.Background(), executor, 5)
 		state, ok := clientOfContext(ctx)
@@ -1651,8 +1622,8 @@ func TestExecutorAuth(t *testing.T) {
 		if !state.IsReplica() {
 			t.Fatal("IsReplica() = false after PSYNC, want true")
 		}
-		if !result.RegisterReplica || registry.Count() != 1 {
-			t.Fatalf("RegisterReplica = %v with %d replicas registered, want true and 1", result.RegisterReplica, registry.Count())
+		if !result.RegisterReplica || executor.master.Count() != 1 {
+			t.Fatalf("RegisterReplica = %v with %d replicas registered, want true and 1", result.RegisterReplica, executor.master.Count())
 		}
 		if !state.IsAuthenticated() {
 			t.Fatal("IsAuthenticated() = false after authenticated PSYNC, want true")
@@ -2351,9 +2322,7 @@ func TestExecutorTransactions(t *testing.T) {
 		for _, tt := range tests {
 			tt := tt
 			t.Run(tt.name, func(t *testing.T) {
-				executor := newTestExecutorWith(func(s *server.Services) {
-					s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
-				})
+				executor := newTestExecutor()
 				ctx := withClientStateForExecutor(context.Background(), executor, 1)
 				state, _ := clientOfContext(ctx)
 
@@ -2943,11 +2912,7 @@ func TestARequestExecutedAgainLogsOnlyItsOwnEffects(t *testing.T) {
 func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	// Queueing refuses PSYNC, so EXEC never runs one. Should it, the attach cut
 	// would wait forever for the gate EXEC holds, so PSYNC refuses itself too.
-	registry := server.NewReplicaRegistry()
-	executor := newTestExecutorWith(func(s *server.Services) {
-		s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
-		s.Replicas = registry
-	})
+	executor := newTestExecutor()
 	ctx := withClientStateForExecutor(context.Background(), executor, 1)
 	state, _ := clientOfContext(ctx)
 
@@ -2956,8 +2921,8 @@ func TestPSyncThatEXECRunsIsRefused(t *testing.T) {
 	if !errors.Is(err, ErrNotAllowedInTransaction) {
 		t.Fatalf("PSYNC run by EXEC error = %v, want ErrNotAllowedInTransaction", err)
 	}
-	if state.IsReplica() || registry.Count() != 0 {
-		t.Fatalf("after a refused PSYNC IsReplica() = %v with %d replicas registered, want false and 0", state.IsReplica(), registry.Count())
+	if state.IsReplica() || executor.master.Count() != 0 {
+		t.Fatalf("after a refused PSYNC IsReplica() = %v with %d replicas registered, want false and 0", state.IsReplica(), executor.master.Count())
 	}
 }
 
@@ -3017,11 +2982,7 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			registry := server.NewReplicaRegistry()
-			executor := newTestExecutorWith(func(s *server.Services) {
-				s.Replication = &server.ReplicationState{MasterReplicationID: "test-replid"}
-				s.Replicas = registry
-			})
+			executor := newTestExecutor()
 			ctx := withClientStateForExecutor(context.Background(), executor, 1)
 			state, _ := clientOfContext(ctx)
 			if tt.replica {
@@ -3032,8 +2993,8 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("PSYNC %v error = %v, want %v", tt.args, err, tt.wantErr)
 			}
-			if len(result.Responses) != 0 || result.RegisterReplica || registry.Count() != 0 {
-				t.Fatalf("PSYNC %v: %d replies, RegisterReplica = %v, %d replicas registered; want none, false and 0", tt.args, len(result.Responses), result.RegisterReplica, registry.Count())
+			if len(result.Responses) != 0 || result.RegisterReplica || executor.master.Count() != 0 {
+				t.Fatalf("PSYNC %v: %d replies, RegisterReplica = %v, %d replicas registered; want none, false and 0", tt.args, len(result.Responses), result.RegisterReplica, executor.master.Count())
 			}
 		})
 	}
@@ -3045,18 +3006,18 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 // append-only file is always open, so writes are always ordered.
 func testServices() server.Services {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	replication, replicas := &server.ReplicationState{}, server.NewReplicaRegistry()
-	recorder := record.New(server.NewReplicaStream(replication, replicas, logger), logger)
+	store := storage.NewStore()
+	master := replication.NewMaster(store, nil, logger)
+	recorder := record.New(master, logger)
 	recorder.SetLog(&recordtest.Log{})
 	return server.Services{
-		Store:            storage.NewStore(),
+		Store:            store,
 		Logger:           logger,
 		Watches:          server.NewWatchRegistry(),
 		PubSub:           server.NewPubSubRegistry(),
 		Slowlog:          server.NewSlowlogRegistry(),
 		SlowlogThreshold: -1,
-		Replication:      replication,
-		Replicas:         replicas,
+		Master:           master,
 		Stats: func() server.Stats {
 			return server.Stats{Role: "master", AOFLastWriteOK: true}
 		},
@@ -3218,7 +3179,7 @@ func newReplicaPeerStateForExecutor(executor *Executor, id uint64, conn net.Conn
 // request, requires it to be REPLCONF GETACK *, and acknowledges offset for
 // replica id in registry as soon as it has, which is what a replica does with
 // GETACK.
-func acknowledgeGetAck(conn net.Conn, registry *server.ReplicaRegistry, id uint64, offset int64) error {
+func acknowledgeGetAck(conn net.Conn, registry *replication.Master, id uint64, offset int64) error {
 	value, err := protocol.NewParser(conn).Parse()
 	if err != nil {
 		return fmt.Errorf("read GETACK: %w", err)
@@ -3230,7 +3191,7 @@ func acknowledgeGetAck(conn net.Conn, registry *server.ReplicaRegistry, id uint6
 	if request.Name != "REPLCONF" || len(request.Args) != 2 || string(request.Args[0]) != "GETACK" || string(request.Args[1]) != "*" {
 		return fmt.Errorf("request = %s %q, want REPLCONF GETACK *", request.Name, request.Args)
 	}
-	if !registry.UpdateAck(id, offset) {
+	if !registry.Ack(id, offset) {
 		return fmt.Errorf("replica %d is not registered", id)
 	}
 	return nil

@@ -1,4 +1,4 @@
-package server
+package replication
 
 import (
 	"errors"
@@ -17,15 +17,16 @@ const replicaFeedLimit = 256 << 20
 // once.
 const replicaFeedWriteChunk = 1 << 20
 
-// errReplicaBacklog reports that a replica has fallen further behind than
-// replicaFeedLimit allows.
-var errReplicaBacklog = errors.New("server: replica is too far behind the propagated stream")
+// ErrReplicaBacklog reports that a replica has fallen further behind than
+// replicaFeedLimit allows, counting the writes made while its full resync
+// reply was being sent.
+var ErrReplicaBacklog = errors.New("replication: replica is too far behind the propagated stream")
 
 // replicaFeed carries the propagated command stream to one replica. A writer that
 // propagates a command only appends its bytes to the feed, which never blocks on
 // the replica; a goroutine of the feed's own hands them, in the order they were
-// appended and many at a time, to the replica's connection, whose Output writes
-// them to the socket and enforces the Replica Push limit and stall rule.
+// appended and many at a time, to the replica's Output, which writes them to the
+// socket and enforces the Replica Push limit and stall rule.
 //
 // A feed queues from the moment it is created but hands nothing over until it
 // is started: a replica's feed holds the writes made while its full resync
@@ -65,7 +66,7 @@ func (f *replicaFeed) enqueue(payload []byte) error {
 	}
 	if len(f.pending)+len(payload) > f.limit {
 		f.mu.Unlock()
-		return errReplicaBacklog
+		return ErrReplicaBacklog
 	}
 	f.pending = append(f.pending, payload...)
 	f.mu.Unlock()

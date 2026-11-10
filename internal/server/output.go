@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/replication"
 )
 
 // outputPushLimit is how much Client output may wait for a connection that
@@ -694,7 +695,7 @@ func (d *goroutineOutputDriver) shut() {
 }
 
 func (d *goroutineOutputDriver) closeWrite() {
-	if ender, ok := d.wire.(streamEnder); ok {
+	if ender, ok := d.wire.(replication.StreamEnder); ok {
 		// One that fails is closed with every other connection afterwards.
 		_ = ender.CloseWrite()
 	}

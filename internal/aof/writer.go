@@ -114,10 +114,13 @@ type Writer struct {
 	rewriteBuffer  bytes.Buffer
 	rewriteActive  bool
 	rewritePending bool
-	closed         bool
-	closeOnce      sync.Once
-	closeCh        chan struct{}
-	wg             sync.WaitGroup
+	// rewriteAgain is set by RequestRewrite while a rewrite is pending or
+	// running: another one starts when that one ends.
+	rewriteAgain bool
+	closed       bool
+	closeOnce    sync.Once
+	closeCh      chan struct{}
+	wg           sync.WaitGroup
 
 	// closing is set, under mu, before Close waits for background work. Adds to wg
 	// happen under mu and only while closing is false, so they cannot race with
@@ -276,8 +279,23 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-// BeginRewrite starts a background rewrite of the current AOF file.
+// BeginRewrite starts a background rewrite of the current AOF file. It
+// reports ErrRewriteInProgress when one is already pending or running.
 func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
+	return w.startRewrite(ctx, store, false)
+}
+
+// RequestRewrite has the file rewritten from the keyspace store holds now: it
+// starts a background rewrite, or, when one is already pending or running,
+// has another start as soon as that one ends, with that one's context and
+// store. A Replica calls it after a full resync replaced its keyspace: the
+// file holds the history of the keyspace it had before, and a rewrite already
+// in flight may have copied that one.
+func (w *Writer) RequestRewrite(ctx context.Context, store *storage.Store) error {
+	return w.startRewrite(ctx, store, true)
+}
+
+func (w *Writer) startRewrite(ctx context.Context, store *storage.Store, again bool) error {
 	if w == nil {
 		return ErrClosed
 	}
@@ -294,6 +312,11 @@ func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
 		return ErrClosed
 	}
 	if w.rewritePending || w.rewriteActive {
+		if again {
+			w.rewriteAgain = true
+			w.mu.Unlock()
+			return nil
+		}
 		w.mu.Unlock()
 		return ErrRewriteInProgress
 	}
@@ -301,8 +324,31 @@ func (w *Writer) BeginRewrite(ctx context.Context, store *storage.Store) error {
 	w.wg.Add(1)
 	w.mu.Unlock()
 
-	go w.runRewrite(ctx, store)
+	go w.runRewrites(ctx, store)
 	return nil
+}
+
+// runRewrites runs one rewrite, and then another for as long as RequestRewrite
+// asked for one while the last was in flight.
+func (w *Writer) runRewrites(ctx context.Context, store *storage.Store) {
+	defer w.wg.Done()
+
+	for {
+		w.runRewrite(ctx, store)
+
+		w.mu.Lock()
+		// A rewrite someone started since this one ended began after the
+		// request, so it copies the keyspace the request was made for.
+		again := w.rewriteAgain && !w.closing && !w.closed && !w.rewritePending && !w.rewriteActive
+		w.rewriteAgain = false
+		if again {
+			w.rewritePending = true
+		}
+		w.mu.Unlock()
+		if !again {
+			return
+		}
+	}
 }
 
 func (w *Writer) append(payload []byte, syncNow bool) error {
@@ -516,8 +562,6 @@ func (w *Writer) dropWrittenLocked(n int) int {
 }
 
 func (w *Writer) runRewrite(ctx context.Context, store *storage.Store) {
-	defer w.wg.Done()
-
 	select {
 	case <-w.closeCh:
 		w.clearRewriteState(false)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/replication"
 )
 
 // pollerEventBatch bounds how many readiness events one Wait call returns.
@@ -348,8 +349,8 @@ func (l *eventLoop) applyQueuedWork() {
 // beginDrain starts the loop's end, when the server shuts down (cause is nil) or
 // accepting fails (cause, which run then returns). It stops accepting and closes
 // every connection but the replicas'. The replicas' feeds go on pushing until
-// shutdown stops them (ReplicaRegistry.StopFeeds) and then ends their streams
-// (ReplicaRegistry.EndStreams): each connection is sent what it holds, has its
+// shutdown stops them (replication.Master.StopFeeds) and then ends their streams
+// (replication.Master.EndStreams): each connection is sent what it holds, has its
 // write side shut, and is closed once the replica closes its own
 // (applyQueuedWork, finishConnEvent). Whatever is left when
 // replicaShutdownGrace has passed is dropped with the connections when run
@@ -766,7 +767,7 @@ func (h *eventConnHandle) Close() error {
 // RemoteAddr returns the peer address captured when the connection was accepted.
 func (h *eventConnHandle) RemoteAddr() net.Addr { return h.conn.remoteAddr }
 
-// CloseWrite asks the loop to end the stream to a replica (ReplicaRegistry.EndStreams):
+// CloseWrite asks the loop to end the stream to a replica (replication.Master.EndStreams):
 // to send what the connection holds, shut its write side, and close it once
 // the replica has closed its own. The loop, draining by then, does that for a
 // replica asked to close at all (applyQueuedWork).
@@ -784,11 +785,11 @@ func (h *eventConnHandle) markReplica() { h.conn.replica.Store(true) }
 // renamed method would compile, and shutdown would close replicas undrained.
 var _ replicaMarker = (*eventConnHandle)(nil)
 
-// Asserted, since ReplicaRegistry.EndStreams finds CloseWrite by type assertion:
+// Asserted, since replication.Master.EndStreams finds CloseWrite by type assertion:
 // a renamed method would compile, and shutdown would skip an event-loop
 // replica's half-close and the wait for the replica to close, leaving its end of
 // stream to CloseAll's close request.
-var _ streamEnder = (*eventConnHandle)(nil)
+var _ replication.StreamEnder = (*eventConnHandle)(nil)
 
 func sockaddrTCPAddr(sa syscall.Sockaddr) net.Addr {
 	switch sa := sa.(type) {
