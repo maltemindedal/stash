@@ -21,295 +21,305 @@ import (
 )
 
 func TestServerPersistsAndReplaysAOF(t *testing.T) {
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	cfg := testAOFConfig(aofPath)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		cfg := aofConfig(base, aofPath)
 
-	addr, stop, errCh := startTestServer(t, cfg)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	parser := protocol.NewParser(conn)
+		addr, stop, errCh := startTestServer(t, cfg)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		parser := protocol.NewParser(conn)
 
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "name", "Stash")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "expiring", "soon", "PX", "60000")
-	assertCommandResponse(t, conn, parser, protocol.Integer{Value: 1}, "HSET", "profile", "lang", "go")
-	assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "RPUSH", "letters", "a", "b")
-	assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "SADD", "tags", "fast", "durable")
-	assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "ZADD", "leaders", "1", "alpha", "2", "beta")
-	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("1-0")}, "XADD", "events", "1-0", "type", "start")
-	assertCommandResponse(t, conn, parser, protocol.Integer{Value: 1}, "INCR", "counter")
-	assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "INCR", "counter")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-bad", "hello")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "INCR", "tx-bad")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-good", "1")
-	assertCommandResponse(t, conn, parser, protocol.Array{Elements: []protocol.Value{
-		protocol.SimpleString{Value: "OK"},
-		protocol.ErrorValue{Message: "ERR value is not an integer or out of range"},
-		protocol.SimpleString{Value: "OK"},
-	}}, "EXEC")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "ERR unknown command \"NOPE\""}, "NOPE")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-abort", "1")
-	assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "name", "Stash")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "expiring", "soon", "PX", "60000")
+		assertCommandResponse(t, conn, parser, protocol.Integer{Value: 1}, "HSET", "profile", "lang", "go")
+		assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "RPUSH", "letters", "a", "b")
+		assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "SADD", "tags", "fast", "durable")
+		assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "ZADD", "leaders", "1", "alpha", "2", "beta")
+		assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("1-0")}, "XADD", "events", "1-0", "type", "start")
+		assertCommandResponse(t, conn, parser, protocol.Integer{Value: 1}, "INCR", "counter")
+		assertCommandResponse(t, conn, parser, protocol.Integer{Value: 2}, "INCR", "counter")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-bad", "hello")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "INCR", "tx-bad")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-good", "1")
+		assertCommandResponse(t, conn, parser, protocol.Array{Elements: []protocol.Value{
+			protocol.SimpleString{Value: "OK"},
+			protocol.ErrorValue{Message: "ERR value is not an integer or out of range"},
+			protocol.SimpleString{Value: "OK"},
+		}}, "EXEC")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "ERR unknown command \"NOPE\""}, "NOPE")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-abort", "1")
+		assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
 
-	watcherConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) watcher error = %v", addr, err)
-	}
-	defer closeTestResource(t, watcherConn)
-	watcherParser := protocol.NewParser(watcherConn)
+		watcherConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) watcher error = %v", addr, err)
+		}
+		defer closeTestResource(t, watcherConn)
+		watcherParser := protocol.NewParser(watcherConn)
 
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "tx-watch")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "tx-watch", "1")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-watch", "2")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, conn, parser, protocol.Array{Elements: []protocol.Value{}}, "EXEC")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "tx-watch")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "tx-watch", "1")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-watch", "2")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, conn, parser, protocol.Array{Elements: []protocol.Value{}}, "EXEC")
 
-	if err := conn.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	stop()
-	waitForServerStop(t, errCh)
+		if err := conn.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		stop()
+		waitForServerStop(t, errCh)
 
-	restartCfg := testAOFConfig(aofPath)
-	restartAddr, restartStop, restartErrCh := startTestServer(t, restartCfg)
-	restartConn, err := net.Dial("tcp", restartAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-	}
-	defer closeTestResource(t, restartConn)
-	restartParser := protocol.NewParser(restartConn)
+		restartCfg := aofConfig(base, aofPath)
+		restartAddr, restartStop, restartErrCh := startTestServer(t, restartCfg)
+		restartConn, err := net.Dial("tcp", restartAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+		}
+		defer closeTestResource(t, restartConn)
+		restartParser := protocol.NewParser(restartConn)
 
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("Stash")}, "GET", "name")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("soon")}, "GET", "expiring")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("go")}, "HGET", "profile", "lang")
-	assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
-		protocol.BulkString{Data: []byte("a")},
-		protocol.BulkString{Data: []byte("b")},
-	}}, "LRANGE", "letters", "0", "-1")
-	assertCommandResponse(t, restartConn, restartParser, protocol.Integer{Value: 1}, "SISMEMBER", "tags", "durable")
-	assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
-		protocol.BulkString{Data: []byte("alpha")},
-		protocol.BulkString{Data: []byte("beta")},
-	}}, "ZRANGE", "leaders", "0", "-1")
-	assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
-		protocol.Array{Elements: []protocol.Value{
-			protocol.BulkString{Data: []byte("events")},
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("Stash")}, "GET", "name")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("soon")}, "GET", "expiring")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("go")}, "HGET", "profile", "lang")
+		assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
+			protocol.BulkString{Data: []byte("a")},
+			protocol.BulkString{Data: []byte("b")},
+		}}, "LRANGE", "letters", "0", "-1")
+		assertCommandResponse(t, restartConn, restartParser, protocol.Integer{Value: 1}, "SISMEMBER", "tags", "durable")
+		assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
+			protocol.BulkString{Data: []byte("alpha")},
+			protocol.BulkString{Data: []byte("beta")},
+		}}, "ZRANGE", "leaders", "0", "-1")
+		assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
 			protocol.Array{Elements: []protocol.Value{
+				protocol.BulkString{Data: []byte("events")},
 				protocol.Array{Elements: []protocol.Value{
-					protocol.BulkString{Data: []byte("1-0")},
 					protocol.Array{Elements: []protocol.Value{
-						protocol.BulkString{Data: []byte("type")},
-						protocol.BulkString{Data: []byte("start")},
+						protocol.BulkString{Data: []byte("1-0")},
+						protocol.Array{Elements: []protocol.Value{
+							protocol.BulkString{Data: []byte("type")},
+							protocol.BulkString{Data: []byte("start")},
+						}},
 					}},
 				}},
 			}},
-		}},
-	}}, "XREAD", "STREAMS", "events", "0-0")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("2")}, "GET", "counter")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("hello")}, "GET", "tx-bad")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "tx-good")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "tx-abort")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "tx-watch")
+		}}, "XREAD", "STREAMS", "events", "0-0")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("2")}, "GET", "counter")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("hello")}, "GET", "tx-bad")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "tx-good")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "tx-abort")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "tx-watch")
 
-	restartStop()
-	waitForServerStop(t, restartErrCh)
+		restartStop()
+		waitForServerStop(t, restartErrCh)
+	})
 }
 
 func TestServerPrefersAOFOverRDB(t *testing.T) {
-	dir := t.TempDir()
-	aofPath := filepath.Join(dir, "appendonly.aof")
-	rdbPath := writeTempRDBFile(t, buildTestRDB(
-		selectTestDB(0),
-		testStringEntry([]byte("name"), []byte("rdb")),
-	))
-	payload, err := protocol.Encode(request("SET", "name", "aof"))
-	if err != nil {
-		t.Fatalf("Encode() error = %v", err)
-	}
-	if err := os.WriteFile(aofPath, payload, 0o600); err != nil {
-		t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		dir := t.TempDir()
+		aofPath := filepath.Join(dir, "appendonly.aof")
+		rdbPath := writeTempRDBFile(t, buildTestRDB(
+			selectTestDB(0),
+			testStringEntry([]byte("name"), []byte("rdb")),
+		))
+		payload, err := protocol.Encode(request("SET", "name", "aof"))
+		if err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+		if err := os.WriteFile(aofPath, payload, 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
+		}
 
-	cfg := testAOFConfig(aofPath)
-	cfg.RDBPath = rdbPath
-	addr, stop, errCh := startTestServer(t, cfg)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	defer closeTestResource(t, conn)
-	parser := protocol.NewParser(conn)
+		cfg := aofConfig(base, aofPath)
+		cfg.RDBPath = rdbPath
+		addr, stop, errCh := startTestServer(t, cfg)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		defer closeTestResource(t, conn)
+		parser := protocol.NewParser(conn)
 
-	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("aof")}, "GET", "name")
+		assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("aof")}, "GET", "name")
 
-	stop()
-	waitForServerStop(t, errCh)
+		stop()
+		waitForServerStop(t, errCh)
+	})
 }
 
 func TestServerKeepsRDBKeysAfterTheAOFTakesOver(t *testing.T) {
-	// The keys an RDB snapshot loaded beside a missing or empty append-only file
-	// used to live in memory only. The first write made the file non-empty, so
-	// the next start loaded the file, skipped the snapshot, and lost every key
-	// that came from it.
-	tests := []struct {
-		name     string
-		emptyAOF bool
-	}{
-		{name: "missing AOF"},
-		{name: "empty AOF", emptyAOF: true},
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// The keys an RDB snapshot loaded beside a missing or empty append-only file
+		// used to live in memory only. The first write made the file non-empty, so
+		// the next start loaded the file, skipped the snapshot, and lost every key
+		// that came from it.
+		tests := []struct {
+			name     string
+			emptyAOF bool
+		}{
+			{name: "missing AOF"},
+			{name: "empty AOF", emptyAOF: true},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-			if tt.emptyAOF {
-				if err := os.WriteFile(aofPath, nil, 0o600); err != nil {
-					t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+				if tt.emptyAOF {
+					if err := os.WriteFile(aofPath, nil, 0o600); err != nil {
+						t.Fatalf("WriteFile(%q) error = %v", aofPath, err)
+					}
 				}
-			}
-			cfg := testAOFConfig(aofPath)
-			cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
-				selectTestDB(0),
-				testStringEntry([]byte("fromrdb"), []byte("hello")),
-			))
+				cfg := aofConfig(base, aofPath)
+				cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
+					selectTestDB(0),
+					testStringEntry([]byte("fromrdb"), []byte("hello")),
+				))
 
-			addr, stop, errCh := startTestServer(t, cfg)
-			conn, err := net.Dial("tcp", addr)
-			if err != nil {
-				t.Fatalf("Dial(%q) error = %v", addr, err)
-			}
-			parser := protocol.NewParser(conn)
-			assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
-			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
-			closeTestResource(t, conn)
-			stop()
-			waitForServerStop(t, errCh)
+				addr, stop, errCh := startTestServer(t, cfg)
+				conn, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Fatalf("Dial(%q) error = %v", addr, err)
+				}
+				parser := protocol.NewParser(conn)
+				assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
+				assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
+				closeTestResource(t, conn)
+				stop()
+				waitForServerStop(t, errCh)
 
-			restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
-			restartConn, err := net.Dial("tcp", restartAddr)
-			if err != nil {
-				t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-			}
-			defer closeTestResource(t, restartConn)
-			restartParser := protocol.NewParser(restartConn)
-			assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
-			assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
+				restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
+				restartConn, err := net.Dial("tcp", restartAddr)
+				if err != nil {
+					t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+				}
+				defer closeTestResource(t, restartConn)
+				restartParser := protocol.NewParser(restartConn)
+				assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("hello")}, "GET", "fromrdb")
+				assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
 
-			restartStop()
-			waitForServerStop(t, restartErrCh)
-		})
-	}
+				restartStop()
+				waitForServerStop(t, restartErrCh)
+			})
+		}
+	})
 }
 
 func TestServerKeepsTheDeadlineOfAnRDBKeyAfterTheAOFTakesOver(t *testing.T) {
-	// The keys an RDB snapshot loads into an empty append-only file keep the
-	// deadline the snapshot gave them, so a restart neither extends a TTL by the
-	// downtime nor brings back a key that expired meanwhile.
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	// session:43's deadline is an hour out, so the file holds it however slow
-	// the runner is. session:42's passes while the server is down; a runner slow
-	// enough to load the snapshot after it rightly leaves the key out, so no
-	// assertion needs it in the file.
-	lateDeadline := time.Now().Add(time.Hour).UnixMilli()
-	soonDeadline := time.Now().Add(time.Second).UnixMilli()
-	cfg := testAOFConfig(aofPath)
-	cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
-		selectTestDB(0),
-		testExpiringMillisEntry(uint64(lateDeadline), []byte("session:43"), []byte("bob")),
-		testExpiringMillisEntry(uint64(soonDeadline), []byte("session:42"), []byte("alice")),
-	))
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// The keys an RDB snapshot loads into an empty append-only file keep the
+		// deadline the snapshot gave them, so a restart neither extends a TTL by the
+		// downtime nor brings back a key that expired meanwhile.
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		// session:43's deadline is an hour out, so the file holds it however slow
+		// the runner is. session:42's passes while the server is down; a runner slow
+		// enough to load the snapshot after it rightly leaves the key out, so no
+		// assertion needs it in the file.
+		lateDeadline := time.Now().Add(time.Hour).UnixMilli()
+		soonDeadline := time.Now().Add(time.Second).UnixMilli()
+		cfg := aofConfig(base, aofPath)
+		cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(
+			selectTestDB(0),
+			testExpiringMillisEntry(uint64(lateDeadline), []byte("session:43"), []byte("bob")),
+			testExpiringMillisEntry(uint64(soonDeadline), []byte("session:42"), []byte("alice")),
+		))
 
-	addr, stop, errCh := startTestServer(t, cfg)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	parser := protocol.NewParser(conn)
-	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
-	closeTestResource(t, conn)
-	stop()
-	waitForServerStop(t, errCh)
+		addr, stop, errCh := startTestServer(t, cfg)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		parser := protocol.NewParser(conn)
+		assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "other", "1")
+		closeTestResource(t, conn)
+		stop()
+		waitForServerStop(t, errCh)
 
-	seeded, err := os.ReadFile(aofPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
-	}
-	want, err := protocol.Encode(request("SET", "session:43", "bob", "PXAT", strconv.FormatInt(lateDeadline, 10)))
-	if err != nil {
-		t.Fatalf("Encode() error = %v", err)
-	}
-	if !bytes.Contains(seeded, want) {
-		t.Fatalf("append-only file = %q, want it to hold %q", seeded, want)
-	}
-	if relative := []byte("$2\r\nPX\r\n"); bytes.Contains(seeded, relative) {
-		t.Fatalf("append-only file = %q, want no TTL relative to the loader's clock", seeded)
-	}
+		seeded, err := os.ReadFile(aofPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+		}
+		want, err := protocol.Encode(request("SET", "session:43", "bob", "PXAT", strconv.FormatInt(lateDeadline, 10)))
+		if err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+		if !bytes.Contains(seeded, want) {
+			t.Fatalf("append-only file = %q, want it to hold %q", seeded, want)
+		}
+		if relative := []byte("$2\r\nPX\r\n"); bytes.Contains(seeded, relative) {
+			t.Fatalf("append-only file = %q, want no TTL relative to the loader's clock", seeded)
+		}
 
-	// session:42 expires while the server is down.
-	for time.Now().UnixMilli() <= soonDeadline {
-		time.Sleep(time.Until(time.UnixMilli(soonDeadline + 1)))
-	}
+		// session:42 expires while the server is down.
+		for time.Now().UnixMilli() <= soonDeadline {
+			time.Sleep(time.Until(time.UnixMilli(soonDeadline + 1)))
+		}
 
-	restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
-	restartConn, err := net.Dial("tcp", restartAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-	}
-	defer closeTestResource(t, restartConn)
-	restartParser := protocol.NewParser(restartConn)
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
+		restartAddr, restartStop, restartErrCh := startTestServer(t, cfg)
+		restartConn, err := net.Dial("tcp", restartAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+		}
+		defer closeTestResource(t, restartConn)
+		restartParser := protocol.NewParser(restartConn)
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "other")
 
-	restartStop()
-	waitForServerStop(t, restartErrCh)
+		restartStop()
+		waitForServerStop(t, restartErrCh)
+	})
 }
 
 func TestServerDoesNotPersistPublishToAOF(t *testing.T) {
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	cfg := testAOFConfig(aofPath)
-	addr, stop, errCh := startTestServer(t, cfg)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		cfg := aofConfig(base, aofPath)
+		addr, stop, errCh := startTestServer(t, cfg)
 
-	subscriberConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) subscriber error = %v", addr, err)
-	}
-	defer closeTestResource(t, subscriberConn)
-	subscriberParser := protocol.NewParser(subscriberConn)
-	if err := protocol.WriteValue(subscriberConn, request("SUBSCRIBE", "updates")); err != nil {
-		t.Fatalf("WriteValue(SUBSCRIBE) error = %v", err)
-	}
-	if _, err := subscriberParser.Parse(); err != nil {
-		t.Fatalf("Parse() SUBSCRIBE error = %v", err)
-	}
+		subscriberConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) subscriber error = %v", addr, err)
+		}
+		defer closeTestResource(t, subscriberConn)
+		subscriberParser := protocol.NewParser(subscriberConn)
+		if err := protocol.WriteValue(subscriberConn, request("SUBSCRIBE", "updates")); err != nil {
+			t.Fatalf("WriteValue(SUBSCRIBE) error = %v", err)
+		}
+		if _, err := subscriberParser.Parse(); err != nil {
+			t.Fatalf("Parse() SUBSCRIBE error = %v", err)
+		}
 
-	publisherConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) publisher error = %v", addr, err)
-	}
-	defer closeTestResource(t, publisherConn)
-	publisherParser := protocol.NewParser(publisherConn)
-	assertCommandResponse(t, publisherConn, publisherParser, protocol.Integer{Value: 1}, "PUBLISH", "updates", "hello")
-	if _, err := subscriberParser.Parse(); err != nil {
-		t.Fatalf("Parse() pushed pubsub message error = %v", err)
-	}
+		publisherConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) publisher error = %v", addr, err)
+		}
+		defer closeTestResource(t, publisherConn)
+		publisherParser := protocol.NewParser(publisherConn)
+		assertCommandResponse(t, publisherConn, publisherParser, protocol.Integer{Value: 1}, "PUBLISH", "updates", "hello")
+		if _, err := subscriberParser.Parse(); err != nil {
+			t.Fatalf("Parse() pushed pubsub message error = %v", err)
+		}
 
-	info, err := os.Stat(aofPath)
-	if err != nil {
-		t.Fatalf("Stat(%q) error = %v", aofPath, err)
-	}
-	if info.Size() != 0 {
-		t.Fatalf("AOF size after PUBLISH = %d, want 0", info.Size())
-	}
+		info, err := os.Stat(aofPath)
+		if err != nil {
+			t.Fatalf("Stat(%q) error = %v", aofPath, err)
+		}
+		if info.Size() != 0 {
+			t.Fatalf("AOF size after PUBLISH = %d, want 0", info.Size())
+		}
 
-	stop()
-	waitForServerStop(t, errCh)
+		stop()
+		waitForServerStop(t, errCh)
+	})
 }
 
 func TestServerRejectsInvalidReplicaConfigBeforeOpeningAOF(t *testing.T) {
@@ -331,189 +341,195 @@ func TestServerRejectsInvalidReplicaConfigBeforeOpeningAOF(t *testing.T) {
 }
 
 func TestServerBGRewriteAOFCompactsAndReloads(t *testing.T) {
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	cfg := testAOFConfig(aofPath)
-	addr, stop, errCh := startTestServer(t, cfg)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	parser := protocol.NewParser(conn)
-
-	for i := 0; i < 20; i++ {
-		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "name", "value"+time.Date(2000, 1, 1, 0, 0, i, 0, time.UTC).Format("05"))
-	}
-	before, err := os.Stat(aofPath)
-	if err != nil {
-		t.Fatalf("Stat(%q) before rewrite error = %v", aofPath, err)
-	}
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "Background append only file rewriting started"}, "BGREWRITEAOF")
-
-	deadline := time.Now().Add(3 * time.Second)
-	compacted := false
-	for time.Now().Before(deadline) {
-		info, statErr := os.Stat(aofPath)
-		if statErr != nil {
-			t.Fatalf("Stat(%q) during rewrite error = %v", aofPath, statErr)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		cfg := aofConfig(base, aofPath)
+		addr, stop, errCh := startTestServer(t, cfg)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
 		}
-		if info.Size() < before.Size() {
-			compacted = true
-			break
+		parser := protocol.NewParser(conn)
+
+		for i := 0; i < 20; i++ {
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "name", "value"+time.Date(2000, 1, 1, 0, 0, i, 0, time.UTC).Format("05"))
 		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if !compacted {
-		t.Fatalf("BGREWRITEAOF did not compact file within timeout (before=%d)", before.Size())
-	}
+		before, err := os.Stat(aofPath)
+		if err != nil {
+			t.Fatalf("Stat(%q) before rewrite error = %v", aofPath, err)
+		}
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "Background append only file rewriting started"}, "BGREWRITEAOF")
 
-	if err := conn.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	stop()
-	waitForServerStop(t, errCh)
+		deadline := time.Now().Add(3 * time.Second)
+		compacted := false
+		for time.Now().Before(deadline) {
+			info, statErr := os.Stat(aofPath)
+			if statErr != nil {
+				t.Fatalf("Stat(%q) during rewrite error = %v", aofPath, statErr)
+			}
+			if info.Size() < before.Size() {
+				compacted = true
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if !compacted {
+			t.Fatalf("BGREWRITEAOF did not compact file within timeout (before=%d)", before.Size())
+		}
 
-	restartCfg := testAOFConfig(aofPath)
-	restartAddr, restartStop, restartErrCh := startTestServer(t, restartCfg)
-	restartConn, err := net.Dial("tcp", restartAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-	}
-	defer closeTestResource(t, restartConn)
-	restartParser := protocol.NewParser(restartConn)
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("value19")}, "GET", "name")
+		if err := conn.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		stop()
+		waitForServerStop(t, errCh)
 
-	restartStop()
-	waitForServerStop(t, restartErrCh)
+		restartCfg := aofConfig(base, aofPath)
+		restartAddr, restartStop, restartErrCh := startTestServer(t, restartCfg)
+		restartConn, err := net.Dial("tcp", restartAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+		}
+		defer closeTestResource(t, restartConn)
+		restartParser := protocol.NewParser(restartConn)
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("value19")}, "GET", "name")
+
+		restartStop()
+		waitForServerStop(t, restartErrCh)
+	})
 }
 
 func TestAOFRewriteKeepsTTLDeadlinesAcrossRestart(t *testing.T) {
-	// The rewrite used to write a TTL as the time left (PX), which replay counts
-	// from the clock at restart, so a key that expired while the server was down
-	// came back with a fresh lease.
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	parser := protocol.NewParser(conn)
-
-	for i := 0; i < 20; i++ {
-		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "filler", "value"+strconv.Itoa(i))
-	}
-	// session:43's deadline is an hour out, so the rewrite's copy of the keyspace
-	// holds it however slow the runner is. session:42's passes while the server
-	// is down; a copy taken after it rightly leaves the key out, so no assertion
-	// needs it in the rewritten file.
-	lateDeadline := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
-	soonDeadline := time.Now().Add(time.Second).UnixMilli()
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "session:43", "bob", "PXAT", lateDeadline)
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "session:42", "alice", "PXAT", strconv.FormatInt(soonDeadline, 10))
-	before, err := os.Stat(aofPath)
-	if err != nil {
-		t.Fatalf("Stat(%q) before rewrite error = %v", aofPath, err)
-	}
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "Background append only file rewriting started"}, "BGREWRITEAOF")
-
-	// Wait for the rewritten file to replace the old one. The bound only stops a
-	// hung rewrite from hanging the test.
-	waitUntil := time.Now().Add(30 * time.Second)
-	for {
-		info, statErr := os.Stat(aofPath)
-		if statErr != nil {
-			t.Fatalf("Stat(%q) during rewrite error = %v", aofPath, statErr)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// The rewrite used to write a TTL as the time left (PX), which replay counts
+		// from the clock at restart, so a key that expired while the server was down
+		// came back with a fresh lease.
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		addr, stop, errCh := startTestServer(t, aofConfig(base, aofPath))
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
 		}
-		if info.Size() < before.Size() {
-			break
+		parser := protocol.NewParser(conn)
+
+		for i := 0; i < 20; i++ {
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "filler", "value"+strconv.Itoa(i))
 		}
-		if time.Now().After(waitUntil) {
-			t.Fatalf("BGREWRITEAOF did not compact file within timeout (before=%d)", before.Size())
+		// session:43's deadline is an hour out, so the rewrite's copy of the keyspace
+		// holds it however slow the runner is. session:42's passes while the server
+		// is down; a copy taken after it rightly leaves the key out, so no assertion
+		// needs it in the rewritten file.
+		lateDeadline := strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)
+		soonDeadline := time.Now().Add(time.Second).UnixMilli()
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "session:43", "bob", "PXAT", lateDeadline)
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "session:42", "alice", "PXAT", strconv.FormatInt(soonDeadline, 10))
+		before, err := os.Stat(aofPath)
+		if err != nil {
+			t.Fatalf("Stat(%q) before rewrite error = %v", aofPath, err)
 		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	rewritten, err := os.ReadFile(aofPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
-	}
-	want, err := protocol.Encode(request("SET", "session:43", "bob", "PXAT", lateDeadline))
-	if err != nil {
-		t.Fatalf("Encode() error = %v", err)
-	}
-	if !bytes.Contains(rewritten, want) {
-		t.Fatalf("rewritten append-only file = %q, want it to hold %q", rewritten, want)
-	}
-	if relative := []byte("$2\r\nPX\r\n"); bytes.Contains(rewritten, relative) {
-		t.Fatalf("rewritten append-only file = %q, want no TTL relative to the loader's clock", rewritten)
-	}
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "Background append only file rewriting started"}, "BGREWRITEAOF")
 
-	closeTestResource(t, conn)
-	stop()
-	waitForServerStop(t, errCh)
+		// Wait for the rewritten file to replace the old one. The bound only stops a
+		// hung rewrite from hanging the test.
+		waitUntil := time.Now().Add(30 * time.Second)
+		for {
+			info, statErr := os.Stat(aofPath)
+			if statErr != nil {
+				t.Fatalf("Stat(%q) during rewrite error = %v", aofPath, statErr)
+			}
+			if info.Size() < before.Size() {
+				break
+			}
+			if time.Now().After(waitUntil) {
+				t.Fatalf("BGREWRITEAOF did not compact file within timeout (before=%d)", before.Size())
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		rewritten, err := os.ReadFile(aofPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+		}
+		want, err := protocol.Encode(request("SET", "session:43", "bob", "PXAT", lateDeadline))
+		if err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+		if !bytes.Contains(rewritten, want) {
+			t.Fatalf("rewritten append-only file = %q, want it to hold %q", rewritten, want)
+		}
+		if relative := []byte("$2\r\nPX\r\n"); bytes.Contains(rewritten, relative) {
+			t.Fatalf("rewritten append-only file = %q, want no TTL relative to the loader's clock", rewritten)
+		}
 
-	// session:42 expires while the server is down.
-	for time.Now().UnixMilli() <= soonDeadline {
-		time.Sleep(time.Until(time.UnixMilli(soonDeadline + 1)))
-	}
+		closeTestResource(t, conn)
+		stop()
+		waitForServerStop(t, errCh)
 
-	restartAddr, restartStop, restartErrCh := startTestServer(t, testAOFConfig(aofPath))
-	restartConn, err := net.Dial("tcp", restartAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-	}
-	defer closeTestResource(t, restartConn)
-	restartParser := protocol.NewParser(restartConn)
+		// session:42 expires while the server is down.
+		for time.Now().UnixMilli() <= soonDeadline {
+			time.Sleep(time.Until(time.UnixMilli(soonDeadline + 1)))
+		}
 
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("value19")}, "GET", "filler")
+		restartAddr, restartStop, restartErrCh := startTestServer(t, aofConfig(base, aofPath))
+		restartConn, err := net.Dial("tcp", restartAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+		}
+		defer closeTestResource(t, restartConn)
+		restartParser := protocol.NewParser(restartConn)
 
-	restartStop()
-	waitForServerStop(t, restartErrCh)
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "session:42")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("bob")}, "GET", "session:43")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("value19")}, "GET", "filler")
+
+		restartStop()
+		waitForServerStop(t, restartErrCh)
+	})
 }
 
 func TestServerDiscardsTornAOFTailBeforeAppending(t *testing.T) {
-	// A crash mid-append leaves a partial command at the end of the file. Startup
-	// used to replay everything before it and then append new commands straight
-	// after the torn bytes, so the next restart read them as part of the torn
-	// command and silently dropped every write acknowledged in between.
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	complete, err := protocol.EncodeValues([]protocol.Value{request("SET", "a", "1"), request("SET", "b", "2")})
-	if err != nil {
-		t.Fatalf("EncodeValues() error = %v", err)
-	}
-	torn := []byte("*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$3\r\nva")
-	if err := os.WriteFile(aofPath, append(append([]byte{}, complete...), torn...), 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// A crash mid-append leaves a partial command at the end of the file. Startup
+		// used to replay everything before it and then append new commands straight
+		// after the torn bytes, so the next restart read them as part of the torn
+		// command and silently dropped every write acknowledged in between.
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		complete, err := protocol.EncodeValues([]protocol.Value{request("SET", "a", "1"), request("SET", "b", "2")})
+		if err != nil {
+			t.Fatalf("EncodeValues() error = %v", err)
+		}
+		torn := []byte("*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$3\r\nva")
+		if err := os.WriteFile(aofPath, append(append([]byte{}, complete...), torn...), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
 
-	addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	parser := protocol.NewParser(conn)
-	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("2")}, "GET", "b")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "d", "4")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "e", "5")
-	closeTestResource(t, conn)
-	stop()
-	waitForServerStop(t, errCh)
+		addr, stop, errCh := startTestServer(t, aofConfig(base, aofPath))
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		parser := protocol.NewParser(conn)
+		assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("2")}, "GET", "b")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "d", "4")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "e", "5")
+		closeTestResource(t, conn)
+		stop()
+		waitForServerStop(t, errCh)
 
-	restartAddr, restartStop, restartErrCh := startTestServer(t, testAOFConfig(aofPath))
-	restartConn, err := net.Dial("tcp", restartAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-	}
-	defer closeTestResource(t, restartConn)
-	restartParser := protocol.NewParser(restartConn)
+		restartAddr, restartStop, restartErrCh := startTestServer(t, aofConfig(base, aofPath))
+		restartConn, err := net.Dial("tcp", restartAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+		}
+		defer closeTestResource(t, restartConn)
+		restartParser := protocol.NewParser(restartConn)
 
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "a")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("4")}, "GET", "d")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("5")}, "GET", "e")
-	assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "c")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("1")}, "GET", "a")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("4")}, "GET", "d")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Data: []byte("5")}, "GET", "e")
+		assertCommandResponse(t, restartConn, restartParser, protocol.BulkString{Null: true}, "GET", "c")
 
-	restartStop()
-	waitForServerStop(t, restartErrCh)
+		restartStop()
+		waitForServerStop(t, restartErrCh)
+	})
 }
 
 func TestServerRefusesToStartOnACorruptAOF(t *testing.T) {
@@ -586,57 +602,59 @@ func TestServerRefusesToStartOnAnAOFThatAsksForAnAcknowledgement(t *testing.T) {
 }
 
 func TestServerKeepsAutoGeneratedStreamIDsAcrossRestart(t *testing.T) {
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
 
-	addr, stop, errCh := startTestServer(t, testAOFConfig(aofPath))
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	parser := protocol.NewParser(conn)
-	if err := protocol.WriteValue(conn, request("XADD", "events", "*", "type", "start")); err != nil {
-		t.Fatalf("WriteValue(XADD) error = %v", err)
-	}
-	reply, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse(XADD reply) error = %v", err)
-	}
-	id, isNull, ok := integrationBulkStringContent(reply)
-	if !ok || isNull || id == "" {
-		t.Fatalf("XADD * reply = %#v, want the generated ID", reply)
-	}
-	closeTestResource(t, conn)
-	stop()
-	waitForServerStop(t, errCh)
+		addr, stop, errCh := startTestServer(t, aofConfig(base, aofPath))
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		parser := protocol.NewParser(conn)
+		if err := protocol.WriteValue(conn, request("XADD", "events", "*", "type", "start")); err != nil {
+			t.Fatalf("WriteValue(XADD) error = %v", err)
+		}
+		reply, err := parser.Parse()
+		if err != nil {
+			t.Fatalf("Parse(XADD reply) error = %v", err)
+		}
+		id, isNull, ok := integrationBulkStringContent(reply)
+		if !ok || isNull || id == "" {
+			t.Fatalf("XADD * reply = %#v, want the generated ID", reply)
+		}
+		closeTestResource(t, conn)
+		stop()
+		waitForServerStop(t, errCh)
 
-	// Replay must not depend on the clock at restart, so let it move on.
-	time.Sleep(20 * time.Millisecond)
+		// Replay must not depend on the clock at restart, so let it move on.
+		time.Sleep(20 * time.Millisecond)
 
-	restartAddr, restartStop, restartErrCh := startTestServer(t, testAOFConfig(aofPath))
-	restartConn, err := net.Dial("tcp", restartAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
-	}
-	defer closeTestResource(t, restartConn)
-	restartParser := protocol.NewParser(restartConn)
+		restartAddr, restartStop, restartErrCh := startTestServer(t, aofConfig(base, aofPath))
+		restartConn, err := net.Dial("tcp", restartAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) restart error = %v", restartAddr, err)
+		}
+		defer closeTestResource(t, restartConn)
+		restartParser := protocol.NewParser(restartConn)
 
-	assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
-		protocol.Array{Elements: []protocol.Value{
-			protocol.BulkString{Data: []byte("events")},
+		assertCommandResponse(t, restartConn, restartParser, protocol.Array{Elements: []protocol.Value{
 			protocol.Array{Elements: []protocol.Value{
+				protocol.BulkString{Data: []byte("events")},
 				protocol.Array{Elements: []protocol.Value{
-					protocol.BulkString{Data: []byte(id)},
 					protocol.Array{Elements: []protocol.Value{
-						protocol.BulkString{Data: []byte("type")},
-						protocol.BulkString{Data: []byte("start")},
+						protocol.BulkString{Data: []byte(id)},
+						protocol.Array{Elements: []protocol.Value{
+							protocol.BulkString{Data: []byte("type")},
+							protocol.BulkString{Data: []byte("start")},
+						}},
 					}},
 				}},
 			}},
-		}},
-	}}, "XREAD", "STREAMS", "events", "0-0")
+		}}, "XREAD", "STREAMS", "events", "0-0")
 
-	restartStop()
-	waitForServerStop(t, restartErrCh)
+		restartStop()
+		waitForServerStop(t, restartErrCh)
+	})
 }
 
 // TestAnIncrUnderMaxmemoryIsNotLoggedAfterADelOfTheKeyItFoundLive sends each
@@ -647,151 +665,155 @@ func TestServerKeepsAutoGeneratedStreamIDsAcrossRestart(t *testing.T) {
 // round can miss the window it aims at, so the test asserts no timing and logs
 // how many rounds straddled their deadline.
 func TestAnIncrUnderMaxmemoryIsNotLoggedAfterADelOfTheKeyItFoundLive(t *testing.T) {
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	cfg := testAOFConfig(aofPath)
-	cfg.AppendFsync = "everysec"
-	cfg.MaxMemory = 1 << 30
-	// Leave the sweeping to accounted writes. An active pass may remove a key
-	// before its INCR arrives, a correct order this test must not have to tell
-	// apart.
-	cfg.EvictionInterval = time.Hour
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		cfg := aofConfig(base, aofPath)
+		cfg.AppendFsync = "everysec"
+		cfg.MaxMemory = 1 << 30
+		// Leave the sweeping to accounted writes. An active pass may remove a key
+		// before its INCR arrives, a correct order this test must not have to tell
+		// apart.
+		cfg.EvictionInterval = time.Hour
 
-	addr, stop, errCh := startTestServer(t, cfg)
-	conn, parser := dialClient(t, addr)
+		addr, stop, errCh := startTestServer(t, cfg)
+		conn, parser := dialClient(t, addr)
 
-	const rounds = 400
-	foundLive := make(map[string]bool)
-	straddled := 0
-	for round := 0; round < rounds; round++ {
-		key := "k" + strconv.Itoa(round)
-		deadline := time.Now().UnixMilli() + 2
-		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", key, "9", "PXAT", strconv.FormatInt(deadline, 10))
+		const rounds = 400
+		foundLive := make(map[string]bool)
+		straddled := 0
+		for round := 0; round < rounds; round++ {
+			key := "k" + strconv.Itoa(round)
+			deadline := time.Now().UnixMilli() + 2
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", key, "9", "PXAT", strconv.FormatInt(deadline, 10))
 
-		// The key expires when the deadline's millisecond ends. Aim the INCR 5 to
-		// 100 µs before that, so it reads the clock just before and makes room
-		// just after.
-		lead := time.Duration(5+round%96) * time.Microsecond
-		sendAt := time.UnixMilli(deadline + 1).Add(-lead)
-		for time.Now().Before(sendAt) {
+			// The key expires when the deadline's millisecond ends. Aim the INCR 5 to
+			// 100 µs before that, so it reads the clock just before and makes room
+			// just after.
+			lead := time.Duration(5+round%96) * time.Microsecond
+			sendAt := time.UnixMilli(deadline + 1).Add(-lead)
+			for time.Now().Before(sendAt) {
+			}
+			reply := roundTrip(t, conn, parser, "INCR", key)
+			n, ok := reply.(protocol.Integer)
+			if !ok {
+				t.Fatalf("INCR %s reply = %#v, want an integer", key, reply)
+			}
+			// 10 means the INCR found the key live, 1 that it had already expired.
+			foundLive[key] = n.Value == 10
+			if foundLive[key] && time.Now().UnixMilli() > deadline {
+				straddled++
+			}
 		}
-		reply := roundTrip(t, conn, parser, "INCR", key)
-		n, ok := reply.(protocol.Integer)
-		if !ok {
-			t.Fatalf("INCR %s reply = %#v, want an integer", key, reply)
-		}
-		// 10 means the INCR found the key live, 1 that it had already expired.
-		foundLive[key] = n.Value == 10
-		if foundLive[key] && time.Now().UnixMilli() > deadline {
-			straddled++
-		}
-	}
-	t.Logf("%d of %d INCRs found their key live and replied after its deadline had passed", straddled, rounds)
-	closeTestResource(t, conn)
-	stop()
-	waitForServerStop(t, errCh)
+		t.Logf("%d of %d INCRs found their key live and replied after its deadline had passed", straddled, rounds)
+		closeTestResource(t, conn)
+		stop()
+		waitForServerStop(t, errCh)
 
-	data, err := os.ReadFile(aofPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
-	}
-	frames := protocol.NewParser(bytes.NewReader(data))
-	deleted := make(map[string]bool)
-	var misordered []string
-	for {
-		frame, err := frames.Parse()
-		if errors.Is(err, io.EOF) {
-			break
-		}
+		data, err := os.ReadFile(aofPath)
 		if err != nil {
-			t.Fatalf("Parse(AOF frame) error = %v", err)
+			t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
 		}
-		args := collectBulkStrings(t, frame)
-		switch strings.ToUpper(args[0]) {
-		case "DEL":
-			for _, key := range args[1:] {
-				deleted[key] = true
+		frames := protocol.NewParser(bytes.NewReader(data))
+		deleted := make(map[string]bool)
+		var misordered []string
+		for {
+			frame, err := frames.Parse()
+			if errors.Is(err, io.EOF) {
+				break
 			}
-		case "INCR":
-			if foundLive[args[1]] && deleted[args[1]] {
-				misordered = append(misordered, args[1])
+			if err != nil {
+				t.Fatalf("Parse(AOF frame) error = %v", err)
+			}
+			args := collectBulkStrings(t, frame)
+			switch strings.ToUpper(args[0]) {
+			case "DEL":
+				for _, key := range args[1:] {
+					deleted[key] = true
+				}
+			case "INCR":
+				if foundLive[args[1]] && deleted[args[1]] {
+					misordered = append(misordered, args[1])
+				}
 			}
 		}
-	}
-	if len(misordered) > 0 {
-		t.Fatalf("the AOF logs a DEL ahead of %d INCRs that found their key live and replied 10, so a replay leaves them at 1 with no TTL: %v", len(misordered), misordered)
-	}
+		if len(misordered) > 0 {
+			t.Fatalf("the AOF logs a DEL ahead of %d INCRs that found their key live and replied 10, so a replay leaves them at 1 with no TTL: %v", len(misordered), misordered)
+		}
+	})
 }
 
 func TestKeysEvictedAtStartupStayEvictedAfterARestart(t *testing.T) {
-	// A start under --maxmemory evicted keys and only logged them. The AOF still
-	// held their SETs and no DEL, so the next start without the limit replayed
-	// the SETs and brought every evicted key back. Keys an RDB snapshot writes
-	// into an empty AOF came back the same way.
-	const keysPerDEL = 1024
-	tests := []struct {
-		name       string
-		keys       int
-		maxMemory  int64
-		minEvicted int
-		fromRDB    bool
-	}{
-		{name: "50 keys from the AOF", keys: 50, maxMemory: 2000, minEvicted: 30},
-		// About 2,870 evicted keys, more than two DELs may name.
-		{name: "3000 keys from the AOF", keys: 3000, maxMemory: 20000, minEvicted: 2*keysPerDEL + 1},
-		{name: "200 keys an RDB snapshot writes into the AOF", keys: 200, maxMemory: 6000, minEvicted: 140},
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// A start under --maxmemory evicted keys and only logged them. The AOF still
+		// held their SETs and no DEL, so the next start without the limit replayed
+		// the SETs and brought every evicted key back. Keys an RDB snapshot writes
+		// into an empty AOF came back the same way.
+		const keysPerDEL = 1024
+		tests := []struct {
+			name       string
+			keys       int
+			maxMemory  int64
+			minEvicted int
+			fromRDB    bool
+		}{
+			{name: "50 keys from the AOF", keys: 50, maxMemory: 2000, minEvicted: 30},
+			// About 2,870 evicted keys, more than two DELs may name.
+			{name: "3000 keys from the AOF", keys: 3000, maxMemory: 20000, minEvicted: 2*keysPerDEL + 1},
+			{name: "200 keys an RDB snapshot writes into the AOF", keys: 200, maxMemory: 6000, minEvicted: 140},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			for _, policy := range []string{"always", "everysec", "no"} {
-				t.Run("appendfsync "+policy, func(t *testing.T) {
-					aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-					cfg := testAOFConfig(aofPath)
-					cfg.AppendFsync = policy
-					keys := evictableKeys(tt.keys)
-					if tt.fromRDB {
-						parts := [][]byte{selectTestDB(0)}
-						for _, key := range keys {
-							parts = append(parts, testStringEntry([]byte(key), []byte(evictableValue)))
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				for _, policy := range []string{"always", "everysec", "no"} {
+					t.Run("appendfsync "+policy, func(t *testing.T) {
+						aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+						cfg := aofConfig(base, aofPath)
+						cfg.AppendFsync = policy
+						keys := evictableKeys(tt.keys)
+						if tt.fromRDB {
+							parts := [][]byte{selectTestDB(0)}
+							for _, key := range keys {
+								parts = append(parts, testStringEntry([]byte(key), []byte(evictableValue)))
+							}
+							cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(parts...))
+						} else {
+							writeSetsAOF(t, aofPath, keys)
 						}
-						cfg.RDBPath = writeTempRDBFile(t, buildTestRDB(parts...))
-					} else {
-						writeSetsAOF(t, aofPath, keys)
-					}
 
-					limited := cfg
-					limited.MaxMemory = tt.maxMemory
-					kept := liveKeysAfterStart(t, limited, keys)
-					evicted := len(keys) - len(kept)
-					if evicted < tt.minEvicted || len(kept) == 0 {
-						t.Fatalf("a start with maxmemory %d evicted %d of %d keys, want at least %d evicted and some kept", tt.maxMemory, evicted, len(keys), tt.minEvicted)
-					}
-
-					if got := liveKeysAfterStart(t, cfg, keys); strings.Join(got, " ") != strings.Join(kept, " ") {
-						t.Fatalf("a restart without maxmemory has %d of %d keys live, want the same %d the start with it kept", len(got), len(keys), len(kept))
-					}
-
-					dels, deleted := 0, 0
-					for _, args := range aofCommands(t, aofPath) {
-						if strings.ToUpper(args[0]) != "DEL" {
-							continue
+						limited := cfg
+						limited.MaxMemory = tt.maxMemory
+						kept := liveKeysAfterStart(t, limited, keys)
+						evicted := len(keys) - len(kept)
+						if evicted < tt.minEvicted || len(kept) == 0 {
+							t.Fatalf("a start with maxmemory %d evicted %d of %d keys, want at least %d evicted and some kept", tt.maxMemory, evicted, len(keys), tt.minEvicted)
 						}
-						if n := len(args) - 1; n > keysPerDEL {
-							t.Fatalf("a DEL in the append-only file names %d keys, want at most %d", n, keysPerDEL)
+
+						if got := liveKeysAfterStart(t, cfg, keys); strings.Join(got, " ") != strings.Join(kept, " ") {
+							t.Fatalf("a restart without maxmemory has %d of %d keys live, want the same %d the start with it kept", len(got), len(keys), len(kept))
 						}
-						dels++
-						deleted += len(args) - 1
-					}
-					if deleted != evicted {
-						t.Fatalf("the append-only file deletes %d keys, want the %d evicted", deleted, evicted)
-					}
-					if want := (evicted + keysPerDEL - 1) / keysPerDEL; dels != want {
-						t.Fatalf("the append-only file holds %d DELs for %d evicted keys, want %d", dels, evicted, want)
-					}
-				})
-			}
-		})
-	}
+
+						dels, deleted := 0, 0
+						for _, args := range aofCommands(t, aofPath) {
+							if strings.ToUpper(args[0]) != "DEL" {
+								continue
+							}
+							if n := len(args) - 1; n > keysPerDEL {
+								t.Fatalf("a DEL in the append-only file names %d keys, want at most %d", n, keysPerDEL)
+							}
+							dels++
+							deleted += len(args) - 1
+						}
+						if deleted != evicted {
+							t.Fatalf("the append-only file deletes %d keys, want the %d evicted", deleted, evicted)
+						}
+						if want := (evicted + keysPerDEL - 1) / keysPerDEL; dels != want {
+							t.Fatalf("the append-only file holds %d DELs for %d evicted keys, want %d", dels, evicted, want)
+						}
+					})
+				}
+			})
+		}
+	})
 }
 
 // evictableValue is the value of every key evictableKeys names: 100 bytes, so
@@ -874,7 +896,12 @@ func liveKeysAfterStart(t *testing.T, cfg config.Config, keys []string) []string
 }
 
 func testAOFConfig(aofPath string) config.Config {
-	cfg := defaultTestConfig()
+	return aofConfig(defaultTestConfig(), aofPath)
+}
+
+// aofConfig is base with an append-only file at aofPath, synced on every write.
+func aofConfig(base config.Config, aofPath string) config.Config {
+	cfg := base
 	cfg.AOFPath = aofPath
 	cfg.AppendFsync = "always"
 	return cfg
@@ -884,51 +911,53 @@ func testAOFConfig(aofPath string) config.Config {
 // connection: whether an append-only file is being written and whether its last
 // write succeeded.
 func TestInfoPersistenceReportsTheAOF(t *testing.T) {
-	infoPersistence := func(t *testing.T, cfg config.Config) string {
-		t.Helper()
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		infoPersistence := func(t *testing.T, cfg config.Config) string {
+			t.Helper()
 
-		addr, stop, errCh := startTestServer(t, cfg)
-		defer func() {
-			stop()
-			waitForServerStop(t, errCh)
-		}()
-		conn, err := net.Dial("tcp", addr)
-		if err != nil {
-			t.Fatalf("Dial(%q) error = %v", addr, err)
-		}
-		defer closeTestResource(t, conn)
-		parser := protocol.NewParser(conn)
-
-		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "k", "v")
-		if err := protocol.WriteValue(conn, request("INFO", "persistence")); err != nil {
-			t.Fatalf("WriteValue(INFO) error = %v", err)
-		}
-		got, err := parser.Parse()
-		if err != nil {
-			t.Fatalf("Parse() error = %v", err)
-		}
-		text, _, ok := integrationBulkStringContent(got)
-		if !ok {
-			t.Fatalf("INFO persistence response type = %T, want a bulk string", got)
-		}
-		return text
-	}
-
-	t.Run("with an append-only file", func(t *testing.T) {
-		text := infoPersistence(t, testAOFConfig(filepath.Join(t.TempDir(), "appendonly.aof")))
-		for _, want := range []string{"# Persistence", "aof_enabled:1", "aof_last_write_status:ok"} {
-			if !strings.Contains(text, want) {
-				t.Fatalf("INFO persistence = %q, missing %q", text, want)
+			addr, stop, errCh := startTestServer(t, cfg)
+			defer func() {
+				stop()
+				waitForServerStop(t, errCh)
+			}()
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("Dial(%q) error = %v", addr, err)
 			}
-		}
-	})
+			defer closeTestResource(t, conn)
+			parser := protocol.NewParser(conn)
 
-	t.Run("without one", func(t *testing.T) {
-		text := infoPersistence(t, defaultTestConfig())
-		for _, want := range []string{"# Persistence", "aof_enabled:0", "aof_last_write_status:ok"} {
-			if !strings.Contains(text, want) {
-				t.Fatalf("INFO persistence = %q, missing %q", text, want)
+			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "k", "v")
+			if err := protocol.WriteValue(conn, request("INFO", "persistence")); err != nil {
+				t.Fatalf("WriteValue(INFO) error = %v", err)
 			}
+			got, err := parser.Parse()
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			text, _, ok := integrationBulkStringContent(got)
+			if !ok {
+				t.Fatalf("INFO persistence response type = %T, want a bulk string", got)
+			}
+			return text
 		}
+
+		t.Run("with an append-only file", func(t *testing.T) {
+			text := infoPersistence(t, aofConfig(base, filepath.Join(t.TempDir(), "appendonly.aof")))
+			for _, want := range []string{"# Persistence", "aof_enabled:1", "aof_last_write_status:ok"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("INFO persistence = %q, missing %q", text, want)
+				}
+			}
+		})
+
+		t.Run("without one", func(t *testing.T) {
+			text := infoPersistence(t, base)
+			for _, want := range []string{"# Persistence", "aof_enabled:0", "aof_last_write_status:ok"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("INFO persistence = %q, missing %q", text, want)
+				}
+			}
+		})
 	})
 }

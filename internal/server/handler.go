@@ -11,7 +11,6 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
-	"github.com/maltemindedal/stash/internal/replication"
 )
 
 func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net.Conn) {
@@ -45,20 +44,16 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	// Replies are queued while requests keep arriving and are sent when the
 	// handler is about to wait for more input.
 	parser := protocol.NewParser(flushBeforeRead{conn: conn, out: out})
-	// What the replica registry is given as the connection: ending its stream
-	// goes through the Output, which writes what is queued first. Closing it
-	// closes the socket, which fails the Output's next write and so closes it.
-	client := &outputConn{Conn: conn, out: out}
 
 	logger.Debug("client connected")
 	defer s.teardownClient(clientID, logger)
-	// Closes the connection, after the last flush below.
+	// Closes the connection, after the drain below.
 	defer out.Close(nil)
 
 	stopClose := context.AfterFunc(ctx, func() {
 		// A replica's connection stays open while shutdown sends it what is
-		// queued for it (replication.Master.StopFeeds, EndStreams), and shutdown
-		// closes it after that (ClientRegistry.CloseAll).
+		// queued for it and ends its stream (replication.Master.EndStreams), and
+		// shutdown closes it after that (ClientRegistry.CloseAll).
 		if state.IsReplica() {
 			return
 		}
@@ -66,8 +61,11 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 	})
 	defer stopClose()
 	// Runs before the connection is closed (deferred after it): whatever replies
-	// are still queued when the handler leaves go out first, if the socket allows.
-	defer func() { _ = out.Flush() }()
+	// are still queued when the handler leaves go out first. The handler waits
+	// here until they are written, by itself or by the pump. A peer that does
+	// not read them keeps it here until shutdown, or a limit on what is pushed
+	// to the connection, closes the Output.
+	defer out.Drain()
 
 	// On a server that requires a password, a connection gets a limited time to
 	// authenticate. The deadline covers reads, including one that is half way
@@ -112,7 +110,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			return
 		}
 
-		responses, execErr := s.executeClientRequest(ctx, call, clientID, client, logger, value)
+		responses, execErr := s.executeClientRequest(ctx, call, clientID, conn, logger, value)
 		if execErr != nil {
 			return
 		}
@@ -136,23 +134,6 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		}
 	}
 }
-
-// outputConn is a goroutine-mode connection as the replica registry sees it:
-// ending its stream goes through its Output, so that it does not cut off output
-// still queued for another goroutine to write.
-type outputConn struct {
-	net.Conn
-	out *Output
-}
-
-// CloseWrite ends the stream to a replica once everything queued for it has
-// been written (replication.Master.EndStreams).
-func (c *outputConn) CloseWrite() error {
-	c.out.EndStream()
-	return nil
-}
-
-var _ replication.StreamEnder = (*outputConn)(nil)
 
 // authTimeoutApplies reports whether a new connection must authenticate within
 // the configured time: only where a password is required and a timeout is set.
@@ -195,10 +176,10 @@ func (r flushBeforeRead) Read(p []byte) (int, error) {
 // responses to deliver, which the caller hands to the connection's Output even
 // when there are none. A non-nil error is fatal for the connection.
 //
-// A PSYNC that registered the connection as a replica has its feed started
-// here (registerReplicaPeer). The feed pushes to the connection's Output from
-// its own goroutine, so the Output holds what it pushes until the caller has
-// replied: the stream follows the FULLRESYNC reply.
+// A PSYNC that made the connection a replica told its Output, inside the
+// attach cut, to hold what is pushed to it (replication.Master.Attach). The
+// stream propagated since then is released when the caller hands the Output
+// the responses, so it follows the FULLRESYNC reply.
 //
 // A request from a connection that is already an attached replica gets no
 // responses.
@@ -220,11 +201,6 @@ func (s *Server) executeClientRequest(ctx context.Context, call Call, clientID u
 	}
 
 	s.commandsProcessed.Add(1)
-
-	if result.RegisterReplica {
-		call.Client.Output().HoldPushes()
-		s.registerReplicaPeer(clientID, conn)
-	}
 
 	if attachedReplica {
 		// A replica's connection carries the replication stream and nothing

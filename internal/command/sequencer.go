@@ -50,13 +50,14 @@ import (
 //
 // Lock order is gate, then stripes by ascending index, then what recording
 // takes: the AOF writer's lock (aof.Writer.Append), and then the Master's
-// lock and a replica feed's (replication.Master.Propagate),
-// which take neither gate nor stripe, and are not held together. Nothing takes
+// lock, under which each replica's Output takes its own
+// (replication.Master.Propagate). None of them takes gate or stripe, and the
+// writer's lock and the Master's are not held together. Nothing takes
 // gate shared while it already holds it, and nothing waits for another request
 // while holding either (a blocking command waits with neither held). Recording
 // is never done under a shard lock.
 // Counting a frame's replication offset and queueing it for every replica happen
-// under that one lock, so writers on different stripes, and WAIT's GETACK, reach
+// under the Master's lock, so writers on different stripes, and WAIT's GETACK, reach
 // every replica in offset order. While no replica is registered, a client write's
 // frames are only counted, without the Master's lock
 // (replication.Master.Propagate, ordered): the attach cut below registers a
@@ -73,8 +74,10 @@ import (
 // stream. Writes that skipped their stripes because nothing was recording are
 // waited for first, by taking gate exclusively once, and the cut switches
 // recording on while it holds gate, so every write after that takes its stripes.
-// The store's shard locks (the copy) and then the Master's lock (registering)
-// come after the stripes, and are not held together. Readers keep running during
+// The store's shard locks (the copy), then the lock of the connection's Output
+// (told there to hold what is pushed to it, so that the stream follows PSYNC's
+// reply) and then the Master's lock (registering) come after the stripes, and
+// are not held together. Readers keep running during
 // the copy; writers wait for it, as they already waited for the shard locks the
 // copy takes. PSYNC orders itself, like BLPOP and WAIT, but waits only for
 // locks, so it also runs under the event loop. It is refused inside MULTI: EXEC

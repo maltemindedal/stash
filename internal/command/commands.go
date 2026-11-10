@@ -235,9 +235,8 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	}
 	// A connection that is already a replica gets no reply, whatever it asks
 	// for, and stays attached as it is, as in Redis, whose syncCommand returns
-	// at once for one. Attaching it again would register a second feed while
-	// the first could still write frames the new snapshot holds, which the
-	// replica would then apply twice.
+	// at once for one. Attaching it again would send a second snapshot into the
+	// stream the connection already carries.
 	if state := request.client; state != nil && state.IsReplica() {
 		e.logger.Debug("ignoring PSYNC from a connection that is already a replica", "replica_id", state.ID)
 		return server.ExecuteResult{}, nil
@@ -256,16 +255,22 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	}
 
 	// The Master copies the snapshot and registers the replica at one attach
-	// cut, and the replica's feed holds every write made since; the connection
-	// starts the feed once this reply is ahead of it.
+	// cut, where it tells the connection's Output to hold what is pushed to it.
+	// Every write made since the cut waits there, and follows this reply.
+	listeningPort := state.ReplicaListeningPort()
 	attachment := e.master.Attach(replication.Candidate{
-		ID: state.ID, ListeningPort: state.ReplicaListeningPort(), Out: state,
+		ID: state.ID, ListeningPort: listeningPort, Out: state.Output(),
 	}, e.seq.attachCut)
 	state.PromoteToReplica()
+	e.logger.Info(
+		"replica registered",
+		"replica_id", state.ID,
+		"remote_addr", state.RemoteAddress(),
+		"listening_port", listeningPort,
+		"master_offset", e.master.Offset(),
+	)
 
-	result := server.MultiResponse(attachment.Reply()...)
-	result.RegisterReplica = true
-	return result, nil
+	return server.MultiResponse(attachment.Reply()...), nil
 }
 
 func (e *Executor) handleWait(ctx context.Context, request *Request) (server.ExecuteResult, error) {

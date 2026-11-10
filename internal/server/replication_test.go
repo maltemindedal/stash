@@ -21,46 +21,47 @@ import (
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
-func TestServerPropagateToReplicasRemovesFailingReplica(t *testing.T) {
+// TestAReplicaWhoseSocketFailsIsDetachedWhenTheNextFrameIsPushed has two
+// Replicas, one on a socket whose writes fail. Propagating only queues a frame
+// on each Replica's Output. The Output whose socket fails closes itself when it
+// writes, and the Master detaches its Replica at the next frame, which that
+// Output refuses. The other Replica receives every frame.
+func TestAReplicaWhoseSocketFailsIsDetachedWhenTheNextFrameIsPushed(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := newTestServer(t, config.Config{}, logger, storage.NewStore(), nil)
 
-	serverConn := &recordingConn{}
-	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, serverConn)}, serverConn)
-	failingConn := &stubConn{writeErr: errors.New("write boom")}
-	srv.master.Add(replication.Candidate{ID: 2, ListeningPort: 6381, Out: newReplicaPeerStateForTest(2, failingConn)}, failingConn)
+	healthy := &recordingConn{}
+	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: NewOutput(healthy)})
+	failing := NewOutput(&stubConn{writeErr: errors.New("write boom")})
+	srv.master.Add(replication.Candidate{ID: 2, ListeningPort: 6381, Out: failing})
 
-	// Propagating only queues the command for each replica; the replica whose
-	// socket fails is found out, and dropped, by its feed.
-	srv.master.Propagate([]byte("+OK\r\n"), true)
-	deadline := time.Now().Add(2 * time.Second)
-	for srv.master.Count() != 1 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if srv.master.Count() != 1 {
-		t.Fatalf("master.Count() = %d, want the failing replica dropped", srv.master.Count())
-	}
-	for len(serverConn.Bytes()) == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	srv.master.Propagate([]byte("+one\r\n"), true)
+	waitForOutput(t, "the failed write to close the Replica's Output", func() bool { return failing.Err() != nil })
+	if got := srv.master.Count(); got != 2 {
+		t.Fatalf("master.Count() = %d before another frame is pushed, want 2", got)
 	}
 
-	parser := protocol.NewParser(bytes.NewReader(serverConn.Bytes()))
-	value, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
+	srv.master.Propagate([]byte("+two\r\n"), true)
+	if got := srv.master.Count(); got != 1 {
+		t.Fatalf("master.Count() = %d, want the Replica whose socket failed detached", got)
 	}
-	if got, ok := value.(protocol.SimpleString); !ok || got.Value != "OK" {
-		t.Fatalf("parsed value = %#v, want simple string OK", value)
+	want := "+one\r\n+two\r\n"
+	waitForOutput(t, "the healthy Replica to be written both frames", func() bool { return len(healthy.Bytes()) == len(want) })
+	if got := string(healthy.Bytes()); got != want {
+		t.Fatalf("the healthy Replica received %q, want %q", got, want)
 	}
 }
 
-// TestADroppedReplicaIsLoggedByWhyItsFeedStopped drops a replica for each cause
-// its feed can stop with. Only a replica that fell behind (its queue past the
-// limit, or a write to it stalled) is logged as dropped. One whose connection
-// ended left, or is being torn down, and is logged as disconnected, as the
-// connection's teardown would have logged it: a replica that closed its socket
-// just as its feed wrote used to be logged as dropped.
-func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
+// TestAReplicaDetachedForRefusingAFrameIsLoggedByWhyItsOutputClosed closes a
+// Replica's Output for each cause it can close with and propagates a frame,
+// which the Output refuses, so the Master detaches the Replica and tells the
+// server. Only a Replica that fell behind (its stream past the Push limit, or
+// nothing accepted for the stall timeout) is logged as dropped. One whose
+// connection ended left, or is being torn down, and is logged as disconnected,
+// as the connection's teardown would have logged it: a Replica that closed its
+// socket just as a frame was written to it used to be logged as dropped. The
+// teardown that follows finds the Replica detached and logs nothing more.
+func TestAReplicaDetachedForRefusingAFrameIsLoggedByWhyItsOutputClosed(t *testing.T) {
 	tests := []struct {
 		name    string
 		cause   error
@@ -68,9 +69,8 @@ func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
 	}{
 		{name: "the connection was closed", cause: net.ErrClosed, wantLog: "replica disconnected"},
 		{name: "the replica reset the connection", cause: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrClosedPipe}, wantLog: "replica disconnected"},
-		{name: "the client state was disconnected", cause: errors.New("client response writer unavailable"), wantLog: "replica disconnected"},
-		{name: "its queue passed the limit", cause: replication.ErrReplicaBacklog, wantLog: "dropping a replica"},
-		{name: "its connection's push limit", cause: fmt.Errorf("%w: 268435457 bytes against a limit of 268435456", errPushLimitExceeded), wantLog: "dropping a replica"},
+		{name: "the connection was torn down", cause: nil, wantLog: "replica disconnected"},
+		{name: "its stream passed the push limit", cause: fmt.Errorf("%w: 268435457 bytes against a limit of 268435456", errPushLimitExceeded), wantLog: "dropping a replica"},
 		{name: "it accepted nothing for the stall timeout", cause: fmt.Errorf("%w of 30s", errReplicaStalled), wantLog: "dropping a replica"},
 	}
 
@@ -78,77 +78,121 @@ func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			var logs bytes.Buffer
-			srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(&logs, nil)), storage.NewStore(), nil)
-			conn := &stubConn{}
-			srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, &recordingConn{})}, conn)
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			srv := newTestServer(t, config.Config{}, logger, storage.NewStore(), nil)
+			out := NewOutput(&recordingConn{})
+			srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
+			out.Close(tt.cause)
 
-			srv.dropReplica(1, tt.cause)
-
-			for _, line := range []string{"replica disconnected", "dropping a replica"} {
-				if got, want := strings.Count(logs.String(), line), map[bool]int{true: 1}[line == tt.wantLog]; got != want {
-					t.Fatalf("logged %q %d times, want %d\nlogs:\n%s", line, got, want, logs.String())
+			logged := func(when string) {
+				t.Helper()
+				for _, line := range []string{"replica disconnected", "dropping a replica"} {
+					if got, want := strings.Count(logs.String(), line), map[bool]int{true: 1}[line == tt.wantLog]; got != want {
+						t.Fatalf("%s: logged %q %d times, want %d\nlogs:\n%s", when, line, got, want, logs.String())
+					}
 				}
 			}
-			if srv.master.Count() != 0 || conn.closes.Load() != 1 {
-				t.Fatalf("after the drop: %d replicas registered, connection closed %d times; want 0 and once", srv.master.Count(), conn.closes.Load())
+			srv.master.Propagate([]byte("+OK\r\n"), true)
+			logged("after the frame the Output refused")
+			if got := srv.master.Count(); got != 0 {
+				t.Fatalf("%d replicas registered after the refusal, want 0", got)
 			}
-			srv.master.StopFeeds(time.Second)
+
+			srv.teardownClient(1, logger)
+			logged("after the connection's teardown")
 		})
 	}
 }
 
-// TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts starts the feed of a
-// replica whose connection, like the event loop's, holds waiting output to a
-// limit that depends on being a replica. The connection must be marked before
-// the feed starts: the feed may push what it queued during the full resync at
-// once, and a connection not yet marked would hold it to a subscriber's 32 MiB
-// instead of a replica's 256 MiB. The feed holds a frame from the attach, so a
-// feed started first would write it while the connection waits to be marked.
-func TestAConnectionIsMarkedAReplicaBeforeItsFeedStarts(t *testing.T) {
+// TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt attaches a
+// Replica on a connection served by its own goroutine and propagates a write
+// before the reply is queued, as a client writes while the snapshot is still
+// being encoded. The attach cut told the connection's Output to hold what is
+// pushed to it, so the write waits there and reaches the socket after the
+// FULLRESYNC reply and the snapshot. The Event loop's connection is covered by
+// TestEventLoopSendsAWritePropagatedDuringAFullResyncAfterItsReply.
+func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
-	out := &markOrderOutput{written: make(chan struct{})}
-	attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
-	defer srv.master.StopFeeds(time.Second)
-	srv.master.Propagate([]byte("*1\r\n$4\r\nPING\r\n"), true)
+	wire := newOutputWire()
+	out := newGoroutineOutput(srv.outputs, wire)
+	defer out.Close(nil)
 
-	conn := &markedConn{}
-	conn.onMark = func() {
-		select {
-		case <-out.written:
-			conn.feedWroteBeforeMark = true
-		case <-time.After(50 * time.Millisecond):
-		}
+	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
+	srv.master.Propagate([]byte(fullResyncStreamFrame), true)
+	if got := out.Backlog(); got != len(fullResyncStreamFrame) {
+		t.Fatalf("Backlog() = %d before the reply, want the %d bytes of the write waiting", got, len(fullResyncStreamFrame))
 	}
-	srv.registerReplicaPeer(1, conn)
 
-	if conn.marks != 1 {
-		t.Fatalf("the connection was marked a replica %d times, want once", conn.marks)
+	reply := attachment.Reply()
+	if err := out.Reply(reply...); err != nil {
+		t.Fatalf("Reply() error = %v", err)
 	}
-	if conn.feedWroteBeforeMark {
-		t.Fatal("the connection was marked a replica after its feed started writing")
+	if err := out.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
 	}
-	select {
-	case <-out.written:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the feed did not start: it wrote nothing within 5s of the connection being registered")
+
+	want := encodedReply(t, reply) + fullResyncStreamFrame
+	waitForOutput(t, "the reply and the write to be written", func() bool { return len(wire.sent()) == len(want) })
+	if got := wire.sent(); got != want {
+		t.Fatalf("the replica was sent %q, want the full resync reply and then the write: %q", got, want)
 	}
 }
 
-// TestAReplicaDroppedWhileItsFullResyncIsSentHasItsConnectionClosed detaches a
-// replica between its attach cut and the start of its feed, as a disconnect or
-// a backlog past the limit during the transfer does. The Master has no
-// connection to close for it yet, so the server closes it once the reply is
-// sent, when the feed will not start.
-func TestAReplicaDroppedWhileItsFullResyncIsSentHasItsConnectionClosed(t *testing.T) {
-	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
-	attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: newReplicaPeerStateForTest(1, &recordingConn{})})
-	srv.master.Detach(1)
+// TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce propagates more
+// than a Replica may have waiting while its full resync reply is still being
+// produced. The stream held behind that reply counts against the Replica Push
+// limit, so the Output closes the connection on the write that passes it,
+// without waiting for the reply, and the Master detaches the Replica and
+// reports it dropped. The reply is then refused, so nothing is written. The
+// connection used to stay open until the whole snapshot had been sent.
+func TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce(t *testing.T) {
+	var logs bytes.Buffer
+	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(&logs, nil)), storage.NewStore(), nil)
+	srv.outputs.replicaPushLimit = 64
+	wire := newOutputWire()
+	out := newGoroutineOutput(srv.outputs, wire)
 
-	conn := &stubConn{}
-	srv.registerReplicaPeer(1, conn)
-	if got := conn.closes.Load(); got != 1 {
-		t.Fatalf("the connection was closed %d times, want once: a dropped replica's reply is followed by a close", got)
+	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
+	srv.master.Propagate(make([]byte, 40), true)
+	if wire.isClosed() || srv.master.Count() != 1 {
+		t.Fatalf("with 40 bytes waiting against a limit of 64: socket closed = %v, %d replicas registered; want it open and 1", wire.isClosed(), srv.master.Count())
 	}
+
+	srv.master.Propagate(make([]byte, 40), true)
+	if !wire.isClosed() {
+		t.Fatal("the socket is open with 80 bytes of stream waiting against a limit of 64, want it closed at once")
+	}
+	if err := out.Err(); !errors.Is(err, errPushLimitExceeded) {
+		t.Fatalf("Err() = %v, want errPushLimitExceeded", err)
+	}
+	if got := srv.master.Count(); got != 0 {
+		t.Fatalf("%d replicas registered after the limit was passed, want 0", got)
+	}
+	if dropped, disconnected := strings.Count(logs.String(), "dropping a replica"), strings.Count(logs.String(), "replica disconnected"); dropped != 1 || disconnected != 0 {
+		t.Fatalf("logged \"dropping a replica\" %d times and \"replica disconnected\" %d times, want 1 and 0\nlogs:\n%s", dropped, disconnected, logs.String())
+	}
+
+	if err := out.Reply(attachment.Reply()...); !errors.Is(err, errPushLimitExceeded) {
+		t.Fatalf("Reply() of the full resync error = %v, want it refused for the limit", err)
+	}
+	if got := wire.sent(); got != "" {
+		t.Fatalf("sent %q to a replica dropped before its reply, want nothing", got)
+	}
+}
+
+// fullResyncStreamFrame is a command frame propagated while a Replica's full
+// resync reply is being produced.
+const fullResyncStreamFrame = "*1\r\n$4\r\nPING\r\n"
+
+// encodedReply is the bytes values are sent as.
+func encodedReply(t *testing.T, values []protocol.Value) string {
+	t.Helper()
+
+	encoded, err := protocol.EncodeValues(values)
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	return string(encoded)
 }
 
 // attachWithoutCut attaches c as PSYNC does, but with no sequencer to cut
@@ -158,31 +202,6 @@ func attachWithoutCut(master *replication.Master, c replication.Candidate) *repl
 		startRecording()
 		return func() {}
 	})
-}
-
-// markOrderOutput is a replica's output that reports its first write.
-type markOrderOutput struct {
-	once    sync.Once
-	written chan struct{}
-}
-
-func (o *markOrderOutput) WriteEncoded([]byte) error {
-	o.once.Do(func() { close(o.written) })
-	return nil
-}
-
-// markedConn is a connection that, like the event loop's, is told when it
-// becomes a replica.
-type markedConn struct {
-	stubConn
-	marks               int
-	onMark              func()
-	feedWroteBeforeMark bool
-}
-
-func (c *markedConn) markReplica() {
-	c.marks++
-	c.onMark()
 }
 
 type stubConn struct {
@@ -247,9 +266,7 @@ func (psyncLikeExecutor) Handle(_ context.Context, call Call, request protocol.V
 		return SingleResponse(protocol.SimpleString{Value: "OK"}), nil
 	}
 	call.Client.PromoteToReplica()
-	result := MultiResponse(protocol.SimpleString{Value: "FULLRESYNC test-replid 0"}, protocol.BulkString{Data: []byte("snapshot")})
-	result.RegisterReplica = true
-	return result, nil
+	return MultiResponse(protocol.SimpleString{Value: "FULLRESYNC test-replid 0"}, protocol.BulkString{Data: []byte("snapshot")}), nil
 }
 
 // TestRequestsOnAReplicasLinkGetNoReplies runs requests from one connection
@@ -292,30 +309,13 @@ func requestFrame(parts ...string) protocol.Array {
 	return protocol.Array{Elements: elements}
 }
 
-// connReplicaWriter writes a replica's stream straight to its connection, so
-// that a test of the Master and its feeds sees each stretch written, or
-// refused, as the feed hands it over. A server's replica is written through
-// its connection's Output (ClientState.WriteEncoded).
-type connReplicaWriter struct {
-	conn net.Conn
-}
-
-func (w connReplicaWriter) WriteEncoded(payload []byte) error {
-	_, err := w.conn.Write(payload)
-	return err
-}
-
-func newReplicaPeerStateForTest(_ uint64, conn net.Conn) replication.Output {
-	return connReplicaWriter{conn: conn}
-}
-
 // TestServerStatsConcurrentWithAckUpdates has INFO's data source read replica
 // offsets while acknowledgements arrive. ServerStats used to read AckOffset from
 // the shared peer without the Master's lock that Ack writes it under; the
 // race detector reports that, so this test is meaningful under -race.
 func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
-	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: nil}, &stubConn{})
+	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: NewOutput(io.Discard)})
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup

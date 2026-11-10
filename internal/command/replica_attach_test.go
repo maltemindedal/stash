@@ -156,18 +156,20 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				state := newTestClientState(executor, id)
 				state.BindOutput(server.NewOutput(stream))
 				result, err := handle(withClient(context.Background(), state), executor, requestValue("PSYNC", "?", "-1"), true)
-				if err != nil || !result.RegisterReplica {
-					t.Fatalf("PSYNC: RegisterReplica = %v, error = %v", result.RegisterReplica, err)
+				if err != nil || len(result.Responses) != 2 {
+					t.Fatalf("PSYNC: %d replies, error = %v; want the full resync reply", len(result.Responses), err)
 				}
 				// The writes counted before the attach are not in this replica's
 				// stream; those counted after it start here.
 				endsMu.Lock()
 				ends = make(map[string]int64)
 				endsMu.Unlock()
-				// As the connection does once the full resync reply is ahead
-				// (registerReplicaPeer).
-				if !registry.Start(id, stream) {
-					t.Fatalf("Start(%d) = false, want true", id)
+				// The connection replies next, which releases the stream its
+				// Output has held since the attach cut. The reply's own values are
+				// left out here, so that what the replica is sent is its stream
+				// alone, counted from zero.
+				if err := state.Output().Reply(); err != nil {
+					t.Fatalf("Reply() error = %v", err)
 				}
 
 				prefix, end := waitForClientWriteInStream(t, stream, func(tag string) (int64, bool) {
@@ -241,7 +243,7 @@ func waitForClientWriteInStream(t *testing.T, stream *replicaStream, endOf func(
 }
 
 // replicaStream is the connection of a replica attached in a test: it keeps
-// what the replica's feed writes to it.
+// what its Output writes to it.
 type replicaStream struct {
 	mu   sync.Mutex
 	data []byte

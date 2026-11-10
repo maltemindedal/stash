@@ -4,12 +4,10 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,16 +18,17 @@ import (
 )
 
 // Master is the component through which a Master serves its Replicas. It owns
-// the replication offset, each Replica's base offset, feed and
-// acknowledgements, and attaching a Replica at one attach cut.
+// the replication offset, each Replica's base offset and acknowledgements,
+// what is pushed to each Replica's Output, and attaching a Replica at one
+// attach cut.
 //
 // Its lock comes after the command sequencer's gate and write stripes, and
-// before a replica feed's lock: lock order is gate, stripes, mu, feed. While
-// holding mu the Master takes no gate, stripe or shard lock, and calls no
-// drop handler, since the handler takes mu itself (Detach). It never holds mu
-// while it runs an attach cut: the cut takes mu under the gate (beginAttach)
-// and Attach takes it again under every stripe (reserve), each time for a few
-// instructions. Await waits holding nothing.
+// before the locks of a Replica's Output: lock order is gate, stripes, mu,
+// Output. While holding mu the Master takes no gate, stripe or shard lock,
+// waits on no socket (no method of an Output does), and calls no dropped
+// handler. It never holds mu while it runs an attach cut: the cut takes mu
+// under the gate (beginAttach) and Attach takes it again under every stripe
+// (reserve), each time for a few instructions. Await waits holding nothing.
 //
 // A client write's frames skip mu while no Replica is registered (Propagate
 // with ordered set): the attach cut orders them against reserve instead. Every
@@ -41,17 +40,13 @@ type Master struct {
 	store  *storage.Store
 	logger *slog.Logger
 
-	// drop is called, with mu not held, when a Replica can no longer be fed: on
-	// the feed's own goroutine when a write to its socket fails, and on the
-	// propagating goroutine when its feed refuses a frame. When it is nil the
-	// Master detaches the Replica and closes its connection itself.
-	drop func(id uint64, cause error)
+	// dropped is told, with mu not held and on the goroutine that propagated
+	// the frame, of each Replica the Master detached because its Output refused
+	// that frame. When it is nil nobody is told.
+	dropped func(replica *Replica, cause error)
 
 	mu       sync.RWMutex
 	replicas map[uint64]*Replica
-	// feeds counts the feed goroutines Start started and that have not yet
-	// returned from the drop handler (WaitFeeds).
-	feeds sync.WaitGroup
 	// registered is len(replicas), stored under mu whenever it changes, so that
 	// an ordered Propagate can find out without mu that no Replica is registered.
 	registered atomic.Int64
@@ -59,10 +54,10 @@ type Master struct {
 	// attaching counts the Replicas between beginAttach and their reserve or
 	// endAttach, which Active counts as Replicas already.
 	attaching int
-	// stopping is set by StopPropagating once the server is shutting down and
-	// drains what each feed holds. Frames are then counted but queued for no
-	// Replica: a feed closed for the drain would refuse them, and the refusal
-	// would drop the Replica and close its socket in the middle of the drain.
+	// stopping is set by StopPropagating once the server is shutting down.
+	// Frames are then counted but pushed to no Replica: shutdown ends each
+	// Replica's stream once what is queued for it has been written
+	// (EndStreams), and nothing may be written past that end.
 	stopping bool
 }
 
@@ -70,11 +65,6 @@ type Master struct {
 type Replica struct {
 	ID            uint64
 	ListeningPort int
-	// Conn is the Replica's connection. It is nil from the attach cut until the
-	// Replica's feed starts (Master.Start), while its full resync reply is
-	// being sent; Start sets it under the Master's lock while the Replica is
-	// registered, so a Replica that Detach returned is read without the lock.
-	Conn io.Closer
 
 	// ack is the latest replication offset the Replica acknowledged, in its own
 	// count: the bytes of the stream it has processed since it attached. It is
@@ -86,15 +76,32 @@ type Replica struct {
 	// before the Replica is registered and never changes.
 	base int64
 
-	out  Output
-	feed *replicaFeed
+	// out is the Replica's Client output, which every frame counted after base
+	// is pushed to.
+	out Output
 }
 
-// Output is where a Replica's feed hands its stream: the Replica's client
-// connection, whose own output writes it to the socket and drops a Replica
-// that does not take it in time. It keeps no reference to payload.
+// Output is the Master's port to a Replica's connection: the connection's
+// Client output, as much of it as the Master uses. It queues the stream behind
+// the full resync reply, writes it to the socket, and closes a Replica that
+// does not take it in time. Its methods are safe for concurrent use and none
+// waits on the Replica's socket, so the Master calls Push under its lock.
 type Output interface {
-	WriteEncoded(payload []byte) error
+	// MarkReplica holds the connection to the Replica Push limit and the
+	// Replica stall rule.
+	MarkReplica()
+	// HoldPushes makes what is pushed from now on wait for the Reply to the
+	// request the connection is running, which is the full resync reply.
+	HoldPushes()
+	// Push queues a frame of the stream, and keeps no reference to it. It
+	// returns false once the connection is closed: because the Replica left, or
+	// because its Output closed it for falling behind.
+	Push(frame []byte) bool
+	// Err reports why the connection was closed, or nil while it is open.
+	Err() error
+	// EndStream shuts the write side of the connection once everything queued
+	// for it has been written.
+	EndStream()
 }
 
 // Candidate is a client that asks to become a Replica.
@@ -103,7 +110,8 @@ type Candidate struct {
 	// ListeningPort is the port the client announced with REPLCONF
 	// listening-port, or 0.
 	ListeningPort int
-	Out           Output
+	// Out is the Client output of the client's connection.
+	Out Output
 }
 
 // Attachment is a Replica attached at its attach cut, whose full resync reply
@@ -147,11 +155,11 @@ type propagationReport struct {
 	endOffset   int64
 }
 
-// replicaRefusal is a Replica that refused a frame, kept until the Master's
-// lock is released so that it can be dropped.
-type replicaRefusal struct {
-	id  uint64
-	err error
+// refusal is a Replica detached because its Output refused a frame, kept until
+// the Master's lock is released so that the dropped handler can be told.
+type refusal struct {
+	replica *Replica
+	cause   error
 }
 
 // getAckPayload is the REPLCONF GETACK * that asks every Replica how far it
@@ -159,10 +167,15 @@ type replicaRefusal struct {
 var getAckPayload = []byte("*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n")
 
 // NewMaster returns a Master with a new replication ID and no Replica. A full
-// resync copies store. drop is called when a Replica can no longer be fed, to
-// detach it (Detach) and close its connection; with nil the Master does both
-// itself.
-func NewMaster(store *storage.Store, drop func(id uint64, cause error), logger *slog.Logger) *Master {
+// resync copies store.
+//
+// dropped is called for each Replica the Master detached because its Output
+// refused a frame, with why that Output was closed. It runs on the goroutine
+// that propagated the frame, with the Master's lock not held. It only reports:
+// an Output refuses a frame once its connection is closed, so nothing is left
+// to close, and the connection's own teardown follows. With nil nobody is
+// told.
+func NewMaster(store *storage.Store, dropped func(replica *Replica, cause error), logger *slog.Logger) *Master {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -170,7 +183,7 @@ func NewMaster(store *storage.Store, drop func(id uint64, cause error), logger *
 		replicationID: randomReplicationID(),
 		store:         store,
 		logger:        logger,
-		drop:          drop,
+		dropped:       dropped,
 		replicas:      make(map[uint64]*Replica),
 		changed:       make(chan struct{}),
 	}
@@ -202,21 +215,22 @@ func (m *Master) Active() bool {
 // and returns holding the locks under which no write sits between being
 // applied and being propagated, with the function that gives them up.
 //
-// A Replica attaches in three steps:
+// A Replica attaches in two steps:
 //
 //  1. beginAttach, which cut calls as startRecording. From then on Active is
 //     true, so every write that begins after it is ordered, and the cut can
 //     wait for it.
-//  2. reserve, inside the cut, right after the snapshot is copied: the Replica
-//     is registered with a feed that queues every write after the snapshot,
-//     but does not write yet.
-//  3. Start, once the reply is ahead of anything the feed writes on the
-//     connection: the feed starts writing.
+//  2. reserve, inside the cut, right after the snapshot is copied: the
+//     Replica's Output is told to hold what is pushed to it, and the Replica
+//     is registered. Every write after the snapshot is pushed to that Output
+//     and waits there.
 //
-// Attach does the first two and returns the reply to send. The Master's lock
-// is not held while cut runs, and the snapshot is encoded after the cut is
-// released, so writers wait only for the copy. If the copy panics, the attach
-// ends and Active reports what it did before.
+// Attach returns the reply, which the connection sends as the Reply to the
+// request that asked to attach. That Reply releases what the Output held, so
+// the stream follows the snapshot. The Master's lock is not held while cut
+// runs, and the snapshot is encoded after the cut is released, so writers wait
+// only for the copy. If the copy panics, the attach ends and Active reports
+// what it did before.
 func (m *Master) Attach(c Candidate, cut func(startRecording func()) (release func())) *Attachment {
 	entries, stats := m.cutAndReserve(c, cut)
 	snapshot, written := rdb.BuildSnapshot(entries)
@@ -277,28 +291,36 @@ func (m *Master) endAttach() {
 }
 
 // reserve registers a Replica that beginAttach began attaching, and ends that
-// attach. Its feed queues every frame counted from now on, so its base offset
-// is the replication offset now, but writes nothing until Start.
+// attach. Every frame counted from now on is pushed to its Output, so its base
+// offset is the replication offset now.
+//
+// The Output is marked a Replica's and told to hold before the Replica is
+// registered, and so before Propagate can find it: the first frame pushed to
+// it is already counted against a Replica's limit, not a subscriber's, and
+// already waits behind the full resync reply.
 func (m *Master) reserve(c Candidate) {
+	c.Out.MarkReplica()
+	c.Out.HoldPushes()
 	m.register(c, true)
 }
 
-// Add registers a Replica and starts its feed at once, outside any attach cut:
-// reserve and Start in one step, for a Replica that has no snapshot to order
-// its stream against, as in tests. The server attaches Replicas through Attach
-// and Start. Outside the cut nothing orders Add against an ordered Propagate,
+// Add registers a Replica outside any attach cut, for a Replica that has no
+// snapshot to order its stream against, as in tests. Its Output holds nothing,
+// since no reply would release it. The server attaches Replicas through
+// Attach. Outside the cut nothing orders Add against an ordered Propagate,
 // which may count a frame without the lock while no Replica is registered, so
 // Add must not run while frames are propagated that way.
-func (m *Master) Add(c Candidate, conn io.Closer) {
+func (m *Master) Add(c Candidate) {
+	c.Out.MarkReplica()
 	m.register(c, false)
-	m.Start(c.ID, conn)
 }
 
 func (m *Master) register(c Candidate, endsAttach bool) {
-	replica := &Replica{ID: c.ID, ListeningPort: c.ListeningPort, out: c.Out, feed: newReplicaFeed(replicaFeedLimit)}
+	replica := &Replica{ID: c.ID, ListeningPort: c.ListeningPort, out: c.Out}
 
 	m.mu.Lock()
-	// Frames are counted and queued under this lock, so the base splits the
+	defer m.mu.Unlock()
+	// Frames are counted and pushed under this lock, so the base splits the
 	// stream exactly: no frame counted before it is sent to the Replica, and
 	// every frame counted after it is. Read before the lock, a frame counted in
 	// between would lie above the base without being sent, and the Replica would
@@ -306,89 +328,12 @@ func (m *Master) register(c Candidate, endsAttach bool) {
 	// could be sent and still lie below the base, and WAIT would count the
 	// Replica for a write it has not acknowledged.
 	replica.base = m.offset.Load()
-	previous := m.replicas[c.ID]
 	m.replicas[c.ID] = replica
 	m.registered.Store(int64(len(m.replicas)))
 	if endsAttach {
 		m.attaching--
 	}
 	m.notifyChangedLocked()
-	m.mu.Unlock()
-
-	if previous != nil {
-		previous.feed.close(0)
-	}
-}
-
-// Start sets the connection of a Replica that Attach registered and starts its
-// feed, which then writes what it queued since the attach cut and everything
-// after. The caller calls it once the full resync reply is ahead of anything
-// the feed writes on the connection. It reports false when the Replica is no
-// longer registered, or its feed was closed, because it was dropped while its
-// reply was sent; the caller then closes conn.
-func (m *Master) Start(id uint64, conn io.Closer) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	replica := m.replicas[id]
-	if replica == nil {
-		return false
-	}
-	m.feeds.Add(1)
-	stopped := func(err error) {
-		defer m.feeds.Done()
-		// With no drop handler a Replica whose socket failed stays registered
-		// until its connection's teardown detaches it.
-		if err != nil && m.drop != nil {
-			m.drop(id, err)
-		}
-	}
-	// Set before the feed starts, so that a drop caused by its first write
-	// finds the connection to close.
-	replica.Conn = conn
-	if !replica.feed.start(replica.send, stopped) {
-		m.feeds.Done()
-		replica.Conn = nil
-		return false
-	}
-	return true
-}
-
-// dropReplica drops a Replica that can no longer be fed, with mu not held:
-// through the drop handler, or by detaching and closing it when none is set.
-func (m *Master) dropReplica(id uint64, cause error) {
-	if m.drop != nil {
-		m.drop(id, cause)
-		return
-	}
-	// With no handler there is nowhere to report a failed close; the server
-	// always sets one, which logs it.
-	_ = m.detachAndClose(id)
-}
-
-// enqueue queues a pre-encoded RESP payload for the Replica, which its feed
-// writes to its socket in order. It does not wait for the socket, and fails
-// only if the Replica is gone or has fallen too far behind.
-func (r *Replica) enqueue(payload []byte) error {
-	if r.out == nil {
-		return fmt.Errorf("replica response writer unavailable")
-	}
-
-	return r.feed.enqueue(payload)
-}
-
-// send hands one stretch of the stream to the Replica's Output.
-func (r *Replica) send(chunk []byte) error {
-	return r.out.WriteEncoded(chunk)
-}
-
-// WaitFeeds waits until the goroutine of every feed Start started has ended,
-// including the drop handler it called, so that nothing a feed does, such as
-// logging why its Replica was dropped, comes after it returns. A feed ends
-// once its Replica is detached or its connection closes, so the server calls
-// it once every connection has been torn down, before ListenAndServe returns.
-func (m *Master) WaitFeeds() {
-	m.feeds.Wait()
 }
 
 // Propagate counts payload into the replication offset and queues it for every
@@ -416,11 +361,14 @@ func (m *Master) WaitFeeds() {
 // above the base of a Replica registering at that moment and never be queued
 // for it.
 //
-// Queueing only appends to each Replica's feed, so the lock is held for
-// copies, never for a socket write. A Replica whose feed refuses payload (it
-// is closed, or too far behind) is sent nothing after it, and is dropped once
-// the lock is released. Once shutdown has begun (StopPropagating), Propagate
-// only counts payload. It keeps no reference to payload.
+// Queueing only appends to each Replica's Output, so the lock is held for
+// copies, never for a socket write. An Output refuses payload once its
+// connection is closed: the Replica left, or the Output closed it for falling
+// behind (the Replica Push limit, the Replica stall rule). That Replica is
+// detached under the same hold of the lock, so it is pushed nothing after the
+// frame it refused, and the dropped handler is told once the lock is released.
+// Once shutdown has begun (StopPropagating), Propagate only counts payload. It
+// keeps no reference to payload.
 func (m *Master) Propagate(payload []byte, ordered bool) (end int64) {
 	return m.propagate(payload, ordered).endOffset
 }
@@ -467,12 +415,12 @@ func (m *Master) propagate(payload []byte, ordered bool) propagationReport {
 }
 
 // countAndQueue counts payload into the offset and queues it for every
-// Replica under the lock, then drops the Replicas that refused it. It returns
-// the offset at which payload ends, how many Replicas it was queued for, and
-// how many refused it.
+// Replica under the lock, detaching the Replicas whose Output refused it, and
+// then tells the dropped handler of those. It returns the offset at which
+// payload ends, how many Replicas it was queued for, and how many refused it.
 func (m *Master) countAndQueue(payload []byte) (end int64, queued, refused int) {
 	// Refusals are rare, so the slice is only allocated when one happens.
-	var refusals []replicaRefusal
+	var refusals []refusal
 
 	m.mu.Lock()
 	end = m.offset.Add(int64(len(payload)))
@@ -481,32 +429,31 @@ func (m *Master) countAndQueue(payload []byte) (end int64, queued, refused int) 
 		return end, 0, 0
 	}
 	for id, replica := range m.replicas {
-		if err := replica.enqueue(payload); err != nil {
-			// Close the feed so that it refuses every later frame as well. A
-			// smaller frame could otherwise still fit under the backlog limit
-			// before the Replica is dropped, and reach the Replica at a position
-			// other than the offset counted for it.
-			replica.feed.close(0)
-			refusals = append(refusals, replicaRefusal{id: id, err: err})
+		if replica.out.Push(payload) {
+			queued++
 			continue
 		}
-		queued++
+		// Detached before the lock is released: the next frame is counted
+		// under it too, and must not reach a Replica that is missing this one.
+		m.detachLocked(id)
+		refusals = append(refusals, refusal{replica: replica, cause: replica.out.Err()})
 	}
 	m.mu.Unlock()
 
-	// Dropping takes the lock, so it runs after the lock is released.
-	for _, refusal := range refusals {
-		m.dropReplica(refusal.id, refusal.err)
+	if m.dropped != nil {
+		for _, detached := range refusals {
+			m.dropped(detached.replica, detached.cause)
+		}
 	}
 
 	return end, queued, len(refusals)
 }
 
-// StopPropagating makes Propagate queue nothing more for any Replica, and
+// StopPropagating makes Propagate push nothing more to any Replica, and
 // returns how many Replicas are registered. Frames are still counted. The
 // server calls it when shutdown begins: a write made from then on reaches no
-// Replica, which has to synchronise again from the start anyway, and no
-// Replica is dropped for it while its feed drains.
+// Replica, which has to synchronise again from the start anyway, and nothing
+// is written past the end of a Replica's stream (EndStreams).
 func (m *Master) StopPropagating() (replicas int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -515,59 +462,30 @@ func (m *Master) StopPropagating() (replicas int) {
 	return len(m.replicas)
 }
 
-// StopFeeds stops propagating (StopPropagating), gives every Replica's feed up
-// to grace to write what is queued for it and then stops them, returning how
-// many had not finished. The server calls it on shutdown, before it closes the
-// sockets, so that commands already propagated are not lost to a graceful
-// stop. A feed that has not started, because its Replica is still being sent
-// its full resync, is stopped without waiting: that Replica has to synchronise
-// again from the start anyway.
-func (m *Master) StopFeeds(grace time.Duration) (unfinished int) {
-	m.StopPropagating()
-	deadline := time.Now().Add(grace)
-	for _, replica := range m.snapshot() {
-		if !replica.feed.close(time.Until(deadline)) {
-			unfinished++
-		}
-	}
-	return unfinished
-}
-
-// StreamEnder is a Replica's connection whose write side can be shut on its
-// own: a TCP connection in the default networking mode, the event loop's
-// handle in the other.
-type StreamEnder interface {
-	CloseWrite() error
-}
-
-// EndStreams shuts the write side of every started Replica's connection, once
-// StopFeeds has sent them what was queued, and waits until deadline for those
-// Replicas to close their own side, which detaches them. It returns how many
-// had not. Closing a Replica's socket outright while the end of its stream is
-// still in the kernel's send queue would let the Replica's next
-// acknowledgement draw a reset that discards it.
+// EndStreams stops propagating (StopPropagating) and ends the stream of every
+// registered Replica: its Output writes what is queued for it and then shuts
+// the write side of its connection. EndStreams then waits until deadline for
+// those Replicas to close their own side, which detaches them, and returns how
+// many had not.
+//
+// The server calls it on shutdown, before it closes the sockets, so that
+// commands already propagated are not lost to a graceful stop. Closing a
+// Replica's socket outright while the end of its stream is still in the
+// kernel's send queue would let the Replica's next acknowledgement draw a
+// reset that discards it. A Replica still waiting for its full resync reply
+// may be cut off before it: it has to synchronise again from the start anyway.
 func (m *Master) EndStreams(deadline time.Time) (remaining int) {
-	m.mu.RLock()
-	enders := make(map[uint64]StreamEnder, len(m.replicas))
-	for id, replica := range m.replicas {
-		if ender, ok := replica.Conn.(StreamEnder); ok {
-			enders[id] = ender
-		}
-	}
-	m.mu.RUnlock()
-
-	for id, ender := range enders {
-		// One that fails is closed with every other connection afterwards.
-		if err := ender.CloseWrite(); err != nil {
-			delete(enders, id)
-		}
+	m.StopPropagating()
+	ended := m.snapshot()
+	for _, replica := range ended {
+		replica.out.EndStream()
 	}
 
 	for {
 		m.mu.RLock()
 		remaining = 0
-		for id := range enders {
-			if _, ok := m.replicas[id]; ok {
+		for _, replica := range ended {
+			if m.replicas[replica.ID] == replica {
 				remaining++
 			}
 		}
@@ -643,9 +561,10 @@ func (m *Master) ackedLocked(target int64) int {
 // ctx's error if ctx ends first.
 //
 // GETACK is part of the stream and counts toward the offset like a write, so
-// it is counted and queued in the same step as writes are; a Replica that
-// refuses it is dropped the way propagation drops one. Nothing orders Await
-// against an attach cut, so it takes the lock even with no Replica registered.
+// it is counted and queued in the same step as writes are; a Replica whose
+// Output refuses it is detached the way propagation detaches one. Nothing
+// orders Await against an attach cut, so it takes the lock even with no
+// Replica registered.
 func (m *Master) Await(ctx context.Context, want int64, target int64, timeout time.Duration) (acked int, timedOut bool, err error) {
 	_, queued, refused := m.countAndQueue(getAckPayload)
 	m.logger.Debug("requested replica acknowledgements", "replica_count", queued+refused, "payload_size", len(getAckPayload))
@@ -692,35 +611,26 @@ func (r *Replica) acknowledgedMasterOffset() int64 {
 	return r.base + acknowledged
 }
 
-// Detach removes a Replica and stops its feed. It returns the Replica, or nil
-// when id is not one: every way a Replica leaves goes through it, so only the
-// first finds it.
+// Detach removes a Replica, which is pushed nothing from then on. It returns
+// the Replica, or nil when id is not one. A Replica leaves once: when its
+// connection is torn down, which calls Detach, or before that when its Output
+// refuses a frame (Propagate). Only the first of the two finds it.
 func (m *Master) Detach(id uint64) *Replica {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	replica := m.replicas[id]
-	delete(m.replicas, id)
-	m.registered.Store(int64(len(m.replicas)))
-	if replica != nil {
-		m.notifyChangedLocked()
-		replica.feed.close(0)
-	}
-	return replica
+	return m.detachLocked(id)
 }
 
-// detachAndClose detaches a Replica and closes its socket. A Replica whose
-// feed has not started has no connection here yet; Start then reports that it
-// was dropped, and its caller closes the connection.
-func (m *Master) detachAndClose(id uint64) error {
-	replica := m.Detach(id)
-	if replica != nil && replica.Conn != nil {
-		if err := replica.Conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			return err
-		}
+func (m *Master) detachLocked(id uint64) *Replica {
+	replica := m.replicas[id]
+	if replica == nil {
+		return nil
 	}
-
-	return nil
+	delete(m.replicas, id)
+	m.registered.Store(int64(len(m.replicas)))
+	m.notifyChangedLocked()
+	return replica
 }
 
 // snapshot returns the Replicas registered now.

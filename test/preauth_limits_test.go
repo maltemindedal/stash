@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/maltemindedal/stash/internal/config"
 )
 
 // respCommand encodes one command as an array of bulk strings.
@@ -79,94 +81,84 @@ func readReplies(t *testing.T, addr string, payload string, wantLines int) strin
 }
 
 func TestUnauthenticatedClientsAreHeldToSmallFrames(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		name := "goroutine per connection"
-		if eventLoop {
-			name = "event loop"
-		}
-		t.Run(name, func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			cfg.RequirePass = "secret"
-			addr, stop, errCh := startTestServer(t, cfg)
-			defer func() {
-				stop()
-				waitForServerStop(t, errCh)
-			}()
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		cfg.RequirePass = "secret"
+		addr, stop, errCh := startTestServer(t, cfg)
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
 
-			bigValue := strings.Repeat("v", 100*1024)
+		bigValue := strings.Repeat("v", 100*1024)
 
-			t.Run("too many arguments before AUTH", func(t *testing.T) {
-				reply := readUntilClosed(t, addr, respCommand("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"))
-				if !strings.HasPrefix(reply, "-ERR protocol: array length 11 exceeds 10 element limit for a client that has not authenticated") || strings.Count(reply, "\r\n") != 1 {
-					t.Fatalf("reply = %q, want one protocol error", reply)
-				}
-			})
-
-			t.Run("a large value before AUTH", func(t *testing.T) {
-				reply := readUntilClosed(t, addr, respCommand("SET", "key", bigValue))
-				if !strings.Contains(reply, "bulk string length 102400 exceeds 16384 byte limit for a client that has not authenticated") {
-					t.Fatalf("reply = %q, want the pre-auth bulk limit error", reply)
-				}
-			})
-
-			t.Run("a header that declares a huge value is refused without waiting for it", func(t *testing.T) {
-				// Only the header is sent. Nothing waits for 500 MB that never comes.
-				reply := readUntilClosed(t, addr, "*1\r\n$500000000\r\n")
-				if !strings.Contains(reply, "has not authenticated") {
-					t.Fatalf("reply = %q, want the pre-auth bulk limit error", reply)
-				}
-			})
-
-			t.Run("AUTH and PING still work", func(t *testing.T) {
-				reply := readReplies(t, addr, respCommand("PING")+respCommand("AUTH", "wrong")+respCommand("AUTH", "secret")+respCommand("PING"), 4)
-				want := "+PONG\r\n-WRONGPASS invalid username-password pair or user is disabled.\r\n+OK\r\n+PONG\r\n"
-				if reply != want {
-					t.Fatalf("reply = %q, want %q", reply, want)
-				}
-			})
-
-			t.Run("large frames are fine once authenticated", func(t *testing.T) {
-				rpush := []string{"RPUSH", "list"}
-				for i := 0; i < 50; i++ {
-					rpush = append(rpush, "x")
-				}
-				reply := readReplies(t, addr, respCommand("AUTH", "secret")+respCommand("SET", "key", bigValue)+respCommand(rpush...), 3)
-				if reply != "+OK\r\n+OK\r\n:50\r\n" {
-					t.Fatalf("reply = %q, want +OK +OK :50", reply)
-				}
-			})
-
-			t.Run("a large frame pipelined right behind a successful AUTH is accepted", func(t *testing.T) {
-				// Both arrive in one segment. The limit for the SET must be the one
-				// that applies after the AUTH ahead of it has run, as in Redis.
-				reply := readReplies(t, addr, respCommand("AUTH", "secret")+respCommand("SET", "piped", bigValue)+respCommand("GET", "piped"), 4)
-				if want := "+OK\r\n+OK\r\n$102400\r\n" + bigValue + "\r\n"; reply != want {
-					t.Fatalf("reply = %.60q..., want +OK +OK and the 100 KiB value back", reply)
-				}
-			})
-
-			t.Run("a large frame pipelined behind a failed AUTH is refused", func(t *testing.T) {
-				reply := readUntilClosed(t, addr, respCommand("AUTH", "wrong")+respCommand("SET", "piped2", bigValue))
-				if !strings.HasPrefix(reply, "-WRONGPASS") || !strings.Contains(reply, "has not authenticated") {
-					t.Fatalf("reply = %q, want WRONGPASS and then the pre-auth limit error", reply)
-				}
-			})
+		t.Run("too many arguments before AUTH", func(t *testing.T) {
+			reply := readUntilClosed(t, addr, respCommand("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"))
+			if !strings.HasPrefix(reply, "-ERR protocol: array length 11 exceeds 10 element limit for a client that has not authenticated") || strings.Count(reply, "\r\n") != 1 {
+				t.Fatalf("reply = %q, want one protocol error", reply)
+			}
 		})
-	}
+
+		t.Run("a large value before AUTH", func(t *testing.T) {
+			reply := readUntilClosed(t, addr, respCommand("SET", "key", bigValue))
+			if !strings.Contains(reply, "bulk string length 102400 exceeds 16384 byte limit for a client that has not authenticated") {
+				t.Fatalf("reply = %q, want the pre-auth bulk limit error", reply)
+			}
+		})
+
+		t.Run("a header that declares a huge value is refused without waiting for it", func(t *testing.T) {
+			// Only the header is sent. Nothing waits for 500 MB that never comes.
+			reply := readUntilClosed(t, addr, "*1\r\n$500000000\r\n")
+			if !strings.Contains(reply, "has not authenticated") {
+				t.Fatalf("reply = %q, want the pre-auth bulk limit error", reply)
+			}
+		})
+
+		t.Run("AUTH and PING still work", func(t *testing.T) {
+			reply := readReplies(t, addr, respCommand("PING")+respCommand("AUTH", "wrong")+respCommand("AUTH", "secret")+respCommand("PING"), 4)
+			want := "+PONG\r\n-WRONGPASS invalid username-password pair or user is disabled.\r\n+OK\r\n+PONG\r\n"
+			if reply != want {
+				t.Fatalf("reply = %q, want %q", reply, want)
+			}
+		})
+
+		t.Run("large frames are fine once authenticated", func(t *testing.T) {
+			rpush := []string{"RPUSH", "list"}
+			for i := 0; i < 50; i++ {
+				rpush = append(rpush, "x")
+			}
+			reply := readReplies(t, addr, respCommand("AUTH", "secret")+respCommand("SET", "key", bigValue)+respCommand(rpush...), 3)
+			if reply != "+OK\r\n+OK\r\n:50\r\n" {
+				t.Fatalf("reply = %q, want +OK +OK :50", reply)
+			}
+		})
+
+		t.Run("a large frame pipelined right behind a successful AUTH is accepted", func(t *testing.T) {
+			// Both arrive in one segment. The limit for the SET must be the one
+			// that applies after the AUTH ahead of it has run, as in Redis.
+			reply := readReplies(t, addr, respCommand("AUTH", "secret")+respCommand("SET", "piped", bigValue)+respCommand("GET", "piped"), 4)
+			if want := "+OK\r\n+OK\r\n$102400\r\n" + bigValue + "\r\n"; reply != want {
+				t.Fatalf("reply = %.60q..., want +OK +OK and the 100 KiB value back", reply)
+			}
+		})
+
+		t.Run("a large frame pipelined behind a failed AUTH is refused", func(t *testing.T) {
+			reply := readUntilClosed(t, addr, respCommand("AUTH", "wrong")+respCommand("SET", "piped2", bigValue))
+			if !strings.HasPrefix(reply, "-WRONGPASS") || !strings.Contains(reply, "has not authenticated") {
+				t.Fatalf("reply = %q, want WRONGPASS and then the pre-auth limit error", reply)
+			}
+		})
+	})
 }
 
 func TestServerWithoutAPasswordKeepsTheDefaultFrameLimits(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		cfg := defaultTestConfig()
-		cfg.EventLoop = eventLoop
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
 		addr, stop, errCh := startTestServer(t, cfg)
 
 		reply := readReplies(t, addr, respCommand("SET", "key", strings.Repeat("v", 100*1024)), 1)
 		if reply != "+OK\r\n" {
-			t.Fatalf("eventLoop=%v: reply = %q, want +OK", eventLoop, reply)
+			t.Fatalf("reply = %q, want +OK", reply)
 		}
 		stop()
 		waitForServerStop(t, errCh)
-	}
+	})
 }

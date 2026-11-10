@@ -26,94 +26,96 @@ import (
 )
 
 func TestServerHandlesMasterReplicaHandshake(t *testing.T) {
-	cfg := defaultTestConfig()
-	cfg.RequirePass = "secret"
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		cfg := base
+		cfg.RequirePass = "secret"
 
-	logger := stashlogger.New(cfg.LogLevel)
-	store := storage.NewStore()
-	srv := newServer(t, cfg, logger, store)
+		logger := stashlogger.New(cfg.LogLevel)
+		store := storage.NewStore()
+		srv := newServer(t, cfg, logger, store)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.ListenAndServe(ctx)
-	}()
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- srv.ListenAndServe(ctx)
+		}()
 
-	addr := waitForAddr(t, srv)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	defer closeTestResource(t, conn)
-
-	parser := protocol.NewParser(conn)
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "PONG"}, "PING")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "AUTH", "secret")
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "REPLCONF", "listening-port", "6380")
-
-	if err := protocol.WriteValue(conn, request("PSYNC", "?", "-1")); err != nil {
-		t.Fatalf("WriteValue(PSYNC) error = %v", err)
-	}
-
-	fullResyncRaw, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() FULLRESYNC error = %v", err)
-	}
-	fullResync, ok := fullResyncRaw.(protocol.SimpleString)
-	if !ok {
-		t.Fatalf("FULLRESYNC type = %T, want protocol.SimpleString", fullResyncRaw)
-	}
-	parts := strings.Fields(fullResync.Value)
-	if len(parts) != 3 || parts[0] != "FULLRESYNC" || parts[1] == "" || parts[2] != "0" {
-		t.Fatalf("FULLRESYNC payload = %q, want 'FULLRESYNC <replid> 0'", fullResync.Value)
-	}
-
-	snapshotRaw, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() snapshot error = %v", err)
-	}
-	snapshot, ok := snapshotRaw.(protocol.BulkString)
-	if !ok {
-		t.Fatalf("snapshot type = %T, want protocol.BulkString", snapshotRaw)
-	}
-	if snapshot.Null {
-		t.Fatal("snapshot bulk string unexpectedly null")
-	}
-	if string(snapshot.Data) != string(rdb.EmptySnapshot()) {
-		t.Fatalf("snapshot payload = %q, want %q", string(snapshot.Data), string(rdb.EmptySnapshot()))
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if srv.ReplicaCount() == 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if srv.ReplicaCount() != 1 {
-		t.Fatalf("ReplicaCount() = %d, want 1", srv.ReplicaCount())
-	}
-
-	// The link of an attached replica carries the stream alone, so its PING
-	// is not answered (TestTheMasterSendsAnAttachedReplicaNothingButTheStream).
-	if err := protocol.WriteValue(conn, request("PING")); err != nil {
-		t.Fatalf("WriteValue(PING) error = %v", err)
-	}
-	if err := assertNoFurtherReplicaRequests(conn, parser, 100*time.Millisecond); err != nil {
-		t.Fatalf("after the replica's PING: %v", err)
-	}
-
-	cancel()
-	select {
-	case err := <-errCh:
+		addr := waitForAddr(t, srv)
+		conn, err := net.Dial("tcp", addr)
 		if err != nil {
-			t.Fatalf("ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) error = %v", addr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("server did not stop within timeout")
-	}
+		defer closeTestResource(t, conn)
+
+		parser := protocol.NewParser(conn)
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "PONG"}, "PING")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "AUTH", "secret")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "REPLCONF", "listening-port", "6380")
+
+		if err := protocol.WriteValue(conn, request("PSYNC", "?", "-1")); err != nil {
+			t.Fatalf("WriteValue(PSYNC) error = %v", err)
+		}
+
+		fullResyncRaw, err := parser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() FULLRESYNC error = %v", err)
+		}
+		fullResync, ok := fullResyncRaw.(protocol.SimpleString)
+		if !ok {
+			t.Fatalf("FULLRESYNC type = %T, want protocol.SimpleString", fullResyncRaw)
+		}
+		parts := strings.Fields(fullResync.Value)
+		if len(parts) != 3 || parts[0] != "FULLRESYNC" || parts[1] == "" || parts[2] != "0" {
+			t.Fatalf("FULLRESYNC payload = %q, want 'FULLRESYNC <replid> 0'", fullResync.Value)
+		}
+
+		snapshotRaw, err := parser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() snapshot error = %v", err)
+		}
+		snapshot, ok := snapshotRaw.(protocol.BulkString)
+		if !ok {
+			t.Fatalf("snapshot type = %T, want protocol.BulkString", snapshotRaw)
+		}
+		if snapshot.Null {
+			t.Fatal("snapshot bulk string unexpectedly null")
+		}
+		if string(snapshot.Data) != string(rdb.EmptySnapshot()) {
+			t.Fatalf("snapshot payload = %q, want %q", string(snapshot.Data), string(rdb.EmptySnapshot()))
+		}
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if srv.ReplicaCount() == 1 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if srv.ReplicaCount() != 1 {
+			t.Fatalf("ReplicaCount() = %d, want 1", srv.ReplicaCount())
+		}
+
+		// The link of an attached replica carries the stream alone, so its PING
+		// is not answered (TestTheMasterSendsAnAttachedReplicaNothingButTheStream).
+		if err := protocol.WriteValue(conn, request("PING")); err != nil {
+			t.Fatalf("WriteValue(PING) error = %v", err)
+		}
+		if err := assertNoFurtherReplicaRequests(conn, parser, 100*time.Millisecond); err != nil {
+			t.Fatalf("after the replica's PING: %v", err)
+		}
+
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not stop within timeout")
+		}
+	})
 }
 
 func TestServerReplicaModeInitiatesHandshake(t *testing.T) {
@@ -860,142 +862,138 @@ func waitForLogFragments(t *testing.T, logs *synchronizedBuffer, timeout time.Du
 }
 
 func TestMasterPropagatesMutationsToReplica(t *testing.T) {
-	masterCfg := config.Default()
-	masterCfg.Host = "127.0.0.1"
-	masterCfg.Port = 0
-	masterCfg.LogLevel = "error"
-	masterCfg.EvictionInterval = 5 * time.Millisecond
-	masterCfg.EvictionSampleSize = 10
-	masterCfg.DumpPath = ""
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		masterCfg := base
 
-	logger := stashlogger.New(masterCfg.LogLevel)
+		logger := stashlogger.New(masterCfg.LogLevel)
 
-	masterStore := storage.NewStore()
-	master := newServer(t, masterCfg, logger, masterStore)
+		masterStore := storage.NewStore()
+		master := newServer(t, masterCfg, logger, masterStore)
 
-	masterCtx, cancelMaster := context.WithCancel(context.Background())
-	defer cancelMaster()
+		masterCtx, cancelMaster := context.WithCancel(context.Background())
+		defer cancelMaster()
 
-	masterErrCh := make(chan error, 1)
-	go func() {
-		masterErrCh <- master.ListenAndServe(masterCtx)
-	}()
+		masterErrCh := make(chan error, 1)
+		go func() {
+			masterErrCh <- master.ListenAndServe(masterCtx)
+		}()
 
-	masterAddr := waitForAddr(t, master)
+		masterAddr := waitForAddr(t, master)
 
-	replicaCfg := config.Default()
-	replicaCfg.Host = "127.0.0.1"
-	replicaCfg.Port = 0
-	replicaCfg.LogLevel = "error"
-	replicaCfg.EvictionInterval = 5 * time.Millisecond
-	replicaCfg.EvictionSampleSize = 10
-	replicaCfg.DumpPath = ""
-	replicaCfg.ReplicaOf = masterAddr
+		replicaCfg := config.Default()
+		replicaCfg.Host = "127.0.0.1"
+		replicaCfg.Port = 0
+		replicaCfg.LogLevel = "error"
+		replicaCfg.EvictionInterval = 5 * time.Millisecond
+		replicaCfg.EvictionSampleSize = 10
+		replicaCfg.DumpPath = ""
+		replicaCfg.ReplicaOf = masterAddr
 
-	replicaStore := storage.NewStore()
-	replica := newServer(t, replicaCfg, logger, replicaStore)
+		replicaStore := storage.NewStore()
+		replica := newServer(t, replicaCfg, logger, replicaStore)
 
-	replicaCtx, cancelReplica := context.WithCancel(context.Background())
-	defer cancelReplica()
+		replicaCtx, cancelReplica := context.WithCancel(context.Background())
+		defer cancelReplica()
 
-	replicaErrCh := make(chan error, 1)
-	go func() {
-		replicaErrCh <- replica.ListenAndServe(replicaCtx)
-	}()
+		replicaErrCh := make(chan error, 1)
+		go func() {
+			replicaErrCh <- replica.ListenAndServe(replicaCtx)
+		}()
 
-	replicaAddr := waitForAddr(t, replica)
+		replicaAddr := waitForAddr(t, replica)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if master.ReplicaCount() == 1 {
-			break
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if master.ReplicaCount() == 1 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if master.ReplicaCount() != 1 {
-		t.Fatalf("ReplicaCount() = %d, want 1", master.ReplicaCount())
-	}
+		if master.ReplicaCount() != 1 {
+			t.Fatalf("ReplicaCount() = %d, want 1", master.ReplicaCount())
+		}
 
-	masterConn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) master error = %v", masterAddr, err)
-	}
-	defer closeTestResource(t, masterConn)
-	masterParser := protocol.NewParser(masterConn)
-
-	replicaConn, err := net.Dial("tcp", replicaAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) replica error = %v", replicaAddr, err)
-	}
-	defer closeTestResource(t, replicaConn)
-	replicaParser := protocol.NewParser(replicaConn)
-
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "name", "Stash")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("Stash")}, 2*time.Second, "GET", "name")
-
-	assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "DEL", "name")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, 2*time.Second, "GET", "name")
-
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-key", "1")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "DEL", "missing")
-	assertCommandResponse(t, masterConn, masterParser, protocol.Array{Elements: []protocol.Value{
-		protocol.SimpleString{Value: "OK"},
-		protocol.Integer{Value: 0},
-	}}, "EXEC")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("1")}, 2*time.Second, "GET", "tx-key")
-
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-bad", "hello")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "INCR", "tx-bad")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-good", "1")
-	assertCommandResponse(t, masterConn, masterParser, protocol.Array{Elements: []protocol.Value{
-		protocol.SimpleString{Value: "OK"},
-		protocol.ErrorValue{Message: "ERR value is not an integer or out of range"},
-		protocol.SimpleString{Value: "OK"},
-	}}, "EXEC")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("hello")}, 2*time.Second, "GET", "tx-bad")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("1")}, 2*time.Second, "GET", "tx-good")
-
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, masterConn, masterParser, protocol.ErrorValue{Message: "ERR unknown command \"NOPE\""}, "NOPE")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-abort", "1")
-	assertCommandResponse(t, masterConn, masterParser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, 2*time.Second, "GET", "tx-abort")
-
-	watcherConn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) watcher error = %v", masterAddr, err)
-	}
-	defer closeTestResource(t, watcherConn)
-	watcherParser := protocol.NewParser(watcherConn)
-
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "tx-watch")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "tx-watch", "1")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-watch", "2")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("1")}, 2*time.Second, "GET", "tx-watch")
-
-	cancelReplica()
-	select {
-	case err := <-replicaErrCh:
+		masterConn, err := net.Dial("tcp", masterAddr)
 		if err != nil {
-			t.Fatalf("replica ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) master error = %v", masterAddr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("replica did not stop within timeout")
-	}
+		defer closeTestResource(t, masterConn)
+		masterParser := protocol.NewParser(masterConn)
 
-	cancelMaster()
-	select {
-	case err := <-masterErrCh:
+		replicaConn, err := net.Dial("tcp", replicaAddr)
 		if err != nil {
-			t.Fatalf("master ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) replica error = %v", replicaAddr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("master did not stop within timeout")
-	}
+		defer closeTestResource(t, replicaConn)
+		replicaParser := protocol.NewParser(replicaConn)
+
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "name", "Stash")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("Stash")}, 2*time.Second, "GET", "name")
+
+		assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "DEL", "name")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, 2*time.Second, "GET", "name")
+
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-key", "1")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "DEL", "missing")
+		assertCommandResponse(t, masterConn, masterParser, protocol.Array{Elements: []protocol.Value{
+			protocol.SimpleString{Value: "OK"},
+			protocol.Integer{Value: 0},
+		}}, "EXEC")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("1")}, 2*time.Second, "GET", "tx-key")
+
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-bad", "hello")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "INCR", "tx-bad")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-good", "1")
+		assertCommandResponse(t, masterConn, masterParser, protocol.Array{Elements: []protocol.Value{
+			protocol.SimpleString{Value: "OK"},
+			protocol.ErrorValue{Message: "ERR value is not an integer or out of range"},
+			protocol.SimpleString{Value: "OK"},
+		}}, "EXEC")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("hello")}, 2*time.Second, "GET", "tx-bad")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("1")}, 2*time.Second, "GET", "tx-good")
+
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, masterConn, masterParser, protocol.ErrorValue{Message: "ERR unknown command \"NOPE\""}, "NOPE")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-abort", "1")
+		assertCommandResponse(t, masterConn, masterParser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, 2*time.Second, "GET", "tx-abort")
+
+		watcherConn, err := net.Dial("tcp", masterAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) watcher error = %v", masterAddr, err)
+		}
+		defer closeTestResource(t, watcherConn)
+		watcherParser := protocol.NewParser(watcherConn)
+
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "tx-watch")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "tx-watch", "1")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "tx-watch", "2")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("1")}, 2*time.Second, "GET", "tx-watch")
+
+		cancelReplica()
+		select {
+		case err := <-replicaErrCh:
+			if err != nil {
+				t.Fatalf("replica ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("replica did not stop within timeout")
+		}
+
+		cancelMaster()
+		select {
+		case err := <-masterErrCh:
+			if err != nil {
+				t.Fatalf("master ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("master did not stop within timeout")
+		}
+	})
 }
 
 // TestMasterPropagatesActiveEvictionOfExpiredKey pins that a key the active TTL
@@ -1004,63 +1002,65 @@ func TestMasterPropagatesMutationsToReplica(t *testing.T) {
 // invalidates any WATCH guarding the key. Without that, a replica keeps serving
 // a key the master has already dropped, and replaying the AOF resurrects it.
 func TestMasterPropagatesActiveEvictionOfExpiredKey(t *testing.T) {
-	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
-	cfg := testAOFConfig(aofPath)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+		cfg := aofConfig(base, aofPath)
 
-	logger := stashlogger.New(cfg.LogLevel)
-	store := storage.NewStore()
-	srv := newServer(t, cfg, logger, store)
+		logger := stashlogger.New(cfg.LogLevel)
+		store := storage.NewStore()
+		srv := newServer(t, cfg, logger, store)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.ListenAndServe(ctx)
-	}()
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- srv.ListenAndServe(ctx)
+		}()
 
-	addr := waitForAddr(t, srv)
-	replicaConn, replicaParser := attachTestReplica(t, srv, addr)
+		addr := waitForAddr(t, srv)
+		replicaConn, replicaParser := attachTestReplica(t, srv, addr)
 
-	clientConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) client error = %v", addr, err)
-	}
-	defer closeTestResource(t, clientConn)
-	clientParser := protocol.NewParser(clientConn)
+		clientConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) client error = %v", addr, err)
+		}
+		defer closeTestResource(t, clientConn)
+		clientParser := protocol.NewParser(clientConn)
 
-	// The TTL must outlive the WATCH below, so that the transaction is aborted
-	// by the eviction rather than by the SET that armed it.
-	assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "ephemeral", "value", "PX", "300")
+		// The TTL must outlive the WATCH below, so that the transaction is aborted
+		// by the eviction rather than by the SET that armed it.
+		assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "ephemeral", "value", "PX", "300")
 
-	watcherConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) watcher error = %v", addr, err)
-	}
-	defer closeTestResource(t, watcherConn)
-	watcherParser := protocol.NewParser(watcherConn)
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "ephemeral")
+		watcherConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) watcher error = %v", addr, err)
+		}
+		defer closeTestResource(t, watcherConn)
+		watcherParser := protocol.NewParser(watcherConn)
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "ephemeral")
 
-	waitForPropagatedDelete(t, replicaConn, replicaParser, "ephemeral")
+		waitForPropagatedDelete(t, replicaConn, replicaParser, "ephemeral")
 
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "ephemeral", "again")
-	assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "ephemeral", "again")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
 
-	cancel()
-	waitForServerStop(t, errCh)
+		cancel()
+		waitForServerStop(t, errCh)
 
-	recorded, err := os.ReadFile(aofPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
-	}
-	wantFrame, err := protocol.EncodeValues([]protocol.Value{request("DEL", "ephemeral")})
-	if err != nil {
-		t.Fatalf("EncodeValues() error = %v", err)
-	}
-	if !bytes.Contains(recorded, wantFrame) {
-		t.Fatalf("AOF = %q, want it to contain the eviction frame %q", recorded, wantFrame)
-	}
+		recorded, err := os.ReadFile(aofPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
+		}
+		wantFrame, err := protocol.EncodeValues([]protocol.Value{request("DEL", "ephemeral")})
+		if err != nil {
+			t.Fatalf("EncodeValues() error = %v", err)
+		}
+		if !bytes.Contains(recorded, wantFrame) {
+			t.Fatalf("AOF = %q, want it to contain the eviction frame %q", recorded, wantFrame)
+		}
+	})
 }
 
 // attachTestReplica completes the replica handshake on a raw connection and
@@ -1134,80 +1134,75 @@ func waitForPropagatedDelete(t *testing.T, conn net.Conn, parser *protocol.Parse
 // inside a replication frame, since the stream is written in 1 MiB chunks that
 // ignore frame boundaries. Acknowledgements must still count.
 func TestTheMasterSendsAnAttachedReplicaNothingButTheStream(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		eventLoop := eventLoop
-		t.Run(fmt.Sprintf("eventLoop=%v", eventLoop), func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			errCh := make(chan error, 1)
-			go func() { errCh <- master.ListenAndServe(ctx) }()
-			addr := waitForAddr(t, master)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errCh := make(chan error, 1)
+		go func() { errCh <- master.ListenAndServe(ctx) }()
+		addr := waitForAddr(t, master)
 
-			replica, replicaParser := attachTestReplica(t, master, addr)
-			client, clientParser := dialClient(t, addr)
+		replica, replicaParser := attachTestReplica(t, master, addr)
+		client, clientParser := dialClient(t, addr)
 
-			set, err := protocol.EncodeValues([]protocol.Value{request("SET", "k", "v")})
-			if err != nil {
-				t.Fatalf("EncodeValues() error = %v", err)
-			}
-			assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "k", "v")
-			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				t.Fatalf("SetReadDeadline() error = %v", err)
-			}
-			if err := assertReplicaRequest(replicaParser, "SET", "k", "v"); err != nil {
-				t.Fatalf("first propagated write: %v", err)
-			}
+		set, err := protocol.EncodeValues([]protocol.Value{request("SET", "k", "v")})
+		if err != nil {
+			t.Fatalf("EncodeValues() error = %v", err)
+		}
+		assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "k", "v")
+		if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline() error = %v", err)
+		}
+		if err := assertReplicaRequest(replicaParser, "SET", "k", "v"); err != nil {
+			t.Fatalf("first propagated write: %v", err)
+		}
 
-			// Each would get a reply on a client's connection. The acknowledgement
-			// last shows, through INFO, that the master has run all of them.
-			acked := fmt.Sprint(len(set))
-			pipeline, err := protocol.EncodeValues([]protocol.Value{
-				request("REPLCONF", "ACK", acked, "FACK", "0"),
-				request("PING"),
-				request("GET", "k"),
-				request("NOSUCHCOMMAND"),
-				request("REPLCONF", "ACK", acked),
-			})
-			if err != nil {
-				t.Fatalf("EncodeValues() error = %v", err)
-			}
-			if _, err := replica.Write(pipeline); err != nil {
-				t.Fatalf("Write(pipeline) error = %v", err)
-			}
-			waitForReplicaAcknowledgement(t, client, clientParser)
-
-			assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "k2", "v2")
-			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				t.Fatalf("SetReadDeadline() error = %v", err)
-			}
-			next, err := replicaParser.Parse()
-			if err != nil {
-				t.Fatalf("Parse() after the replica's requests error = %v", err)
-			}
-			if propagated, err := command.DecodeRequest(next); err != nil || propagated.Name != "SET" {
-				t.Fatalf("after its own requests the replica read %#v, want the propagated SET k2 v2", next)
-			}
-
-			// A frame that cannot be parsed closes the link, with no reply first.
-			if _, err := replica.Write([]byte("*x\r\n")); err != nil {
-				t.Fatalf("Write(garbage) error = %v", err)
-			}
-			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				t.Fatalf("SetReadDeadline() error = %v", err)
-			}
-			if value, err := replicaParser.Parse(); err == nil {
-				t.Fatalf("after a frame that cannot be parsed the replica read %#v, want the link closed", value)
-			} else if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
-				t.Fatalf("after a frame that cannot be parsed Parse() error = %v, want the link closed", err)
-			}
-
-			cancel()
-			waitForServerStop(t, errCh)
+		// Each would get a reply on a client's connection. The acknowledgement
+		// last shows, through INFO, that the master has run all of them.
+		acked := fmt.Sprint(len(set))
+		pipeline, err := protocol.EncodeValues([]protocol.Value{
+			request("REPLCONF", "ACK", acked, "FACK", "0"),
+			request("PING"),
+			request("GET", "k"),
+			request("NOSUCHCOMMAND"),
+			request("REPLCONF", "ACK", acked),
 		})
-	}
+		if err != nil {
+			t.Fatalf("EncodeValues() error = %v", err)
+		}
+		if _, err := replica.Write(pipeline); err != nil {
+			t.Fatalf("Write(pipeline) error = %v", err)
+		}
+		waitForReplicaAcknowledgement(t, client, clientParser)
+
+		assertCommandResponse(t, client, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "k2", "v2")
+		if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline() error = %v", err)
+		}
+		next, err := replicaParser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() after the replica's requests error = %v", err)
+		}
+		if propagated, err := command.DecodeRequest(next); err != nil || propagated.Name != "SET" {
+			t.Fatalf("after its own requests the replica read %#v, want the propagated SET k2 v2", next)
+		}
+
+		// A frame that cannot be parsed closes the link, with no reply first.
+		if _, err := replica.Write([]byte("*x\r\n")); err != nil {
+			t.Fatalf("Write(garbage) error = %v", err)
+		}
+		if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline() error = %v", err)
+		}
+		if value, err := replicaParser.Parse(); err == nil {
+			t.Fatalf("after a frame that cannot be parsed the replica read %#v, want the link closed", value)
+		} else if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("after a frame that cannot be parsed Parse() error = %v, want the link closed", err)
+		}
+
+		cancel()
+		waitForServerStop(t, errCh)
+	})
 }
 
 // waitForReplicaAcknowledgement waits until INFO replication on conn shows the
@@ -1236,10 +1231,9 @@ func waitForReplicaAcknowledgement(t *testing.T, conn net.Conn, parser *protocol
 // replica whose command produces a reply. The master used to subscribe the
 // replica, or make it a monitor, and push into its stream.
 func TestAnAttachedReplicaIsPushedNoMessageOrMonitorEvent(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		eventLoop := eventLoop
-		t.Run(fmt.Sprintf("SUBSCRIBE closes the replica, eventLoop=%v", eventLoop), func(t *testing.T) {
-			master, replica, replicaParser, client, clientParser := attachedReplicaForPushes(t, eventLoop)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		t.Run("SUBSCRIBE closes the replica", func(t *testing.T) {
+			master, replica, replicaParser, client, clientParser := attachedReplicaForPushes(t, cfg)
 
 			if err := protocol.WriteValue(replica, request("SUBSCRIBE", "news")); err != nil {
 				t.Fatalf("WriteValue(SUBSCRIBE) error = %v", err)
@@ -1265,8 +1259,8 @@ func TestAnAttachedReplicaIsPushedNoMessageOrMonitorEvent(t *testing.T) {
 			}
 		})
 
-		t.Run(fmt.Sprintf("MONITOR is ignored, eventLoop=%v", eventLoop), func(t *testing.T) {
-			_, replica, replicaParser, client, clientParser := attachedReplicaForPushes(t, eventLoop)
+		t.Run("MONITOR is ignored", func(t *testing.T) {
+			_, replica, replicaParser, client, clientParser := attachedReplicaForPushes(t, cfg)
 
 			// The acknowledgement after MONITOR shows, through INFO, that the master
 			// has run MONITOR and still takes the replica's requests.
@@ -1294,16 +1288,14 @@ func TestAnAttachedReplicaIsPushedNoMessageOrMonitorEvent(t *testing.T) {
 				t.Fatalf("after MONITOR and a write: %v", err)
 			}
 		})
-	}
+	})
 }
 
 // attachedReplicaForPushes starts a master, attaches a replica to it, and has a
 // client write SET before 1, which the replica has read when it returns.
-func attachedReplicaForPushes(t *testing.T, eventLoop bool) (*server.Server, net.Conn, *protocol.Parser, net.Conn, *protocol.Parser) {
+func attachedReplicaForPushes(t *testing.T, cfg config.Config) (*server.Server, net.Conn, *protocol.Parser, net.Conn, *protocol.Parser) {
 	t.Helper()
 
-	cfg := defaultTestConfig()
-	cfg.EventLoop = eventLoop
 	master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -1327,247 +1319,239 @@ func attachedReplicaForPushes(t *testing.T, eventLoop bool) (*server.Server, net
 }
 
 func TestMasterFullResyncTransfersExistingKeyspace(t *testing.T) {
-	masterCfg := config.Default()
-	masterCfg.Host = "127.0.0.1"
-	masterCfg.Port = 0
-	masterCfg.LogLevel = "error"
-	masterCfg.EvictionInterval = 5 * time.Millisecond
-	masterCfg.EvictionSampleSize = 10
-	masterCfg.DumpPath = ""
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		masterCfg := base
 
-	logger := stashlogger.New(masterCfg.LogLevel)
+		logger := stashlogger.New(masterCfg.LogLevel)
 
-	masterStore := storage.NewStore()
-	master := newServer(t, masterCfg, logger, masterStore)
+		masterStore := storage.NewStore()
+		master := newServer(t, masterCfg, logger, masterStore)
 
-	masterCtx, cancelMaster := context.WithCancel(context.Background())
-	defer cancelMaster()
+		masterCtx, cancelMaster := context.WithCancel(context.Background())
+		defer cancelMaster()
 
-	masterErrCh := make(chan error, 1)
-	go func() {
-		masterErrCh <- master.ListenAndServe(masterCtx)
-	}()
+		masterErrCh := make(chan error, 1)
+		go func() {
+			masterErrCh <- master.ListenAndServe(masterCtx)
+		}()
 
-	masterAddr := waitForAddr(t, master)
+		masterAddr := waitForAddr(t, master)
 
-	masterConn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) master error = %v", masterAddr, err)
-	}
-	defer closeTestResource(t, masterConn)
-	masterParser := protocol.NewParser(masterConn)
-
-	// Populate the master before any replica exists, so these keys can only
-	// reach the replica through the full resync snapshot.
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "preexisting", "value")
-	assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "second", "another")
-	// RDB support is scoped to string keys; a collection on the master must not
-	// break the handshake, it is simply absent from the snapshot.
-	assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "HSET", "collection", "field", "value")
-
-	replicaCfg := config.Default()
-	replicaCfg.Host = "127.0.0.1"
-	replicaCfg.Port = 0
-	replicaCfg.LogLevel = "error"
-	replicaCfg.EvictionInterval = 5 * time.Millisecond
-	replicaCfg.EvictionSampleSize = 10
-	replicaCfg.DumpPath = ""
-	replicaCfg.ReplicaOf = masterAddr
-
-	replicaStore := storage.NewStore()
-	replica := newServer(t, replicaCfg, logger, replicaStore)
-
-	replicaCtx, cancelReplica := context.WithCancel(context.Background())
-	defer cancelReplica()
-
-	replicaErrCh := make(chan error, 1)
-	go func() {
-		replicaErrCh <- replica.ListenAndServe(replicaCtx)
-	}()
-
-	replicaAddr := waitForAddr(t, replica)
-
-	replicaConn, err := net.Dial("tcp", replicaAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) replica error = %v", replicaAddr, err)
-	}
-	defer closeTestResource(t, replicaConn)
-	replicaParser := protocol.NewParser(replicaConn)
-
-	assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("value")}, 2*time.Second, "GET", "preexisting")
-	assertCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("another")}, "GET", "second")
-	assertCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, "HGET", "collection", "field")
-
-	cancelReplica()
-	select {
-	case err := <-replicaErrCh:
+		masterConn, err := net.Dial("tcp", masterAddr)
 		if err != nil {
-			t.Fatalf("replica ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) master error = %v", masterAddr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("replica did not stop within timeout")
-	}
+		defer closeTestResource(t, masterConn)
+		masterParser := protocol.NewParser(masterConn)
 
-	cancelMaster()
-	select {
-	case err := <-masterErrCh:
+		// Populate the master before any replica exists, so these keys can only
+		// reach the replica through the full resync snapshot.
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "preexisting", "value")
+		assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "second", "another")
+		// RDB support is scoped to string keys; a collection on the master must not
+		// break the handshake, it is simply absent from the snapshot.
+		assertCommandResponse(t, masterConn, masterParser, protocol.Integer{Value: 1}, "HSET", "collection", "field", "value")
+
+		replicaCfg := config.Default()
+		replicaCfg.Host = "127.0.0.1"
+		replicaCfg.Port = 0
+		replicaCfg.LogLevel = "error"
+		replicaCfg.EvictionInterval = 5 * time.Millisecond
+		replicaCfg.EvictionSampleSize = 10
+		replicaCfg.DumpPath = ""
+		replicaCfg.ReplicaOf = masterAddr
+
+		replicaStore := storage.NewStore()
+		replica := newServer(t, replicaCfg, logger, replicaStore)
+
+		replicaCtx, cancelReplica := context.WithCancel(context.Background())
+		defer cancelReplica()
+
+		replicaErrCh := make(chan error, 1)
+		go func() {
+			replicaErrCh <- replica.ListenAndServe(replicaCtx)
+		}()
+
+		replicaAddr := waitForAddr(t, replica)
+
+		replicaConn, err := net.Dial("tcp", replicaAddr)
 		if err != nil {
-			t.Fatalf("master ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) replica error = %v", replicaAddr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("master did not stop within timeout")
-	}
+		defer closeTestResource(t, replicaConn)
+		replicaParser := protocol.NewParser(replicaConn)
+
+		assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("value")}, 2*time.Second, "GET", "preexisting")
+		assertCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("another")}, "GET", "second")
+		assertCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, "HGET", "collection", "field")
+
+		cancelReplica()
+		select {
+		case err := <-replicaErrCh:
+			if err != nil {
+				t.Fatalf("replica ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("replica did not stop within timeout")
+		}
+
+		cancelMaster()
+		select {
+		case err := <-masterErrCh:
+			if err != nil {
+				t.Fatalf("master ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("master did not stop within timeout")
+		}
+	})
 }
 
 func TestPublishPropagatesToReplicaSubscribers(t *testing.T) {
-	masterCfg := config.Default()
-	masterCfg.Host = "127.0.0.1"
-	masterCfg.Port = 0
-	masterCfg.LogLevel = "error"
-	masterCfg.EvictionInterval = 5 * time.Millisecond
-	masterCfg.EvictionSampleSize = 10
-	masterCfg.DumpPath = ""
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		masterCfg := base
 
-	logger := stashlogger.New(masterCfg.LogLevel)
+		logger := stashlogger.New(masterCfg.LogLevel)
 
-	masterStore := storage.NewStore()
-	master := newServer(t, masterCfg, logger, masterStore)
+		masterStore := storage.NewStore()
+		master := newServer(t, masterCfg, logger, masterStore)
 
-	masterCtx, cancelMaster := context.WithCancel(context.Background())
-	defer cancelMaster()
+		masterCtx, cancelMaster := context.WithCancel(context.Background())
+		defer cancelMaster()
 
-	masterErrCh := make(chan error, 1)
-	go func() {
-		masterErrCh <- master.ListenAndServe(masterCtx)
-	}()
+		masterErrCh := make(chan error, 1)
+		go func() {
+			masterErrCh <- master.ListenAndServe(masterCtx)
+		}()
 
-	masterAddr := waitForAddr(t, master)
+		masterAddr := waitForAddr(t, master)
 
-	replicaCfg := config.Default()
-	replicaCfg.Host = "127.0.0.1"
-	replicaCfg.Port = 0
-	replicaCfg.LogLevel = "error"
-	replicaCfg.EvictionInterval = 5 * time.Millisecond
-	replicaCfg.EvictionSampleSize = 10
-	replicaCfg.DumpPath = ""
-	replicaCfg.ReplicaOf = masterAddr
+		replicaCfg := config.Default()
+		replicaCfg.Host = "127.0.0.1"
+		replicaCfg.Port = 0
+		replicaCfg.LogLevel = "error"
+		replicaCfg.EvictionInterval = 5 * time.Millisecond
+		replicaCfg.EvictionSampleSize = 10
+		replicaCfg.DumpPath = ""
+		replicaCfg.ReplicaOf = masterAddr
 
-	replicaStore := storage.NewStore()
-	replica := newServer(t, replicaCfg, logger, replicaStore)
+		replicaStore := storage.NewStore()
+		replica := newServer(t, replicaCfg, logger, replicaStore)
 
-	replicaCtx, cancelReplica := context.WithCancel(context.Background())
-	defer cancelReplica()
+		replicaCtx, cancelReplica := context.WithCancel(context.Background())
+		defer cancelReplica()
 
-	replicaErrCh := make(chan error, 1)
-	go func() {
-		replicaErrCh <- replica.ListenAndServe(replicaCtx)
-	}()
+		replicaErrCh := make(chan error, 1)
+		go func() {
+			replicaErrCh <- replica.ListenAndServe(replicaCtx)
+		}()
 
-	replicaAddr := waitForAddr(t, replica)
+		replicaAddr := waitForAddr(t, replica)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if master.ReplicaCount() == 1 {
-			break
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if master.ReplicaCount() == 1 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if master.ReplicaCount() != 1 {
-		t.Fatalf("ReplicaCount() = %d, want 1", master.ReplicaCount())
-	}
+		if master.ReplicaCount() != 1 {
+			t.Fatalf("ReplicaCount() = %d, want 1", master.ReplicaCount())
+		}
 
-	publisherConn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) publisher error = %v", masterAddr, err)
-	}
-	defer closeTestResource(t, publisherConn)
-	publisherParser := protocol.NewParser(publisherConn)
-
-	masterSubscriberConn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) master subscriber error = %v", masterAddr, err)
-	}
-	defer closeTestResource(t, masterSubscriberConn)
-	masterSubscriberParser := protocol.NewParser(masterSubscriberConn)
-
-	replicaSubscriberConn, err := net.Dial("tcp", replicaAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) replica subscriber error = %v", replicaAddr, err)
-	}
-	defer closeTestResource(t, replicaSubscriberConn)
-	replicaSubscriberParser := protocol.NewParser(replicaSubscriberConn)
-
-	assertCommandResponse(t, masterSubscriberConn, masterSubscriberParser, protocol.Array{Elements: []protocol.Value{
-		protocol.TextBulkString{Value: "subscribe"},
-		protocol.BulkString{Data: []byte("updates")},
-		protocol.Integer{Value: 1},
-	}}, "SUBSCRIBE", "updates")
-	assertCommandResponse(t, replicaSubscriberConn, replicaSubscriberParser, protocol.Array{Elements: []protocol.Value{
-		protocol.TextBulkString{Value: "subscribe"},
-		protocol.BulkString{Data: []byte("updates")},
-		protocol.Integer{Value: 1},
-	}}, "SUBSCRIBE", "updates")
-
-	if err := protocol.WriteValue(publisherConn, request("PUBLISH", "updates", "hello")); err != nil {
-		t.Fatalf("WriteValue(PUBLISH) error = %v", err)
-	}
-	publishResponse, err := publisherParser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() PUBLISH response error = %v", err)
-	}
-	publishedCount, ok := publishResponse.(protocol.Integer)
-	if !ok {
-		t.Fatalf("PUBLISH response type = %T, want protocol.Integer", publishResponse)
-	}
-	if publishedCount.Value < 1 {
-		t.Fatalf("PUBLISH subscriber count = %d, want at least 1 local subscriber", publishedCount.Value)
-	}
-
-	masterMessage, err := masterSubscriberParser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() master subscriber message error = %v", err)
-	}
-	assertValuesEqual(t, masterMessage, protocol.Array{Elements: []protocol.Value{
-		protocol.TextBulkString{Value: "message"},
-		protocol.BulkString{Data: []byte("updates")},
-		protocol.BulkString{Data: []byte("hello")},
-	}})
-
-	if err := replicaSubscriberConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline() replica subscriber error = %v", err)
-	}
-	replicaMessage, err := replicaSubscriberParser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() replica subscriber message error = %v", err)
-	}
-	if err := replicaSubscriberConn.SetReadDeadline(time.Time{}); err != nil {
-		t.Fatalf("reset SetReadDeadline() replica subscriber error = %v", err)
-	}
-	assertValuesEqual(t, replicaMessage, protocol.Array{Elements: []protocol.Value{
-		protocol.TextBulkString{Value: "message"},
-		protocol.BulkString{Data: []byte("updates")},
-		protocol.BulkString{Data: []byte("hello")},
-	}})
-
-	cancelReplica()
-	select {
-	case err := <-replicaErrCh:
+		publisherConn, err := net.Dial("tcp", masterAddr)
 		if err != nil {
-			t.Fatalf("replica ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) publisher error = %v", masterAddr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("replica did not stop within timeout")
-	}
+		defer closeTestResource(t, publisherConn)
+		publisherParser := protocol.NewParser(publisherConn)
 
-	cancelMaster()
-	select {
-	case err := <-masterErrCh:
+		masterSubscriberConn, err := net.Dial("tcp", masterAddr)
 		if err != nil {
-			t.Fatalf("master ListenAndServe() error = %v", err)
+			t.Fatalf("Dial(%q) master subscriber error = %v", masterAddr, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("master did not stop within timeout")
-	}
+		defer closeTestResource(t, masterSubscriberConn)
+		masterSubscriberParser := protocol.NewParser(masterSubscriberConn)
+
+		replicaSubscriberConn, err := net.Dial("tcp", replicaAddr)
+		if err != nil {
+			t.Fatalf("Dial(%q) replica subscriber error = %v", replicaAddr, err)
+		}
+		defer closeTestResource(t, replicaSubscriberConn)
+		replicaSubscriberParser := protocol.NewParser(replicaSubscriberConn)
+
+		assertCommandResponse(t, masterSubscriberConn, masterSubscriberParser, protocol.Array{Elements: []protocol.Value{
+			protocol.TextBulkString{Value: "subscribe"},
+			protocol.BulkString{Data: []byte("updates")},
+			protocol.Integer{Value: 1},
+		}}, "SUBSCRIBE", "updates")
+		assertCommandResponse(t, replicaSubscriberConn, replicaSubscriberParser, protocol.Array{Elements: []protocol.Value{
+			protocol.TextBulkString{Value: "subscribe"},
+			protocol.BulkString{Data: []byte("updates")},
+			protocol.Integer{Value: 1},
+		}}, "SUBSCRIBE", "updates")
+
+		if err := protocol.WriteValue(publisherConn, request("PUBLISH", "updates", "hello")); err != nil {
+			t.Fatalf("WriteValue(PUBLISH) error = %v", err)
+		}
+		publishResponse, err := publisherParser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() PUBLISH response error = %v", err)
+		}
+		publishedCount, ok := publishResponse.(protocol.Integer)
+		if !ok {
+			t.Fatalf("PUBLISH response type = %T, want protocol.Integer", publishResponse)
+		}
+		if publishedCount.Value < 1 {
+			t.Fatalf("PUBLISH subscriber count = %d, want at least 1 local subscriber", publishedCount.Value)
+		}
+
+		masterMessage, err := masterSubscriberParser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() master subscriber message error = %v", err)
+		}
+		assertValuesEqual(t, masterMessage, protocol.Array{Elements: []protocol.Value{
+			protocol.TextBulkString{Value: "message"},
+			protocol.BulkString{Data: []byte("updates")},
+			protocol.BulkString{Data: []byte("hello")},
+		}})
+
+		if err := replicaSubscriberConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline() replica subscriber error = %v", err)
+		}
+		replicaMessage, err := replicaSubscriberParser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() replica subscriber message error = %v", err)
+		}
+		if err := replicaSubscriberConn.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatalf("reset SetReadDeadline() replica subscriber error = %v", err)
+		}
+		assertValuesEqual(t, replicaMessage, protocol.Array{Elements: []protocol.Value{
+			protocol.TextBulkString{Value: "message"},
+			protocol.BulkString{Data: []byte("updates")},
+			protocol.BulkString{Data: []byte("hello")},
+		}})
+
+		cancelReplica()
+		select {
+		case err := <-replicaErrCh:
+			if err != nil {
+				t.Fatalf("replica ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("replica did not stop within timeout")
+		}
+
+		cancelMaster()
+		select {
+		case err := <-masterErrCh:
+			if err != nil {
+				t.Fatalf("master ListenAndServe() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("master did not stop within timeout")
+		}
+	})
 }
 
 func TestWaitReturnsReplicaAcknowledgements(t *testing.T) {
@@ -1825,32 +1809,27 @@ func infoFields(t *testing.T, conn net.Conn, parser *protocol.Parser, section st
 // client is not left attached as a replica. It used to be queued, and EXEC
 // answered with an invalid-response error and left the client marked a replica.
 func TestPsyncInsideMultiIsRefusedAndExecAborts(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		eventLoop := eventLoop
-		t.Run(fmt.Sprintf("eventLoop=%v", eventLoop), func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			addr, stop, errCh := startTestServer(t, cfg)
-			defer stop()
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		addr, stop, errCh := startTestServer(t, cfg)
+		defer stop()
 
-			conn, parser := dialClient(t, addr)
-			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "REPLCONF", "listening-port", "6380")
-			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
-			assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "ERR Command not allowed inside a transaction"}, "PSYNC", "?", "-1")
-			assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
+		conn, parser := dialClient(t, addr)
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "REPLCONF", "listening-port", "6380")
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "MULTI")
+		assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "ERR Command not allowed inside a transaction"}, "PSYNC", "?", "-1")
+		assertCommandResponse(t, conn, parser, protocol.ErrorValue{Message: "EXECABORT Transaction discarded because of previous errors."}, "EXEC")
 
-			fields := infoFields(t, conn, parser, "replication")
-			if got := fields["connected_slaves"]; got != "0" {
-				t.Fatalf("connected_slaves = %q, want 0", got)
-			}
-			// The connection is still an ordinary client.
-			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "after", "exec")
-			assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("exec")}, "GET", "after")
+		fields := infoFields(t, conn, parser, "replication")
+		if got := fields["connected_slaves"]; got != "0" {
+			t.Fatalf("connected_slaves = %q, want 0", got)
+		}
+		// The connection is still an ordinary client.
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "after", "exec")
+		assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte("exec")}, "GET", "after")
 
-			stop()
-			waitForServerStop(t, errCh)
-		})
-	}
+		stop()
+		waitForServerStop(t, errCh)
+	})
 }
 
 // TestPsyncFromAConnectionThatIsAlreadyAReplicaIsIgnored has an attached replica
@@ -1861,76 +1840,71 @@ func TestPsyncInsideMultiIsRefusedAndExecAborts(t *testing.T) {
 // FULLRESYNC and snapshot while the first attachment's feed could still write
 // writes the new snapshot already held, which the replica then applied twice.
 func TestPsyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		eventLoop := eventLoop
-		t.Run(fmt.Sprintf("eventLoop=%v", eventLoop), func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			errCh := make(chan error, 1)
-			go func() { errCh <- master.ListenAndServe(ctx) }()
-			addr := waitForAddr(t, master)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		master := newServer(t, cfg, stashlogger.New(cfg.LogLevel), storage.NewStore())
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errCh := make(chan error, 1)
+		go func() { errCh <- master.ListenAndServe(ctx) }()
+		addr := waitForAddr(t, master)
 
-			replica, replicaParser := attachTestReplica(t, master, addr)
-			client, clientParser := dialClient(t, addr)
+		replica, replicaParser := attachTestReplica(t, master, addr)
+		client, clientParser := dialClient(t, addr)
 
-			incr, err := protocol.EncodeValues([]protocol.Value{request("INCR", "counter")})
-			if err != nil {
-				t.Fatalf("EncodeValues() error = %v", err)
-			}
-			assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 1}, "INCR", "counter")
-			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				t.Fatalf("SetReadDeadline() error = %v", err)
-			}
-			if err := assertReplicaRequest(replicaParser, "INCR", "counter"); err != nil {
-				t.Fatalf("first propagated write: %v", err)
-			}
+		incr, err := protocol.EncodeValues([]protocol.Value{request("INCR", "counter")})
+		if err != nil {
+			t.Fatalf("EncodeValues() error = %v", err)
+		}
+		assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 1}, "INCR", "counter")
+		if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline() error = %v", err)
+		}
+		if err := assertReplicaRequest(replicaParser, "INCR", "counter"); err != nil {
+			t.Fatalf("first propagated write: %v", err)
+		}
 
-			// PSYNC again, then acknowledge what the stream has carried so far.
-			// The master runs a connection's requests in order, so once INFO shows
-			// the acknowledgement it has run the PSYNC.
-			again := append(mustEncode(t, request("PSYNC", "?", "-1")), mustEncode(t, request("REPLCONF", "ACK", fmt.Sprint(len(incr))))...)
-			if _, err := replica.Write(again); err != nil {
-				t.Fatalf("Write(PSYNC, REPLCONF ACK) error = %v", err)
+		// PSYNC again, then acknowledge what the stream has carried so far.
+		// The master runs a connection's requests in order, so once INFO shows
+		// the acknowledgement it has run the PSYNC.
+		again := append(mustEncode(t, request("PSYNC", "?", "-1")), mustEncode(t, request("REPLCONF", "ACK", fmt.Sprint(len(incr))))...)
+		if _, err := replica.Write(again); err != nil {
+			t.Fatalf("Write(PSYNC, REPLCONF ACK) error = %v", err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		var fields map[string]string
+		for {
+			fields = infoFields(t, client, clientParser, "replication")
+			if !strings.HasSuffix(fields["slave0"], ",offset=0") || time.Now().After(deadline) {
+				break
 			}
-			deadline := time.Now().Add(2 * time.Second)
-			var fields map[string]string
-			for {
-				fields = infoFields(t, client, clientParser, "replication")
-				if !strings.HasSuffix(fields["slave0"], ",offset=0") || time.Now().After(deadline) {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			if got := fields["connected_slaves"]; got != "1" {
-				t.Fatalf("connected_slaves = %q after a second PSYNC, want 1", got)
-			}
-			// Still the first attachment, which has acknowledged everything.
-			if want := ",offset=" + fields["master_repl_offset"]; !strings.HasSuffix(fields["slave0"], want) {
-				t.Fatalf("slave0 = %q after a second PSYNC and an acknowledgement of the whole stream, want it to end in %q", fields["slave0"], want)
-			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := fields["connected_slaves"]; got != "1" {
+			t.Fatalf("connected_slaves = %q after a second PSYNC, want 1", got)
+		}
+		// Still the first attachment, which has acknowledged everything.
+		if want := ",offset=" + fields["master_repl_offset"]; !strings.HasSuffix(fields["slave0"], want) {
+			t.Fatalf("slave0 = %q after a second PSYNC and an acknowledgement of the whole stream, want it to end in %q", fields["slave0"], want)
+		}
 
-			assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 2}, "INCR", "counter")
-			if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				t.Fatalf("SetReadDeadline() error = %v", err)
-			}
-			next, err := replicaParser.Parse()
-			if err != nil {
-				t.Fatalf("Parse() after a second PSYNC error = %v", err)
-			}
-			if propagated, err := command.DecodeRequest(next); err != nil || propagated.Name != "INCR" {
-				t.Fatalf("after a second PSYNC the replica read %#v, want the propagated INCR counter", next)
-			}
-			if err := assertNoFurtherReplicaRequests(replica, replicaParser, 200*time.Millisecond); err != nil {
-				t.Fatalf("after the second write: %v", err)
-			}
+		assertCommandResponse(t, client, clientParser, protocol.Integer{Value: 2}, "INCR", "counter")
+		if err := replica.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline() error = %v", err)
+		}
+		next, err := replicaParser.Parse()
+		if err != nil {
+			t.Fatalf("Parse() after a second PSYNC error = %v", err)
+		}
+		if propagated, err := command.DecodeRequest(next); err != nil || propagated.Name != "INCR" {
+			t.Fatalf("after a second PSYNC the replica read %#v, want the propagated INCR counter", next)
+		}
+		if err := assertNoFurtherReplicaRequests(replica, replicaParser, 200*time.Millisecond); err != nil {
+			t.Fatalf("after the second write: %v", err)
+		}
 
-			cancel()
-			waitForServerStop(t, errCh)
-		})
-	}
+		cancel()
+		waitForServerStop(t, errCh)
+	})
 }
 
 // mustEncode encodes value as RESP.
@@ -2056,8 +2030,9 @@ func TestReplicationStructuredLogs(t *testing.T) {
 	}
 
 	// Two paths remove a replica that leaves, the connection's teardown and the
-	// replica's feed when a write finds the connection ended, and whichever runs
-	// first logs it as disconnected. Both have run when ListenAndServe returns.
+	// Master when a frame it pushes finds the connection closed, and whichever
+	// runs first logs it as disconnected. Both have run when ListenAndServe
+	// returns.
 	masterOutput := masterLogs.String()
 	for _, fragment := range []string{"replica registered", "requested replica acknowledgements", "replica acknowledged offset", "WAIT completed", "replica disconnected"} {
 		if !strings.Contains(masterOutput, fragment) {

@@ -1280,7 +1280,7 @@ func TestExecutorReplicationAcknowledgements(t *testing.T) {
 		defer func() { _ = replicaConn.Close() }()
 
 		state := newReplicaPeerStateForExecutor(executor, 7, serverConn)
-		executor.master.Add(replication.Candidate{ID: 7, ListeningPort: 6380, Out: state}, serverConn)
+		executor.master.Add(replication.Candidate{ID: 7, ListeningPort: 6380, Out: state.Output()})
 
 		ctx := withClient(context.Background(), state)
 
@@ -1312,7 +1312,7 @@ func TestExecutorWait(t *testing.T) {
 		// 60, so only an acknowledgement of 10 bytes or more of the replica's own
 		// count reaches it. The replica acknowledges exactly 10 below.
 		executor.master.Propagate(make([]byte, 50), true)
-		executor.master.Add(replication.Candidate{ID: 11, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 11, serverConn)}, serverConn)
+		executor.master.Add(replication.Candidate{ID: 11, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 11, serverConn).Output()})
 		writer := newTestClientState(executor, 1)
 		writer.SetLastWriteReplicationOffset(60)
 		// This WAIT ends when the replica acknowledges, not when a clock says so: the
@@ -1418,7 +1418,7 @@ func TestExecutorWait(t *testing.T) {
 		defer func() { _ = serverConn.Close() }()
 		defer func() { _ = replicaConn.Close() }()
 
-		executor.master.Add(replication.Candidate{ID: 12, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 12, serverConn)}, serverConn)
+		executor.master.Add(replication.Candidate{ID: 12, ListeningPort: 6380, Out: newReplicaPeerStateForExecutor(executor, 12, serverConn).Output()})
 
 		state := &server.ClientState{ID: 99, Authenticated: true}
 		state.SetLastWriteReplicationOffset(0)
@@ -1622,8 +1622,8 @@ func TestExecutorAuth(t *testing.T) {
 		if !state.IsReplica() {
 			t.Fatal("IsReplica() = false after PSYNC, want true")
 		}
-		if !result.RegisterReplica || executor.master.Count() != 1 {
-			t.Fatalf("RegisterReplica = %v with %d replicas registered, want true and 1", result.RegisterReplica, executor.master.Count())
+		if got := executor.master.Count(); got != 1 {
+			t.Fatalf("%d replicas registered after PSYNC, want 1", got)
 		}
 		if !state.IsAuthenticated() {
 			t.Fatal("IsAuthenticated() = false after authenticated PSYNC, want true")
@@ -2965,9 +2965,9 @@ func TestAReplicaIsNeitherSubscribedNorMadeAMonitor(t *testing.T) {
 
 func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 	// As in Redis, whose syncCommand returns without a reply for a client that
-	// is already a replica, whatever it asks for. Attaching it again registered
-	// a second feed beside the first. Any other client is still refused the
-	// partial resync Stash does not support.
+	// is already a replica, whatever it asks for. It used to be attached a
+	// second time. Any other client is still refused the partial resync Stash
+	// does not support.
 	tests := []struct {
 		name    string
 		replica bool
@@ -2993,8 +2993,8 @@ func TestPSyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("PSYNC %v error = %v, want %v", tt.args, err, tt.wantErr)
 			}
-			if len(result.Responses) != 0 || result.RegisterReplica || executor.master.Count() != 0 {
-				t.Fatalf("PSYNC %v: %d replies, RegisterReplica = %v, %d replicas registered; want none, false and 0", tt.args, len(result.Responses), result.RegisterReplica, executor.master.Count())
+			if len(result.Responses) != 0 || executor.master.Count() != 0 {
+				t.Fatalf("PSYNC %v: %d replies, %d replicas registered; want none and 0", tt.args, len(result.Responses), executor.master.Count())
 			}
 		})
 	}

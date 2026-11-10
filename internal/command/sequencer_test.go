@@ -361,7 +361,7 @@ func TestSequenceModeOfRequests(t *testing.T) {
 
 // benchStream stands in for one attached replica in the sequenced write
 // benchmarks: it counts each payload into an offset and copies it into a buffer
-// it reuses, as a replica's feed copies what it queues. The buffer is allocated up front, so the
+// it reuses, as a replica's Output copies what is pushed to it. The buffer is allocated up front, so the
 // copies allocate nothing.
 type benchStream struct {
 	mu  sync.Mutex
