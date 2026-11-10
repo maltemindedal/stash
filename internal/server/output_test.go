@@ -385,6 +385,103 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 	})
 }
 
+// TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome marks
+// a connection a Replica's and holds what is pushed to it, as a Replica's
+// stream is held while its full resync reply is produced. Until that Reply
+// comes the socket is offered nothing, however long the snapshot takes, so the
+// Replica is not stalled. The stall rule used to count from the first frame
+// that waited, and would close a Replica whose snapshot took longer than the
+// stall timeout before it was sent a byte. Once the Reply has released the
+// stream and a writer offers it to the socket, the rule counts.
+func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *testing.T) {
+	shared := newOutputs()
+	shared.stallTimeout = 30 * time.Millisecond
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(shared, wire)
+	out.MarkReplica()
+	out.HoldPushes()
+	if !out.Push([]byte("stream")) {
+		t.Fatal("Push() = false, want the stream held")
+	}
+
+	time.Sleep(4 * shared.stallTimeout)
+	if err := out.Err(); err != nil {
+		t.Fatalf("Err() = %v with the stream held behind a reply that has not come, want the connection open", err)
+	}
+
+	if err := out.Reply(protocol.SimpleString{Value: "FULLRESYNC"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	waitForOutput(t, "the replica that takes nothing of the reply to be closed", func() bool { return out.Err() != nil })
+	if err := out.Err(); !errors.Is(err, errReplicaStalled) {
+		t.Fatalf("Err() = %v, want errReplicaStalled", err)
+	}
+}
+
+// nothingTaken is a socket of the Event loop whose send buffer is full: a write
+// to it returns at once, having taken nothing.
+type nothingTaken struct{}
+
+func (nothingTaken) Write([]byte) (int, error) { return 0, nil }
+
+// TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered queues a Reply that
+// is not flushed and then marks the connection a Replica's, as a replica that
+// sends REPLCONF and PSYNC in one write has the +OK to its REPLCONF queued
+// when the attach cut makes it a Replica. The connection then produces the
+// snapshot, and offers the socket nothing until it has. The stall rule counted
+// the Reply as waiting from the mark, and closed a Replica whose snapshot took
+// longer than the stall timeout, although it read everything it was sent. The
+// rule counts once a writer offers the batch and the socket takes nothing of
+// it.
+func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
+	tests := []struct {
+		name string
+		open func(shared *outputs) (out *Output, offer func())
+	}{
+		{name: "by the goroutine mode's driver", open: func(shared *outputs) (*Output, func()) {
+			out := newGoroutineOutput(shared, newStalledOutputWire())
+			// The write blocks until the stall rule closes the connection.
+			return out, func() { go func() { _ = out.Flush() }() }
+		}},
+		{name: "by the Event loop's flush", open: func(shared *outputs) (*Output, func()) {
+			state := &ClientState{ID: 1}
+			out := newOutput(shared, unscheduledOutputDriver{}, discardLogger)
+			state.BindOutput(out)
+			machine := NewConnMachine(state)
+			return out, func() {
+				if err := machine.Flush(nothingTaken{}); err != nil {
+					t.Errorf("Flush() error = %v, want a full socket left for later", err)
+				}
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			shared := newOutputs()
+			shared.stallTimeout = 30 * time.Millisecond
+			out, offer := tt.open(shared)
+			defer out.Close(nil)
+
+			if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+				t.Fatalf("Reply() error = %v", err)
+			}
+			out.MarkReplica()
+			time.Sleep(4 * shared.stallTimeout)
+			if err := out.Err(); err != nil {
+				t.Fatalf("Err() = %v with a reply queued that no writer has offered to the socket, want the connection open", err)
+			}
+
+			offer()
+			waitForOutput(t, "the replica that takes nothing of what it is offered to be closed", func() bool { return out.Err() != nil })
+			if err := out.Err(); !errors.Is(err, errReplicaStalled) {
+				t.Fatalf("Err() = %v, want errReplicaStalled", err)
+			}
+		})
+	}
+}
+
 func TestCloseDoesNotWaitForAStuckWrite(t *testing.T) {
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(newOutputs(), wire)

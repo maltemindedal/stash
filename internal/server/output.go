@@ -32,8 +32,11 @@ const outputReplicaPushLimit = 256 << 20
 // with the most waiting is closed.
 const outputPushBudget = 128 << 20
 
-// outputReplicaStallTimeout is how long a Replica may accept nothing while
-// output waits for it before it is dropped.
+// outputReplicaStallTimeout is how long a Replica's socket may take nothing of
+// a batch of output it is offered before the Replica is dropped. Output that no
+// writer has offered to the socket does not count, since the Replica is not
+// failing to take it: Replies that are not flushed yet, and Pushed messages
+// held behind a Reply that has not come.
 const outputReplicaStallTimeout = 30 * time.Second
 
 // outputWriteThrough is how much Client output a connection's goroutine lets
@@ -66,8 +69,8 @@ var errPushLimitExceeded = errors.New("server: more output waiting than the conn
 // output waiting for all push-receiving connections back within the budget.
 var errPushBudgetExceeded = errors.New("server: closed to stay within the budget for pushed output")
 
-// errReplicaStalled reports that a Replica accepted nothing for
-// outputReplicaStallTimeout while output waited for it.
+// errReplicaStalled reports that a Replica's socket took nothing for
+// outputReplicaStallTimeout of the output it was offered.
 var errReplicaStalled = errors.New("server: replica accepted no output within the stall timeout")
 
 // errOutputClosed is what a closed Output reports when it was closed without a
@@ -189,8 +192,9 @@ type Output struct {
 	// ending is set once the stream is to end when everything queued has been
 	// written (EndStream).
 	ending bool
-	// lastProgress is when the socket last accepted a byte, or when output
-	// began to wait; stallArmed is set while a timer is due to check it.
+	// lastProgress is when the socket last accepted a byte, or when it was
+	// offered the batch that is inflight; stallArmed is set while a timer is
+	// due to check it.
 	lastProgress time.Time
 	stallArmed   bool
 
@@ -462,7 +466,6 @@ func (o *Output) MarkReplica() {
 	defer o.mu.Unlock()
 
 	o.replica = true
-	o.lastProgress = time.Now()
 	if o.counted {
 		o.counted = false
 		o.shared.total.Add(-o.backlog.Load())
@@ -470,7 +473,9 @@ func (o *Output) MarkReplica() {
 		delete(o.shared.pushers, o)
 		o.shared.mu.Unlock()
 	}
-	o.armStallLocked()
+	if o.offeredLocked() {
+		o.countStallLocked()
+	}
 }
 
 // Backlog reports how many bytes of Client output wait for the connection.
@@ -526,39 +531,48 @@ func (o *Output) growLocked(delta int) {
 	if delta == 0 {
 		return
 	}
-	if o.backlog.Add(int64(delta)) == int64(delta) && delta > 0 && o.replica {
-		// Output began to wait: the stall rule counts from here.
-		o.lastProgress = time.Now()
-		o.armStallLocked()
-	}
+	o.backlog.Add(int64(delta))
 	if o.counted {
 		o.shared.total.Add(int64(delta))
 	}
 }
 
-// armStallLocked starts the timer that enforces the Replica stall rule, unless
-// one is running or there is nothing to enforce.
-func (o *Output) armStallLocked() {
-	if !o.replica || o.stallArmed || o.closed || o.backlog.Load() == 0 {
+// offeredLocked reports whether the socket is being offered a batch that it has
+// not taken all of.
+func (o *Output) offeredLocked() bool {
+	return o.sent < len(o.inflight)
+}
+
+// countStallLocked starts the Replica stall rule's count for the batch on
+// offer: the socket has the stall timeout from now to take some of it.
+func (o *Output) countStallLocked() {
+	o.lastProgress = time.Now()
+	o.armStallLocked(o.shared.stallTimeout)
+}
+
+// armStallLocked has checkStall run after wait, unless it is due to run
+// already.
+func (o *Output) armStallLocked(wait time.Duration) {
+	if o.stallArmed {
 		return
 	}
 	o.stallArmed = true
-	wait := o.shared.stallTimeout - time.Since(o.lastProgress)
-	time.AfterFunc(max(wait, time.Millisecond), o.checkStall)
+	time.AfterFunc(wait, o.checkStall)
 }
 
-// checkStall closes a Replica that has accepted nothing for the stall timeout
-// while output waited, and otherwise looks again when that could next be true.
+// checkStall closes a Replica whose socket has taken nothing for the stall
+// timeout of the batch it is offered, and otherwise looks again when that could
+// next be true. With no batch on offer it stops looking: the next batch starts
+// the count again (write).
 func (o *Output) checkStall() {
 	o.mu.Lock()
 	o.stallArmed = false
-	if o.closed || o.backlog.Load() == 0 {
+	if o.closed || !o.offeredLocked() {
 		o.mu.Unlock()
 		return
 	}
-	idle := time.Since(o.lastProgress)
-	if idle < o.shared.stallTimeout {
-		o.armStallLocked()
+	if idle := time.Since(o.lastProgress); idle < o.shared.stallTimeout {
+		o.armStallLocked(o.shared.stallTimeout - idle)
 		o.mu.Unlock()
 		return
 	}
@@ -620,6 +634,9 @@ func (o *Output) write(w io.Writer, oneBatch bool) error {
 			default:
 				batches++
 				o.inflight, o.queued, o.spare, o.sent = o.queued, o.spare[:0], nil, 0
+			}
+			if o.replica {
+				o.countStallLocked()
 			}
 		}
 		chunk := o.inflight[o.sent:]
