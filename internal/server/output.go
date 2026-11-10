@@ -371,7 +371,9 @@ func (o *Output) sealQueuedLocked() {
 // that is. Behind whole buffers, what is in queued becomes the last of them:
 // left where it is, it would grow by what is pushed while the buffers ahead of
 // it are written. With no whole buffer the batch is queued as it is, which the
-// writer takes in one piece.
+// writer takes in one piece under its next hold of the lock: a Push that lands
+// in that instant rides with the batch. It is one batch either way, which is
+// what bounds the writer.
 func (o *Output) sealBatchLocked() int {
 	if len(o.ahead) == 0 {
 		return 1
