@@ -151,12 +151,12 @@ type eventLoop struct {
 	acceptPaused bool
 	// draining is set once the server shuts down or accepting fails
 	// (beginDrain). The loop then serves only the replicas, to send them what is
-	// queued for them, and returns drainErr once shutdown has stopped their feeds
-	// and each replica has received the end of its stream and closed its
-	// connection, or once drainExpired is set, replicaShutdownGrace later.
-	draining     bool
-	drainErr     error
-	drainExpired atomic.Bool
+	// queued for them, and returns drainErr once no connection is left. The
+	// server's shutdown owns the time that takes: it ends each replica's stream,
+	// waits replicaShutdownGrace for the replicas to close their connections,
+	// and then asks for every connection to be closed (Server.shutdown).
+	draining bool
+	drainErr error
 
 	// waiting is set from just before the loop looks at its queues for the last
 	// time ahead of a Wait until that Wait returns.
@@ -172,9 +172,9 @@ type eventLoop struct {
 }
 
 // eventConn tracks one accepted connection inside the event loop. All fields
-// are owned by the loop goroutine except out and dirty, which are safe for
-// concurrent use, and closeRequested and detached, which are guarded by
-// eventLoop.mu.
+// are owned by the loop goroutine except out, dirty and endStream, which are
+// safe for concurrent use, and closeRequested and detached, which are guarded
+// by eventLoop.mu.
 type eventConn struct {
 	fd         int
 	clientID   uint64
@@ -194,11 +194,11 @@ type eventConn struct {
 	replica atomic.Bool
 	// dirty is set while the connection is on eventLoop.dirty.
 	dirty atomic.Bool
-	// endStream is set when shutdown asks for a replica's connection to be
-	// closed while the loop drains: once its output has reached the kernel, the
-	// loop shuts the write side (writeShut) and closes the connection when the
-	// replica closes its own.
-	endStream bool
+	// endStream is set when the stream to the peer is to end, as shutdown ends
+	// a replica's (loopOutputDriver.closeWrite): once the connection's output
+	// has reached the kernel, the loop shuts the write side (writeShut), and it
+	// closes the connection when the peer closes its own.
+	endStream atomic.Bool
 	writeShut bool
 
 	closeRequested bool
@@ -218,7 +218,7 @@ func (l *eventLoop) run(ctx context.Context) error {
 		// What the events below queued for other connections on this goroutine,
 		// such as the messages of a PUBLISH, is written here without a wakeup.
 		l.applyQueuedWork()
-		if l.draining && (len(l.conns) == 0 || l.drainExpired.Load()) {
+		if l.draining && len(l.conns) == 0 {
 			return l.drainErr
 		}
 
@@ -279,8 +279,9 @@ func (l *eventLoop) wakeIfWaiting() {
 	}
 }
 
-// markDirty lists conn as having output the loop has not been asked to write.
-// Safe for concurrent use; it is called with the connection's Output locked.
+// markDirty lists conn as having output the loop has not been asked to write,
+// or a stream the loop has not been asked to end. Safe for concurrent use; it
+// may be called with the connection's Output locked.
 func (l *eventLoop) markDirty(conn *eventConn) {
 	if !conn.dirty.CompareAndSwap(false, true) {
 		return
@@ -304,9 +305,6 @@ func (l *eventLoop) applyQueuedWork() {
 	l.resumeAccept = false
 	l.mu.Unlock()
 
-	// Checked after the queues are taken: shutdown, which the cancellation
-	// starts, asks for the replicas to be closed only after it has stopped
-	// their feeds, and those requests must find the loop draining.
 	if l.ctx.Err() != nil && !l.draining {
 		l.beginDrain(nil)
 	}
@@ -323,17 +321,6 @@ func (l *eventLoop) applyQueuedWork() {
 	l.spareDirty = dirty[:0]
 
 	for _, conn := range closes {
-		if l.conns[conn.fd] != conn {
-			continue
-		}
-		if l.draining && conn.replica.Load() {
-			// Shutdown has stopped the replica's feed, whose last frames the
-			// pushes above buffered: send them and end the stream
-			// (finishConnEvent).
-			conn.endStream = true
-			l.finishConnEvent(conn)
-			continue
-		}
 		l.closeConn(conn, nil)
 	}
 
@@ -352,9 +339,9 @@ func (l *eventLoop) applyQueuedWork() {
 // shutdown stops them (replication.Master.StopFeeds) and then ends their streams
 // (replication.Master.EndStreams): each connection is sent what it holds, has its
 // write side shut, and is closed once the replica closes its own
-// (applyQueuedWork, finishConnEvent). Whatever is left when
-// replicaShutdownGrace has passed is dropped with the connections when run
-// returns.
+// (finishConnEvent). The loop keeps no time itself. Shutdown closes whatever is
+// still open when its grace has passed (ClientRegistry.CloseAll), and run
+// returns when no connection is left.
 func (l *eventLoop) beginDrain(cause error) {
 	l.draining = true
 	l.drainErr = cause
@@ -366,18 +353,16 @@ func (l *eventLoop) beginDrain(cause error) {
 			l.closeConn(conn, nil)
 		}
 	}
-	time.AfterFunc(replicaShutdownGrace, func() {
-		l.drainExpired.Store(true)
-		_ = l.poller.Wake()
-	})
 	if cause != nil {
 		// Only a cancelled context starts shutdown on its own; serve would start
-		// it once run returns, which waits for it.
+		// it once run returns, and run returns only once shutdown has closed the
+		// replicas' connections.
 		go l.srv.shutdown()
 	}
 }
 
-// requestClose asks the loop goroutine to close conn. Safe for concurrent use.
+// requestClose asks the loop goroutine to close conn, which it does whether or
+// not it is draining and whoever the peer is. Safe for concurrent use.
 func (l *eventLoop) requestClose(conn *eventConn) {
 	l.mu.Lock()
 	if conn.detached || conn.closeRequested {
@@ -627,7 +612,7 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 		l.closeConn(conn, nil)
 		return
 	}
-	if conn.endStream && !conn.writeShut && !conn.machine.HasPendingOutput() {
+	if conn.endStream.Load() && !conn.writeShut && !conn.machine.HasPendingOutput() {
 		// The end of the replica's stream may still be in the kernel's send
 		// queue, and closing the socket now would let the replica's next
 		// request (an acknowledgement) draw a reset that discards it. Shutting
@@ -730,7 +715,7 @@ func (w fdWriter) Write(p []byte) (int, error) {
 // loopOutputDriver is the Event loop's side of a connection's Output: the loop
 // writes every connection itself (ConnMachine.Flush), so the driver only tells
 // it which connections were given output from elsewhere, and asks it to close
-// one.
+// one or to end its stream.
 type loopOutputDriver struct {
 	loop *eventLoop
 	conn *eventConn
@@ -742,9 +727,16 @@ func (d *loopOutputDriver) flush(*Output) error { return nil }
 
 func (d *loopOutputDriver) shut() { d.loop.requestClose(d.conn) }
 
-// closeWrite does nothing: the loop ends a Replica's stream itself
-// (eventConnHandle.CloseWrite).
-func (d *loopOutputDriver) closeWrite() {}
+// closeWrite has the loop end the stream to the peer, now that everything
+// queued for it was written (Output.EndStream): the loop shuts the
+// connection's write side and closes it once the peer has closed its own
+// (finishConnEvent). An Output calls it again each time it finds nothing left
+// to write, so only the first call lists the connection.
+func (d *loopOutputDriver) closeWrite() {
+	if d.conn.endStream.CompareAndSwap(false, true) {
+		d.loop.markDirty(d.conn)
+	}
+}
 
 func (d *loopOutputDriver) peerClosed() bool { return false }
 
@@ -767,12 +759,11 @@ func (h *eventConnHandle) Close() error {
 // RemoteAddr returns the peer address captured when the connection was accepted.
 func (h *eventConnHandle) RemoteAddr() net.Addr { return h.conn.remoteAddr }
 
-// CloseWrite asks the loop to end the stream to a replica (replication.Master.EndStreams):
-// to send what the connection holds, shut its write side, and close it once
-// the replica has closed its own. The loop, draining by then, does that for a
-// replica asked to close at all (applyQueuedWork).
+// CloseWrite ends the stream to a replica once everything queued for it has
+// been written (replication.Master.EndStreams), through the connection's
+// Output as the goroutine mode does (outputConn.CloseWrite).
 func (h *eventConnHandle) CloseWrite() error {
-	h.loop.requestClose(h.conn)
+	h.conn.out.EndStream()
 	return nil
 }
 
