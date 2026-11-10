@@ -617,8 +617,15 @@ func (o *Output) offeredLocked() bool {
 }
 
 // countStallLocked starts the Replica stall rule's count for the batch on
-// offer: the socket has the stall timeout from now to take some of it.
+// offer: the socket has the stall timeout from now to take some of it. A closed
+// Output's socket is offered nothing, whatever its writer left unsent, so no
+// count starts for it. Its timer would hold the Output, and that batch, for
+// the stall timeout (armStallLocked): the attach cut of a PSYNC marks a
+// connection a Replica's even when it has closed meanwhile.
 func (o *Output) countStallLocked() {
+	if o.closed {
+		return
+	}
 	o.lastProgress = time.Now()
 	o.armStallLocked(o.shared.stallTimeout)
 }

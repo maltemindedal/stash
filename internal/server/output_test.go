@@ -483,38 +483,63 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 }
 
 // TestAClosedReplicasOutputIsNotKeptForTheStallTimeout closes a Replica's
-// connection while the stall rule's timer is running, as a Replica that leaves
-// in the middle of its full resync does, and waits for what the Output holds
-// to be collected. The timer used to keep the Output reachable until it fired,
-// and with it the batch that was being written: every Replica that left
+// connection in the middle of a batch, as a Replica that leaves in the middle
+// of its full resync does, and waits for what the Output holds to be
+// collected. The stall rule's timer used to keep the Output reachable until it
+// fired, and with it the batch that was being written: every Replica that left
 // mid-snapshot held a buffer the size of the snapshot for 30 seconds.
+//
+// The connection may also close before it is marked a Replica's: the attach cut
+// of the PSYNC it sent marks its Output whatever its state. A closed Output is
+// offered nothing, so no count starts for it. One used to start for the batch
+// its writer had left unsent, and its timer held the Output as before.
 //
 // The socket stands for everything the Output holds. An Output refers to
 // itself, and the collector runs no finalizer for such an object.
 func TestAClosedReplicasOutputIsNotKeptForTheStallTimeout(t *testing.T) {
-	collected := make(chan struct{})
-	func() {
-		wire := newStalledOutputWire()
-		runtime.SetFinalizer(wire, func(*outputWire) { close(collected) })
-		out := newGoroutineOutput(newOutputs(), wire)
-		out.MarkReplica()
-		if !out.Push([]byte("stream")) {
-			t.Fatal("Push() = false, want the stream queued")
-		}
-		<-wire.writeBegun
-		out.Close(nil)
-	}()
+	tests := []struct {
+		name string
+		// markedFirst marks the Output a Replica's before the batch is offered.
+		// Otherwise it is marked after the connection has closed.
+		markedFirst bool
+	}{
+		{name: "closed while the stall rule counts", markedFirst: true},
+		{name: "marked a Replica's after it closed in the middle of a batch"},
+	}
 
-	for deadline := time.Now().Add(5 * time.Second); ; {
-		runtime.GC()
-		select {
-		case <-collected:
-			return
-		case <-time.After(10 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("what a closed replica's Output held was still reachable after 5s, want nothing to keep it for the stall timeout of %v", outputReplicaStallTimeout)
-		}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			collected := make(chan struct{})
+			func() {
+				wire := newStalledOutputWire()
+				runtime.SetFinalizer(wire, func(*outputWire) { close(collected) })
+				out := newGoroutineOutput(newOutputs(), wire)
+				if tt.markedFirst {
+					out.MarkReplica()
+				}
+				if !out.Push([]byte("stream")) {
+					t.Fatal("Push() = false, want the stream queued")
+				}
+				<-wire.writeBegun
+				out.Close(nil)
+				if !tt.markedFirst {
+					out.MarkReplica()
+				}
+			}()
+
+			for deadline := time.Now().Add(5 * time.Second); ; {
+				runtime.GC()
+				select {
+				case <-collected:
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("what a closed replica's Output held was still reachable after 5s, want nothing to keep it for the stall timeout of %v", outputReplicaStallTimeout)
+				}
+			}
+		})
 	}
 }
 
