@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,215 +26,204 @@ import (
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
-func TestGenerateRewriteRoundTripsState(t *testing.T) {
-	store := storage.NewStore()
-	_ = store.Set(nil, "name", []byte("Stash"), 0)
-	_ = store.Set(nil, "expiring", []byte("soon"), time.Now().Add(time.Minute).UnixMilli())
-	if _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
-		t.Fatalf("RightPush() error = %v", err)
-	}
-	if _, err := store.HSet(nil, "profile", []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}, {Field: "tier", Value: []byte("senior")}}); err != nil {
-		t.Fatalf("HSet() error = %v", err)
-	}
-	if _, err := store.SAdd(nil, "tags", [][]byte{[]byte("fast"), []byte("durable")}); err != nil {
-		t.Fatalf("SAdd() error = %v", err)
-	}
-	if _, err := store.ZAdd(nil, "leaders", []storage.ZSetEntry{{Member: []byte("alpha"), Score: 1}, {Member: []byte("beta"), Score: 2}}); err != nil {
-		t.Fatalf("ZAdd() error = %v", err)
-	}
-	if _, err := store.XAdd(nil, "events", "1-0", [][]byte{[]byte("type"), []byte("start")}); err != nil {
-		t.Fatalf("XAdd() error = %v", err)
-	}
+// rewriteOf returns the rewrite of the store's keyspace image.
+func rewriteOf(t *testing.T, store *storage.Store) ([]byte, aof.RewriteStats) {
+	t.Helper()
 
-	entries, _ := store.SnapshotAll()
 	var payload bytes.Buffer
-	stats, err := aof.GenerateRewrite(entries, &payload)
+	stats, err := aof.GenerateRewrite(store.Image(nil), &payload)
 	if err != nil {
 		t.Fatalf("GenerateRewrite() error = %v", err)
 	}
-	if stats.Keys != 7 {
-		t.Fatalf("stats.Keys = %d, want 7", stats.Keys)
+	return payload.Bytes(), stats
+}
+
+// replayInto replays the append-only file at path into a new store, through
+// the command executor as startup does, and returns the store.
+func replayInto(t *testing.T, path string) (*storage.Store, aof.LoadStats) {
+	t.Helper()
+
+	store := storage.NewStore()
+	executor := replayExecutor(t, store)
+	loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
+		_, execErr := executor.Handle(ctx, server.Call{Origin: record.OriginReplay}, value)
+		return execErr
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
 	}
-	if stats.Commands != 7 {
-		t.Fatalf("stats.Commands = %d, want 7", stats.Commands)
+	return store, loaded
+}
+
+// TestRewrittenAppendOnlyFileReplaysToTheSameKeyspace pins storage's recreation
+// commands to the command grammar: a rewrite, replayed through the loader and
+// the real executor into an empty store, must rewrite to the same bytes. It
+// holds every value kind in both of its encodings, a collection that takes
+// several commands, and a TTL.
+func TestRewrittenAppendOnlyFileReplaysToTheSameKeyspace(t *testing.T) {
+	long := strings.Repeat("l", 100) // too long for a compact hash or sorted set
+	bulk := func(items ...string) [][]byte {
+		out := make([][]byte, len(items))
+		for i, item := range items {
+			out[i] = []byte(item)
+		}
+		return out
+	}
+	many := make([]string, 2500)
+	for i := range many {
+		many[i] = strconv.Itoa(i)
+	}
+	manyPairs := make([]storage.HashFieldValue, len(many))
+	manyScores := make([]storage.ZSetEntry, len(many))
+	for i, item := range many {
+		manyPairs[i] = storage.HashFieldValue{Field: item, Value: []byte("v" + item)}
+		manyScores[i] = storage.ZSetEntry{Member: []byte(item), Score: float64(i%7) + 0.25}
 	}
 
-	replayedStore := storage.NewStore()
-	executor := replayExecutor(t, replayedStore)
-	parser := protocol.NewParser(bytes.NewReader(payload.Bytes()))
-	for {
-		value, parseErr := parser.Parse()
-		if parseErr != nil {
-			if errors.Is(parseErr, io.EOF) {
-				break
+	store := storage.NewStore()
+	deadline := time.Now().Add(time.Hour).UnixMilli()
+	writes := []func() error{
+		func() error { err := store.Set(nil, "name", []byte("Stash"), 0); return err },
+		func() error { err := store.Set(nil, "empty", nil, 0); return err },
+		func() error { err := store.Set(nil, "binary", []byte("a\r\nb\x00c"), 0); return err },
+		func() error { err := store.Set(nil, "expiring", []byte("soon"), deadline); return err },
+		func() error { _, err := store.RightPush(nil, "letters", bulk("a", "b", "a")); return err },
+		func() error { _, err := store.RightPush(nil, "many-values", bulk(many...)); return err },
+		func() error {
+			_, err := store.HSet(nil, "profile", []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}, {Field: "tier", Value: []byte("senior")}})
+			return err
+		},
+		func() error {
+			_, err := store.HSet(nil, "wide-profile", []storage.HashFieldValue{{Field: "bio", Value: []byte(long)}, {Field: "", Value: nil}})
+			return err
+		},
+		func() error { _, err := store.HSet(nil, "many-fields", manyPairs); return err },
+		func() error { _, err := store.SAdd(nil, "numbers", bulk("3", "-1", "20")); return err },
+		func() error { _, err := store.SAdd(nil, "tags", bulk("fast", "durable", "7")); return err },
+		func() error { _, err := store.SAdd(nil, "many-members", bulk(many...)); return err },
+		func() error {
+			_, err := store.ZAdd(nil, "leaders", []storage.ZSetEntry{{Member: []byte("beta"), Score: 2}, {Member: []byte("alpha"), Score: 1}, {Member: []byte("aardvark"), Score: 2}, {Member: []byte("low"), Score: -math.MaxFloat64}, {Member: []byte("tiny"), Score: 1e-7}})
+			return err
+		},
+		func() error {
+			_, err := store.ZAdd(nil, "wide-leaders", []storage.ZSetEntry{{Member: []byte(long), Score: 1.5}, {Member: []byte("m"), Score: -3}})
+			return err
+		},
+		func() error { _, err := store.ZAdd(nil, "many-scores", manyScores); return err },
+		func() error { _, err := store.XAdd(nil, "events", "1-0", bulk("type", "start")); return err },
+		func() error { _, err := store.XAdd(nil, "events", "1-1", bulk("type", "stop", "code", "")); return err },
+	}
+	for i, write := range writes {
+		if err := write(); err != nil {
+			t.Fatalf("write %d error = %v", i, err)
+		}
+	}
+
+	first, stats := rewriteOf(t, store)
+	// 16 keys: 11 take one command, the stream two, and each collection of 2,500
+	// items three.
+	if stats.Keys != 16 || stats.Commands != 11+2+4*3 {
+		t.Fatalf("stats = %+v, want 16 keys in 25 commands", stats)
+	}
+	if again, _ := rewriteOf(t, store); !bytes.Equal(again, first) {
+		t.Fatal("a second rewrite of the same store differs from the first")
+	}
+
+	path := filepath.Join(t.TempDir(), "rewrite.aof")
+	if err := os.WriteFile(path, first, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	replayed, loaded := replayInto(t, path)
+	if loaded.TruncatedTail || loaded.ReplayedCommands != stats.Commands {
+		t.Fatalf("LoadFile() stats = %+v, want %d complete commands", loaded, stats.Commands)
+	}
+	second, _ := rewriteOf(t, replayed)
+	if !bytes.Equal(second, first) {
+		firstCommands, secondCommands := rewriteCommands(t, first), rewriteCommands(t, second)
+		for i := 0; i < len(firstCommands) && i < len(secondCommands); i++ {
+			if !reflect.DeepEqual(firstCommands[i], secondCommands[i]) {
+				t.Fatalf("command %d of the replayed keyspace's rewrite = %.200q, want %.200q", i, secondCommands[i], firstCommands[i])
 			}
-			t.Fatalf("Parse() error = %v", parseErr)
 		}
-		// Replayed as the server replays its AOF at startup.
-		if _, execErr := executor.Handle(context.Background(), server.Call{Origin: record.OriginReplay}, value); execErr != nil {
-			t.Fatalf("Handle() error = %v", execErr)
-		}
+		t.Fatalf("the replayed keyspace rewrites to %d commands, want %d", len(secondCommands), len(firstCommands))
 	}
 
-	if got, ok, err := replayedStore.Get("name"); err != nil {
-		t.Fatalf("Get(name) error = %v", err)
-	} else if !ok || string(got) != "Stash" {
-		t.Fatalf("Get(name) = (%q, %v), want (Stash, true)", string(got), ok)
+	if values, err := replayed.ListRange("letters", 0, -1); err != nil || len(values) != 3 || string(values[0]) != "a" || string(values[1]) != "b" || string(values[2]) != "a" {
+		t.Fatalf("ListRange(letters) = (%q, %v), want [a b a]", values, err)
 	}
-	if got, ok, err := replayedStore.Get("expiring"); err != nil {
-		t.Fatalf("Get(expiring) error = %v", err)
-	} else if !ok || string(got) != "soon" {
-		t.Fatalf("Get(expiring) = (%q, %v), want (soon, true)", string(got), ok)
-	}
-
-	replayedEntries, _ := replayedStore.SnapshotAll()
-	var foundTTL bool
-	for _, entry := range replayedEntries {
-		if entry.Key == "expiring" {
-			foundTTL = entry.ExpiresAt > time.Now().UnixMilli()
-		}
-	}
-	if !foundTTL {
-		t.Fatal("rewritten expiring key did not retain a future TTL")
-	}
-
-	if values, err := replayedStore.ListRange("letters", 0, -1); err != nil {
-		t.Fatalf("ListRange() error = %v", err)
-	} else if len(values) != 2 || string(values[0]) != "a" || string(values[1]) != "b" {
-		t.Fatalf("ListRange() = %q, want [a b]", values)
-	}
-	if fields, err := replayedStore.HGetAll("profile"); err != nil {
-		t.Fatalf("HGetAll() error = %v", err)
-	} else if len(fields) != 2 {
-		t.Fatalf("len(HGetAll()) = %d, want 2", len(fields))
-	}
-	if members, err := replayedStore.SMembers("tags"); err != nil {
-		t.Fatalf("SMembers() error = %v", err)
-	} else if len(members) != 2 {
-		t.Fatalf("len(SMembers()) = %d, want 2", len(members))
-	}
-	if entries, err := replayedStore.ZRange("leaders", 0, -1); err != nil {
-		t.Fatalf("ZRange() error = %v", err)
-	} else if len(entries) != 2 || entries[0].Member != "alpha" || entries[1].Member != "beta" {
-		t.Fatalf("ZRange() = %#v, want alpha/beta order", entries)
-	}
-	if entries, err := replayedStore.XRead("events", "0-0"); err != nil {
-		t.Fatalf("XRead() error = %v", err)
-	} else if len(entries) != 1 || entries[0].ID != "1-0" {
-		t.Fatalf("XRead() = %#v, want single entry 1-0", entries)
+	if entries, err := replayed.XRead("events", "0-0"); err != nil || len(entries) != 2 || entries[0].ID != "1-0" || entries[1].ID != "1-1" {
+		t.Fatalf("XRead(events) = (%#v, %v), want entries 1-0 and 1-1", entries, err)
 	}
 }
 
-func TestGenerateRewriteOutputLoadsBackForHugeCollections(t *testing.T) {
+func TestGenerateRewriteOutputLoadsBackForAHugeCollection(t *testing.T) {
 	// The loader rejects any command array over 1,048,576 elements, so a rewrite
 	// that emits one command per key produced a file the server could not start
-	// from once a collection passed about a million values (half that for hashes
-	// and sorted sets). The list and hash sizes below are the smallest that used
-	// to fail. Sets and sorted sets share the chunking helper, so a small
-	// collection is enough to check that their commands are bounded too; only one
-	// single-value and one paired kind run at full size because parsing a million
-	// values is slow under the race detector.
+	// from once a list passed about a million values. This is the smallest list
+	// that used to fail. That every kind bounds its commands is checked, on small
+	// collections, by storage's TestEveryValueKindKeepsItsContract.
 	if testing.Short() {
-		t.Skip("builds collections of about a million values")
+		t.Skip("builds a list of about a million values")
 	}
-
-	const listSize = 1 << 20   // +key and command name exceed the array limit
-	const pairSize = 1<<19 + 1 // two elements per pair
-	const smallSize = 70_000   // one command would exceed maxCommandElements; far below the loader limit
+	const listSize = 1 << 20 // +key and command name exceed the array limit
 	const maxCommandElements = 1 << 16
 	member := func(i int) string { return strconv.Itoa(i) }
 
-	tests := []struct {
-		name  string
-		entry storage.SnapshotEntry
-		size  int // values the replayed commands must carry in total
-	}{
-		{name: "list", size: listSize, entry: func() storage.SnapshotEntry {
-			e := storage.SnapshotEntry{Key: "big", Kind: storage.ValueKindList, List: make([][]byte, listSize)}
-			for i := range e.List {
-				e.List[i] = []byte(member(i))
-			}
-			return e
-		}()},
-		{name: "set", size: smallSize, entry: func() storage.SnapshotEntry {
-			e := storage.SnapshotEntry{Key: "big", Kind: storage.ValueKindSet, Set: make([][]byte, smallSize)}
-			for i := range e.Set {
-				e.Set[i] = []byte(member(i))
-			}
-			return e
-		}()},
-		{name: "hash", size: pairSize, entry: func() storage.SnapshotEntry {
-			e := storage.SnapshotEntry{Key: "big", Kind: storage.ValueKindHash, Hash: make([]storage.HashFieldValue, pairSize)}
-			for i := range e.Hash {
-				e.Hash[i] = storage.HashFieldValue{Field: member(i), Value: []byte("v")}
-			}
-			return e
-		}()},
-		{name: "sorted set", size: smallSize, entry: func() storage.SnapshotEntry {
-			e := storage.SnapshotEntry{Key: "big", Kind: storage.ValueKindZSet, ZSet: make([]storage.ZSetRangeEntry, smallSize)}
-			for i := range e.ZSet {
-				e.ZSet[i] = storage.ZSetRangeEntry{Member: member(i), Score: float64(i)}
-			}
-			return e
-		}()},
+	store := storage.NewStore()
+	values := make([][]byte, listSize)
+	for i := range values {
+		values[i] = []byte(member(i))
+	}
+	if _, err := store.RightPush(nil, "big", values); err != nil {
+		t.Fatalf("RightPush() error = %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "rewrite.aof")
-			file, err := os.Create(path)
-			if err != nil {
-				t.Fatalf("Create() error = %v", err)
+	path := filepath.Join(t.TempDir(), "rewrite.aof")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	w := bufio.NewWriter(file)
+	stats, err := aof.GenerateRewrite(store.Image(nil), w)
+	if err == nil {
+		err = w.Flush()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("GenerateRewrite() error = %v", err)
+	}
+	// Replay the file the way startup does and count the values it carries.
+	items := 0
+	replayed, err := aof.LoadFile(context.Background(), path, func(_ context.Context, value protocol.Value) error {
+		array, ok := value.(protocol.Array)
+		if !ok || len(array.Elements) < 3 {
+			return fmt.Errorf("replayed frame = %#v, want a command array with values", value)
+		}
+		// RPUSH appends, so the values must arrive in list order across commands.
+		for i, element := range array.Elements[2:] {
+			if got := string(element.(protocol.BulkString).Data); got != member(items+i) {
+				return fmt.Errorf("list value %d = %q, want %q", items+i, got, member(items+i))
 			}
-			w := bufio.NewWriter(file)
-			stats, err := aof.GenerateRewrite([]storage.SnapshotEntry{tt.entry}, w)
-			if err == nil {
-				err = w.Flush()
-			}
-			if closeErr := file.Close(); err == nil {
-				err = closeErr
-			}
-			if err != nil {
-				t.Fatalf("GenerateRewrite() error = %v", err)
-			}
-			// Replay the file the way startup does and count the values it carries.
-			items := 0
-			replayed, err := aof.LoadFile(context.Background(), path, func(_ context.Context, value protocol.Value) error {
-				array, ok := value.(protocol.Array)
-				if !ok || len(array.Elements) < 3 {
-					return fmt.Errorf("replayed frame = %#v, want a command array with values", value)
-				}
-				perItem := 1
-				if tt.name == "hash" || tt.name == "sorted set" {
-					perItem = 2
-				}
-				if tt.name == "list" {
-					// RPUSH appends, so the values must arrive in list order across commands.
-					for i, element := range array.Elements[2:] {
-						if got := string(element.(protocol.BulkString).Data); got != member(items+i) {
-							return fmt.Errorf("list value %d = %q, want %q", items+i, got, member(items+i))
-						}
-					}
-				}
-				if len(array.Elements) > maxCommandElements {
-					return fmt.Errorf("replayed command has %d elements, want at most %d", len(array.Elements), maxCommandElements)
-				}
-				items += (len(array.Elements) - 2) / perItem
-				return nil
-			})
-			if err != nil {
-				t.Fatalf("LoadFile() error = %v: the rewritten file is not loadable", err)
-			}
-			if replayed.TruncatedTail {
-				t.Fatal("LoadFile() reported a truncated tail for a complete rewrite")
-			}
-			if items != tt.size {
-				t.Fatalf("replayed %d values, want %d", items, tt.size)
-			}
-			if stats.Keys != 1 || stats.Commands < 2 {
-				t.Fatalf("stats = %+v, want 1 key split across several commands", stats)
-			}
-		})
+		}
+		if len(array.Elements) > maxCommandElements {
+			return fmt.Errorf("replayed command has %d elements, want at most %d", len(array.Elements), maxCommandElements)
+		}
+		items += len(array.Elements) - 2
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v: the rewritten file is not loadable", err)
+	}
+	if replayed.TruncatedTail {
+		t.Fatal("LoadFile() reported a truncated tail for a complete rewrite")
+	}
+	if items != listSize {
+		t.Fatalf("replayed %d values, want %d", items, listSize)
+	}
+	if stats.Keys != 1 || stats.Commands < 2 {
+		t.Fatalf("stats = %+v, want 1 key split across several commands", stats)
 	}
 }
 
@@ -255,48 +244,16 @@ func TestRewriteKeepsTheAbsoluteDeadlineOfAStringKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			entry := storage.SnapshotEntry{Key: "k", Kind: storage.ValueKindString, ExpiresAt: tt.expiresAt, String: []byte("v")}
-			var out bytes.Buffer
-			stats, err := aof.GenerateRewrite([]storage.SnapshotEntry{entry}, &out)
-			if err != nil {
-				t.Fatalf("GenerateRewrite() error = %v", err)
+			store := storage.NewStore()
+			if err := store.Set(nil, "k", []byte("v"), tt.expiresAt); err != nil {
+				t.Fatalf("Set() error = %v", err)
 			}
-			if got := rewriteCommands(t, out.Bytes()); !reflect.DeepEqual(got, tt.want) {
+			out, stats := rewriteOf(t, store)
+			if got := rewriteCommands(t, out); !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("rewrite = %q, want %q", got, tt.want)
 			}
 			if stats.Keys != len(tt.want) || stats.Commands != len(tt.want) {
 				t.Fatalf("stats = %+v, want %d key and command", stats, len(tt.want))
-			}
-		})
-	}
-}
-
-func TestRewriteRefusesACollectionWithATTL(t *testing.T) {
-	// No command gives a collection a TTL yet, and the rewrite has no command that
-	// recreates one, so it used to write the collection without its TTL. The
-	// rewrite now fails instead, and the writer keeps the old file.
-	expiresAt := time.Now().Add(time.Hour).UnixMilli()
-	tests := []struct {
-		name  string
-		entry storage.SnapshotEntry
-	}{
-		{name: "list", entry: storage.SnapshotEntry{Key: "letters", Kind: storage.ValueKindList, List: [][]byte{[]byte("a")}}},
-		{name: "hash", entry: storage.SnapshotEntry{Key: "profile", Kind: storage.ValueKindHash, Hash: []storage.HashFieldValue{{Field: "lang", Value: []byte("go")}}}},
-		{name: "set", entry: storage.SnapshotEntry{Key: "tags", Kind: storage.ValueKindSet, Set: [][]byte{[]byte("fast")}}},
-		{name: "sorted set", entry: storage.SnapshotEntry{Key: "leaders", Kind: storage.ValueKindZSet, ZSet: []storage.ZSetRangeEntry{{Member: "alpha", Score: 1}}}},
-		{name: "stream", entry: storage.SnapshotEntry{Key: "events", Kind: storage.ValueKindStream, Stream: []storage.StreamEntry{{ID: "1-0", Values: [][]byte{[]byte("type"), []byte("start")}}}}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			entry := tt.entry
-			entry.ExpiresAt = expiresAt
-			_, err := aof.GenerateRewrite([]storage.SnapshotEntry{entry}, io.Discard)
-			if err == nil {
-				t.Fatalf("GenerateRewrite() error = nil, want a refusal to rewrite the TTL of %s key %q", entry.Kind, entry.Key)
-			}
-			if !strings.HasPrefix(err.Error(), "aof: ") || !strings.Contains(err.Error(), strconv.Quote(entry.Key)) {
-				t.Fatalf("GenerateRewrite() error = %q, want an aof: error naming key %q", err, entry.Key)
 			}
 		})
 	}
@@ -343,7 +300,7 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 	if _, err := store.RightPush(nil, "letters", [][]byte{[]byte("a"), []byte("b")}); err != nil {
 		t.Fatalf("RightPush() error = %v", err)
 	}
-	entries, _ := store.SnapshotAll()
+	want, _ := rewriteOf(t, store)
 
 	tests := []struct {
 		name string
@@ -369,7 +326,7 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			path := tt.aofPath(t, t.TempDir())
 
-			stats, err := aof.SeedFile(path, entries)
+			stats, err := aof.SeedFile(path, store.Image(nil))
 			if err != nil {
 				t.Fatalf("SeedFile() error = %v", err)
 			}
@@ -377,21 +334,12 @@ func TestSeedFileWritesAFileThatReplaysToTheSnapshot(t *testing.T) {
 				t.Fatalf("SeedFile() stats = %+v, want 3 keys in 3 commands", stats)
 			}
 
-			replayedStore := storage.NewStore()
-			executor := replayExecutor(t, replayedStore)
-			loaded, err := aof.LoadFile(context.Background(), path, func(ctx context.Context, value protocol.Value) error {
-				_, execErr := executor.Handle(ctx, server.Call{Origin: record.OriginReplay}, value)
-				return execErr
-			})
-			if err != nil {
-				t.Fatalf("LoadFile() error = %v", err)
-			}
+			replayed, loaded := replayInto(t, path)
 			if loaded.TornTail || loaded.ReplayedCommands != stats.Commands {
 				t.Fatalf("LoadFile() stats = %+v, want %d complete commands", loaded, stats.Commands)
 			}
-			replayed, _ := replayedStore.SnapshotAll()
-			if got, want := sortedSnapshot(replayed), sortedSnapshot(entries); !reflect.DeepEqual(got, want) {
-				t.Fatalf("replayed keyspace = %+v, want the snapshot %+v", got, want)
+			if got, _ := rewriteOf(t, replayed); !bytes.Equal(got, want) {
+				t.Fatalf("the replayed keyspace rewrites to %q, want the seeded keyspace's %q", got, want)
 			}
 
 			files, err := os.ReadDir(filepath.Dir(path))
@@ -409,11 +357,11 @@ func TestSeedFileWritesThroughASymbolicLinkToTheFileItLeadsTo(t *testing.T) {
 	// OpenWriter appends through a symbolic link to the file it leads to. A seed
 	// renamed over the link itself would replace the link with a regular file and
 	// leave that file empty, moving the AOF off the volume the link chose.
-	entries := []storage.SnapshotEntry{{Key: "k", Kind: storage.ValueKindString, String: []byte("v")}}
-	var want bytes.Buffer
-	if _, err := aof.GenerateRewrite(entries, &want); err != nil {
-		t.Fatalf("GenerateRewrite() error = %v", err)
+	store := storage.NewStore()
+	if err := store.Set(nil, "k", []byte("v"), 0); err != nil {
+		t.Fatalf("Set() error = %v", err)
 	}
+	want, _ := rewriteOf(t, store)
 
 	tests := []struct {
 		name         string
@@ -443,14 +391,14 @@ func TestSeedFileWritesThroughASymbolicLinkToTheFileItLeadsTo(t *testing.T) {
 				t.Skipf("Symlink() error = %v", err)
 			}
 
-			if _, err := aof.SeedFile(link, entries); err != nil {
+			if _, err := aof.SeedFile(link, store.Image(nil)); err != nil {
 				t.Fatalf("SeedFile() error = %v", err)
 			}
 			if got, err := os.Readlink(link); err != nil || got != linkTo {
 				t.Fatalf("Readlink() = (%q, %v), want the link to %q left in place", got, err, linkTo)
 			}
-			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, want.Bytes()) {
-				t.Fatalf("file the link leads to = (%q, %v), want the seed %q", got, err, want.Bytes())
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("file the link leads to = (%q, %v), want the seed %q", got, err, want)
 			}
 			for _, d := range []struct {
 				dir  string
@@ -476,7 +424,10 @@ func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
 	// The rename that ends seeding replaces whatever the path names. Over
 	// commands it would lose them, and over a device such as /dev/full, which
 	// reports a size of zero, it would put a regular file in the device's place.
-	entries := []storage.SnapshotEntry{{Key: "k", Kind: storage.ValueKindString, String: []byte("v")}}
+	store := storage.NewStore()
+	if err := store.Set(nil, "k", []byte("v"), 0); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
 	commands := []byte("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nold\r\n")
 
 	tests := []struct {
@@ -522,7 +473,7 @@ func TestSeedFileRefusesToReplaceAnythingButAnEmptyFile(t *testing.T) {
 			path := filepath.Join(dir, "appendonly.aof")
 			tt.prepare(t, path)
 
-			_, err := aof.SeedFile(path, entries)
+			_, err := aof.SeedFile(path, store.Image(nil))
 			if err == nil {
 				t.Fatal("SeedFile() error = nil, want a refusal")
 			}
@@ -561,11 +512,4 @@ func replayExecutor(t *testing.T, store *storage.Store) *command.Executor {
 		t.Fatalf("command.New() error = %v", err)
 	}
 	return executor
-}
-
-// sortedSnapshot orders a snapshot by key, which SnapshotAll does not.
-func sortedSnapshot(entries []storage.SnapshotEntry) []storage.SnapshotEntry {
-	sorted := append([]storage.SnapshotEntry(nil), entries...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
-	return sorted
 }

@@ -1,26 +1,11 @@
 package storage
 
 import (
-	"errors"
-	"maps"
-	"math"
 	"sync/atomic"
 )
 
-var errInvalidValueObjectState = errors.New("storage: invalid value object state")
-
 // ValueKind identifies the logical data shape of a stored value.
 type ValueKind string
-
-// ValueEncoding identifies the internal physical representation of a stored value.
-type ValueEncoding uint8
-
-const (
-	// ValueEncodingGeneral stores a value in its general-purpose representation.
-	ValueEncodingGeneral ValueEncoding = iota
-	// ValueEncodingCompact stores a small collection in a contiguous compact representation.
-	ValueEncodingCompact
-)
 
 const (
 	// ValueKindString is the Phase 1 string storage type used by SET/GET.
@@ -96,53 +81,33 @@ type StringSnapshotStats struct {
 	SkippedUnsupportedKeys int
 }
 
-// SnapshotEntry is a defensive copy of a stored value used for AOF rewrite generation.
-type SnapshotEntry struct {
-	Key       string
-	Kind      ValueKind
-	ExpiresAt int64
-	String    []byte
-	List      [][]byte
-	ZSet      []ZSetRangeEntry
-	Stream    []StreamEntry
-	Hash      []HashFieldValue
-	Set       [][]byte
-}
-
-// SnapshotStats summarizes a full-value snapshot export.
-type SnapshotStats struct {
-	TotalKeys          int
-	ExportedKeys       int
-	SkippedExpiredKeys int
-}
-
-// ValueObject is the internal representation of an item stored in Stash.
+// ValueObject is the internal representation of an item stored in Stash: its
+// TTL, its access stamp and its value.
 //
-// The type is a tagged union: Kind selects which payload field is valid.
-// ExpiresAt is stored as a Unix timestamp in milliseconds; 0 means no TTL.
-// LastAccessedAt stores the last observed successful access in Unix
-// milliseconds. Reads refresh it with atomic stores so shard read paths can
-// keep their RLock fast path while still providing data for approximate LRU
-// eviction.
+// The value is a string when data is nil, and then String holds its bytes.
+// Otherwise data is the payload of a collection kind and String is unused. A
+// string therefore costs one allocation beside its bytes, and GET and SET make
+// no interface call.
 //
-// A list keeps its values in List[ListHead:]; see liveList.
+// ExpiresAt is a Unix timestamp in milliseconds; 0 means no TTL.
+// LastAccessedAt is the last successful access in Unix milliseconds. Reads
+// refresh it with atomic stores, so shard read paths keep their RLock fast path
+// while still providing data for approximate LRU eviction. The two int64 fields
+// come first, which keeps them 8-byte aligned for those atomic stores on every
+// platform.
 type ValueObject struct {
-	String         []byte
-	List           [][]byte
-	ZSet           *SortedSet
-	CompactZSet    *CompactZSet
-	ZSetEncoding   ValueEncoding
-	ListHead       int32
-	Stream         *StreamValue
-	Hash           map[string][]byte
-	CompactHash    *CompactHash
-	HashEncoding   ValueEncoding
-	Set            map[string]struct{}
-	IntSet         *IntSet
-	SetEncoding    ValueEncoding
 	ExpiresAt      int64
 	LastAccessedAt int64
-	Kind           ValueKind
+	String         []byte
+	data           kindValue
+}
+
+// kind returns the kind of the value v holds.
+func (v *ValueObject) kind() kindID {
+	if v.data == nil {
+		return kindString
+	}
+	return v.data.kind()
 }
 
 func (v *ValueObject) touch(now int64) {
@@ -163,198 +128,31 @@ func (v *ValueObject) lastAccessed() int64 {
 
 // StringValue returns the string payload for a string value.
 func (v *ValueObject) StringValue() ([]byte, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindString {
+	if v.data != nil {
 		return nil, ErrWrongType
 	}
 
 	return v.String, nil
 }
 
-// ListValue returns the list payload for a list value.
-func (v *ValueObject) ListValue() ([][]byte, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindList {
-		return nil, ErrWrongType
-	}
-
-	return v.liveList(), nil
-}
-
-// liveList returns the values of a list value. List holds the whole array the
-// list lives in and ListHead counts the dead (nil) slots at its front, left by
-// pops from the left. LPUSH refills those slots, so a list used from its left end
-// is neither copied on push nor left holding memory it no longer needs.
-func (v *ValueObject) liveList() [][]byte {
-	return v.List[v.ListHead:]
-}
-
-// dropListFront removes the n left-most values of a list without copying: their
-// slots become dead, and a later LPUSH can refill them.
-func (v *ValueObject) dropListFront(n int) {
-	if head := int(v.ListHead) + n; head <= math.MaxInt32 {
-		v.ListHead = int32(head)
-		return
-	}
-
-	// Two billion pops from the left with no append moving the list into a new
-	// array: copy what is left instead of letting the head overflow.
-	v.List = append([][]byte(nil), v.List[int(v.ListHead)+n:]...)
-	v.ListHead = 0
-}
-
-// dropListEnd removes the n right-most values of a list.
-func (v *ValueObject) dropListEnd(n int) {
-	v.List = v.List[:len(v.List)-n]
-}
-
-// popListFront removes the left-most value of a list that is not empty, and
-// returns it with the number of values left. It and popListBack are two methods
-// rather than one taking a side so that each inlines: the call cost a pop about
-// 3% of its time.
-func (v *ValueObject) popListFront() ([]byte, int) {
-	list := v.liveList()
-	item := list[0]
-	list[0] = nil
-	v.dropListFront(1)
-	return item, len(list) - 1
-}
-
-// popListBack removes the right-most value of a list that is not empty, and
-// returns it with the number of values left.
-func (v *ValueObject) popListBack() ([]byte, int) {
-	list := v.liveList()
-	last := len(list) - 1
-	item := list[last]
-	list[last] = nil
-	v.dropListEnd(1)
-	return item, last
-}
-
-// popListValues removes up to count values, which must not be negative, from
-// the left or right end of a list that is not empty. It returns them in the
-// order they were popped, with the number of values left. count is an int, which
-// the command parses as one, so no int64 is narrowed on the way (6db82b0).
-func (v *ValueObject) popListValues(count int, left bool) ([][]byte, int) {
-	list := v.liveList()
-	n := min(count, len(list))
-	popped := make([][]byte, n)
-	if left {
-		for i := 0; i < n; i++ {
-			popped[i] = list[i]
-			list[i] = nil
-		}
-		v.dropListFront(n)
-	} else {
-		for i := 0; i < n; i++ {
-			src := len(list) - 1 - i
-			popped[i] = list[src]
-			list[src] = nil
-		}
-		v.dropListEnd(n)
-	}
-	return popped, len(list) - n
-}
-
 // emptied reports whether v is a list, hash, set or sorted set with nothing
 // left in it, which a write deletes rather than keeps. A string or a stream is
-// kept however short it is. The list case is answered here, where it inlines,
-// because the pops are the commonest shrinking writes.
+// kept however short it is.
 func (v *ValueObject) emptied() bool {
-	if v.Kind == ValueKindList {
-		return len(v.List) == int(v.ListHead)
-	}
-	return v.emptiedCollection()
-}
-
-// emptiedCollection is emptied for a value that is not a list.
-func (v *ValueObject) emptiedCollection() bool {
-	switch v.Kind {
-	case ValueKindHash:
-		n, err := v.hashLen()
-		return err == nil && n == 0
-	case ValueKindSet:
-		n, err := v.setLen()
-		return err == nil && n == 0
-	case ValueKindZSet:
-		n, err := v.zsetLen()
-		return err == nil && n == 0
-	}
-	return false
+	return v.data != nil && v.data.empty()
 }
 
 // containerCopy returns a copy of v that a growing write can edit while v stays
 // stored under its key, so that a write refused for want of memory leaves v as
-// it was. It copies the container and not the elements: a list's array, a
-// hash's map or compact entries and arena, a set's map or integers, a sorted
-// set's index and skip list or compact entries and arena, and a stream's
-// records. The element byte strings are shared, because nothing edits one in
-// place once it is stored. A string's bytes are shared too, so a write that
-// edits a string's bytes in place must not be handed this copy.
+// it was. It copies the container and not the elements (see kindValue.clone). A
+// string's bytes are shared too, so a write that edits a string's bytes in place
+// must not be handed this copy.
 func (v *ValueObject) containerCopy() *ValueObject {
+	if v.data != nil {
+		return v.data.clone(*v)
+	}
 	c := *v
-	switch v.Kind {
-	case ValueKindList:
-		c.List = append([][]byte(nil), v.liveList()...)
-		c.ListHead = 0
-	case ValueKindHash:
-		c.Hash = maps.Clone(v.Hash)
-		c.CompactHash = cloneCompactHash(v.CompactHash)
-	case ValueKindSet:
-		c.Set = maps.Clone(v.Set)
-		c.IntSet = cloneIntSet(v.IntSet)
-	case ValueKindZSet:
-		c.ZSet = cloneSortedSet(v.ZSet)
-		c.CompactZSet = cloneCompactZSet(v.CompactZSet)
-	case ValueKindStream:
-		c.Stream = v.Stream.containerCopy()
-	}
 	return &c
-}
-
-// ZSetValue returns the general sorted-set payload for a sorted-set value.
-// Compact sorted sets are materialized as detached general sorted sets.
-func (v *ValueObject) ZSetValue() (*SortedSet, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindZSet {
-		return nil, ErrWrongType
-	}
-	if v.ZSetEncoding == ValueEncodingCompact {
-		if v.CompactZSet == nil {
-			return nil, errInvalidValueObjectState
-		}
-		set := newSortedSet()
-		for _, entry := range v.CompactZSet.rangeByRank(0, v.CompactZSet.len()-1) {
-			set.add(entry.Member, entry.Score)
-		}
-		return set, nil
-	}
-	if v.ZSet == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.ZSet, nil
-}
-
-// StreamValue returns the stream payload for a stream value.
-func (v *ValueObject) StreamValue() (*StreamValue, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindStream {
-		return nil, ErrWrongType
-	}
-	if v.Stream == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.Stream, nil
 }
 
 func newStringValue(data []byte, expiresAt int64) *ValueObject {
@@ -367,124 +165,22 @@ func newOwnedStringValue(data []byte, expiresAt int64) *ValueObject {
 	return &ValueObject{
 		String:    data,
 		ExpiresAt: expiresAt,
-		Kind:      ValueKindString,
 	}
 }
 
-// newListValue stores an already-owned list representation without cloning.
-// Callers must only pass slices whose element bytes are not aliased with caller-
-// controlled memory.
-func newListValue(items [][]byte, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		List:      items,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindList,
-	}
-}
-
-func newZSetValue(set *SortedSet, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		ZSet:      set,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindZSet,
-	}
-}
-
-func newCompactZSetValue(set *CompactZSet, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		CompactZSet:  set,
-		ZSetEncoding: ValueEncodingCompact,
-		ExpiresAt:    expiresAt,
-		Kind:         ValueKindZSet,
-	}
-}
-
-func newStreamValue(stream *StreamValue, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		Stream:    stream,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindStream,
-	}
-}
-
-// HashValue returns the general hash payload for a hash value. Compact hashes
-// are materialized as detached general hash maps.
-func (v *ValueObject) HashValue() (map[string][]byte, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindHash {
-		return nil, ErrWrongType
-	}
-	if v.HashEncoding == ValueEncodingCompact {
-		if v.CompactHash == nil {
-			return nil, errInvalidValueObjectState
-		}
-		fields := make(map[string][]byte, v.CompactHash.len())
-		for _, entry := range v.CompactHash.all() {
-			fields[entry.Field] = cloneBytes(entry.Value)
-		}
-		return fields, nil
-	}
-	if v.Hash == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.Hash, nil
-}
-
-// SetValue returns the general set payload for a set value. Integer sets are
-// materialized as detached general set maps.
-func (v *ValueObject) SetValue() (map[string]struct{}, error) {
-	if v == nil {
-		return nil, errInvalidValueObjectState
-	}
-	if v.Kind != ValueKindSet {
-		return nil, ErrWrongType
-	}
-	if v.SetEncoding == ValueEncodingCompact {
-		if v.IntSet == nil {
-			return nil, errInvalidValueObjectState
-		}
-		return v.IntSet.generalSet(), nil
-	}
-	if v.Set == nil {
-		return nil, errInvalidValueObjectState
-	}
-
-	return v.Set, nil
-}
-
-func newHashValue(fields map[string][]byte, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		Hash:      fields,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindHash,
-	}
-}
-
-func newCompactHashValue(hash *CompactHash, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		CompactHash:  hash,
-		HashEncoding: ValueEncodingCompact,
-		ExpiresAt:    expiresAt,
-		Kind:         ValueKindHash,
-	}
-}
-
-func newSetValue(members map[string]struct{}, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		Set:       members,
-		ExpiresAt: expiresAt,
-		Kind:      ValueKindSet,
-	}
-}
-
-func newIntSetValue(members *IntSet, expiresAt int64) *ValueObject {
-	return &ValueObject{
-		IntSet:      members,
-		SetEncoding: ValueEncodingCompact,
-		ExpiresAt:   expiresAt,
-		Kind:        ValueKindSet,
-	}
+// newKindValue returns a value that holds data, the payload of a collection
+// kind, under a copy of header: a ValueObject{} for a new key, which the write
+// that stores it stamps, or the stored value's own header for a clone. The
+// value and its payload are one allocation, so a collection costs no more
+// allocations than a string does.
+func newKindValue[T any, P interface {
+	*T
+	kindValue
+}](header ValueObject, data T) *ValueObject {
+	box := &struct {
+		value ValueObject
+		data  T
+	}{value: header, data: data}
+	box.value.data = P(&box.data)
+	return &box.value
 }

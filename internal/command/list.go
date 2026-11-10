@@ -139,7 +139,7 @@ func (e *Executor) handleBLPop(ctx context.Context, request *Request) (server.Ex
 		}
 
 		// Replies to the requests pipelined ahead of this one must not wait behind it.
-		if err := request.client.TryFlushResponses(); err != nil {
+		if err := request.client.Output().Flush(); err != nil {
 			e.store.UnsubscribeListPush(key, waiter)
 			return server.ExecuteResult{}, err
 		}

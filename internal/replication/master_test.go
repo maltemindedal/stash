@@ -823,7 +823,7 @@ func newTestMaster() *Master {
 // connOutput is a Replica's Output that writes its stream to w.
 type connOutput struct{ w io.Writer }
 
-func (o connOutput) WriteEncodedWithDeadline(payload []byte, _ time.Duration) error {
+func (o connOutput) WriteEncoded(payload []byte) error {
 	_, err := o.w.Write(payload)
 	return err
 }
@@ -1057,7 +1057,7 @@ type notifyingOutput struct {
 	wrote chan struct{}
 }
 
-func (o *notifyingOutput) WriteEncodedWithDeadline(payload []byte, _ time.Duration) error {
+func (o *notifyingOutput) WriteEncoded(payload []byte) error {
 	_, err := o.Write(payload)
 	o.once.Do(func() { close(o.wrote) })
 	return err

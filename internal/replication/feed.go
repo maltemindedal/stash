@@ -13,14 +13,9 @@ import (
 // grow the master's memory, or hold up its writers, without bound.
 const replicaFeedLimit = 256 << 20
 
-// replicaFeedWriteChunk is the most bytes handed to the socket at once, so that
-// the write deadline bounds how long one stretch of the stream may stall, not the
-// whole backlog.
+// replicaFeedWriteChunk is the most bytes handed to the replica's connection at
+// once.
 const replicaFeedWriteChunk = 1 << 20
-
-// replicaFeedWriteTimeout is how long one chunk may take to be accepted by the
-// replica's socket before the replica is considered stalled and dropped.
-const replicaFeedWriteTimeout = 30 * time.Second
 
 // ErrReplicaBacklog reports that a replica has fallen further behind than
 // replicaFeedLimit allows, counting the writes made while its full resync
@@ -29,14 +24,13 @@ var ErrReplicaBacklog = errors.New("replication: replica is too far behind the p
 
 // replicaFeed carries the propagated command stream to one replica. A writer that
 // propagates a command only appends its bytes to the feed, which never blocks on
-// the replica; a goroutine of the feed's own writes them to the socket, in the
-// order they were appended and many at a time. Before, each writer wrote to every
-// replica's socket itself and flushed after every command, so one stalled replica
-// stopped every writer and one healthy replica cost a syscall per command.
+// the replica; a goroutine of the feed's own hands them, in the order they were
+// appended and many at a time, to the replica's Output, which writes them to the
+// socket and enforces the Replica Push limit and stall rule.
 //
-// A feed queues from the moment it is created but writes nothing until it is
-// started: a replica's feed holds the writes made while its full resync reply is
-// being sent, which must reach the replica after that reply.
+// A feed queues from the moment it is created but hands nothing over until it
+// is started: a replica's feed holds the writes made while its full resync
+// reply is being produced, which must reach the replica after that reply.
 type replicaFeed struct {
 	mu      sync.Mutex
 	pending []byte

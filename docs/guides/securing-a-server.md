@@ -69,6 +69,12 @@ See [Setting up replication](replication.md).
 go run ./cmd/stash --maxclients 1000
 ```
 
+## Memory held for slow subscribers
+
+A client that subscribes to a channel or runs `MONITOR` and then stops reading makes the server queue what is pushed to it. In both networking modes the server holds at most 32 MiB for one such client and 128 MiB for all of them together, and closes the client with the most waiting when either is passed. A replica is held to 256 MiB of its own, outside the 128 MiB. Budget for up to 128 MiB of memory beyond the data set when untrusted clients can subscribe. The limits are not configurable.
+
+Replies to a client's own requests are not counted unless that client also receives pushed messages. A client that does not read its replies stops having its requests read once 1 MiB of them is waiting.
+
 ## File permissions
 
 The append-only file and snapshots are created with mode `0600`. Parent directories that Stash has to create for them get `0750`, subject to the process umask; directories that already exist are left as they are.

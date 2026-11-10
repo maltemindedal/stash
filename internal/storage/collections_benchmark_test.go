@@ -496,3 +496,34 @@ func BenchmarkAccountedCollections(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkStream appends 1,000 entries of 3 fields to one stream and then
+// reads all of them back, as an XRANGE over the whole stream would.
+func BenchmarkStream(b *testing.B) {
+	const entries = 1000
+	values := [][]byte{
+		[]byte("sensor"), []byte("kitchen"),
+		[]byte("temperature"), []byte("21.5"),
+		[]byte("humidity"), []byte("40"),
+	}
+	ids := make([]string, entries)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("1-%d", i+1)
+	}
+
+	b.Run("XAdd 1000 entries then read all", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			store := NewStore()
+			for _, id := range ids {
+				if _, err := store.XAdd(nil, "events", id, values); err != nil {
+					b.Fatal(err)
+				}
+			}
+			read, err := store.XRead("events", "0-0")
+			if err != nil || len(read) != entries {
+				b.Fatalf("XRead() = (%d entries, %v), want %d", len(read), err, entries)
+			}
+		}
+	})
+}

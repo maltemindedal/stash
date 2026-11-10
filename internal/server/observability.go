@@ -9,8 +9,6 @@ import (
 	"github.com/maltemindedal/stash/internal/replication"
 )
 
-const monitorWriteTimeout = 100 * time.Millisecond
-
 // Stats is a snapshot of server-level state used by INFO.
 type Stats struct {
 	ConnectedClients    int
@@ -85,26 +83,10 @@ func commandParts(value protocol.Value) ([]string, bool) {
 }
 
 func (s *Server) broadcastMonitorEvent(command observedCommand) {
-	if s == nil || s.monitorRegistry == nil || !command.OK {
+	if s == nil || !command.OK {
 		return
 	}
-
-	payload, err := protocol.Encode(protocol.SimpleString{Value: monitorLine(command)})
-	if err != nil {
-		s.logger.Warn("failed to encode monitor event", "error", err)
-		return
-	}
-
-	subscribers := s.monitorRegistry.AppendSubscribers(nil)
-	for _, subscriber := range subscribers {
-		if subscriber == nil {
-			continue
-		}
-		if err := subscriber.WriteEncodedWithDeadline(payload, monitorWriteTimeout); err != nil {
-			s.logger.Warn("failed to deliver monitor event", "subscriber_id", subscriber.ID, "error", err)
-			subscriber.Disconnect()
-		}
-	}
+	s.monitorRegistry.Broadcast(monitorLine(command))
 }
 
 func monitorLine(command observedCommand) string {

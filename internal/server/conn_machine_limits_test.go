@@ -26,8 +26,8 @@ func TestConnMachineRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
 	// bytes of output are pending, flushes them, and carries on. A client that
 	// pipelines 64 KiB replies takes the buffer to that mark and past it again
 	// and again, so that buffer has to be kept.
-	if want := 2 * eventLoopOutputHighWater; retainedWriteBufferCap < want {
-		t.Fatalf("retainedWriteBufferCap = %d, want at least %d (twice the output high-water mark)", retainedWriteBufferCap, want)
+	if want := 2 * eventLoopOutputHighWater; outputRetainedBuffer < want {
+		t.Fatalf("outputRetainedBuffer = %d, want at least %d (twice the output high-water mark)", outputRetainedBuffer, want)
 	}
 
 	reply := bytes.Repeat([]byte("x"), 64<<10)
@@ -39,7 +39,7 @@ func TestConnMachineRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
 
 	// drain flushes everything and returns the identity of the buffer it emptied.
 	drain := func() *byte {
-		identity := bufferIdentity(machine.writeBuf)
+		identity := bufferIdentity(machine.out.queued)
 		for machine.HasPendingOutput() {
 			if err := machine.Flush(io.Discard); err != nil {
 				t.Fatalf("Flush() error = %v", err)
@@ -68,13 +68,9 @@ func TestConnMachineRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
 		identities = append(identities, drain())
 	}
 
-	replaced := 0
-	for i := 1; i < len(identities); i++ {
-		if identities[i] != identities[i-1] {
-			replaced++
-		}
-	}
-	if limit := len(identities) / 4; replaced > limit {
-		t.Fatalf("the write buffer was replaced %d times in %d flushes, want at most %d", replaced, len(identities), limit)
+	// The output fills one buffer while it writes the other, so two buffers
+	// serve every pipeline; a third would be an allocation per pipeline.
+	if distinct := distinctBuffers(identities); distinct > 2 {
+		t.Fatalf("the output used %d buffers in %d flushes", distinct, len(identities))
 	}
 }

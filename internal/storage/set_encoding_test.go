@@ -16,25 +16,28 @@ func TestSetUpgradesPastIntSetThreshold(t *testing.T) {
 	}
 
 	// Exactly at the threshold: still compact.
-	value := newSetValueForMembers(members[:intSetMaxEntries], 0)
-	if value.SetEncoding != ValueEncodingCompact {
-		t.Fatalf("SetEncoding = %v at threshold, want compact", value.SetEncoding)
+	store := NewStore()
+	if _, err := store.SAdd(nil, "s", members[:intSetMaxEntries]); err != nil {
+		t.Fatalf("SAdd() error = %v", err)
+	}
+	if got := store.encodingForTest("s"); got != "set:compact" {
+		t.Fatalf("encodingForTest(s) = %q at the threshold, want set:compact", got)
 	}
 
 	// Adding past the threshold upgrades to the general encoding.
-	if _, err := value.setAdd(members[intSetMaxEntries:]); err != nil {
-		t.Fatalf("setAdd error = %v", err)
+	if _, err := store.SAdd(nil, "s", members[intSetMaxEntries:]); err != nil {
+		t.Fatalf("SAdd() error = %v", err)
 	}
-	if value.SetEncoding != ValueEncodingGeneral {
-		t.Fatalf("SetEncoding = %v after exceeding threshold, want general", value.SetEncoding)
+	if got := store.encodingForTest("s"); got != "set:general" {
+		t.Fatalf("encodingForTest(s) = %q past the threshold, want set:general", got)
 	}
 
-	got, err := value.setLen()
+	got, err := store.SMembers("s")
 	if err != nil {
-		t.Fatalf("setLen error = %v", err)
+		t.Fatalf("SMembers() error = %v", err)
 	}
-	if got != total {
-		t.Fatalf("setLen = %d, want %d (no members lost on upgrade)", got, total)
+	if len(got) != total {
+		t.Fatalf("the set has %d members, want %d (no members lost on upgrade)", len(got), total)
 	}
 }
 
@@ -47,8 +50,11 @@ func TestLargeIntSetInitialBatchUsesGeneralEncoding(t *testing.T) {
 		members = append(members, []byte(strconv.Itoa(i)))
 	}
 
-	value := newSetValueForMembers(members, 0)
-	if value.SetEncoding != ValueEncodingGeneral {
-		t.Fatalf("SetEncoding = %v for oversized initial batch, want general", value.SetEncoding)
+	store := NewStore()
+	if _, err := store.SAdd(nil, "s", members); err != nil {
+		t.Fatalf("SAdd() error = %v", err)
+	}
+	if got := store.encodingForTest("s"); got != "set:general" {
+		t.Fatalf("encodingForTest(s) = %q for an oversized first batch, want set:general", got)
 	}
 }

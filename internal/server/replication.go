@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 
 	"github.com/maltemindedal/stash/internal/protocol"
@@ -37,8 +36,8 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 	return ExecuteResult{Responses: responses}
 }
 
-// replicaMarker is a connection whose limits depend on whether it is a replica:
-// the event loop's, which holds a replica's waiting output to the replica limit.
+// replicaMarker is a connection that is told when it becomes a replica's: the
+// event loop's, which drains a replica on shutdown instead of closing it.
 type replicaMarker interface {
 	markReplica()
 }
@@ -51,6 +50,7 @@ type replicaMarker interface {
 func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 	// Before the feed starts, so that the first frame it pushes is held to the
 	// replica's output limit, not a subscriber's.
+	s.getClientState(clientID).Output().MarkReplica()
 	if marker, ok := conn.(replicaMarker); ok {
 		marker.markReplica()
 	}
@@ -77,8 +77,9 @@ func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 
 // dropReplica removes a replica that can no longer be fed, logs why, and closes
 // it. It has to synchronise again from the start. It is the Master's drop
-// handler, so it is called with the Master's lock not held, and takes it. A replica dropped while its full resync reply is being sent has no
-// connection here yet; its feed never starts, and registerReplicaPeer closes the
+// handler, so it is called with the Master's lock not held, and takes it. A
+// replica dropped while its full resync reply is being sent has no connection
+// here yet; its feed never starts, and registerReplicaPeer closes the
 // connection once the reply is sent.
 //
 // Only a replica that fell behind (replicaFellBehind) is logged as dropped. Any
@@ -104,15 +105,13 @@ func (s *Server) dropReplica(id uint64, cause error) {
 }
 
 // replicaFellBehind reports whether a replica's feed stopped because the replica
-// did not keep up: its queue passed its limit (replication.ErrReplicaBacklog, or the event
-// loop's push limit), or a write to it, or the wait for its connection's writer,
-// took longer than the replica feed allows. Anything else means its connection
-// ended.
+// did not keep up: its queue passed its limit (replication.ErrReplicaBacklog, or
+// its connection's Push limit), or it accepted nothing for the stall timeout.
+// Anything else means its connection ended.
 func replicaFellBehind(cause error) bool {
 	return errors.Is(cause, replication.ErrReplicaBacklog) ||
 		errors.Is(cause, errPushLimitExceeded) ||
-		errors.Is(cause, os.ErrDeadlineExceeded) ||
-		errors.Is(cause, errResponseWriterBusy)
+		errors.Is(cause, errReplicaStalled)
 }
 
 // startReplicaLink keeps the replica attached to its master (replication.Follow) until ctx

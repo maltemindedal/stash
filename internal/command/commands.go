@@ -9,7 +9,6 @@ import (
 	"math"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
@@ -18,32 +17,10 @@ import (
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
-const pubSubWriteTimeout = 100 * time.Millisecond
-
 // maxWaitMillis is the longest WAIT timeout a time.Duration can represent, about
 // 292 years. A longer request is clamped to it: converting it as given overflowed
 // to a negative duration, so a WAIT asked to wait a very long time returned at once.
 const maxWaitMillis = math.MaxInt64 / int64(time.Millisecond)
-
-var pubSubSubscriberSlicePool = sync.Pool{
-	New: func() any {
-		subscribers := make([]*server.ClientState, 0, 32)
-		return &subscribers
-	},
-}
-
-func getPooledPubSubSubscribers() *[]*server.ClientState {
-	return pubSubSubscriberSlicePool.Get().(*[]*server.ClientState)
-}
-
-func putPooledPubSubSubscribers(subscribers *[]*server.ClientState) {
-	if cap(*subscribers) > 1024 {
-		return
-	}
-
-	*subscribers = (*subscribers)[:0]
-	pubSubSubscriberSlicePool.Put(subscribers)
-}
 
 func (e *Executor) handleWatch(ctx context.Context, request *Request) (protocol.Value, error) {
 	state, err := clientStateOf(request)
@@ -323,7 +300,7 @@ func (e *Executor) handleWait(ctx context.Context, request *Request) (server.Exe
 	}
 
 	// Replies to the requests pipelined ahead of this one must not wait behind it.
-	if err := request.client.TryFlushResponses(); err != nil {
+	if err := request.client.Output().Flush(); err != nil {
 		return server.ExecuteResult{}, err
 	}
 
@@ -439,26 +416,7 @@ func (e *Executor) handleEcho(_ context.Context, request *Request) (protocol.Val
 }
 
 func (e *Executor) handlePublish(_ context.Context, request *Request) (protocol.Value, error) {
-	channel := string(request.Args[0])
-	pooledSubscribers := getPooledPubSubSubscribers()
-	subscribers := e.pubSubRegistry.AppendSubscribers(channel, (*pooledSubscribers)[:0])
-	defer func() {
-		*pooledSubscribers = subscribers
-		putPooledPubSubSubscribers(pooledSubscribers)
-	}()
-	if len(subscribers) == 0 {
-		return protocol.Integer{Value: 0}, nil
-	}
-
-	message := pubSubMessageResponse(request.Args[0], request.Args[1])
-	encodedMessage, err := protocol.Encode(message)
-	if err != nil {
-		return nil, fmt.Errorf("encode pub/sub message: %w", err)
-	}
-
-	matched := e.deliverPubSubMessage(channel, encodedMessage, subscribers)
-
-	return protocol.Integer{Value: matched}, nil
+	return protocol.Integer{Value: int64(e.pubSubRegistry.Publish(request.Args[0], request.Args[1]))}, nil
 }
 
 // parseSetExpiry parses SET's EX, PX or PXAT arguments into a Unix-millis
@@ -810,43 +768,6 @@ func pubSubAckResponse(kind string, channel protocol.Value, count int) protocol.
 		channel,
 		protocol.Integer{Value: int64(count)},
 	}}
-}
-
-func pubSubMessageResponse(channel []byte, payload []byte) protocol.Array {
-	return protocol.Array{Elements: []protocol.Value{
-		protocol.TextBulkString{Value: "message"},
-		protocol.BulkString{Data: channel},
-		protocol.BulkString{Data: payload},
-	}}
-}
-
-func (e *Executor) deliverPubSubMessage(channel string, payload []byte, subscribers []*server.ClientState) int64 {
-	matched := int64(0)
-	for _, subscriber := range subscribers {
-		if e.deliverPubSubMessageToSubscriber(channel, payload, subscriber) {
-			matched++
-		}
-	}
-
-	return matched
-}
-
-func (e *Executor) deliverPubSubMessageToSubscriber(channel string, payload []byte, subscriber *server.ClientState) bool {
-	if subscriber == nil {
-		return false
-	}
-	if err := subscriber.WriteEncodedWithDeadline(payload, pubSubWriteTimeout); err != nil {
-		e.logger.Warn(
-			"failed to deliver pub/sub message",
-			"channel", channel,
-			"subscriber_id", subscriber.ID,
-			"error", err,
-		)
-		subscriber.Disconnect()
-		return false
-	}
-
-	return true
 }
 
 func parseIntegerArgument(raw []byte) (int64, error) {

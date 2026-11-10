@@ -9,7 +9,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
@@ -19,10 +18,6 @@ import (
 // pushOrderMessage is the pub/sub message PUBLISH news hello delivers to a
 // subscriber of news.
 const pushOrderMessage = "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n"
-
-// pushOrderPushTimeout is the delivery timeout the pushes in these tests use, as
-// PUBLISH does. It never elapses: the event loop's push writer does not block.
-const pushOrderPushTimeout = 100 * time.Millisecond
 
 // handDrivenPoller reports no readiness and accepts every registration, so a
 // test runs the event loop's steps itself in the order it chooses.
@@ -60,14 +55,13 @@ func newHandDrivenEventLoop(t *testing.T) (*eventLoop, *eventConn, int) {
 }
 
 // pushToConn delivers frame to conn the way PUBLISH delivers a message to a
-// subscriber: through the connection's client state, from outside the
-// connection's own request.
+// subscriber: to the Output of the connection's client state.
 func pushToConn(t *testing.T, loop *eventLoop, conn *eventConn, frame string) {
 	t.Helper()
 
 	state := loop.srv.getClientState(conn.clientID)
-	if err := state.WriteEncodedWithDeadline([]byte(frame), pushOrderPushTimeout); err != nil {
-		t.Fatalf("WriteEncodedWithDeadline() error = %v", err)
+	if !state.Output().Push([]byte(frame)) {
+		t.Fatal("Push() = false, want the frame queued")
 	}
 }
 
@@ -130,12 +124,13 @@ func TestEventLoopSendsAPushQueuedBeforeARequestAheadOfItsReply(t *testing.T) {
 	}
 }
 
-func TestEventLoopSendsAPushQueuedDuringARequestAfterItsReply(t *testing.T) {
+func TestEventLoopSendsAPushHeldByARequestAfterItsReply(t *testing.T) {
 	loop, conn, clientFD := newHandDrivenEventLoop(t)
 
-	// A push from another goroutine, such as a replica applying its master's
-	// PUBLISH, arrives while the connection's request runs.
+	// A request that lets Pushed messages in, as SUBSCRIBE does, holds them
+	// behind its reply. One arrives from another goroutine while it runs.
 	conn.run = func(context.Context, protocol.Value) ([]protocol.Value, error) {
+		conn.out.HoldPushes()
 		pushToConn(t, loop, conn, pushOrderMessage)
 		return []protocol.Value{protocol.SimpleString{Value: "OK"}}, nil
 	}
@@ -148,5 +143,26 @@ func TestEventLoopSendsAPushQueuedDuringARequestAfterItsReply(t *testing.T) {
 	want := "+OK\r\n" + pushOrderMessage
 	if got := readSent(t, clientFD); got != want {
 		t.Fatalf("client received %q, want %q", got, want)
+	}
+}
+
+func TestEventLoopWritesAPushFromAnotherGoroutineWithoutAnEvent(t *testing.T) {
+	loop, conn, clientFD := newHandDrivenEventLoop(t)
+
+	// No request and no readiness event: the push alone has to get the
+	// connection written on the loop's next iteration.
+	pushed := make(chan struct{})
+	go func() {
+		defer close(pushed)
+		pushToConn(t, loop, conn, pushOrderMessage)
+	}()
+	<-pushed
+	if !loop.hasQueuedWork() {
+		t.Fatal("hasQueuedWork() = false after a push, want the loop to find the connection before it waits")
+	}
+	loop.applyQueuedWork()
+
+	if got := readSent(t, clientFD); got != pushOrderMessage {
+		t.Fatalf("client received %q, want %q", got, pushOrderMessage)
 	}
 }

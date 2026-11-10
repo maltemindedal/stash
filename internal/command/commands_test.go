@@ -1,8 +1,6 @@
 package command
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1012,6 +1010,10 @@ func TestExecutorInfo(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("INFO memory = %q, missing %q", text, want)
 		}
+	}
+	// The per-kind counts close the section, in this order.
+	if want := "key_count:2\r\nkey_count_string:1\r\nkey_count_list:1\r\nkey_count_hash:0\r\nkey_count_set:0\r\nkey_count_zset:0\r\nkey_count_stream:0\r\n"; !strings.HasSuffix(text, want) {
+		t.Fatalf("INFO memory = %q, want it to end with %q", text, want)
 	}
 
 	value, err = executor.Execute(clientContext(executor), requestValue("INFO"))
@@ -2380,13 +2382,20 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("SUBSCRIBE then PUBLISH delivers message and returns subscriber count", func(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
-		var outbound bytes.Buffer
-		state.BindResponseWriter(bufio.NewWriter(&outbound))
+		outbound, subscriber := net.Pipe()
+		defer func() { _ = subscriber.Close() }()
+		state.BindOutput(server.NewOutput(outbound))
+		defer state.Output().Close(nil)
 		ctx := withClient(context.Background(), state)
 
 		result, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false)
 		if err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
+		}
+		// The connection replies, which lets the messages held behind the
+		// acknowledgement through.
+		if err := state.Output().Reply(result.Responses...); err != nil {
+			t.Fatalf("Reply() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -2403,7 +2412,10 @@ func TestExecutorPubSub(t *testing.T) {
 		}
 		assertValueEqual(t, published, protocol.Integer{Value: 1})
 
-		parser := protocol.NewParser(&outbound)
+		parser := protocol.NewParser(subscriber)
+		if _, err := parser.Parse(); err != nil {
+			t.Fatalf("Parse() acknowledgement error = %v", err)
+		}
 		message, err := parser.Parse()
 		if err != nil {
 			t.Fatalf("Parse() pushed message error = %v", err)
@@ -2501,14 +2513,13 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("PUBLISH skips disconnected subscribers and prunes the registry", func(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
-		state.BindResponseWriter(bufio.NewWriter(io.Discard))
 		ctx := withClient(context.Background(), state)
 
 		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
 		}
 
-		state.Disconnect()
+		state.Abandon()
 
 		published, err := executor.Execute(clientContext(executor), requestValue("PUBLISH", "news", "hello"))
 		if err != nil {
@@ -2583,10 +2594,14 @@ func BenchmarkExecutorPublish(b *testing.B) {
 			executor := newTestExecutor()
 			for i := 0; i < subscriberCount; i++ {
 				state := newTestClientState(executor, uint64(i+1))
-				state.BindResponseWriter(bufio.NewWriter(io.Discard))
+				state.BindOutput(server.NewOutput(io.Discard))
 				ctx := withClient(context.Background(), state)
 				if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 					b.Fatalf("SUBSCRIBE error = %v", err)
+				}
+				// Replying lets the messages held behind the acknowledgement through.
+				if err := state.Output().Reply(); err != nil {
+					b.Fatalf("Reply() error = %v", err)
 				}
 			}
 
@@ -3156,7 +3171,7 @@ func newTestClientState(executor *Executor, id uint64) *server.ClientState {
 func newReplicaPeerStateForExecutor(executor *Executor, id uint64, conn net.Conn) *server.ClientState {
 	state := newTestClientState(executor, id)
 	state.PromoteToReplica()
-	state.BindResponseWriter(bufio.NewWriter(conn))
+	state.BindOutput(server.NewOutput(conn))
 	return state
 }
 
@@ -3182,16 +3197,31 @@ func acknowledgeGetAck(conn net.Conn, registry *replication.Master, id uint64, o
 	return nil
 }
 
+// storedExpiryMillis returns the TTL deadline stored for a string key, or 0 for
+// a key without one, read from the recreation commands of the keyspace image.
 func storedExpiryMillis(t *testing.T, executor *Executor, key string) int64 {
 	t.Helper()
-	entries, _ := executor.store.SnapshotAll()
-	for _, entry := range entries {
-		if entry.Key == key {
-			return entry.ExpiresAt
+
+	found, deadline := false, int64(0)
+	_, err := executor.store.Image(nil).Recreate(func(args [][]byte) error {
+		if string(args[1]) != key {
+			return nil
 		}
+		found = true
+		if len(args) == 5 && string(args[0]) == "SET" && string(args[3]) == "PXAT" {
+			parsed, err := strconv.ParseInt(string(args[4]), 10, 64)
+			deadline = parsed
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Recreate() error = %v", err)
 	}
-	t.Fatalf("key %q not found in store snapshot", key)
-	return 0
+	if !found {
+		t.Fatalf("key %q not found in the keyspace image", key)
+	}
+	return deadline
 }
 
 func requestValue(parts ...string) protocol.Value {

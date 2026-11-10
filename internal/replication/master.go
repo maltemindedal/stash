@@ -90,10 +90,11 @@ type Replica struct {
 	feed *replicaFeed
 }
 
-// Output is where a Replica's feed writes its stream: the Replica's client
-// connection, which gives up on a write the Replica does not take in time.
+// Output is where a Replica's feed hands its stream: the Replica's client
+// connection, whose own output writes it to the socket and drops a Replica
+// that does not take it in time. It keeps no reference to payload.
 type Output interface {
-	WriteEncodedWithDeadline(payload []byte, timeout time.Duration) error
+	WriteEncoded(payload []byte) error
 }
 
 // Candidate is a client that asks to become a Replica.
@@ -376,10 +377,9 @@ func (r *Replica) enqueue(payload []byte) error {
 	return r.feed.enqueue(payload)
 }
 
-// send writes one stretch of the stream to the Replica's socket, giving up if
-// the Replica does not take it in time.
+// send hands one stretch of the stream to the Replica's Output.
 func (r *Replica) send(chunk []byte) error {
-	return r.out.WriteEncodedWithDeadline(chunk, replicaFeedWriteTimeout)
+	return r.out.WriteEncoded(chunk)
 }
 
 // WaitFeeds waits until the goroutine of every feed Start started has ended,
