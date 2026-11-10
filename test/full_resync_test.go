@@ -24,7 +24,10 @@ import (
 // follows it. The default networking mode used to register the replica only once
 // the whole snapshot was on the socket, so a write in between was in neither.
 // With WAIT's base offset that also made WAIT count the replica for the write.
-// The event-loop row is TestAWriteMadeWhileAFullResyncIsSentReachesTheReplicaUnderTheEventLoop.
+// The WAIT row runs in the default mode only: a WAIT that has to wait is an
+// error under --event-loop, and the event loop runs PSYNC and every other
+// client's command on one goroutine, so there a write from another client
+// always runs after PSYNC has returned.
 func TestAWriteMadeWhileAFullResyncIsSentReachesTheReplica(t *testing.T) {
 	tests := []struct {
 		name string
@@ -33,21 +36,26 @@ func TestAWriteMadeWhileAFullResyncIsSentReachesTheReplica(t *testing.T) {
 		// and only once the replica has acknowledged a stream that holds it.
 		wait bool
 	}{
-		{name: "default networking"},
-		{name: "default networking with an append-only file", aof: true},
+		{name: "no append-only file"},
+		{name: "an append-only file", aof: true},
 		{name: "WAIT counts the replica once it holds the write", wait: true},
 	}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := defaultTestConfig()
-			if tt.aof {
-				cfg.AOFPath = filepath.Join(t.TempDir(), "master.aof")
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		for _, tt := range tests {
+			tt := tt
+			if tt.wait && base.EventLoop {
+				continue
 			}
-			writeDuringFullResync(t, cfg, tt.wait)
-		})
-	}
+			t.Run(tt.name, func(t *testing.T) {
+				cfg := base
+				if tt.aof {
+					cfg.AOFPath = filepath.Join(t.TempDir(), "master.aof")
+				}
+				writeDuringFullResync(t, cfg, tt.wait)
+			})
+		}
+	})
 }
 
 // fullResyncKeys fills the master with a snapshot of about 21 MB, more than the

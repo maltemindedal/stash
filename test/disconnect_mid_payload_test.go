@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
 )
@@ -32,54 +33,46 @@ func TestAClientThatHangsUpInsideABulkPayloadIsNotAnsweredWithAProtocolError(t *
 		{name: "inside the CRLF after a payload", request: "*2\r\n$4\r\nECHO\r\n$3\r\nabc\r"},
 	}
 
-	for _, eventLoop := range []bool{false, true} {
-		name := "goroutine per connection"
-		if eventLoop {
-			name = "event loop"
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		var logs synchronizedBuffer
+		logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		addr, stop, errCh := startTestServerWithLogger(t, cfg, logger)
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
+
+		for _, tt := range requests {
+			t.Run(tt.name, func(t *testing.T) {
+				conn, err := net.Dial("tcp", addr)
+				if err != nil {
+					t.Fatalf("Dial(%q) error = %v", addr, err)
+				}
+				defer closeTestResource(t, conn)
+
+				if _, err := io.WriteString(conn, tt.request); err != nil {
+					t.Fatalf("Write() error = %v", err)
+				}
+				if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+					t.Fatalf("CloseWrite() error = %v", err)
+				}
+				if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+					t.Fatalf("SetReadDeadline() error = %v", err)
+				}
+				reply, err := io.ReadAll(conn)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v, want the server to close the connection (got %q so far)", err, reply)
+				}
+				if len(reply) != 0 {
+					t.Fatalf("reply = %q, want none for a client that hung up", reply)
+				}
+			})
 		}
-		t.Run(name, func(t *testing.T) {
-			var logs synchronizedBuffer
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-			addr, stop, errCh := startTestServerWithLogger(t, cfg, logger)
-			defer func() {
-				stop()
-				waitForServerStop(t, errCh)
-			}()
 
-			for _, tt := range requests {
-				t.Run(tt.name, func(t *testing.T) {
-					conn, err := net.Dial("tcp", addr)
-					if err != nil {
-						t.Fatalf("Dial(%q) error = %v", addr, err)
-					}
-					defer closeTestResource(t, conn)
-
-					if _, err := io.WriteString(conn, tt.request); err != nil {
-						t.Fatalf("Write() error = %v", err)
-					}
-					if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
-						t.Fatalf("CloseWrite() error = %v", err)
-					}
-					if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-						t.Fatalf("SetReadDeadline() error = %v", err)
-					}
-					reply, err := io.ReadAll(conn)
-					if err != nil {
-						t.Fatalf("ReadAll() error = %v, want the server to close the connection (got %q so far)", err, reply)
-					}
-					if len(reply) != 0 {
-						t.Fatalf("reply = %q, want none for a client that hung up", reply)
-					}
-				})
-			}
-
-			if output := logs.String(); output != "" {
-				t.Fatalf("server logged %q, want nothing at warn level or above for clients that hung up", output)
-			}
-		})
-	}
+		if output := logs.String(); output != "" {
+			t.Fatalf("server logged %q, want nothing at warn level or above for clients that hung up", output)
+		}
+	})
 }
 
 // TestAMasterThatHangsUpInsideAFrameEndsTheLinkWithoutAParseWarning has a fake

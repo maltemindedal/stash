@@ -1,5 +1,3 @@
-//go:build linux || darwin
-
 package test
 
 import (
@@ -11,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 )
 
@@ -68,50 +67,53 @@ func drain(conn net.Conn, wait time.Duration) (received int64, closed bool) {
 	return received, !errors.Is(err, os.ErrDeadlineExceeded)
 }
 
-func TestEventLoopClosesASubscriberWhoseOutputPassesThePerConnectionLimit(t *testing.T) {
-	// A subscriber that never reads used to be allowed 512 MiB of queued output
-	// (and it could hold that twice, in the push queue and the write buffer).
-	// The limit is 32 MiB, Redis's pub/sub hard limit; the kernel's socket
-	// buffers hold a few more megabytes before the server's buffer starts to fill.
-	addr, stop, errCh := startTestServer(t, eventLoopTestConfig())
-	defer func() {
-		stop()
-		waitForServerStop(t, errCh)
-	}()
+func TestASubscriberWhoseOutputPassesThePerConnectionLimitIsClosed(t *testing.T) {
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// A subscriber that never reads may have 32 MiB of output waiting for it,
+		// Redis's pub/sub hard limit, in both networking modes. The kernel's socket
+		// buffers hold a few more megabytes before the server's buffer starts to fill.
+		addr, stop, errCh := startTestServer(t, base)
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
 
-	subscriber := stalledSubscriber(t, addr, "news")
-	publishMiB(t, addr, "news", 96)
+		subscriber := stalledSubscriber(t, addr, "news")
+		publishMiB(t, addr, "news", 96)
 
-	received, closed := drain(subscriber, 5*time.Second)
-	if !closed {
-		t.Fatalf("the subscriber was still connected after %d bytes were queued for it, want it closed at the limit", received)
-	}
-	const limit = 64 << 20
-	if received > limit {
-		t.Fatalf("the subscriber received %d bytes before it was closed, want well under the 32 MiB limit plus socket buffers", received)
-	}
+		received, closed := drain(subscriber, 5*time.Second)
+		if !closed {
+			t.Fatalf("the subscriber was still connected after %d bytes were queued for it, want it closed at the limit", received)
+		}
+		const limit = 64 << 20
+		if received > limit {
+			t.Fatalf("the subscriber received %d bytes before it was closed, want well under the 32 MiB limit plus socket buffers", received)
+		}
+	})
 }
 
-func TestEventLoopStillSendsLargeRepliesToAClientThatAskedForThem(t *testing.T) {
-	// The push limit is for output nobody asked for. A client that requests a
-	// 48 MiB value, more than the limit, must still get all of it.
-	addr, stop, errCh := startTestServer(t, eventLoopTestConfig())
-	defer func() {
-		stop()
-		waitForServerStop(t, errCh)
-	}()
+func TestLargeRepliesStillReachAClientThatAskedForThem(t *testing.T) {
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// The push limit is for output nobody asked for. A client that requests a
+		// 48 MiB value, more than the limit, must still get all of it.
+		addr, stop, errCh := startTestServer(t, base)
+		defer func() {
+			stop()
+			waitForServerStop(t, errCh)
+		}()
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Dial(%q) error = %v", addr, err)
-	}
-	defer closeTestResource(t, conn)
-	parser := protocol.NewParser(conn)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		defer closeTestResource(t, conn)
+		parser := protocol.NewParser(conn)
 
-	value := strings.Repeat("v", 48<<20)
-	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		t.Fatalf("SetDeadline() error = %v", err)
-	}
-	assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "big", value)
-	assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte(value)}, "GET", "big")
+		value := strings.Repeat("v", 48<<20)
+		if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			t.Fatalf("SetDeadline() error = %v", err)
+		}
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "SET", "big", value)
+		assertCommandResponse(t, conn, parser, protocol.BulkString{Data: []byte(value)}, "GET", "big")
+	})
 }

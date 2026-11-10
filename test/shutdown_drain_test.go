@@ -35,29 +35,26 @@ import (
 // queue, and the next acknowledgement drew a reset that discarded them.
 func TestAReplicaReceivesEveryAcknowledgedWriteWhenItsMasterShutsDown(t *testing.T) {
 	tests := []struct {
-		name      string
-		eventLoop bool
-		acks      bool
+		name string
+		acks bool
 	}{
-		{name: "default networking"},
-		{name: "default networking, with a replica acknowledging while it reads", acks: true},
-		{name: "event loop", eventLoop: true},
-		{name: "event loop, with a replica acknowledging while it reads", eventLoop: true, acks: true},
+		{name: "a replica that only reads"},
+		{name: "a replica acknowledging while it reads", acks: true},
 	}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = tt.eventLoop
-			replicaDrainsAtShutdown(t, cfg, func(drain *shutdownDrain) {
-				drain.cancel()
-				if tt.acks {
-					drain.acknowledgeWhileReading(t)
-				}
-			}, nil)
-		})
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				replicaDrainsAtShutdown(t, base, func(drain *shutdownDrain) {
+					drain.cancel()
+					if tt.acks {
+						drain.acknowledgeWhileReading(t)
+					}
+				}, nil)
+			})
+		}
+	})
 }
 
 // drainedWrites is how many writes of drainedValueSize bytes the replica in

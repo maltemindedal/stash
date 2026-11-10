@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 )
 
@@ -20,18 +21,13 @@ import (
 // The event loop closes its clients when it stops accepting, and used to close
 // the replica with them.
 func TestAReplicaReceivesEveryAcknowledgedWriteWhenItsMastersAcceptLoopFails(t *testing.T) {
-	for _, eventLoop := range []bool{false, true} {
-		eventLoop := eventLoop
-		t.Run(map[bool]string{false: "default networking, with a write during the drain", true: "event loop"}[eventLoop], func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			replicaDrainsAtShutdown(t, cfg, func(drain *shutdownDrain) {
-				breakAcceptLoop(t, drain.addr)
-				waitForLogFragments(t, drain.logs, 5*time.Second, "sending the replicas what is queued for them before shutting down")
-				if !eventLoop {
-					assertCommandResponse(t, drain.client, drain.clientParser, protocol.SimpleString{Value: "OK"}, "SET", "written-during-the-drain", "x")
-				}
-			}, syscall.EINVAL)
-		})
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		replicaDrainsAtShutdown(t, cfg, func(drain *shutdownDrain) {
+			breakAcceptLoop(t, drain.addr)
+			waitForLogFragments(t, drain.logs, 5*time.Second, "sending the replicas what is queued for them before shutting down")
+			if !cfg.EventLoop {
+				assertCommandResponse(t, drain.client, drain.clientParser, protocol.SimpleString{Value: "OK"}, "SET", "written-during-the-drain", "x")
+			}
+		}, syscall.EINVAL)
+	})
 }

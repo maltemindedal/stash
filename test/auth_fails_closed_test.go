@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/maltemindedal/stash/internal/command"
+	"github.com/maltemindedal/stash/internal/config"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/server"
@@ -24,45 +25,37 @@ func TestAuthFailsClosedWhenThePasswordNeverReachesTheExecutor(t *testing.T) {
 	noAuth := protocol.ErrorValue{Message: "NOAUTH Authentication required."}
 	authNotConfigured := protocol.ErrorValue{Message: "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"}
 
-	for _, eventLoop := range []bool{false, true} {
-		name := "goroutine per connection"
-		if eventLoop {
-			name = "event loop"
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		cfg.RequirePass = "secret"
+
+		logger := stashlogger.New(cfg.LogLevel)
+		store := storage.NewStore()
+		srv, err := server.New(cfg, logger, store, newExecutorWithoutPassword)
+		if err != nil {
+			t.Fatalf("server.New() error = %v", err)
 		}
-		t.Run(name, func(t *testing.T) {
-			cfg := defaultTestConfig()
-			cfg.EventLoop = eventLoop
-			cfg.RequirePass = "secret"
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- srv.ListenAndServe(ctx)
+		}()
+		defer func() {
+			cancel()
+			waitForServerStop(t, errCh)
+		}()
 
-			logger := stashlogger.New(cfg.LogLevel)
-			store := storage.NewStore()
-			srv, err := server.New(cfg, logger, store, newExecutorWithoutPassword)
-			if err != nil {
-				t.Fatalf("server.New() error = %v", err)
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- srv.ListenAndServe(ctx)
-			}()
-			defer func() {
-				cancel()
-				waitForServerStop(t, errCh)
-			}()
+		addr := waitForAddr(t, srv)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		defer closeTestResource(t, conn)
+		parser := protocol.NewParser(conn)
 
-			addr := waitForAddr(t, srv)
-			conn, err := net.Dial("tcp", addr)
-			if err != nil {
-				t.Fatalf("Dial(%q) error = %v", addr, err)
-			}
-			defer closeTestResource(t, conn)
-			parser := protocol.NewParser(conn)
-
-			assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "PONG"}, "PING")
-			assertCommandResponse(t, conn, parser, noAuth, "GET", "name")
-			assertCommandResponse(t, conn, parser, noAuth, "SET", "name", "Stash")
-			assertCommandResponse(t, conn, parser, authNotConfigured, "AUTH", "secret")
-			assertCommandResponse(t, conn, parser, noAuth, "GET", "name")
-		})
-	}
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "PONG"}, "PING")
+		assertCommandResponse(t, conn, parser, noAuth, "GET", "name")
+		assertCommandResponse(t, conn, parser, noAuth, "SET", "name", "Stash")
+		assertCommandResponse(t, conn, parser, authNotConfigured, "AUTH", "secret")
+		assertCommandResponse(t, conn, parser, noAuth, "GET", "name")
+	})
 }

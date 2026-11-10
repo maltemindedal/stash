@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/config"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/rdb"
@@ -15,52 +16,54 @@ import (
 )
 
 func TestAStalledReplicaDoesNotBlockWritersOnTheMaster(t *testing.T) {
-	// A replica that stops reading fills its socket buffers. Writers used to write
-	// to every replica's socket themselves, so the first one to hit the full
-	// buffer, and then every other, stopped until the replica read again.
-	cfg := defaultTestConfig()
-	logger := stashlogger.New(cfg.LogLevel)
-	store := storage.NewStore()
-	srv := newServer(t, cfg, logger, store)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe(ctx) }()
-	addr := waitForAddr(t, srv)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		// A replica that stops reading fills its socket buffers. Writers used to write
+		// to every replica's socket themselves, so the first one to hit the full
+		// buffer, and then every other, stopped until the replica read again.
+		cfg := base
+		logger := stashlogger.New(cfg.LogLevel)
+		store := storage.NewStore()
+		srv := newServer(t, cfg, logger, store)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errCh := make(chan error, 1)
+		go func() { errCh <- srv.ListenAndServe(ctx) }()
+		addr := waitForAddr(t, srv)
 
-	attachTestReplica(t, srv, addr) // never reads what the master sends it
+		attachTestReplica(t, srv, addr) // never reads what the master sends it
 
-	client, clientParser := dialClient(t, addr)
-	value := strings.Repeat("v", 512<<10)
-	started := time.Now()
-	const writes = 80 // 40 MiB, far past what the socket buffers hold
-	for i := 0; i < writes; i++ {
-		if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			t.Fatalf("SetDeadline() error = %v", err)
+		client, clientParser := dialClient(t, addr)
+		value := strings.Repeat("v", 512<<10)
+		started := time.Now()
+		const writes = 80 // 40 MiB, far past what the socket buffers hold
+		for i := 0; i < writes; i++ {
+			if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatalf("SetDeadline() error = %v", err)
+			}
+			if err := protocol.WriteValue(client, request("SET", "big", value)); err != nil {
+				t.Fatalf("write %d error = %v (a stalled replica is blocking the master's writers)", i, err)
+			}
+			if _, err := clientParser.Parse(); err != nil {
+				t.Fatalf("reply %d error = %v (a stalled replica is blocking the master's writers)", i, err)
+			}
 		}
-		if err := protocol.WriteValue(client, request("SET", "big", value)); err != nil {
-			t.Fatalf("write %d error = %v (a stalled replica is blocking the master's writers)", i, err)
+		if elapsed := time.Since(started); elapsed > 10*time.Second {
+			t.Fatalf("%d writes took %v behind a stalled replica", writes, elapsed)
 		}
-		if _, err := clientParser.Parse(); err != nil {
-			t.Fatalf("reply %d error = %v (a stalled replica is blocking the master's writers)", i, err)
+		if srv.ReplicaCount() != 1 {
+			t.Fatalf("ReplicaCount() = %d, want the stalled replica still registered (it is 40 MiB behind, under the limit)", srv.ReplicaCount())
 		}
-	}
-	if elapsed := time.Since(started); elapsed > 10*time.Second {
-		t.Fatalf("%d writes took %v behind a stalled replica", writes, elapsed)
-	}
-	if srv.ReplicaCount() != 1 {
-		t.Fatalf("ReplicaCount() = %d, want the stalled replica still registered (it is 40 MiB behind, under the limit)", srv.ReplicaCount())
-	}
 
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("ListenAndServe() error = %v", err)
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("ListenAndServe() error = %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the master did not shut down with a stalled replica attached")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the master did not shut down with a stalled replica attached")
-	}
+	})
 }
 
 func TestReplicaReconnectsAndResynchronisesWhenItsMasterDrops(t *testing.T) {
