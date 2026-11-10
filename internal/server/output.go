@@ -33,7 +33,9 @@ const outputReplicaPushLimit = 256 << 20
 const outputPushBudget = 128 << 20
 
 // outputReplicaStallTimeout is how long a Replica may accept nothing while
-// output waits for it before it is dropped.
+// output its socket could take waits for it before it is dropped. Pushed
+// messages held behind a Reply that has not come are not waiting for the
+// socket.
 const outputReplicaStallTimeout = 30 * time.Second
 
 // outputWriteThrough is how much Client output a connection's goroutine lets
@@ -184,8 +186,9 @@ type Output struct {
 	// ending is set once the stream is to end when everything queued has been
 	// written (EndStream).
 	ending bool
-	// lastProgress is when the socket last accepted a byte, or when output
-	// began to wait; stallArmed is set while a timer is due to check it.
+	// lastProgress is when the socket last accepted a byte, or when output it
+	// could take began to wait; stallArmed is set while a timer is due to check
+	// it.
 	lastProgress time.Time
 	stallArmed   bool
 
@@ -225,6 +228,7 @@ func (o *Output) Reply(values ...protocol.Value) error {
 		o.mu.Unlock()
 		return err
 	}
+	writable := o.pendingLocked()
 	before := len(o.queued)
 	queued, err := protocol.AppendValues(o.queued, values)
 	if err != nil {
@@ -251,6 +255,7 @@ func (o *Output) Reply(values ...protocol.Value) error {
 			o.driver.schedule(o)
 		}
 	}
+	o.beganToWaitLocked(writable)
 	o.mu.Unlock()
 	return nil
 }
@@ -296,8 +301,10 @@ func (o *Output) Push(frame []byte) bool {
 		o.held = append(o.held, frame...)
 		o.growLocked(len(frame))
 	} else {
+		writable := o.pendingLocked()
 		o.queued = append(o.queued, frame...)
 		o.growLocked(len(frame))
+		o.beganToWaitLocked(writable)
 		o.driver.schedule(o)
 	}
 	overBudget := o.counted && o.shared.total.Load() > o.shared.pushBudget
@@ -466,20 +473,27 @@ func (o *Output) growLocked(delta int) {
 	if delta == 0 {
 		return
 	}
-	if o.backlog.Add(int64(delta)) == int64(delta) && delta > 0 && o.replica {
-		// Output began to wait: the stall rule counts from here.
-		o.lastProgress = time.Now()
-		o.armStallLocked()
-	}
+	o.backlog.Add(int64(delta))
 	if o.counted {
 		o.shared.total.Add(int64(delta))
+	}
+}
+
+// beganToWaitLocked starts the Replica stall rule's count when output the
+// socket could take begins to wait: before is how much of it waited already.
+// What is held behind a Reply does not count until that Reply releases it,
+// since the peer is not failing to take what it has not been offered.
+func (o *Output) beganToWaitLocked(before int) {
+	if o.replica && before == 0 && o.pendingLocked() > 0 {
+		o.lastProgress = time.Now()
+		o.armStallLocked()
 	}
 }
 
 // armStallLocked starts the timer that enforces the Replica stall rule, unless
 // one is running or there is nothing to enforce.
 func (o *Output) armStallLocked() {
-	if !o.replica || o.stallArmed || o.closed || o.backlog.Load() == 0 {
+	if !o.replica || o.stallArmed || o.closed || o.pendingLocked() == 0 {
 		return
 	}
 	o.stallArmed = true
@@ -488,11 +502,12 @@ func (o *Output) armStallLocked() {
 }
 
 // checkStall closes a Replica that has accepted nothing for the stall timeout
-// while output waited, and otherwise looks again when that could next be true.
+// while output its socket could take waited, and otherwise looks again when
+// that could next be true.
 func (o *Output) checkStall() {
 	o.mu.Lock()
 	o.stallArmed = false
-	if o.closed || o.backlog.Load() == 0 {
+	if o.closed || o.pendingLocked() == 0 {
 		o.mu.Unlock()
 		return
 	}

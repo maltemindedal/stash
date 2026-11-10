@@ -384,6 +384,39 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 	})
 }
 
+// TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome marks
+// a connection a Replica's and holds what is pushed to it, as a Replica's
+// stream is held while its full resync reply is produced. Until that Reply
+// comes there is nothing the socket could take, however long the snapshot
+// takes, so the Replica is not stalled. The stall rule used to count from the
+// first frame held, and would close a Replica whose snapshot took longer than
+// the stall timeout before it was sent a byte. Once the Reply has released the
+// stream, the rule counts from there.
+func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *testing.T) {
+	shared := newOutputs()
+	shared.stallTimeout = 30 * time.Millisecond
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(shared, wire)
+	out.MarkReplica()
+	out.HoldPushes()
+	if !out.Push([]byte("stream")) {
+		t.Fatal("Push() = false, want the stream held")
+	}
+
+	time.Sleep(4 * shared.stallTimeout)
+	if err := out.Err(); err != nil {
+		t.Fatalf("Err() = %v with the stream held behind a reply that has not come, want the connection open", err)
+	}
+
+	if err := out.Reply(protocol.SimpleString{Value: "FULLRESYNC"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	waitForOutput(t, "the replica that takes nothing of the reply to be closed", func() bool { return out.Err() != nil })
+	if err := out.Err(); !errors.Is(err, errReplicaStalled) {
+		t.Fatalf("Err() = %v, want errReplicaStalled", err)
+	}
+}
+
 func TestCloseDoesNotWaitForAStuckWrite(t *testing.T) {
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(newOutputs(), wire)
