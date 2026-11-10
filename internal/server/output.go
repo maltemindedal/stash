@@ -43,9 +43,13 @@ const outputReplicaStallTimeout = 30 * time.Second
 // bufio.Writer would.
 const outputWriteThrough = 4 << 10
 
-// outputHighWater is how much Client output may wait before the connection's
-// own requests stop being read and run until it drains, so that a client that
-// pipelines without reading cannot turn small requests into unbounded Replies.
+// outputHighWater is how many bytes of a connection's Replies may wait before
+// its own requests stop being read and run until they are written, so that a
+// client that pipelines without reading cannot turn small requests into
+// unbounded Replies. What is pushed to the connection does not count: its Push
+// limit bounds that, and a Replica with its stream waiting must still have its
+// acknowledgements read. The Event loop holds everything that waits for a
+// connection to the same mark (eventLoopOutputHighWater).
 const outputHighWater = 1 << 20
 
 // outputWriteChunk is the most bytes handed to a socket in one write. In the
@@ -182,11 +186,9 @@ type Output struct {
 	// what is written to be Replies first. For a Replica that is exact: its one
 	// Reply, the full resync, is ahead of its whole stream.
 	replyWaiting int
-	// unflushed is set by a Reply and cleared by the Flush that follows it.
-	unflushed bool
-	holding   bool
-	closed    bool
-	cause     error
+	holding      bool
+	closed       bool
+	cause        error
 	// replica holds the connection to the Replica Push limit and stall rule,
 	// and leaves it out of the Push budget.
 	replica bool
@@ -203,8 +205,8 @@ type Output struct {
 	stallArmed   bool
 	stallWatch   *atomic.Pointer[Output]
 
-	// drained is signalled when a writer finishes and when the backlog falls to
-	// outputHighWater.
+	// drained is signalled when a writer finishes and when no more than
+	// outputHighWater of Replies is left to write.
 	drained *sync.Cond
 	// backlog is every byte in queued, held and inflight[sent:].
 	backlog atomic.Int64
@@ -266,7 +268,6 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	if added > 0 {
 		o.growLocked(added)
 		o.replyWaiting += added
-		o.unflushed = true
 	}
 
 	if o.holding {
@@ -417,11 +418,11 @@ func (o *Output) HoldPushes() {
 // Flush writes out what is queued, for the connection's own goroutine: before
 // it waits for the next request, once outputWriteThrough is waiting, and before
 // a command blocks. When another goroutine is already writing it leaves the
-// writing to that one. It then waits only if Replies were queued since the last
-// Flush and more than outputHighWater is waiting, until the backlog has fallen:
-// a client that does not read its Replies stops having its requests run. It
-// reports why the connection is closed, if it is. The Event loop writes its
-// connections itself, so there Flush does nothing.
+// writing to that one, and waits only while more than outputHighWater of the
+// connection's own Replies is unwritten: a client that does not read its
+// Replies stops having its requests run. It reports why the connection is
+// closed, if it is. The Event loop writes its connections itself, so there
+// Flush does nothing.
 func (o *Output) Flush() error {
 	if o == nil {
 		return nil
@@ -740,7 +741,7 @@ func (o *Output) write(w io.Writer, buffers int) error {
 			}
 			o.growLocked(-n)
 			o.replyWaiting = max(o.replyWaiting-n, 0)
-			if o.backlog.Load() <= outputHighWater {
+			if o.replyWaiting <= outputHighWater {
 				o.drained.Broadcast()
 			}
 		}
@@ -797,12 +798,11 @@ func (d *goroutineOutputDriver) flush(o *Output) error {
 	o.mu.Lock()
 	// Another goroutine may have the socket, and then writes the Replies queued
 	// here with everything else. Waiting for it is only backpressure on this
-	// connection's own Replies. A connection that queued none never waits: its
+	// connection's own requests, so it lasts while its Replies are unwritten and
+	// no longer. What is pushed to the connection never makes it wait: its
 	// goroutine reads the peer's requests, which for a Replica that has fallen
 	// behind are the acknowledgements that show how far.
-	replied := o.unflushed
-	o.unflushed = false
-	for replied && o.writing && !o.closed && o.backlog.Load() > outputHighWater {
+	for o.writing && !o.closed && o.replyWaiting > outputHighWater {
 		o.drained.Wait()
 	}
 	if o.closed {

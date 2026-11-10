@@ -646,12 +646,14 @@ func TestConcurrentPushesAndRepliesAllArriveWhole(t *testing.T) {
 	}
 }
 
-// TestAConnectionThatQueuedNoReplyNeverWaitsToFlush is a replica's connection
-// with more than the high-water mark of its stream waiting behind a stuck
-// write. Its goroutine flushes before every read and has no reply of its own
-// to send, so it must not wait for the backlog: it would stop reading the
-// replica's acknowledgements. A client with replies of its own waits there.
-func TestAConnectionThatQueuedNoReplyNeverWaitsToFlush(t *testing.T) {
+// TestAFlushBehindAStuckWriterWaitsOnlyForTheConnectionsOwnReplies is a
+// replica's connection with more than the high-water mark of its stream waiting
+// behind a stuck write. Its goroutine flushes before every read, and must not
+// wait for what was pushed to it: it would stop reading the replica's
+// acknowledgements. That holds with no Reply of its own queued and with a small
+// one. It waits only while more than the high-water mark of its own Replies is
+// unwritten, as a client that does not read its Replies must.
+func TestAFlushBehindAStuckWriterWaitsOnlyForTheConnectionsOwnReplies(t *testing.T) {
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(newOutputs(), wire)
 	out.MarkReplica()
@@ -669,11 +671,20 @@ func TestAConnectionThatQueuedNoReplyNeverWaitsToFlush(t *testing.T) {
 	if err := out.Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
 		t.Fatalf("Reply() error = %v", err)
 	}
+	within(t, "a flush with a small reply queued behind 2 MiB that was pushed", func() {
+		if err := out.Flush(); err != nil {
+			t.Errorf("Flush() error = %v, want the reply left to the writer", err)
+		}
+	})
+
+	if err := out.Reply(protocol.BulkString{Data: make([]byte, outputHighWater)}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
 	flushed := make(chan error, 1)
 	go func() { flushed <- out.Flush() }()
 	select {
 	case err := <-flushed:
-		t.Fatalf("Flush() returned %v with a reply behind 2 MiB that the peer is not reading, want it to wait", err)
+		t.Fatalf("Flush() returned %v with more than 1 MiB of replies that the peer is not reading, want it to wait", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	out.Close(nil)
@@ -681,6 +692,52 @@ func TestAConnectionThatQueuedNoReplyNeverWaitsToFlush(t *testing.T) {
 	case <-flushed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Flush() still waiting after the connection was closed")
+	}
+}
+
+// TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten sends a Replica its
+// full resync reply with a write held behind it, so that the Reply hands the
+// socket to the pump, and pushes more of the stream than the high-water mark.
+// The connection's goroutine waits in Flush while the pump writes the Reply.
+// The Replica then reads the Reply and no more of the stream. Flush returns:
+// the goroutine goes on to read the Replica's acknowledgements. It used to
+// wait until all that was waiting had fallen to the high-water mark, the stream
+// included, and under steady writes that is never.
+func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
+	values := []protocol.Value{protocol.SimpleString{Value: "FULLRESYNC"}, protocol.BulkString{Data: make([]byte, 2*outputHighWater)}}
+	reply, err := protocol.EncodeValues(values)
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	wire := newReplyReadingWire(len(reply))
+	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	defer out.Close(nil)
+	defer wire.readOn()
+
+	out.MarkReplica()
+	out.HoldPushes()
+	if !out.Push([]byte("+a write made during the attach\r\n")) {
+		t.Fatalf("Push() = false, want the write held: %v", out.Err())
+	}
+	if err := out.Reply(values...); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	<-wire.writeBegun // the pump has the socket
+	if !out.Push(make([]byte, 2*outputHighWater)) {
+		t.Fatalf("Push() = false, want the stream queued: %v", out.Err())
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- out.Flush() }()
+	close(wire.proceed)
+
+	select {
+	case err := <-flushed:
+		if err != nil {
+			t.Fatalf("Flush() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush() was still waiting 5s after the replica read its %d byte reply, with %d bytes of its stream waiting behind it", len(reply), out.Backlog())
 	}
 }
 

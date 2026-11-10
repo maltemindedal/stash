@@ -6,6 +6,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,21 +29,28 @@ import (
 func TestTheMasterReadsAReplicasAcknowledgementsWhileItsStreamWaits(t *testing.T) {
 	tests := []struct {
 		name string
+		// writeDuringAttach has a client write from before PSYNC is sent until
+		// the replica is reading its snapshot.
+		writeDuringAttach bool
 	}{
 		// The connection's own goroutine writes the full resync reply, and what
 		// is written meanwhile is queued behind it.
 		{name: "nothing is written while the full resync reply is produced"},
+		// A write is held behind the full resync reply, which then hands the
+		// socket to the pump, and the connection's goroutine waits for the pump
+		// to write the reply.
+		{name: "writes are made while the full resync reply is produced", writeDuringAttach: true},
 	}
 
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			acknowledgeBehindAWaitingStream(t)
+			acknowledgeBehindAWaitingStream(t, tt.writeDuringAttach)
 		})
 	}
 }
 
-func acknowledgeBehindAWaitingStream(t *testing.T) {
+func acknowledgeBehindAWaitingStream(t *testing.T, writeDuringAttach bool) {
 	t.Helper()
 
 	const megabyte = 1 << 20
@@ -71,6 +80,48 @@ func acknowledgeBehindAWaitingStream(t *testing.T) {
 		t.Fatalf("SetDeadline() error = %v", err)
 	}
 
+	// The master copies the snapshot while writers wait, and encodes it after
+	// they go on. A client that writes all the time therefore has a write
+	// propagated between the two, which is held behind the reply.
+	early := request("SET", "early", "e")
+	earlyLen, err := protocol.EncodedLen(early)
+	if err != nil {
+		t.Fatalf("EncodedLen() error = %v", err)
+	}
+	var earlyWrites atomic.Int64
+	stopEarlyWrites := func() {}
+	if writeDuringAttach {
+		earlyWriter, earlyParser := dialClient(t, addr)
+		stop, done := make(chan struct{}), make(chan struct{})
+		stopEarlyWrites = sync.OnceFunc(func() {
+			close(stop)
+			<-done
+		})
+		defer stopEarlyWrites()
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := protocol.WriteValue(earlyWriter, early); err != nil {
+					t.Errorf("WriteValue(SET early) error = %v", err)
+					return
+				}
+				if _, err := earlyParser.Parse(); err != nil {
+					t.Errorf("Parse() SET early reply error = %v", err)
+					return
+				}
+				earlyWrites.Add(1)
+			}
+		}()
+		for earlyWrites.Load() == 0 && !t.Failed() {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
 	if err := protocol.WriteValue(replica, request("PSYNC", "?", "-1")); err != nil {
 		t.Fatalf("WriteValue(PSYNC) error = %v", err)
 	}
@@ -92,22 +143,26 @@ func acknowledgeBehindAWaitingStream(t *testing.T) {
 		t.Fatalf("reading the start of the snapshot: %v", err)
 	}
 
+	stopEarlyWrites()
+
 	writer, writerParser := dialClient(t, addr)
-	acknowledged := request("SET", "acknowledged", "1")
-	upTo, err := protocol.EncodedLen(acknowledged)
+	acknowledged, err := protocol.EncodedLen(request("SET", "acknowledged", "1"))
 	if err != nil {
 		t.Fatalf("EncodedLen() error = %v", err)
 	}
+	// The write to acknowledge ends no further into the stream than this: the
+	// early writes that were made after the snapshot was copied are ahead of it.
+	upTo := int(earlyWrites.Load())*earlyLen + acknowledged
 	assertCommandResponse(t, writer, writerParser, protocol.SimpleString{Value: "OK"}, "SET", "acknowledged", "1")
 	megabyteValue := strings.Repeat("f", megabyte)
 	for i := 0; i < 32; i++ {
 		assertCommandResponse(t, filler, fillerParser, protocol.SimpleString{Value: "OK"}, "SET", "fill", megabyteValue)
 	}
 
-	// The rest of the snapshot with its line ending, then the stream as far as
-	// the write to acknowledge, which is its first frame.
+	// The rest of the snapshot with its line ending, then the stream past the
+	// write to acknowledge.
 	if _, err := io.CopyN(io.Discard, reader, snapshot-snapshot/4+2+int64(upTo)); err != nil {
-		t.Fatalf("reading the rest of the snapshot and the first write of the stream: %v", err)
+		t.Fatalf("reading the rest of the snapshot and the start of the stream: %v", err)
 	}
 	if err := protocol.WriteValue(replica, request("REPLCONF", "ACK", strconv.Itoa(upTo))); err != nil {
 		t.Fatalf("WriteValue(REPLCONF ACK) error = %v", err)

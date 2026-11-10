@@ -31,7 +31,8 @@ const eventLoopReadBudget = 1 << 20
 
 // eventLoopOutputHighWater is the pending-output level above which the loop
 // stops reading and executing further requests for a connection until its
-// output drains, as the goroutine mode stops in Output.Flush.
+// output drains. The goroutine mode stops in Output.Flush, and counts the
+// connection's Replies alone.
 const eventLoopOutputHighWater = outputHighWater
 
 // eventLoopAcceptRetryDelay is how long accepting pauses after the process
