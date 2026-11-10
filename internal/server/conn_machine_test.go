@@ -223,8 +223,8 @@ func TestConnMachineClosesAReplicaUnansweredAfterAFrameItCannotParse(t *testing.
 	machine := NewConnMachine(state)
 
 	stream := machineFrame("SET", "k", "v")
-	if err := machine.BufferEncoded(stream); err != nil {
-		t.Fatalf("BufferEncoded() error = %v", err)
+	if !machine.out.Push(stream) {
+		t.Fatal("Push() = false, want the stream queued")
 	}
 	if err := machine.Feed([]byte("*x\r\n")); err != nil {
 		t.Fatalf("Feed() error = %v", err)
@@ -424,7 +424,6 @@ func TestConnMachineRunnerErrorClosesImmediately(t *testing.T) {
 
 func TestConnMachineCloseCleansUpClientState(t *testing.T) {
 	state := &ClientState{ID: 7}
-	state.BindResponseWriter(bufio.NewWriter(io.Discard))
 	if !state.BeginTransaction() {
 		t.Fatal("BeginTransaction() = false, want true")
 	}
@@ -443,8 +442,8 @@ func TestConnMachineCloseCleansUpClientState(t *testing.T) {
 	if state.InTransactionActive() {
 		t.Fatal("InTransactionActive() = true, want transaction reset on close")
 	}
-	if state.HasActiveResponseWriter() {
-		t.Fatal("HasActiveResponseWriter() = true, want response writer detached on close")
+	if state.Output().Err() == nil {
+		t.Fatal("Output().Err() = nil, want the connection's output closed with the machine")
 	}
 
 	if err := machine.Feed([]byte("+ping\r\n")); !errors.Is(err, ErrConnMachineClosed) {
@@ -471,7 +470,7 @@ func TestConnMachineCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestConnMachineBufferEncodedOrdersPushFramesWithResponses(t *testing.T) {
+func TestConnMachineWritesAPushedFrameAfterTheReplyQueuedBeforeIt(t *testing.T) {
 	run, _ := echoRunner(t)
 	machine := NewConnMachine(nil)
 
@@ -488,8 +487,8 @@ func TestConnMachineBufferEncodedOrdersPushFramesWithResponses(t *testing.T) {
 	if err := machine.Flush(short); err != nil {
 		t.Fatalf("Flush() error = %v", err)
 	}
-	if err := machine.BufferEncoded([]byte("+push\r\n")); err != nil {
-		t.Fatalf("BufferEncoded() error = %v", err)
+	if !machine.out.Push([]byte("+push\r\n")) {
+		t.Fatal("Push() = false, want the frame queued")
 	}
 
 	rest := flushAll(t, machine)
@@ -498,12 +497,12 @@ func TestConnMachineBufferEncodedOrdersPushFramesWithResponses(t *testing.T) {
 	}
 }
 
-func TestConnMachineBufferEncodedRejectsClosedMachine(t *testing.T) {
+func TestConnMachineRefusesAPushedFrameOnceClosed(t *testing.T) {
 	machine := NewConnMachine(nil)
 	machine.Close(nil)
 
-	if err := machine.BufferEncoded([]byte("+push\r\n")); !errors.Is(err, ErrConnMachineClosed) {
-		t.Fatalf("BufferEncoded() after close = %v, want ErrConnMachineClosed", err)
+	if machine.out.Push([]byte("+push\r\n")) {
+		t.Fatal("Push() after close = true, want the frame refused")
 	}
 }
 
@@ -557,21 +556,6 @@ func TestConnMachineWriteBufferLimitClosesOnOversizedResponses(t *testing.T) {
 	}
 	if machine.State() != ConnStateClosed {
 		t.Fatalf("State() = %d, want ConnStateClosed", machine.State())
-	}
-}
-
-func TestConnMachineWriteBufferLimitRejectsOversizedPushFrames(t *testing.T) {
-	machine := NewConnMachine(nil)
-	machine.maxWriteBuffer = 8
-
-	if err := machine.BufferEncoded([]byte("+ok\r\n")); err != nil {
-		t.Fatalf("BufferEncoded() within limit error = %v", err)
-	}
-	if err := machine.BufferEncoded([]byte("+more\r\n")); err == nil {
-		t.Fatal("BufferEncoded() error = nil, want write-buffer limit error")
-	}
-	if machine.State() == ConnStateClosed {
-		t.Fatal("State() = ConnStateClosed, want machine left open for the caller to close")
 	}
 }
 
@@ -788,36 +772,6 @@ func TestConnMachineDecodesOneRequestAtATimeWhileLimitsApply(t *testing.T) {
 	})
 }
 
-func TestConnMachinePushLimitDoesNotApplyToReplies(t *testing.T) {
-	// A reply can be as large as a stored value; only pushed frames are held to
-	// the tighter limit.
-	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
-		return []protocol.Value{protocol.BulkString{Data: bytes.Repeat([]byte("x"), 1024)}}, nil
-	}
-	machine := NewConnMachine(nil)
-	machine.SetPushLimit(64)
-
-	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
-		t.Fatalf("Feed() error = %v", err)
-	}
-	if err := machine.ProcessPending(context.Background(), run); err != nil {
-		t.Fatalf("ProcessPending() error = %v, want a reply above the push limit accepted", err)
-	}
-	if got := machine.PendingOutputBytes(); got <= 64 {
-		t.Fatalf("PendingOutputBytes() = %d, want the 1 KiB reply buffered", got)
-	}
-
-	if err := machine.BufferEncoded([]byte("+push\r\n")); err == nil {
-		t.Fatal("BufferEncoded() error = nil, want a push refused while output above the push limit is pending")
-	}
-
-	// Once the reply has drained, a small push fits again.
-	flushAll(t, machine)
-	if err := machine.BufferEncoded([]byte("+push\r\n")); err != nil {
-		t.Fatalf("BufferEncoded() after draining error = %v", err)
-	}
-}
-
 // idleBufferCapBound is the capacity above which an idle connection must not
 // keep a read or write buffer.
 const idleBufferCapBound = 64 << 10
@@ -993,7 +947,7 @@ func TestConnMachineReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
 	}{
 		{name: "a large reply the peer accepts in one write", replySize: 32 << 20, writeLimit: 1 << 30, wantReleased: true},
 		{name: "a large reply the peer accepts a megabyte at a time", replySize: 32 << 20, writeLimit: 1 << 20, wantReleased: true},
-		{name: "a reply just over what the machine keeps", replySize: retainedWriteBufferCap + 1, writeLimit: 1 << 30, wantReleased: true},
+		{name: "a reply just over what the machine keeps", replySize: outputRetainedBuffer + 1, writeLimit: 1 << 30, wantReleased: true},
 		{name: "a reply of a megabyte keeps its buffer for the next one", replySize: 1 << 20, writeLimit: 1 << 30, wantReleased: false},
 		{name: "a small reply keeps its buffer for the next one", replySize: 1 << 10, writeLimit: 1 << 30, wantReleased: false},
 	}
@@ -1027,17 +981,17 @@ func TestConnMachineReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
 				t.Fatalf("peer received %d bytes, want %d", peer.total, wantTotal)
 			}
 
-			got := cap(machine.writeBuf)
+			got := max(cap(machine.out.queued), cap(machine.out.inflight), cap(machine.out.spare))
 			if tt.wantReleased && got > idleBufferCapBound {
 				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want at most %d", got, idleBufferCapBound)
 			}
-			if !tt.wantReleased && (got == 0 || got > retainedWriteBufferCap) {
-				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want it kept for reuse and at most %d", got, retainedWriteBufferCap)
+			if !tt.wantReleased && (got == 0 || got > outputRetainedBuffer) {
+				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want it kept for reuse and at most %d", got, outputRetainedBuffer)
 			}
 
 			// The released buffer is still good for the next output.
-			if err := machine.BufferEncoded([]byte("+later\r\n")); err != nil {
-				t.Fatalf("BufferEncoded() error = %v", err)
+			if !machine.out.Push([]byte("+later\r\n")) {
+				t.Fatal("Push() = false, want the later frame queued")
 			}
 			for machine.HasPendingOutput() {
 				if err := machine.Flush(peer); err != nil {
@@ -1086,8 +1040,8 @@ func TestConnMachineKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *test
 				}
 				// The identity is taken while the replies are buffered, since a buffer
 				// that has drained is empty.
-				identities = append(identities, bufferIdentity(machine.writeBuf))
-				caps = append(caps, cap(machine.writeBuf))
+				identities = append(identities, bufferIdentity(machine.out.queued))
+				caps = append(caps, cap(machine.out.queued))
 				for machine.HasPendingOutput() {
 					if err := machine.Flush(io.Discard); err != nil {
 						t.Fatalf("Flush() error = %v", err)
@@ -1095,14 +1049,10 @@ func TestConnMachineKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *test
 				}
 			}
 
-			replaced := 0
-			for i := 1; i < len(identities); i++ {
-				if identities[i] != identities[i-1] {
-					replaced++
-				}
-			}
-			if limit := len(identities) / 4; replaced > limit {
-				t.Fatalf("the write buffer was replaced %d times in %d pipelines (capacities %v), want at most %d", replaced, len(identities), caps, limit)
+			// The output fills one buffer while it writes the other, so two buffers
+			// serve every pipeline; a third would be an allocation per pipeline.
+			if distinct := distinctBuffers(identities); distinct > 2 {
+				t.Fatalf("the output used %d buffers in %d pipelines (capacities %v)", distinct, len(identities), caps)
 			}
 		})
 	}
@@ -1139,4 +1089,13 @@ func TestConnMachineReleasesAProcessedRequestWhileTheConnectionIdles(t *testing.
 	if after > before && after-before > valueSize/2 {
 		t.Fatalf("the idle machine keeps %d bytes reachable after a %d byte request has run, want it released", after-before, valueSize)
 	}
+}
+
+// distinctBuffers counts the different backing arrays among identities.
+func distinctBuffers(identities []*byte) int {
+	seen := make(map[*byte]struct{}, len(identities))
+	for _, identity := range identities {
+		seen[identity] = struct{}{}
+	}
+	return len(seen)
 }

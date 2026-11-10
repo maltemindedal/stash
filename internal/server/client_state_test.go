@@ -1,13 +1,9 @@
 package server
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"io"
 	"net"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -161,15 +157,13 @@ func TestClientStateTransactionLifecycle(t *testing.T) {
 	})
 }
 
-func TestClientStateDisconnectClearsWriterAndPubSubState(t *testing.T) {
+func TestClientStateAbandonLeavesEveryRegistryAndDropsTheTransaction(t *testing.T) {
 	registry := NewPubSubRegistry()
 	watchRegistry := NewWatchRegistry()
 	state := &ClientState{ID: 5, Authenticated: true}
 	state.SetPubSubRegistry(registry)
 	state.SetWatchRegistry(watchRegistry)
 
-	var outbound bytes.Buffer
-	state.BindResponseWriter(bufio.NewWriter(&outbound))
 	state.SubscribeChannel("alpha")
 	state.SubscribeChannel("beta")
 	state.WatchKeys("pubsub-key")
@@ -187,106 +181,36 @@ func TestClientStateDisconnectClearsWriterAndPubSubState(t *testing.T) {
 		t.Fatalf("len(Subscribers(beta)) = %d, want 1", got)
 	}
 
-	state.Disconnect()
-	state.Disconnect()
+	state.Abandon()
+	state.Abandon()
 
-	if state.HasActiveResponseWriter() {
-		t.Fatal("HasActiveResponseWriter() = true after Disconnect, want false")
-	}
 	if got := state.SubscriptionCount(); got != 0 {
-		t.Fatalf("SubscriptionCount() = %d after Disconnect, want 0", got)
+		t.Fatalf("SubscriptionCount() = %d after Abandon, want 0", got)
 	}
 	if len(state.SubscribedChannels()) != 0 {
-		t.Fatalf("SubscribedChannels() = %#v after Disconnect, want empty", state.SubscribedChannels())
+		t.Fatalf("SubscribedChannels() = %#v after Abandon, want empty", state.SubscribedChannels())
 	}
 	if state.InTransactionActive() {
-		t.Fatal("InTransactionActive() = true after Disconnect, want false")
+		t.Fatal("InTransactionActive() = true after Abandon, want false")
 	}
 	if state.TransactionFailed() {
-		t.Fatal("TransactionFailed() = true after Disconnect, want false")
+		t.Fatal("TransactionFailed() = true after Abandon, want false")
 	}
 	if state.TransactionDirty() {
-		t.Fatal("TransactionDirty() = true after Disconnect, want false")
+		t.Fatal("TransactionDirty() = true after Abandon, want false")
 	}
 	if state.TxQueue != nil {
-		t.Fatalf("TxQueue = %#v after Disconnect, want nil", state.TxQueue)
+		t.Fatalf("TxQueue = %#v after Abandon, want nil", state.TxQueue)
 	}
 	if got := len(registry.Subscribers("alpha")); got != 0 {
-		t.Fatalf("len(Subscribers(alpha)) = %d after Disconnect, want 0", got)
+		t.Fatalf("len(Subscribers(alpha)) = %d after Abandon, want 0", got)
 	}
 	if got := len(registry.Subscribers("beta")); got != 0 {
-		t.Fatalf("len(Subscribers(beta)) = %d after Disconnect, want 0", got)
+		t.Fatalf("len(Subscribers(beta)) = %d after Abandon, want 0", got)
 	}
-	if err := state.WriteEncoded([]byte("+OK\r\n")); err == nil {
-		t.Fatal("WriteEncoded() error = nil after Disconnect, want error")
-	}
-
 	watchRegistry.Touch("pubsub-key")
 	if state.TransactionFailed() {
-		t.Fatal("TransactionFailed() = true after Disconnect and Touch, want false")
-	}
-}
-
-func TestClientStateWriteEncodedWithDeadlineTimesOut(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer func() {
-		if err := serverConn.Close(); err != nil {
-			t.Errorf("serverConn.Close() error = %v", err)
-		}
-	}()
-	defer func() {
-		if err := clientConn.Close(); err != nil {
-			t.Errorf("clientConn.Close() error = %v", err)
-		}
-	}()
-
-	state := &ClientState{ID: 6, Authenticated: true}
-	state.BindResponseWriter(bufio.NewWriter(serverConn))
-	state.BindResponseConn(serverConn)
-
-	if err := state.WriteEncodedWithDeadline([]byte("+OK\r\n"), 5*time.Millisecond); err == nil {
-		t.Fatal("WriteEncodedWithDeadline() error = nil, want timeout error")
-	}
-}
-
-// closesAfterWriteConn is a connection that is closed by the time a write to it
-// has gone through: the write succeeds, and clearing the write deadline after
-// it fails as on a closed connection.
-type closesAfterWriteConn struct {
-	recordingConn
-	written atomic.Bool
-}
-
-func (c *closesAfterWriteConn) Write(p []byte) (int, error) {
-	n, err := c.recordingConn.Write(p)
-	c.written.Store(true)
-	return n, err
-}
-
-func (c *closesAfterWriteConn) SetWriteDeadline(time.Time) error {
-	if c.written.Load() {
-		return net.ErrClosed
-	}
-	return nil
-}
-
-// TestClientStateWriteEncodedWithDeadlineReportsAWriteThatSucceeded writes to a
-// connection that closes once the write has gone through, as a replica's does
-// when the replica leaves just then. The write succeeded, so it must not be
-// reported as failed: clearing the write deadline after it fails, and that error
-// used to be returned, which had the replica's feed drop a replica that had only
-// left.
-func TestClientStateWriteEncodedWithDeadlineReportsAWriteThatSucceeded(t *testing.T) {
-	conn := &closesAfterWriteConn{}
-	state := &ClientState{ID: 7, Authenticated: true}
-	state.BindResponseWriter(bufio.NewWriter(conn))
-	state.BindResponseConn(conn)
-
-	if err := state.WriteEncodedWithDeadline([]byte("+OK\r\n"), time.Second); err != nil {
-		t.Fatalf("WriteEncodedWithDeadline() error = %v, want nil for a write that went through", err)
-	}
-	if got := string(conn.Bytes()); got != "+OK\r\n" {
-		t.Fatalf("written = %q, want %q", got, "+OK\r\n")
+		t.Fatal("TransactionFailed() = true after Abandon and Touch, want false")
 	}
 }
 
@@ -440,346 +364,5 @@ func TestHandleConnectionDisconnectCleansTransactionState(t *testing.T) {
 	registry.Touch("alpha")
 	if state.TransactionFailed() {
 		t.Fatal("TransactionFailed() = true after registry.Touch post-disconnect, want false")
-	}
-}
-
-func TestHandleConnectionClosesConnectionBeforeDisconnect(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newTestServer(t, config.Default(), logger, storage.NewStore(), stubExecutor{})
-
-	conn := newBlockingConn()
-	clientID := srv.registry.Add(conn)
-	state := srv.createClientState(clientID)
-
-	srv.handlerWG.Add(1)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.handleConnection(context.Background(), clientID, conn)
-	}()
-
-	waitForCondition(t, time.Second, func() bool {
-		return state.HasActiveResponseWriter()
-	}, "handleConnection to bind the client response writer")
-
-	writeErrCh := make(chan error, 1)
-	go func() {
-		writeErrCh <- state.WriteEncoded([]byte("+push\r\n"))
-	}()
-
-	waitForSignal(t, time.Second, conn.writeStarted, "async client write to start")
-	conn.ReleaseRead()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("handleConnection() did not exit; expected it to close the connection before disconnecting client state")
-	}
-
-	select {
-	case err := <-writeErrCh:
-		if err == nil {
-			t.Fatal("WriteEncoded() error = nil, want close-induced error")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("WriteEncoded() did not unblock after handleConnection closed the connection")
-	}
-
-	if got := srv.getClientState(clientID); got != nil {
-		t.Fatalf("getClientState(%d) after close-before-disconnect cleanup = %p, want nil", clientID, got)
-	}
-	if state.HasActiveResponseWriter() {
-		t.Fatal("HasActiveResponseWriter() = true after handleConnection cleanup, want false")
-	}
-	if got := srv.registry.Count(); got != 0 {
-		t.Fatalf("registry.Count() after handleConnection cleanup = %d, want 0", got)
-	}
-}
-
-func TestShutdownClosesConnectionsBeforeDisconnectingClientStates(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Default()
-	cfg.DumpPath = ""
-	srv := newTestServer(t, cfg, logger, storage.NewStore(), stubExecutor{})
-
-	conn := newBlockingConn()
-	clientID := srv.registry.Add(conn)
-	state := srv.createClientState(clientID)
-	state.BindResponseWriter(bufio.NewWriter(conn))
-
-	writeErrCh := make(chan error, 1)
-	go func() {
-		writeErrCh <- state.WriteEncoded([]byte("+push\r\n"))
-	}()
-
-	waitForSignal(t, time.Second, conn.writeStarted, "shutdown write to start")
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		srv.shutdown()
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("shutdown() did not return; expected it to close client connections before disconnecting client state")
-	}
-
-	select {
-	case err := <-writeErrCh:
-		if err == nil {
-			t.Fatal("WriteEncoded() error = nil, want close-induced error")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("WriteEncoded() did not unblock after shutdown closed the client connection")
-	}
-
-	if got := srv.getClientState(clientID); got != nil {
-		t.Fatalf("getClientState(%d) after shutdown cleanup = %p, want nil", clientID, got)
-	}
-	if state.HasActiveResponseWriter() {
-		t.Fatal("HasActiveResponseWriter() = true after shutdown cleanup, want false")
-	}
-	if got := srv.registry.Count(); got != 0 {
-		t.Fatalf("registry.Count() after shutdown cleanup = %d, want 0", got)
-	}
-}
-
-type blockingConn struct {
-	closed           chan struct{}
-	readRelease      chan struct{}
-	writeStarted     chan struct{}
-	closeOnce        sync.Once
-	readReleaseOnce  sync.Once
-	writeStartedOnce sync.Once
-}
-
-func newBlockingConn() *blockingConn {
-	return &blockingConn{
-		closed:       make(chan struct{}),
-		readRelease:  make(chan struct{}),
-		writeStarted: make(chan struct{}),
-	}
-}
-
-func (c *blockingConn) ReleaseRead() {
-	c.readReleaseOnce.Do(func() {
-		close(c.readRelease)
-	})
-}
-
-func (c *blockingConn) Read(_ []byte) (int, error) {
-	<-c.readRelease
-	return 0, io.EOF
-}
-
-func (c *blockingConn) Write(_ []byte) (int, error) {
-	c.writeStartedOnce.Do(func() {
-		close(c.writeStarted)
-	})
-	<-c.closed
-	return 0, net.ErrClosed
-}
-
-func (c *blockingConn) Close() error {
-	c.closeOnce.Do(func() {
-		close(c.closed)
-	})
-	return nil
-}
-
-func (c *blockingConn) LocalAddr() net.Addr {
-	return blockingConnAddr("local")
-}
-
-func (c *blockingConn) RemoteAddr() net.Addr {
-	return blockingConnAddr("remote")
-}
-
-func (c *blockingConn) SetDeadline(time.Time) error {
-	return nil
-}
-
-func (c *blockingConn) SetReadDeadline(time.Time) error {
-	return nil
-}
-
-func (c *blockingConn) SetWriteDeadline(time.Time) error {
-	return nil
-}
-
-type blockingConnAddr string
-
-func (a blockingConnAddr) Network() string {
-	return "test"
-}
-
-func (a blockingConnAddr) String() string {
-	return string(a)
-}
-
-func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, description string) {
-	t.Helper()
-
-	deadline := time.After(timeout)
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if condition() {
-			return
-		}
-
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", description)
-		case <-ticker.C:
-		}
-	}
-}
-
-func waitForSignal(t *testing.T, timeout time.Duration, signal <-chan struct{}, description string) {
-	t.Helper()
-
-	select {
-	case <-signal:
-	case <-time.After(timeout):
-		t.Fatalf("timed out waiting for %s", description)
-	}
-}
-
-// startBlockedReply starts a reply write that cannot finish, because the peer end
-// of the pipe never reads, and returns once that write holds the client's
-// response lock, the way a client that stopped draining its socket does.
-func startBlockedReply(t *testing.T) (*ClientState, <-chan error) {
-	t.Helper()
-
-	server, peer := net.Pipe()
-	t.Cleanup(func() {
-		_ = server.Close()
-		_ = peer.Close()
-	})
-
-	state := &ClientState{ID: 9, Authenticated: true}
-	state.BindResponseWriter(bufio.NewWriter(server))
-	state.BindResponseConn(server)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- state.WriteResponses([]protocol.Value{protocol.SimpleString{Value: "PONG"}})
-	}()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for state.responseMu.TryLock() {
-		state.responseMu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatal("the reply write never took the response lock")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return state, done
-}
-
-func TestClientStatePushToBlockedReplyGivesUpAtDeadline(t *testing.T) {
-	// A client whose own reply flush is stuck holds its response lock. A publisher
-	// pushing to it must give up after its write timeout instead of queueing
-	// behind that flush, or one client that stops reading freezes every publisher.
-	state, _ := startBlockedReply(t)
-
-	result := make(chan error, 1)
-	start := time.Now()
-	go func() { result <- state.WriteEncodedWithDeadline([]byte("+pushed\r\n"), 100*time.Millisecond) }()
-
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("WriteEncodedWithDeadline() error = nil, want a timeout while the reply flush holds the lock")
-		}
-		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Fatalf("WriteEncodedWithDeadline() took %v, want it bounded by its 100ms timeout", elapsed)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("WriteEncodedWithDeadline() is still blocked behind the stuck reply flush")
-	}
-}
-
-func TestClientStateDisconnectUnblocksStuckReplyWrite(t *testing.T) {
-	// Disconnect is what publishers call after a failed push. It must not wait
-	// for the stuck flush; closing the connection is what ends that flush.
-	state, replyDone := startBlockedReply(t)
-
-	disconnected := make(chan struct{})
-	go func() {
-		state.Disconnect()
-		close(disconnected)
-	}()
-
-	select {
-	case <-disconnected:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Disconnect() is still blocked behind the stuck reply flush")
-	}
-	select {
-	case err := <-replyDone:
-		if err == nil {
-			t.Fatal("WriteResponses() error = nil, want the write to fail once the client is disconnected")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the stuck reply write was never released")
-	}
-}
-
-func TestTryFlushResponsesDoesNotWaitForAStuckWriter(t *testing.T) {
-	// A push or replica propagation can be stuck writing to a peer that stopped
-	// reading, holding the response lock. The connection handler flushes before
-	// each read and must not park behind that writer: it would stop reading the
-	// peer's own requests, which for a replica are its acknowledgements.
-	state, _ := startBlockedReply(t)
-
-	done := make(chan error, 1)
-	go func() { done <- state.TryFlushResponses() }()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("flush behind a stuck writer error = %v, want it to be skipped", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("a flush waited behind a writer stuck holding the response lock")
-	}
-}
-
-func TestQueuedResponsesGoOutOnTheNextFlush(t *testing.T) {
-	var out bytes.Buffer
-	state := &ClientState{ID: 4}
-	state.BindResponseWriter(bufio.NewWriter(&out))
-
-	for i := 0; i < 3; i++ {
-		if err := state.QueueResponses([]protocol.Value{protocol.SimpleString{Value: "OK"}}); err != nil {
-			t.Fatalf("QueueResponses() error = %v", err)
-		}
-	}
-	if out.Len() != 0 {
-		t.Fatalf("output = %q before any flush, want the replies held back", out.String())
-	}
-	if err := state.TryFlushResponses(); err != nil {
-		t.Fatalf("TryFlushResponses() error = %v", err)
-	}
-	if got := out.String(); got != "+OK\r\n+OK\r\n+OK\r\n" {
-		t.Fatalf("output after the flush = %q, want the three queued replies in order", got)
-	}
-
-	// Nothing queued, or nothing to write to, is not an error.
-	if err := state.FlushResponses(); err != nil {
-		t.Fatalf("FlushResponses() with nothing queued error = %v", err)
-	}
-	state.Disconnect()
-	if err := state.FlushResponses(); err != nil {
-		t.Fatalf("FlushResponses() after Disconnect error = %v, want success", err)
-	}
-	var nilState *ClientState
-	if err := nilState.TryFlushResponses(); err != nil {
-		t.Fatalf("TryFlushResponses() on a nil state error = %v", err)
 	}
 }

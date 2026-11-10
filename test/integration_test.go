@@ -30,7 +30,7 @@ func defaultTestConfig() config.Config {
 
 // newServer builds a server from cfg with the command executor, as cmd/stash
 // does.
-func newServer(t *testing.T, cfg config.Config, logger *slog.Logger, store *storage.Store) *server.Server {
+func newServer(t testing.TB, cfg config.Config, logger *slog.Logger, store *storage.Store) *server.Server {
 	t.Helper()
 
 	srv, err := server.New(cfg, logger, store, newCommandExecutor)
@@ -46,14 +46,14 @@ func newCommandExecutor(services server.Services) (server.CommandExecutor, error
 	return command.New(services)
 }
 
-func startTestServer(t *testing.T, cfg config.Config) (string, context.CancelFunc, <-chan error) {
+func startTestServer(t testing.TB, cfg config.Config) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	return startTestServerWithLogger(t, cfg, stashlogger.New(cfg.LogLevel))
 }
 
 // startTestServerWithLogger is startTestServer for a test that reads the server's
 // log output.
-func startTestServerWithLogger(t *testing.T, cfg config.Config, logger *slog.Logger) (string, context.CancelFunc, <-chan error) {
+func startTestServerWithLogger(t testing.TB, cfg config.Config, logger *slog.Logger) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -67,7 +67,7 @@ func startTestServerWithLogger(t *testing.T, cfg config.Config, logger *slog.Log
 	return waitForAddr(t, srv), cancel, errCh
 }
 
-func waitForServerStop(t *testing.T, errCh <-chan error) {
+func waitForServerStop(t testing.TB, errCh <-chan error) {
 	t.Helper()
 	select {
 	case err := <-errCh:
@@ -79,7 +79,7 @@ func waitForServerStop(t *testing.T, errCh <-chan error) {
 	}
 }
 
-func closeTestResource(t *testing.T, resource io.Closer) {
+func closeTestResource(t testing.TB, resource io.Closer) {
 	t.Helper()
 
 	if err := resource.Close(); err != nil {
@@ -575,8 +575,10 @@ func TestServerHandlesWatchOptimisticLocking(t *testing.T) {
 }
 
 func TestServerHandlesPubSubCommands(t *testing.T) {
-	cfg := defaultTestConfig()
+	forEachNetworkingMode(t, defaultTestConfig(), testServerHandlesPubSubCommands)
+}
 
+func testServerHandlesPubSubCommands(t *testing.T, cfg config.Config) {
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -659,8 +661,10 @@ func TestServerHandlesPubSubCommands(t *testing.T) {
 }
 
 func TestServerPubSubPublishesToEverySubscriber(t *testing.T) {
-	cfg := defaultTestConfig()
+	forEachNetworkingMode(t, defaultTestConfig(), testServerPubSubPublishesToEverySubscriber)
+}
 
+func testServerPubSubPublishesToEverySubscriber(t *testing.T, cfg config.Config) {
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -740,8 +744,10 @@ func TestServerPubSubPublishesToEverySubscriber(t *testing.T) {
 }
 
 func TestServerSubscribedClientsRejectTransactionCommands(t *testing.T) {
-	cfg := defaultTestConfig()
+	forEachNetworkingMode(t, defaultTestConfig(), testServerSubscribedClientsRejectTransactionCommands)
+}
 
+func testServerSubscribedClientsRejectTransactionCommands(t *testing.T, cfg config.Config) {
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -786,8 +792,10 @@ func TestServerSubscribedClientsRejectTransactionCommands(t *testing.T) {
 }
 
 func TestServerPubSubDisconnectCleanup(t *testing.T) {
-	cfg := defaultTestConfig()
+	forEachNetworkingMode(t, defaultTestConfig(), testServerPubSubDisconnectCleanup)
+}
 
+func testServerPubSubDisconnectCleanup(t *testing.T, cfg config.Config) {
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -859,8 +867,10 @@ func TestServerPubSubDisconnectCleanup(t *testing.T) {
 }
 
 func TestServerMonitorStreamsCommands(t *testing.T) {
-	cfg := defaultTestConfig()
+	forEachNetworkingMode(t, defaultTestConfig(), testServerMonitorStreamsCommands)
+}
 
+func testServerMonitorStreamsCommands(t *testing.T, cfg config.Config) {
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -916,8 +926,10 @@ func TestServerMonitorStreamsCommands(t *testing.T) {
 }
 
 func TestServerRejectsEmptyPubSubChannelNames(t *testing.T) {
-	cfg := defaultTestConfig()
+	forEachNetworkingMode(t, defaultTestConfig(), testServerRejectsEmptyPubSubChannelNames)
+}
 
+func testServerRejectsEmptyPubSubChannelNames(t *testing.T, cfg config.Config) {
 	logger := stashlogger.New(cfg.LogLevel)
 	store := storage.NewStore()
 	srv := newServer(t, cfg, logger, store)
@@ -954,7 +966,7 @@ func TestServerRejectsEmptyPubSubChannelNames(t *testing.T) {
 	}
 }
 
-func waitForAddr(t *testing.T, srv *server.Server) string {
+func waitForAddr(t testing.TB, srv *server.Server) string {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)

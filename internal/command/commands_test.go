@@ -1,8 +1,6 @@
 package command
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -2415,13 +2413,20 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("SUBSCRIBE then PUBLISH delivers message and returns subscriber count", func(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
-		var outbound bytes.Buffer
-		state.BindResponseWriter(bufio.NewWriter(&outbound))
+		outbound, subscriber := net.Pipe()
+		defer func() { _ = subscriber.Close() }()
+		state.BindOutput(server.NewOutput(outbound))
+		defer state.Output().Close(nil)
 		ctx := withClient(context.Background(), state)
 
 		result, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false)
 		if err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
+		}
+		// The connection replies, which lets the messages held behind the
+		// acknowledgement through.
+		if err := state.Output().Reply(result.Responses...); err != nil {
+			t.Fatalf("Reply() error = %v", err)
 		}
 		if len(result.Responses) != 1 {
 			t.Fatalf("len(result.Responses) = %d, want 1", len(result.Responses))
@@ -2438,7 +2443,10 @@ func TestExecutorPubSub(t *testing.T) {
 		}
 		assertValueEqual(t, published, protocol.Integer{Value: 1})
 
-		parser := protocol.NewParser(&outbound)
+		parser := protocol.NewParser(subscriber)
+		if _, err := parser.Parse(); err != nil {
+			t.Fatalf("Parse() acknowledgement error = %v", err)
+		}
 		message, err := parser.Parse()
 		if err != nil {
 			t.Fatalf("Parse() pushed message error = %v", err)
@@ -2536,14 +2544,13 @@ func TestExecutorPubSub(t *testing.T) {
 	t.Run("PUBLISH skips disconnected subscribers and prunes the registry", func(t *testing.T) {
 		executor := newTestExecutor()
 		state := newTestClientState(executor, 1)
-		state.BindResponseWriter(bufio.NewWriter(io.Discard))
 		ctx := withClient(context.Background(), state)
 
 		if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 			t.Fatalf("SUBSCRIBE error = %v", err)
 		}
 
-		state.Disconnect()
+		state.Abandon()
 
 		published, err := executor.Execute(clientContext(executor), requestValue("PUBLISH", "news", "hello"))
 		if err != nil {
@@ -2618,10 +2625,14 @@ func BenchmarkExecutorPublish(b *testing.B) {
 			executor := newTestExecutor()
 			for i := 0; i < subscriberCount; i++ {
 				state := newTestClientState(executor, uint64(i+1))
-				state.BindResponseWriter(bufio.NewWriter(io.Discard))
+				state.BindOutput(server.NewOutput(io.Discard))
 				ctx := withClient(context.Background(), state)
 				if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 					b.Fatalf("SUBSCRIBE error = %v", err)
+				}
+				// Replying lets the messages held behind the acknowledgement through.
+				if err := state.Output().Reply(); err != nil {
+					b.Fatalf("Reply() error = %v", err)
 				}
 			}
 
@@ -3199,7 +3210,7 @@ func newTestClientState(executor *Executor, id uint64) *server.ClientState {
 func newReplicaPeerStateForExecutor(executor *Executor, id uint64, conn net.Conn) *server.ClientState {
 	state := newTestClientState(executor, id)
 	state.PromoteToReplica()
-	state.BindResponseWriter(bufio.NewWriter(conn))
+	state.BindOutput(server.NewOutput(conn))
 	return state
 }
 

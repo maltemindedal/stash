@@ -21,13 +21,13 @@ func TestMonitorRegistryMaintainsClientStateInvariants(t *testing.T) {
 			t.Fatal("IsMonitoring() = false after Subscribe, want true")
 		}
 
-		snapshot := registry.AppendSubscribers(nil)
+		snapshot := registry.Subscribers()
 		if len(snapshot) != 1 || snapshot[0] != state {
 			t.Fatalf("snapshot = %#v, want one subscribed state", snapshot)
 		}
 
 		snapshot[0] = nil
-		fresh := registry.AppendSubscribers(nil)
+		fresh := registry.Subscribers()
 		if len(fresh) != 1 || fresh[0] != state {
 			t.Fatalf("fresh snapshot = %#v, want detached original subscriber", fresh)
 		}

@@ -26,16 +26,19 @@ type temporaryError interface {
 
 // Server owns the TCP listener, active clients, and command execution pipeline.
 type Server struct {
-	cfg               config.Config
-	logger            *slog.Logger
-	store             *storage.Store
-	executor          CommandExecutor
-	registry          *ClientRegistry
-	replicaPeers      *ReplicaRegistry
-	watchRegistry     *WatchRegistry
-	pubSubRegistry    *PubSubRegistry
-	monitorRegistry   *MonitorRegistry
-	slowlogRegistry   *SlowlogRegistry
+	cfg             config.Config
+	logger          *slog.Logger
+	store           *storage.Store
+	executor        CommandExecutor
+	registry        *ClientRegistry
+	replicaPeers    *ReplicaRegistry
+	watchRegistry   *WatchRegistry
+	pubSubRegistry  *PubSubRegistry
+	monitorRegistry *MonitorRegistry
+	slowlogRegistry *SlowlogRegistry
+	// outputs is what every connection's Output shares: the Push limits and
+	// the Push budget.
+	outputs           *outputs
 	replication       *ReplicationState
 	aofWriter         *aof.Writer
 	recorder          *record.Recorder
@@ -76,6 +79,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		pubSubRegistry:  NewPubSubRegistry(),
 		monitorRegistry: NewMonitorRegistry(),
 		slowlogRegistry: NewSlowlogRegistry(),
+		outputs:         newOutputs(),
 		replication:     newReplicationState(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
@@ -476,11 +480,7 @@ func (s *Server) getClientState(clientID uint64) *ClientState {
 }
 
 func (s *Server) disconnectClientState(state *ClientState) {
-	if state == nil {
-		return
-	}
-
-	state.Disconnect()
+	state.Abandon()
 }
 
 func (s *Server) removeClientState(clientID uint64) {

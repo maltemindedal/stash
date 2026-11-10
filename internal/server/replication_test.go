@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -10,7 +9,6 @@ import (
 	"log/slog"
 	"math"
 	"net"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -842,9 +840,8 @@ func TestADroppedReplicaIsLoggedByWhyItsFeedStopped(t *testing.T) {
 		{name: "the replica reset the connection", cause: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrClosedPipe}, wantLog: "replica disconnected"},
 		{name: "the client state was disconnected", cause: errors.New("client response writer unavailable"), wantLog: "replica disconnected"},
 		{name: "its queue passed the limit", cause: errReplicaBacklog, wantLog: "dropping a replica"},
-		{name: "the event loop's push limit", cause: fmt.Errorf("%w: more than its 268435456 byte limit waiting", errPushLimitExceeded), wantLog: "dropping a replica"},
-		{name: "a write stalled", cause: &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}, wantLog: "dropping a replica"},
-		{name: "the writer stayed busy", cause: fmt.Errorf("%w for 30s", errResponseWriterBusy), wantLog: "dropping a replica"},
+		{name: "its connection's push limit", cause: fmt.Errorf("%w: 268435457 bytes against a limit of 268435456", errPushLimitExceeded), wantLog: "dropping a replica"},
+		{name: "it accepted nothing for the stall timeout", cause: fmt.Errorf("%w of 30s", errReplicaStalled), wantLog: "dropping a replica"},
 	}
 
 	for _, tt := range tests {
@@ -884,8 +881,16 @@ func TestWaitFeedsWaitsForTheFeedErrorHandler(t *testing.T) {
 	})
 	conn := &stubConn{writeErr: io.ErrClosedPipe}
 	registry.Add(&ReplicationState{}, 1, conn, 6380, newReplicaPeerStateForTest(1, conn))
-	registry.Propagate(&ReplicationState{}, []byte("frame"))
-	<-handling
+	// The connection's Output writes on a goroutine of its own, so the feed
+	// learns of the failed write from a later frame.
+	for failed := false; !failed; {
+		registry.Propagate(&ReplicationState{}, []byte("frame"))
+		select {
+		case <-handling:
+			failed = true
+		case <-time.After(time.Millisecond):
+		}
+	}
 
 	waited := make(chan struct{})
 	go func() {
@@ -1048,7 +1053,7 @@ func TestRequestsOnAReplicasLinkGetNoReplies(t *testing.T) {
 		{request: []string{"PING"}, wantReplies: 0},
 	}
 	for _, step := range steps {
-		responses, _, err := srv.executeClientRequest(context.Background(), call, state.ID, &stubConn{}, logger, requestFrame(step.request...))
+		responses, err := srv.executeClientRequest(context.Background(), call, state.ID, &stubConn{}, logger, requestFrame(step.request...))
 		if err != nil {
 			t.Fatalf("%v error = %v", step.request, err)
 		}
@@ -1067,11 +1072,21 @@ func requestFrame(parts ...string) protocol.Array {
 	return protocol.Array{Elements: elements}
 }
 
-func newReplicaPeerStateForTest(id uint64, conn net.Conn) *ClientState {
-	state := &ClientState{ID: id, Authenticated: true}
-	state.PromoteToReplica()
-	state.BindResponseWriter(bufio.NewWriter(conn))
-	return state
+// connReplicaWriter writes a replica's stream straight to its connection, so
+// that a test of the registry and its feeds sees each stretch written, or
+// refused, as the feed hands it over. A server's replica is written through
+// its connection's Output (ClientState.WriteEncoded).
+type connReplicaWriter struct {
+	conn net.Conn
+}
+
+func (w connReplicaWriter) WriteEncoded(payload []byte) error {
+	_, err := w.conn.Write(payload)
+	return err
+}
+
+func newReplicaPeerStateForTest(_ uint64, conn net.Conn) encodedReplicaWriter {
+	return connReplicaWriter{conn: conn}
 }
 
 // TestServerStatsConcurrentWithAckUpdates has INFO's data source read replica

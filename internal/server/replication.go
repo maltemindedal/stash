@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"math"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,11 +83,6 @@ type encodedReplicaWriter interface {
 	WriteEncoded([]byte) error
 }
 
-// deadlineReplicaWriter is a writer that can bound how long one write may take.
-type deadlineReplicaWriter interface {
-	WriteEncodedWithDeadline([]byte, time.Duration) error
-}
-
 type propagationReport struct {
 	attempted   int
 	succeeded   int
@@ -108,12 +102,9 @@ func (p *ReplicaPeer) WriteEncoded(payload []byte) error {
 	return p.feed.enqueue(payload)
 }
 
-// send writes one stretch of the stream to the replica's socket, giving up if the
-// replica does not take it in time.
+// send hands one stretch of the stream to the replica's connection, whose
+// Output writes it and drops a replica that does not take it in time.
 func (p *ReplicaPeer) send(chunk []byte) error {
-	if writer, ok := p.writer.(deadlineReplicaWriter); ok {
-		return writer.WriteEncodedWithDeadline(chunk, replicaFeedWriteTimeout)
-	}
 	return p.writer.WriteEncoded(chunk)
 }
 
@@ -652,8 +643,8 @@ func randomReplicationID() string {
 	return hex.EncodeToString(raw[:])
 }
 
-// replicaMarker is a connection whose limits depend on whether it is a replica:
-// the event loop's, which holds a replica's waiting output to the replica limit.
+// replicaMarker is a connection that is told when it becomes a replica's: the
+// event loop's, which drains a replica on shutdown instead of closing it.
 type replicaMarker interface {
 	markReplica()
 }
@@ -666,6 +657,7 @@ type replicaMarker interface {
 func (s *Server) registerReplicaPeer(clientID uint64, conn ClientConn) {
 	// Before the feed starts, so that the first frame it pushes is held to the
 	// replica's output limit, not a subscriber's.
+	s.getClientState(clientID).Output().MarkReplica()
 	if marker, ok := conn.(replicaMarker); ok {
 		marker.markReplica()
 	}
@@ -791,15 +783,13 @@ func (s *Server) dropReplica(id uint64, cause error) {
 }
 
 // replicaFellBehind reports whether a replica's feed stopped because the replica
-// did not keep up: its queue passed its limit (errReplicaBacklog, or the event
-// loop's push limit), or a write to it, or the wait for its connection's writer,
-// took longer than the replica feed allows. Anything else means its connection
-// ended.
+// did not keep up: its queue passed its limit (errReplicaBacklog, or its
+// connection's Push limit), or it accepted nothing for the stall timeout.
+// Anything else means its connection ended.
 func replicaFellBehind(cause error) bool {
 	return errors.Is(cause, errReplicaBacklog) ||
 		errors.Is(cause, errPushLimitExceeded) ||
-		errors.Is(cause, os.ErrDeadlineExceeded) ||
-		errors.Is(cause, errResponseWriterBusy)
+		errors.Is(cause, errReplicaStalled)
 }
 
 func (s *Server) setUpstreamConn(conn net.Conn) {

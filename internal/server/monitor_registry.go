@@ -3,6 +3,8 @@ package server
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/maltemindedal/stash/internal/protocol"
 )
 
 // MonitorRegistry tracks clients currently receiving MONITOR events.
@@ -29,6 +31,9 @@ func (r *MonitorRegistry) Subscribe(state *ClientState) {
 	if _, exists := r.subscribers[state.ID]; !exists {
 		r.subscriberCount.Add(1)
 	}
+	// Under the lock, so that every event Broadcast queues from here on waits
+	// behind the reply to this MONITOR.
+	state.Output().HoldPushes()
 	r.subscribers[state.ID] = state
 	state.setMonitoring(true)
 }
@@ -49,24 +54,43 @@ func (r *MonitorRegistry) Unsubscribe(state *ClientState) {
 	state.setMonitoring(false)
 }
 
-// AppendSubscribers appends a snapshot of monitor clients to dst.
-func (r *MonitorRegistry) AppendSubscribers(dst []*ClientState) []*ClientState {
+// Subscribers returns a snapshot of the clients currently in MONITOR mode.
+func (r *MonitorRegistry) Subscribers() []*ClientState {
 	if r == nil {
-		return dst[:0]
+		return nil
 	}
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	dst = dst[:0]
-	if cap(dst) < len(r.subscribers) {
-		dst = make([]*ClientState, 0, len(r.subscribers))
-	}
+	subscribers := make([]*ClientState, 0, len(r.subscribers))
 	for _, state := range r.subscribers {
-		dst = append(dst, state)
+		subscribers = append(subscribers, state)
+	}
+	return subscribers
+}
+
+// Broadcast queues line as a Pushed message for every client in MONITOR mode.
+// It never waits on a socket. A client that the event takes past its Push
+// limit, or that is closed to keep the Push budget, is closed.
+func (r *MonitorRegistry) Broadcast(line string) {
+	if r == nil {
+		return
 	}
 
-	return dst
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.subscribers) == 0 {
+		return
+	}
+	frame, err := protocol.Encode(protocol.SimpleString{Value: line})
+	if err != nil {
+		return
+	}
+	for _, state := range r.subscribers {
+		state.Output().Push(frame)
+	}
 }
 
 // Count reports the number of clients currently in MONITOR mode.
