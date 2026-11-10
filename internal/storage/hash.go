@@ -24,7 +24,7 @@ func hashOf(v *ValueObject) (*hashValue, error) {
 
 // newHashValueForPairs returns a hash of pairs, compact when they allow it. A
 // field given twice keeps its last value. The hash owns copies of the values.
-func newHashValueForPairs(pairs []HashFieldValue) *hashValue {
+func newHashValueForPairs(pairs []HashFieldValue) hashValue {
 	table := make(map[string][]byte, len(pairs))
 	compactEligible := true
 	for _, pair := range pairs {
@@ -34,14 +34,14 @@ func newHashValueForPairs(pairs []HashFieldValue) *hashValue {
 		table[pair.Field] = cloneBytes(pair.Value)
 	}
 	if !compactEligible || len(table) > compactHashMaxEntries {
-		return &hashValue{table: table}
+		return hashValue{table: table}
 	}
 
 	compact := &CompactHash{entries: make([]compactHashEntry, 0, len(table))}
 	for field, value := range table {
 		compact.set(field, value)
 	}
-	return &hashValue{compact: compact}
+	return hashValue{compact: compact}
 }
 
 func (h *hashValue) len() int {
@@ -138,8 +138,8 @@ func (h *hashValue) approxSize() int64 {
 }
 
 // clone copies the hash table, or the compact entries and their arena.
-func (h *hashValue) clone() kindValue {
-	return &hashValue{compact: cloneCompactHash(h.compact), table: maps.Clone(h.table)}
+func (h *hashValue) clone(header ValueObject) *ValueObject {
+	return newKindValue(header, hashValue{compact: cloneCompactHash(h.compact), table: maps.Clone(h.table)})
 }
 
 func (h *hashValue) empty() bool { return h.len() == 0 }
@@ -202,7 +202,7 @@ func (s *Store) HSet(key string, pairs []HashFieldValue) (int64, []string, error
 	return mutateKey(s, key, kindHash, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newHashValueForPairs(pairs)
-			return newKindValue(created), int64(created.len()), nil
+			return newKindValue(ValueObject{}, created), int64(created.len()), nil
 		}
 		hash, err := hashOf(cur)
 		if err != nil {

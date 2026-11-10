@@ -55,12 +55,12 @@ func (s *StreamValue) approxSize() int64 {
 // clone returns a copy that XADD can append to while s stays stored: a new
 // slice of the same records. A record is never edited once it is added, so the
 // copies share them.
-func (s *StreamValue) clone() kindValue {
-	return &StreamValue{
+func (s *StreamValue) clone(header ValueObject) *ValueObject {
+	return newKindValue(header, StreamValue{
 		entries:    append([]streamRecord(nil), s.entries...),
 		lastID:     s.lastID,
 		hasEntries: s.hasEntries,
-	}
+	})
 }
 
 // empty is false for every stream: a stream key stays however short it is.

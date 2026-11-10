@@ -13,6 +13,7 @@ type Image struct {
 	entries []imageEntry
 	stats   SnapshotStats
 	sorted  bool
+	arena   arena
 }
 
 // SnapshotStats summarizes the keys a keyspace image was taken from.
@@ -77,9 +78,12 @@ func (s *Store) Image(barrier func()) *Image {
 // imageLocked copies every key that is live at now. The caller holds every
 // shard lock.
 func (s *Store) imageLocked(now int64) *Image {
+	// The arena lives in the image, so that taking one allocates the image and
+	// nothing else that does not hold keys or values.
+	img := &Image{}
+	a := &img.arena
 	stats := SnapshotStats{}
 	entries := make([]imageEntry, 0, s.totalKeyCountLocked())
-	var a arena
 	for i := range s.shards {
 		shard := &s.shards[i]
 		stats.TotalKeys += len(shard.data)
@@ -91,7 +95,7 @@ func (s *Store) imageLocked(now int64) *Image {
 
 			entry := imageEntry{key: key, expiresAt: value.ExpiresAt}
 			if value.data != nil {
-				entry.data = value.data.image(&a)
+				entry.data = value.data.image(a)
 			} else {
 				entry.str = a.bytes(value.String)
 			}
@@ -101,7 +105,8 @@ func (s *Store) imageLocked(now int64) *Image {
 		}
 	}
 
-	return &Image{entries: entries, stats: stats}
+	img.entries, img.stats = entries, stats
+	return img
 }
 
 // Stats reports how many keys the image was taken from and how many it holds.

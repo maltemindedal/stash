@@ -24,14 +24,14 @@ func setOf(v *ValueObject) (*setValue, error) {
 
 // newSetValueForMembers returns a set of members, as integers when they allow
 // it.
-func newSetValueForMembers(members [][]byte) *setValue {
+func newSetValueForMembers(members [][]byte) setValue {
 	if ints, ok := newIntSet(members); ok && ints.len() <= intSetMaxEntries {
-		return &setValue{ints: ints}
+		return setValue{ints: ints}
 	}
 
 	table := make(map[string]struct{}, len(members))
 	addSetMembers(table, members)
-	return &setValue{table: table}
+	return setValue{table: table}
 }
 
 func addSetMembers(table map[string]struct{}, members [][]byte) int64 {
@@ -131,8 +131,8 @@ func (s *setValue) approxSize() int64 {
 }
 
 // clone copies the integers or the hash table.
-func (s *setValue) clone() kindValue {
-	return &setValue{ints: cloneIntSet(s.ints), table: maps.Clone(s.table)}
+func (s *setValue) clone(header ValueObject) *ValueObject {
+	return newKindValue(header, setValue{ints: cloneIntSet(s.ints), table: maps.Clone(s.table)})
 }
 
 func (s *setValue) empty() bool { return s.len() == 0 }
@@ -175,7 +175,7 @@ func (s *Store) SAdd(key string, members [][]byte) (int64, []string, error) {
 	return mutateKey(s, key, kindSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newSetValueForMembers(members)
-			return newKindValue(created), int64(created.len()), nil
+			return newKindValue(ValueObject{}, created), int64(created.len()), nil
 		}
 		set, err := setOf(cur)
 		if err != nil {

@@ -170,7 +170,7 @@ func TestEveryValueKindKeepsItsContract(t *testing.T) {
 				before := recreationCommands(t, store)
 
 				cloned, _ := newStoreWithManualClock()
-				cloned.setValueObjectForTest(kindFixtureKey, newKindValue(data.clone()))
+				cloned.setValueObjectForTest(kindFixtureKey, data.clone(ValueObject{}))
 				if got := recreationCommands(t, cloned); !reflect.DeepEqual(got, before) {
 					t.Fatalf("the clone recreates as %.200q, want %.200q", got, before)
 				}
@@ -265,7 +265,7 @@ func TestAnEmptiedValueIsDeletedUnlessItIsAStream(t *testing.T) {
 			if got := tt.value.empty(); got != tt.want {
 				t.Fatalf("empty() = %v, want %v", got, tt.want)
 			}
-			if got := newKindValue(tt.value).emptied(); got != tt.want {
+			if got := (&ValueObject{data: tt.value}).emptied(); got != tt.want {
 				t.Fatalf("emptied() = %v, want %v", got, tt.want)
 			}
 		})

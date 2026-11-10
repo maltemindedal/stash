@@ -29,7 +29,7 @@ func zsetOf(v *ValueObject) (*zsetValue, error) {
 
 // newZSetValueForEntries returns a sorted set of entries, compact when they
 // allow it. A member given twice keeps its last score.
-func newZSetValueForEntries(entries []ZSetEntry) *zsetValue {
+func newZSetValueForEntries(entries []ZSetEntry) zsetValue {
 	members := make(map[string]float64, len(entries))
 	compactEligible := true
 	for _, entry := range entries {
@@ -44,14 +44,14 @@ func newZSetValueForEntries(entries []ZSetEntry) *zsetValue {
 		for member, score := range members {
 			compact.add([]byte(member), score)
 		}
-		return &zsetValue{compact: compact}
+		return zsetValue{compact: compact}
 	}
 
 	general := newSortedSet()
 	for member, score := range members {
 		general.add(member, score)
 	}
-	return &zsetValue{general: general}
+	return zsetValue{general: general}
 }
 
 func (z *zsetValue) len() int {
@@ -126,8 +126,8 @@ func (z *zsetValue) approxSize() int64 {
 }
 
 // clone copies the index and skip list, or the compact entries and their arena.
-func (z *zsetValue) clone() kindValue {
-	return &zsetValue{compact: cloneCompactZSet(z.compact), general: cloneSortedSet(z.general)}
+func (z *zsetValue) clone(header ValueObject) *ValueObject {
+	return newKindValue(header, zsetValue{compact: cloneCompactZSet(z.compact), general: cloneSortedSet(z.general)})
 }
 
 func (z *zsetValue) empty() bool { return z.len() == 0 }

@@ -39,11 +39,12 @@ type kindValue interface {
 	// approxSize returns the accounted size of the value beyond the per-key
 	// base: what the value itself counts toward maxmemory.
 	approxSize() int64
-	// clone returns a copy that a growing write can edit while the value stays
-	// stored under its key, so that a write refused for want of memory leaves
-	// the stored value as it was. It copies the container and shares the element
-	// byte strings, which nothing edits in place once they are stored.
-	clone() kindValue
+	// clone returns a copy, under a copy of header, that a growing write can
+	// edit while the value stays stored under its key, so that a write refused
+	// for want of memory leaves the stored value as it was. It copies the
+	// container and shares the element byte strings, which nothing edits in
+	// place once they are stored.
+	clone(header ValueObject) *ValueObject
 	// empty reports whether a write that left the value like this deletes its
 	// key. A stream is never empty in this sense.
 	empty() bool

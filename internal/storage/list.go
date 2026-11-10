@@ -153,8 +153,8 @@ func (l *listValue) approxSize() int64 {
 
 // clone copies the live values into an array of their own, without the dead
 // slots.
-func (l *listValue) clone() kindValue {
-	return &listValue{items: append([][]byte(nil), l.live()...)}
+func (l *listValue) clone(header ValueObject) *ValueObject {
+	return newKindValue(header, listValue{items: append([][]byte(nil), l.live()...)})
 }
 
 func (l *listValue) empty() bool { return len(l.items) == int(l.head) }

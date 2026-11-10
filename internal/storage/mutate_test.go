@@ -490,7 +490,7 @@ func TestAnEmptiedCollectionIsDeletedAndAnEmptyStringIsKept(t *testing.T) {
 			// sorted set and runs a mutation that leaves it as it is.
 			name: "a mutation of an empty sorted set",
 			setup: func(s *Store) error {
-				s.setValueObjectForTest(key, newKindValue(newZSetValueForEntries(nil)))
+				s.setValueObjectForTest(key, newKindValue(ValueObject{}, newZSetValueForEntries(nil)))
 				return nil
 			},
 			write: func(s *Store) error { _, _, err := mutateKey(s, key, kindZSet, shrinks, unchanged); return err },

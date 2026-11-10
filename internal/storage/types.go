@@ -148,10 +148,10 @@ func (v *ValueObject) emptied() bool {
 // string's bytes are shared too, so a write that edits a string's bytes in place
 // must not be handed this copy.
 func (v *ValueObject) containerCopy() *ValueObject {
-	c := *v
 	if v.data != nil {
-		c.data = v.data.clone()
+		return v.data.clone(*v)
 	}
+	c := *v
 	return &c
 }
 
@@ -168,8 +168,19 @@ func newOwnedStringValue(data []byte, expiresAt int64) *ValueObject {
 	}
 }
 
-// newKindValue wraps the payload of a collection kind in a value without a
-// TTL. The write that stores it stamps it.
-func newKindValue(data kindValue) *ValueObject {
-	return &ValueObject{data: data}
+// newKindValue returns a value that holds data, the payload of a collection
+// kind, under a copy of header: a ValueObject{} for a new key, which the write
+// that stores it stamps, or the stored value's own header for a clone. The
+// value and its payload are one allocation, so a collection costs no more
+// allocations than a string does.
+func newKindValue[T any, P interface {
+	*T
+	kindValue
+}](header ValueObject, data T) *ValueObject {
+	box := &struct {
+		value ValueObject
+		data  T
+	}{value: header, data: data}
+	box.value.data = P(&box.data)
+	return &box.value
 }

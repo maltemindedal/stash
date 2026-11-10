@@ -394,7 +394,7 @@ func (s *Store) ZAdd(key string, entries []ZSetEntry) (int64, []string, error) {
 	return mutateKey(s, key, kindZSet, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
 			created := newZSetValueForEntries(entries)
-			return newKindValue(created), int64(created.len()), nil
+			return newKindValue(ValueObject{}, created), int64(created.len()), nil
 		}
 		zset, err := zsetOf(cur)
 		if err != nil {
@@ -486,7 +486,7 @@ func (s *Store) XAdd(key, rawID string, values [][]byte) (string, []string, erro
 
 	return mutateKey(s, key, kindStream, mayGrow, func(cur *ValueObject, now int64) (*ValueObject, string, error) {
 		if cur == nil {
-			cur = newKindValue(newStream())
+			cur = newKindValue(ValueObject{}, StreamValue{})
 		}
 		stream, err := streamOf(cur)
 		if err != nil {
@@ -823,7 +823,7 @@ func (s *Store) pushList(key string, values [][]byte, left bool) (int64, []strin
 
 	length, evicted, err := mutateKey(s, key, kindList, mayGrow, func(cur *ValueObject, _ int64) (*ValueObject, int64, error) {
 		if cur == nil {
-			cur = newKindValue(&listValue{})
+			cur = newKindValue(ValueObject{}, listValue{})
 		}
 		list, err := listOf(cur)
 		if err != nil {
