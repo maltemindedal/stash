@@ -114,7 +114,7 @@ func TestAReplicaDetachedForRefusingAFrameIsLoggedByWhyItsOutputClosed(t *testin
 func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 	wire := newOutputWire()
-	out := newGoroutineOutput(srv.outputs, wire)
+	out := newGoroutineOutput(newOutputs(), wire)
 	defer out.Close(nil)
 
 	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
@@ -148,9 +148,8 @@ func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T)
 func TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce(t *testing.T) {
 	var logs bytes.Buffer
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(&logs, nil)), storage.NewStore(), nil)
-	srv.outputs.replicaPushLimit = 64
 	wire := newOutputWire()
-	out := newGoroutineOutput(srv.outputs, wire)
+	out := newGoroutineOutput(newOutputs(withReplicaPushLimit(64)), wire)
 
 	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	srv.master.Propagate(make([]byte, 40), true)
@@ -346,4 +345,23 @@ func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestAClientWithNoOutputIsAClosedConnectionToTheMaster hands the Master the
+// Output of a Client state that was never bound to a connection, which is nil,
+// as PSYNC would. Attaching it does nothing to it, it refuses the first frame
+// with the cause of a closed connection, and so the Master detaches the
+// Replica as one whose connection ended.
+func TestAClientWithNoOutputIsAClosedConnectionToTheMaster(t *testing.T) {
+	out := (&ClientState{ID: 1}).Output()
+
+	out.MarkReplica()
+	out.HoldPushes()
+	out.EndStream()
+	if out.Push([]byte("+message\r\n")) {
+		t.Fatal("Push() = true for a client with no connection, want it refused")
+	}
+	if err := out.Err(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Err() = %v, want a closed connection's", err)
+	}
 }

@@ -33,11 +33,13 @@ func (handDrivenPoller) Close() error                  { return nil }
 
 // newHandDrivenEventLoop returns an event loop that only the test drives, one
 // connection registered on it whose requests stubExecutor answers with +OK, and
-// the client end of that connection's socket.
-func newHandDrivenEventLoop(t *testing.T) (*eventLoop, *eventConn, int) {
+// the client end of that connection's socket. limits replace the server's
+// output limits.
+func newHandDrivenEventLoop(t *testing.T, limits ...outputLimit) (*eventLoop, *eventConn, int) {
 	t.Helper()
 
 	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
+	srv.outputs = newOutputs(limits...)
 	loop := &eventLoop{
 		srv:     srv,
 		poller:  handDrivenPoller{},

@@ -102,8 +102,27 @@ type outputs struct {
 	pushers map[*Output]struct{}
 }
 
-func newOutputs() *outputs {
-	return &outputs{
+// outputLimit replaces one of a server's limits when its outputs are built.
+// Limits go in here and cannot be read back: what they decide is asked of an
+// Output by name (MayReadRequests, Service), so no caller has a threshold to
+// compare a byte count with.
+type outputLimit func(*outputs)
+
+// withReplicaPushLimit bounds what waits for a Replica behind its latest Reply.
+func withReplicaPushLimit(bytes int64) outputLimit {
+	return func(s *outputs) { s.replicaPushLimit = bytes }
+}
+
+// withStallTimeout is how long a Replica's socket may take nothing of what it
+// is offered.
+func withStallTimeout(timeout time.Duration) outputLimit {
+	return func(s *outputs) { s.stallTimeout = timeout }
+}
+
+// newOutputs returns what the Outputs of one server share, with the server's
+// limits. A test that cannot wait for those, or queue as much, replaces them.
+func newOutputs(limits ...outputLimit) *outputs {
+	shared := &outputs{
 		pushLimit:        outputPushLimit,
 		replicaPushLimit: outputReplicaPushLimit,
 		pushBudget:       outputPushBudget,
@@ -111,6 +130,10 @@ func newOutputs() *outputs {
 		stallTimeout:     outputReplicaStallTimeout,
 		pushers:          make(map[*Output]struct{}),
 	}
+	for _, limit := range limits {
+		limit(shared)
+	}
+	return shared
 }
 
 // enforceBudget closes push-receiving connections, the one with the most

@@ -114,6 +114,13 @@ func newGoroutineOutput(shared *outputs, wire *outputWire) *Output {
 	return newBlockingOutput(shared, wire, discardLogger)
 }
 
+// newLoopOutput returns the Output of a connection the Event loop serves,
+// under the limits in shared, with no loop behind it: it is written when the
+// test calls Service.
+func newLoopOutput(shared *outputs) *Output {
+	return newPolledOutput(shared, nil, discardLogger)
+}
+
 // queuedReplies are the limits of a server whose connections never write a
 // Reply through: a Reply only queues, however much waits, so that a test
 // decides when the connection's goroutine writes (Flush, Drain).
@@ -522,13 +529,10 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 			return out, func() { go func() { _ = out.Flush() }() }
 		}},
 		{name: "by the Event loop's flush", open: func(shared *outputs) (*Output, func()) {
-			state := &ClientState{ID: 1}
-			out := newPolledOutput(shared, nil, discardLogger)
-			state.BindOutput(out)
-			machine := NewConnMachine(state)
+			out := newLoopOutput(shared)
 			return out, func() {
-				if err := machine.Flush(nothingTaken{}); err != nil {
-					t.Errorf("Flush() error = %v, want a full socket left for later", err)
+				if err := out.Service(nothingTaken{}).Closed; err != nil {
+					t.Errorf("Service() closed the Output: %v, want a full socket left for later", err)
 				}
 			}
 		}},
@@ -1229,13 +1233,12 @@ func TestOutputIsWrittenInChunksSoTheStallRuleBoundsEachStretch(t *testing.T) {
 			waitForOutput(t, "everything pushed to be written", func() bool { return len(wire.sent()) == total })
 		}},
 		{name: "by the Event loop's flush", write: func(t *testing.T, wire *outputWire) {
-			state := &ClientState{ID: 1}
-			machine := NewConnMachine(state)
-			if !state.Output().Push(make([]byte, total)) {
-				t.Fatalf("Push() = false, want it queued: %v", state.Output().Err())
+			out := newLoopOutput(newOutputs())
+			if !out.Push(make([]byte, total)) {
+				t.Fatalf("Push() = false, want it queued: %v", out.Err())
 			}
-			if err := machine.Flush(wire); err != nil {
-				t.Fatalf("Flush() error = %v", err)
+			if err := out.Service(wire).Closed; err != nil {
+				t.Fatalf("Service() closed the Output: %v", err)
 			}
 		}},
 	}
@@ -1359,11 +1362,10 @@ var outputDrivers = []struct {
 		}
 	}},
 	{name: "by the Event loop's flush", open: func(t *testing.T, wire *outputWire) (*Output, func(int)) {
-		state := &ClientState{ID: 1}
-		machine := NewConnMachine(state)
-		return state.Output(), func(int) {
-			if err := machine.Flush(wire); err != nil {
-				t.Fatalf("Flush() error = %v", err)
+		out := newLoopOutput(newOutputs())
+		return out, func(int) {
+			if err := out.Service(wire).Closed; err != nil {
+				t.Fatalf("Service() closed the Output: %v", err)
 			}
 		}
 	}},
@@ -1712,9 +1714,7 @@ func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
 func TestAReplyReleasesLargeHeldPushesWithoutCopyingThem(t *testing.T) {
 	const held = 8 << 20
 	wire := newOutputWire()
-	state := &ClientState{ID: 1}
-	machine := NewConnMachine(state)
-	out := state.Output()
+	out := newLoopOutput(newOutputs())
 
 	out.HoldPushes()
 	frame := bytes.Repeat([]byte("s"), 1<<20)
@@ -1732,29 +1732,10 @@ func TestAReplyReleasesLargeHeldPushesWithoutCopyingThem(t *testing.T) {
 		t.Fatalf("the Reply allocated %d bytes to release %d bytes of held pushes, want them queued without a copy", allocated, held)
 	}
 
-	if err := machine.Flush(wire); err != nil {
-		t.Fatalf("Flush() error = %v", err)
+	if err := out.Service(wire).Closed; err != nil {
+		t.Fatalf("Service() closed the Output: %v", err)
 	}
 	if got, want := wire.sent(), "+OK\r\n"+strings.Repeat("s", held); got != want {
 		t.Fatalf("sent %d bytes, want the reply and then the %d bytes held behind it", len(got), held)
-	}
-}
-
-// TestAClientWithNoOutputIsAClosedConnectionToTheMaster hands the Master the
-// Output of a Client state that was never bound to a connection, which is nil,
-// as PSYNC would. Attaching it does nothing to it, it refuses the first frame
-// with the cause of a closed connection, and so the Master detaches the
-// Replica as one whose connection ended.
-func TestAClientWithNoOutputIsAClosedConnectionToTheMaster(t *testing.T) {
-	out := (&ClientState{ID: 1}).Output()
-
-	out.MarkReplica()
-	out.HoldPushes()
-	out.EndStream()
-	if out.Push([]byte("+message\r\n")) {
-		t.Fatal("Push() = true for a client with no connection, want it refused")
-	}
-	if err := out.Err(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Err() = %v, want a closed connection's", err)
 	}
 }

@@ -69,8 +69,7 @@ func TestEventLoopIsWokenOnlyWhileItWaits(t *testing.T) {
 // stall time has passed the rule asks the loop to try the socket once more, and
 // the loop closes the replica when that try takes nothing either.
 func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.T) {
-	loop, conn, _ := newHandDrivenEventLoop(t)
-	loop.srv.outputs.stallTimeout = 250 * time.Millisecond
+	loop, conn, _ := newHandDrivenEventLoop(t, withStallTimeout(250*time.Millisecond))
 	conn.out.MarkReplica()
 
 	if !conn.out.Push(make([]byte, 8<<20)) {
@@ -105,8 +104,8 @@ func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.
 // full from one that nobody tried, so it leaves the verdict to the loop's next
 // try, which finds room, and the count starts again.
 func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.T) {
-	loop, conn, clientFD := newHandDrivenEventLoop(t)
-	loop.srv.outputs.stallTimeout = 50 * time.Millisecond
+	const stallTimeout = 50 * time.Millisecond
+	loop, conn, clientFD := newHandDrivenEventLoop(t, withStallTimeout(stallTimeout))
 	conn.out.MarkReplica()
 
 	const stream = 8 << 20
@@ -127,7 +126,7 @@ func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.
 			return loop.hasQueuedWork()
 		})
 		if err := conn.out.Err(); err != nil {
-			t.Fatalf("Err() = %v the %d. time the loop stayed away for the stall time of %v, after the replica read all %d bytes its socket was given; want the replica kept until the loop has tried its socket", err, away, loop.srv.outputs.stallTimeout, received)
+			t.Fatalf("Err() = %v the %d. time the loop stayed away for the stall time of %v, after the replica read all %d bytes its socket was given; want the replica kept until the loop has tried its socket", err, away, stallTimeout, received)
 		}
 		before := conn.out.Backlog()
 		loop.applyQueuedWork()
@@ -146,13 +145,13 @@ func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.
 // TestEventLoopKeepsAReplicaThatTakesItsStream is the same replica reading what
 // it is sent: output waits for it at every look, and the socket keeps accepting.
 func TestEventLoopKeepsAReplicaThatTakesItsStream(t *testing.T) {
-	loop, conn, clientFD := newHandDrivenEventLoop(t)
-	loop.srv.outputs.stallTimeout = 50 * time.Millisecond
+	const stallTimeout = 50 * time.Millisecond
+	loop, conn, clientFD := newHandDrivenEventLoop(t, withStallTimeout(stallTimeout))
 	conn.out.MarkReplica()
 
 	chunk := make([]byte, 1<<20)
 	received := 0
-	for start := time.Now(); time.Since(start) < 4*loop.srv.outputs.stallTimeout; {
+	for start := time.Now(); time.Since(start) < 4*stallTimeout; {
 		if conn.out.Backlog() < len(chunk) && !conn.out.Push(chunk) {
 			t.Fatalf("Push() = false, want a replica that is reading kept: %v", conn.out.Err())
 		}
