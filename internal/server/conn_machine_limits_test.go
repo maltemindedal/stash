@@ -22,11 +22,11 @@ func TestConnMachineRetainsTheReadBuffersTheEventLoopFills(t *testing.T) {
 }
 
 func TestConnMachineRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
-	// The loop executes a connection's requests until eventLoopOutputHighWater
+	// The loop executes a connection's requests until outputHighWater
 	// bytes of output are pending, flushes them, and carries on. A client that
 	// pipelines 64 KiB replies takes the buffer to that mark and past it again
 	// and again, so that buffer has to be kept.
-	if want := 2 * eventLoopOutputHighWater; outputRetainedBuffer < want {
+	if want := 2 * outputHighWater; outputRetainedBuffer < want {
 		t.Fatalf("outputRetainedBuffer = %d, want at least %d (twice the output high-water mark)", outputRetainedBuffer, want)
 	}
 
@@ -54,7 +54,7 @@ func TestConnMachineRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
 			t.Fatalf("Feed() error = %v", err)
 		}
 		for {
-			if machine.PendingOutputBytes() > eventLoopOutputHighWater {
+			if !machine.MayReadRequests() {
 				identities = append(identities, drain())
 			}
 			more, err := machine.ProcessNext(context.Background(), run)

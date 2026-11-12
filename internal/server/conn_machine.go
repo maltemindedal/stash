@@ -150,6 +150,12 @@ func (m *ConnMachine) HasPendingOutput() bool {
 	return m.PendingOutputBytes() > 0
 }
 
+// MayReadRequests reports whether the connection's requests may be read and
+// run, by the rule Output.MayReadRequests applies in both networking modes.
+func (m *ConnMachine) MayReadRequests() bool {
+	return m.out.MayReadRequests()
+}
+
 // PendingOutputBytes reports how many buffered response bytes await flushing.
 func (m *ConnMachine) PendingOutputBytes() int {
 	return m.out.Backlog()

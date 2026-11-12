@@ -53,7 +53,7 @@ const outputWriteThrough = 4 << 10
 // counts, since it is written first. What is pushed after it does not: the
 // Push limit bounds that, and a Replica with its stream waiting must still
 // have its acknowledgements read. The Event loop holds everything that waits
-// for a connection to the same mark (eventLoopOutputHighWater).
+// for a connection by the same rule (MayReadRequests).
 const outputHighWater = 1 << 20
 
 // outputWriteChunk is the most bytes handed to a socket in one write. In the
@@ -577,6 +577,22 @@ func (o *Output) Backlog() int {
 		return 0
 	}
 	return int(o.backlog.Load())
+}
+
+// MayReadRequests reports whether the connection's own requests may be read
+// and run: whether at most outputHighWater bytes are left to write before its
+// latest Reply is out. What was pushed after that Reply does not count, so a
+// Replica whose stream waits still has its acknowledgements read; the Push
+// limit bounds that output instead. Both networking modes hold a connection's
+// requests back by this one rule. The lock is taken only when the whole
+// backlog is above the mark.
+func (o *Output) MayReadRequests() bool {
+	if o == nil || o.backlog.Load() <= outputHighWater {
+		return true
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.replyBacklogLocked() <= outputHighWater
 }
 
 // Err reports why the connection was closed, or nil while it is open. A nil

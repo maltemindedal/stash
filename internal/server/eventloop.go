@@ -29,12 +29,6 @@ const eventLoopReadChunk = 64 * 1024
 // other connections. Level-triggered readiness re-reports leftover data.
 const eventLoopReadBudget = 1 << 20
 
-// eventLoopOutputHighWater is the pending-output level above which the loop
-// stops reading and executing further requests for a connection until its
-// output drains. The goroutine mode stops in Output.Flush, and counts only
-// what is left to write before the connection's latest Reply is out.
-const eventLoopOutputHighWater = outputHighWater
-
 // eventLoopAcceptRetryDelay is how long accepting pauses after the process
 // runs out of file descriptors, preventing a level-triggered busy loop on a
 // backlog the loop cannot drain.
@@ -502,10 +496,10 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 }
 
 func (l *eventLoop) connReadable(conn *eventConn) {
-	// Skip pulling more input while buffered output is above the high-water
-	// mark; the interest set already dropped read readiness in that state, but
+	// Skip pulling more input while the connection's own Replies are backed
+	// up; the interest set already dropped read readiness in that state, but
 	// an event may still be in flight.
-	if conn.machine.PendingOutputBytes() <= eventLoopOutputHighWater {
+	if conn.machine.MayReadRequests() {
 		budget := eventLoopReadBudget
 		for budget > 0 {
 			n, err := syscall.Read(conn.fd, l.readBuf)
@@ -563,11 +557,11 @@ func (l *eventLoop) processConn(conn *eventConn) {
 	}()
 
 	for conn.machine.State() != ConnStateClosed {
-		if conn.machine.PendingOutputBytes() > eventLoopOutputHighWater {
+		if !conn.machine.MayReadRequests() {
 			if !l.flushOnce(conn) {
 				return
 			}
-			if conn.machine.PendingOutputBytes() > eventLoopOutputHighWater {
+			if !conn.machine.MayReadRequests() {
 				break
 			}
 		}
@@ -630,8 +624,8 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 	}
 
 	// Reading stays off after EOF (level-triggered readiness would spin) and
-	// while output is backed up beyond the high-water mark.
-	wantRead := !conn.peerClosed && conn.machine.PendingOutputBytes() <= eventLoopOutputHighWater
+	// while the connection's own Replies are backed up.
+	wantRead := !conn.peerClosed && conn.machine.MayReadRequests()
 	l.setInterest(conn, wantRead, conn.machine.HasPendingOutput())
 }
 
