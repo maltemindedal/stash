@@ -1,6 +1,6 @@
 //go:build linux || darwin || freebsd
 
-package server
+package output
 
 import (
 	"net"

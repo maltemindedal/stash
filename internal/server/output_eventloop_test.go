@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 // wakeCountingPoller is a hand-driven poller that counts how often it is woken.
@@ -69,7 +71,7 @@ func TestEventLoopIsWokenOnlyWhileItWaits(t *testing.T) {
 // stall time has passed the rule asks the loop to try the socket once more, and
 // the loop closes the replica when that try takes nothing either.
 func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.T) {
-	loop, conn, _ := newHandDrivenEventLoop(t, withStallTimeout(250*time.Millisecond))
+	loop, conn, _ := newHandDrivenEventLoop(t, output.StallTimeout(250*time.Millisecond))
 	conn.out.MarkReplica()
 
 	if !conn.out.Push(make([]byte, 8<<20)) {
@@ -85,8 +87,8 @@ func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.
 
 	waitForOutput(t, "the stall rule to give the loop work once the stall time has passed", loop.hasQueuedWork)
 	loop.applyQueuedWork() // the loop's next iteration
-	if err := conn.out.Err(); !errors.Is(err, errReplicaStalled) {
-		t.Fatalf("Err() = %v, want errReplicaStalled", err)
+	if err := conn.out.Err(); !errors.Is(err, output.ErrReplicaStalled) {
+		t.Fatalf("Err() = %v, want output.ErrReplicaStalled", err)
 	}
 	if loop.conns[conn.fd] != nil {
 		t.Fatal("the loop still has the connection, want it closed")
@@ -105,7 +107,7 @@ func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.
 // try, which finds room, and the count starts again.
 func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.T) {
 	const stallTimeout = 50 * time.Millisecond
-	loop, conn, clientFD := newHandDrivenEventLoop(t, withStallTimeout(stallTimeout))
+	loop, conn, clientFD := newHandDrivenEventLoop(t, output.StallTimeout(stallTimeout))
 	conn.out.MarkReplica()
 
 	const stream = 8 << 20
@@ -146,7 +148,7 @@ func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.
 // it is sent: output waits for it at every look, and the socket keeps accepting.
 func TestEventLoopKeepsAReplicaThatTakesItsStream(t *testing.T) {
 	const stallTimeout = 50 * time.Millisecond
-	loop, conn, clientFD := newHandDrivenEventLoop(t, withStallTimeout(stallTimeout))
+	loop, conn, clientFD := newHandDrivenEventLoop(t, output.StallTimeout(stallTimeout))
 	conn.out.MarkReplica()
 
 	chunk := make([]byte, 1<<20)
@@ -234,7 +236,7 @@ func TestEventLoopClosesADrainingReplicasConnectionWhenAskedTo(t *testing.T) {
 			}
 		}},
 		{name: "by its Output", close: func(_ *eventLoop, conn *eventConn) {
-			conn.out.Close(errPushLimitExceeded)
+			conn.out.Close(output.ErrPushLimitExceeded)
 		}},
 	}
 
@@ -285,7 +287,7 @@ func TestEventLoopKeepsNoConnectionItClosedOnRequest(t *testing.T) {
 			t.Fatalf("Push() = false, want the stream queued: %v", conn.out.Err())
 		}
 		loop.applyQueuedWork() // part of the batch reaches the socket
-		conn.out.Close(errPushLimitExceeded)
+		conn.out.Close(output.ErrPushLimitExceeded)
 		loop.applyQueuedWork() // the loop takes the request to close it
 		if len(loop.conns) != 0 {
 			t.Fatal("the loop still has the connection after it was asked to close it")
@@ -317,7 +319,7 @@ func TestAnEventLoopConnectionClosedBeforeItsOutputExistsIsClosedOnceItDoes(t *t
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	out := newPolledOutput(newOutputs(), nil, discardLogger)
+	out := output.NewPolled(output.NewShared(), nil, discardLogger)
 	handle.bind(out)
 	if err := out.Err(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Err() = %v after the handle closed before it was bound, want the Output closed", err)

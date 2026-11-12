@@ -1,4 +1,12 @@
-package server
+// Package output is everything one connection is sent: its Replies and the
+// Pushed messages it receives, in the order they were produced, in both
+// networking modes. The server builds an Output for each connection and
+// everything the connection is sent goes through it.
+//
+// The limits on what may wait for a connection are decided here. A caller
+// asks an Output a question by name (MayReadRequests, Service's Status) and
+// has no threshold of its own to compare a byte count with.
+package output
 
 import (
 	"errors"
@@ -67,26 +75,27 @@ const outputWriteChunk = 1 << 20
 // size on every connection that asked for one.
 const outputRetainedBuffer = 2 << 20
 
-// errPushLimitExceeded reports that more Client output is waiting for a
+// ErrPushLimitExceeded reports that more Client output is waiting for a
 // connection that receives Pushed messages, or a Replica's stream, than it may
 // hold.
-var errPushLimitExceeded = errors.New("server: more output waiting than the connection's push limit")
+var ErrPushLimitExceeded = errors.New("output: more output waiting than the connection's push limit")
 
 // errPushBudgetExceeded reports that a connection was closed to bring the
 // output waiting for all push-receiving connections back within the budget.
-var errPushBudgetExceeded = errors.New("server: closed to stay within the budget for pushed output")
+var errPushBudgetExceeded = errors.New("output: closed to stay within the budget for pushed output")
 
-// errReplicaStalled reports that a Replica's socket took nothing for
+// ErrReplicaStalled reports that a Replica's socket took nothing for
 // outputReplicaStallTimeout of the output it was offered.
-var errReplicaStalled = errors.New("server: replica accepted no output within the stall timeout")
+var ErrReplicaStalled = errors.New("output: replica accepted no output within the stall timeout")
 
 // errOutputClosed is what a closed Output reports when it was closed without a
 // cause, as an ordinary teardown closes it.
-var errOutputClosed = fmt.Errorf("server: client output closed: %w", net.ErrClosed)
+var errOutputClosed = fmt.Errorf("output: client output closed: %w", net.ErrClosed)
 
-// outputs holds what every connection's Output shares: the limits, and the
-// Push budget's running total. Its lock comes after any Output's.
-type outputs struct {
+// Shared holds what every connection's Output of one server shares: the
+// limits, and the Push budget's running total. Its lock comes after any
+// Output's.
+type Shared struct {
 	pushLimit        int64
 	replicaPushLimit int64
 	pushBudget       int64
@@ -102,27 +111,25 @@ type outputs struct {
 	pushers map[*Output]struct{}
 }
 
-// outputLimit replaces one of a server's limits when its outputs are built.
-// Limits go in here and cannot be read back: what they decide is asked of an
-// Output by name (MayReadRequests, Service), so no caller has a threshold to
-// compare a byte count with.
-type outputLimit func(*outputs)
+// Limit replaces one of a server's limits when its Shared is built. Limits go
+// in here and cannot be read back.
+type Limit func(*Shared)
 
-// withReplicaPushLimit bounds what waits for a Replica behind its latest Reply.
-func withReplicaPushLimit(bytes int64) outputLimit {
-	return func(s *outputs) { s.replicaPushLimit = bytes }
+// ReplicaPushLimit bounds what waits for a Replica behind its latest Reply.
+func ReplicaPushLimit(bytes int64) Limit {
+	return func(s *Shared) { s.replicaPushLimit = bytes }
 }
 
-// withStallTimeout is how long a Replica's socket may take nothing of what it
+// StallTimeout is how long a Replica's socket may take nothing of what it
 // is offered.
-func withStallTimeout(timeout time.Duration) outputLimit {
-	return func(s *outputs) { s.stallTimeout = timeout }
+func StallTimeout(timeout time.Duration) Limit {
+	return func(s *Shared) { s.stallTimeout = timeout }
 }
 
-// newOutputs returns what the Outputs of one server share, with the server's
+// NewShared returns what the Outputs of one server share, with the server's
 // limits. A test that cannot wait for those, or queue as much, replaces them.
-func newOutputs(limits ...outputLimit) *outputs {
-	shared := &outputs{
+func NewShared(limits ...Limit) *Shared {
+	shared := &Shared{
 		pushLimit:        outputPushLimit,
 		replicaPushLimit: outputReplicaPushLimit,
 		pushBudget:       outputPushBudget,
@@ -139,7 +146,7 @@ func newOutputs(limits ...outputLimit) *outputs {
 // enforceBudget closes push-receiving connections, the one with the most
 // waiting first, until their total is back within the budget. It holds no
 // Output's lock: it reads each one's atomic backlog.
-func (s *outputs) enforceBudget() {
+func (s *Shared) enforceBudget() {
 	for s.total.Load() > s.pushBudget {
 		var victim *Output
 		var most int64
@@ -157,9 +164,9 @@ func (s *outputs) enforceBudget() {
 	}
 }
 
-// errWouldBlock is what the Event loop's socket reports when it has taken part
+// ErrWouldBlock is what the Event loop's socket reports when it has taken part
 // of what it was given and can take no more now (Service).
-var errWouldBlock = errors.New("server: socket write would block")
+var ErrWouldBlock = errors.New("output: socket write would block")
 
 // stallPhase is where the Replica stall rule stands for an Output.
 type stallPhase uint8
@@ -258,38 +265,38 @@ type Output struct {
 	// starting it again allocates nothing. Guarded by mu.
 	pump func()
 
-	shared *outputs
+	shared *Shared
 	logger *slog.Logger
 }
 
-// newBlockingOutput returns the Client output of a connection served by its
+// NewBlocking returns the Client output of a connection served by its
 // own goroutine, which writes its Replies to wire (Flush). A pump goroutine
 // writes what other connections push. Closing the Output closes wire when it
 // is an io.Closer.
-func newBlockingOutput(shared *outputs, wire io.Writer, logger *slog.Logger) *Output {
+func NewBlocking(shared *Shared, wire io.Writer, logger *slog.Logger) *Output {
 	o := &Output{wire: wire, shared: shared, logger: logger}
 	o.drained = sync.NewCond(&o.mu)
 	return o
 }
 
-// newPolledOutput returns the Client output of a connection the Event loop
+// NewPolled returns the Client output of a connection the Event loop
 // serves. The loop writes it (Service). attention tells the loop to call
 // Service for the connection: bytes were queued from elsewhere, the stream is
 // to end, the stall rule wants the socket tried, or the connection was closed.
 // With a nil attention the Output is written only when its owner chooses to,
 // as a ConnMachine built without an Event loop is.
-func newPolledOutput(shared *outputs, attention func(), logger *slog.Logger) *Output {
+func NewPolled(shared *Shared, attention func(), logger *slog.Logger) *Output {
 	o := &Output{attention: attention, shared: shared, logger: logger}
 	o.drained = sync.NewCond(&o.mu)
 	return o
 }
 
-// NewOutput returns the Client output of a connection served by its own
+// New returns the Client output of a connection served by its own
 // goroutine, writing to w. Closing the Output closes w when it is an io.Closer.
 // The server builds each connection's Output itself; this is for code that
 // drives a Client state without a server.
-func NewOutput(w io.Writer) *Output {
-	return newBlockingOutput(newOutputs(), w, discardLogger)
+func New(w io.Writer) *Output {
+	return NewBlocking(NewShared(), w, discardLogger)
 }
 
 // Reply queues the Replies to the request the connection just ran (none is
@@ -444,7 +451,7 @@ func (o *Output) Push(frame []byte) bool {
 	}
 	if waiting > limit {
 		o.mu.Unlock()
-		o.Close(fmt.Errorf("%w: %d bytes against a limit of %d", errPushLimitExceeded, waiting, limit))
+		o.Close(fmt.Errorf("%w: %d bytes against a limit of %d", ErrPushLimitExceeded, waiting, limit))
 		return false
 	}
 
@@ -553,7 +560,7 @@ func (o *Output) Close(cause error) {
 	o.drained.Broadcast()
 	o.mu.Unlock()
 
-	if errors.Is(cause, errPushLimitExceeded) || errors.Is(cause, errPushBudgetExceeded) || errors.Is(cause, errReplicaStalled) {
+	if errors.Is(cause, ErrPushLimitExceeded) || errors.Is(cause, errPushBudgetExceeded) || errors.Is(cause, ErrReplicaStalled) {
 		o.logger.Warn("closing a connection that is not keeping up with what is pushed to it", "pending_bytes", waiting, "error", cause)
 	}
 	if o.wire == nil {
@@ -677,8 +684,8 @@ func (o *Output) isClosed() bool {
 	return o.closed
 }
 
-// isReplica reports whether the connection is a Replica's (MarkReplica).
-func (o *Output) isReplica() bool {
+// IsReplica reports whether the connection is a Replica's (MarkReplica).
+func (o *Output) IsReplica() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.replica
@@ -809,7 +816,7 @@ func (o *Output) checkStall() {
 }
 
 func (o *Output) stalledErr() error {
-	return fmt.Errorf("%w of %v", errReplicaStalled, o.shared.stallTimeout)
+	return fmt.Errorf("%w of %v", ErrReplicaStalled, o.shared.stallTimeout)
 }
 
 // Status is where a connection the Event loop serves stands after a Service.
@@ -844,13 +851,13 @@ func (o *Output) statusLocked() Status {
 // Service writes what is queued to the socket until nothing is left or the
 // socket takes no more, and reports where the connection stands. Only the Event
 // loop calls it, with the connection's socket. A socket that accepts part of a
-// chunk, and reports that it would block (errWouldBlock) or reports nothing
+// chunk, and reports that it would block (ErrWouldBlock) or reports nothing
 // (io.ErrShortWrite), leaves the rest for the next Service. Any other failure
 // closes the Output, as does a try the stall rule asked for (checkStall) that
 // takes nothing.
 func (o *Output) Service(socket io.Writer) Status {
 	status, err := o.write(socket, everyBuffer)
-	if status.Closed != nil || err == nil || errors.Is(err, errWouldBlock) || errors.Is(err, io.ErrShortWrite) {
+	if status.Closed != nil || err == nil || errors.Is(err, ErrWouldBlock) || errors.Is(err, io.ErrShortWrite) {
 		return status
 	}
 	o.Close(err)
@@ -863,7 +870,7 @@ const everyBuffer = -1
 
 // errMoreQueued is what write returns, still holding the socket (writing stays
 // set), when it has written the buffers it was asked for and more is queued.
-var errMoreQueued = errors.New("server: more output was queued during the write")
+var errMoreQueued = errors.New("output: more output was queued during the write")
 
 // write writes what is queued to w until nothing is left or w fails, and
 // returns w's error and, for Service, where the Output stood when it stopped.
@@ -873,7 +880,7 @@ var errMoreQueued = errors.New("server: more output was queued during the write"
 // If more is queued once those are written, it returns errMoreQueued and
 // leaves writing set, for the caller to hand the socket on: what was queued
 // meanwhile was pushed by other connections. When the stall rule asked for
-// this try (checkStall) and w takes nothing, the error is errReplicaStalled,
+// this try (checkStall) and w takes nothing, the error is ErrReplicaStalled,
 // for the caller to close the connection with.
 func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 	for {

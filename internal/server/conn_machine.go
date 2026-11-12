@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 // ConnMachineState identifies the lifecycle phase of a connection state machine.
@@ -86,7 +88,7 @@ type connEvent struct {
 // under its own lock.
 type ConnMachine struct {
 	client *ClientState
-	out    *Output
+	out    *output.Output
 
 	state          ConnMachineState
 	err            error
@@ -105,13 +107,16 @@ type ConnMachine struct {
 	decodePaused  bool
 }
 
+// discardLogger is the logger of an Output that no server's connection owns.
+var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
 // NewConnMachine constructs an active connection state machine bound to the
 // connection-scoped client state, writing through the Output bound to it. A
 // client with none is given one that is written only by Service and Flush.
 func NewConnMachine(client *ClientState) *ConnMachine {
 	out := client.Output()
 	if out == nil {
-		out = newPolledOutput(newOutputs(), nil, discardLogger)
+		out = output.NewPolled(output.NewShared(), nil, discardLogger)
 		if client != nil {
 			client.BindOutput(out)
 		}
@@ -350,7 +355,7 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 // machine when the Output is closed, by a failed write or from elsewhere. Once
 // a closing machine has drained its parsed requests and pending output, Service
 // completes the transition to the closed state.
-func (m *ConnMachine) Service(w io.Writer) Status {
+func (m *ConnMachine) Service(w io.Writer) output.Status {
 	status := m.out.Service(w)
 	switch {
 	case status.Closed != nil:

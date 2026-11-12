@@ -11,6 +11,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net.Conn) {
@@ -32,7 +33,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	// Every byte the connection is sent goes through its Output: its Replies,
 	// written by this goroutine, and what other connections push to it.
-	out := newBlockingOutput(s.outputs, conn, logger)
+	out := output.NewBlocking(s.outputs, conn, logger)
 	state := s.getClientState(clientID)
 	if state != nil {
 		state.BindOutput(out)
@@ -153,7 +154,7 @@ func (s *Server) requestLimits(state *ClientState) protocol.Limits {
 // buffer empty is the only time the handler can block on input.
 type flushBeforeRead struct {
 	conn net.Conn
-	out  *Output
+	out  *output.Output
 }
 
 func (r flushBeforeRead) Read(p []byte) (int, error) {

@@ -1,4 +1,4 @@
-package server
+package output
 
 import (
 	"bytes"
@@ -20,6 +20,19 @@ func (w *countingDiscard) Write(p []byte) (int, error) {
 	n := min(len(p), w.limit)
 	w.total += n
 	return n, nil
+}
+
+// idleBufferCapBound is the capacity above which an idle connection must not
+// keep a write buffer.
+const idleBufferCapBound = 64 << 10
+
+// bufferIdentity returns the address of the first byte of b's backing array. It
+// changes whenever the Output replaces a buffer with a new one.
+func bufferIdentity(b []byte) *byte {
+	if cap(b) == 0 {
+		return nil
+	}
+	return &b[:1][0]
 }
 
 // serviceUntilWritten has the Event loop's Service write to w until nothing
@@ -44,7 +57,7 @@ func TestAnOutputRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
 	}
 
 	reply := protocol.BulkString{Data: bytes.Repeat([]byte("x"), 64<<10)}
-	out := newLoopOutput(newOutputs())
+	out := newLoopOutput(NewShared())
 
 	// drain flushes everything and returns the identity of the buffer it emptied.
 	drain := func() *byte {
@@ -93,7 +106,7 @@ func TestAnOutputReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reply := protocol.BulkString{Data: bytes.Repeat([]byte("x"), tt.replySize)}
-			out := newLoopOutput(newOutputs())
+			out := newLoopOutput(NewShared())
 			peer := &countingDiscard{limit: tt.writeLimit}
 
 			if err := out.Reply(reply); err != nil {
@@ -147,7 +160,7 @@ func TestAnOutputKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *testing
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reply := protocol.BulkString{Data: bytes.Repeat([]byte("x"), tt.replySize)}
-			out := newLoopOutput(newOutputs())
+			out := newLoopOutput(NewShared())
 
 			var identities []*byte
 			var caps []int

@@ -17,6 +17,7 @@ import (
 	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/replication"
+	"github.com/maltemindedal/stash/internal/server/output"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -39,7 +40,7 @@ type Server struct {
 	slowlogRegistry *SlowlogRegistry
 	// outputs is what every connection's Output shares: the Push limits and
 	// the Push budget.
-	outputs           *outputs
+	outputs           *output.Shared
 	aofWriter         *aof.Writer
 	recorder          *record.Recorder
 	runtimeCtx        context.Context
@@ -79,7 +80,7 @@ func New(cfg config.Config, logger *slog.Logger, store *storage.Store, newExecut
 		pubSubRegistry:  NewPubSubRegistry(),
 		monitorRegistry: NewMonitorRegistry(),
 		slowlogRegistry: NewSlowlogRegistry(),
-		outputs:         newOutputs(),
+		outputs:         output.NewShared(),
 		clientStates:    make(map[uint64]*ClientState),
 	}
 	srv.link = &replication.Link{MasterAuth: cfg.MasterAuth, Store: replicaStore{server: srv}, Logger: logger}

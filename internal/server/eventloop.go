@@ -15,6 +15,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 // pollerEventBatch bounds how many readiness events one Wait call returns.
@@ -171,7 +172,7 @@ type eventConn struct {
 	clientID   uint64
 	remoteAddr net.Addr
 	machine    *ConnMachine
-	out        *Output
+	out        *output.Output
 	ctx        context.Context
 	run        ConnCommandRunner
 	logger     *slog.Logger
@@ -266,7 +267,7 @@ func (l *eventLoop) wakeIfWaiting() {
 }
 
 // markDirty lists conn for the loop to serve. It is the attention the
-// connection's Output asks for (newPolledOutput). Safe for concurrent use; it
+// connection's Output asks for (output.NewPolled). Safe for concurrent use; it
 // may be called with the connection's Output locked.
 func (l *eventLoop) markDirty(conn *eventConn) {
 	if !conn.dirty.CompareAndSwap(false, true) {
@@ -333,7 +334,7 @@ func (l *eventLoop) beginDrain(cause error) {
 		l.srv.logger.Debug("failed to stop accepting connections for shutdown", "error", err)
 	}
 	for _, conn := range l.conns {
-		if !conn.out.isReplica() {
+		if !conn.out.IsReplica() {
 			l.closeConn(conn, nil)
 		}
 	}
@@ -435,7 +436,7 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 
 	conn.ctx = l.ctx
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
-	conn.out = newPolledOutput(l.srv.outputs, func() { l.markDirty(conn) }, conn.logger)
+	conn.out = output.NewPolled(l.srv.outputs, func() { l.markDirty(conn) }, conn.logger)
 	handle.bind(conn.out)
 	state.BindOutput(conn.out)
 	conn.machine = NewConnMachine(state)
@@ -639,7 +640,7 @@ func (l *eventLoop) cleanup() {
 }
 
 // fdWriter adapts a non-blocking socket descriptor to io.Writer for
-// Output.Service. A full kernel send buffer surfaces as errWouldBlock with a
+// Output.Service. A full kernel send buffer surfaces as output.ErrWouldBlock with a
 // partial byte count, leaving the remainder in the Output until the poller
 // reports the socket writable.
 type fdWriter struct {
@@ -647,7 +648,7 @@ type fdWriter struct {
 }
 
 // Write pushes p to the socket, retrying short writes and EINTR. It reports
-// errWouldBlock with a partial count when the kernel send buffer fills.
+// output.ErrWouldBlock with a partial count when the kernel send buffer fills.
 func (w fdWriter) Write(p []byte) (int, error) {
 	total := 0
 	for total < len(p) {
@@ -660,7 +661,7 @@ func (w fdWriter) Write(p []byte) (int, error) {
 				continue
 			}
 			if err == syscall.EAGAIN {
-				return total, errWouldBlock
+				return total, output.ErrWouldBlock
 			}
 			return total, err
 		}
@@ -679,14 +680,14 @@ type eventConnHandle struct {
 	// out is the connection's Output once it exists (bind): the registry names
 	// the connection, and makes the handle reachable, before the Output can be
 	// built with a logger that carries that name.
-	out *Output
+	out *output.Output
 	// closed is set by a Close, for a bind that comes after it.
 	closed bool
 }
 
 // bind gives the handle the connection's Output, and closes it if the handle
 // was closed already.
-func (h *eventConnHandle) bind(out *Output) {
+func (h *eventConnHandle) bind(out *output.Output) {
 	h.mu.Lock()
 	h.out = out
 	closed := h.closed
