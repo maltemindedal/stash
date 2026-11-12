@@ -41,8 +41,8 @@ const outputPushBudget = 128 << 20
 const outputReplicaStallTimeout = 30 * time.Second
 
 // outputWriteThrough is how much Client output a connection's goroutine lets
-// wait before it writes it out without waiting for the next read, as a 4 KiB
-// bufio.Writer would.
+// wait before a Reply writes it out without waiting for the next read, as a
+// 4 KiB bufio.Writer would.
 const outputWriteThrough = 4 << 10
 
 // outputHighWater bounds what may be left to write before a connection's
@@ -90,6 +90,7 @@ type outputs struct {
 	pushLimit        int64
 	replicaPushLimit int64
 	pushBudget       int64
+	writeThrough     int64
 	stallTimeout     time.Duration
 
 	// total is the output waiting for the connections in pushers.
@@ -106,6 +107,7 @@ func newOutputs() *outputs {
 		pushLimit:        outputPushLimit,
 		replicaPushLimit: outputReplicaPushLimit,
 		pushBudget:       outputPushBudget,
+		writeThrough:     outputWriteThrough,
 		stallTimeout:     outputReplicaStallTimeout,
 		pushers:          make(map[*Output]struct{}),
 	}
@@ -266,9 +268,12 @@ func NewOutput(w io.Writer) *Output {
 
 // Reply queues the Replies to the request the connection just ran (none is
 // allowed) and releases the Pushed messages held since HoldPushes. Only the
-// connection's own executor calls it. It never waits. A Push to the connection
-// takes the lock Reply holds, so a large Reply is encoded before that lock is
-// taken and queued whole (isLargeReply).
+// connection's own executor calls it. Replies leave together when a
+// connection's goroutine next waits for input (Flush), unless outputWriteThrough
+// is waiting already: Reply then writes them out as Flush does, and waits as
+// Flush does. On the Event loop it never waits. A Push to the connection takes
+// the lock Reply holds, so a large Reply is encoded before that lock is taken
+// and queued whole (isLargeReply).
 func (o *Output) Reply(values ...protocol.Value) error {
 	var whole []byte
 	if isLargeReply(values) {
@@ -323,6 +328,10 @@ func (o *Output) Reply(values ...protocol.Value) error {
 		}
 	}
 	o.mu.Unlock()
+
+	if o.backlog.Load() >= o.shared.writeThrough {
+		return o.driver.flush(o, outputHighWater)
+	}
 	return nil
 }
 
@@ -453,8 +462,7 @@ func (o *Output) HoldPushes() {
 }
 
 // Flush writes out what is queued, for the connection's own goroutine: before
-// it waits for the next request, once outputWriteThrough is waiting, and before
-// a command blocks. When another goroutine is already writing it leaves the
+// it waits for the next request and before a command blocks. When another goroutine is already writing it leaves the
 // writing to that one, and waits only while more than outputHighWater is left
 // to write before the connection's latest Reply is out: a client that does not
 // read what it is sent stops having its requests run. It reports why the

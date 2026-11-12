@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"runtime"
 	"strings"
@@ -113,6 +114,15 @@ func newGoroutineOutput(shared *outputs, wire *outputWire) *Output {
 	return newOutput(shared, &goroutineOutputDriver{wire: wire}, discardLogger)
 }
 
+// queuedReplies are the limits of a server whose connections never write a
+// Reply through: a Reply only queues, however much waits, so that a test
+// decides when the connection's goroutine writes (Flush, Drain).
+func queuedReplies() *outputs {
+	shared := newOutputs()
+	shared.writeThrough = math.MaxInt64
+	return shared
+}
+
 // waitForOutput polls until done reports true, and fails the test with what it
 // was waiting for after five seconds.
 func waitForOutput(t *testing.T, what string, done func() bool) {
@@ -171,6 +181,73 @@ func TestPipelinedRepliesLeaveInOneWrite(t *testing.T) {
 	// Nothing queued is not an error.
 	if err := out.Flush(); err != nil {
 		t.Fatalf("Flush() with nothing queued error = %v", err)
+	}
+}
+
+// TestAReplyWritesThroughOnceEnoughIsWaiting is a connection's goroutine
+// running a pipeline whose Replies add up to more than outputWriteThrough. The
+// first ones wait for its next read. The Reply that brings what is waiting to
+// the mark writes them all, without a Flush.
+func TestAReplyWritesThroughOnceEnoughIsWaiting(t *testing.T) {
+	wire := newOutputWire()
+	out := newGoroutineOutput(newOutputs(), wire)
+	defer out.Close(nil)
+
+	reply := protocol.BulkString{Data: make([]byte, outputWriteThrough/4)}
+	encoded, err := protocol.EncodeValues([]protocol.Value{reply})
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := out.Reply(reply); err != nil {
+			t.Fatalf("Reply() error = %v", err)
+		}
+	}
+	if got := wire.writeCount(); got != 0 {
+		t.Fatalf("the socket was written %d times with %d bytes waiting, want the replies held back below %d", got, out.Backlog(), outputWriteThrough)
+	}
+
+	if err := out.Reply(reply); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	if got, want := len(wire.sent()), 4*len(encoded); got != want {
+		t.Fatalf("%d bytes were written when the Reply that reached %d bytes waiting returned, want all %d", got, outputWriteThrough, want)
+	}
+	if got := wire.writeCount(); got != 1 {
+		t.Fatalf("the socket was written %d times, want the four replies in one write", got)
+	}
+}
+
+// TestAReplyThatWritesThroughWaitsAsAFlushDoes is a subscriber that reads
+// nothing, with twice the high-water mark of messages waiting ahead of its
+// next Reply. That Reply writes through, so the connection's goroutine waits
+// in it as it would in Flush, and its next request is not run. It waits until
+// the connection is closed.
+func TestAReplyThatWritesThroughWaitsAsAFlushDoes(t *testing.T) {
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(newOutputs(), wire)
+	defer out.Close(nil)
+
+	if !out.Push(make([]byte, 2*outputHighWater)) {
+		t.Fatalf("Push() = false, want the messages queued: %v", out.Err())
+	}
+	<-wire.writeBegun // the pump has the socket
+	replied := make(chan error, 1)
+	go func() { replied <- out.Reply(protocol.SimpleString{Value: "PONG"}) }()
+	select {
+	case err := <-replied:
+		t.Fatalf("Reply() returned %v with more than 1 MiB to write before it is out, to a peer that is not reading, want it to wait", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	out.Close(nil)
+	select {
+	case err := <-replied:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Reply() error = %v after the connection was closed, want why it was closed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reply() still waiting after the connection was closed")
 	}
 }
 
@@ -730,7 +807,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			wire := newStalledOutputWire()
-			out := newGoroutineOutput(newOutputs(), wire)
+			out := newGoroutineOutput(queuedReplies(), wire)
 			defer out.Close(nil)
 
 			tt.queue(t, out)
@@ -774,7 +851,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 // left is the pump's to write.
 func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t *testing.T) {
 	wire := newReplyReadingWire(outputHighWater)
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -830,7 +907,7 @@ func TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// The peer reads the messages, and nothing of the Reply until readOn.
 			wire := newReplyReadingWire(tt.ahead)
-			out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
 			defer out.Close(nil)
 			defer wire.readOn()
 
@@ -966,7 +1043,7 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 		t.Fatalf("EncodeValues() error = %v", err)
 	}
 	wire := newReplyReadingWire(len(reply))
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -1048,7 +1125,7 @@ func (w *slowOutputWire) Write(p []byte) (int, error) {
 // steady writes, its acknowledgements.
 func TestAFlushLeavesWhatIsPushedMeanwhileToThePump(t *testing.T) {
 	wire := &slowOutputWire{outputWire: *newOutputWire(), delay: 2 * time.Millisecond}
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
 	defer out.Close(nil)
 
 	if err := out.Reply(protocol.BulkString{Data: make([]byte, 8<<10)}); err != nil {
@@ -1412,7 +1489,7 @@ func firstDifference(a, b string) int {
 // took the socket, the Reply queued whole included.
 func TestAFlushWritesEveryReplyQueuedBeforeIt(t *testing.T) {
 	wire := newOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(queuedReplies(), wire)
 	defer out.Close(nil)
 
 	large := protocol.BulkString{Data: make([]byte, outputRetainedBuffer)}
@@ -1524,7 +1601,7 @@ func TestAFlushWritesNothingThatWasPushedDuringIt(t *testing.T) {
 				t.Fatalf("EncodeValues() error = %v", err)
 			}
 			wire := newReplyReadingWire(len(replies))
-			out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
 			defer out.Close(nil)
 			defer wire.readOn()
 

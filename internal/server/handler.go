@@ -120,17 +120,11 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			authDeadlineSet = false
 		}
 
-		if err := out.Reply(responses...); err != nil {
-			logger.Debug("failed to queue response", "error", err)
-			return
-		}
 		// Replies leave together when the handler next waits for input, unless
-		// enough of them are waiting already.
-		if out.Backlog() >= outputWriteThrough {
-			if err := out.Flush(); err != nil {
-				logger.Debug("failed to write response", "error", err)
-				return
-			}
+		// enough of them are waiting already (Output.Reply).
+		if err := out.Reply(responses...); err != nil {
+			logger.Debug("failed to write response", "error", err)
+			return
 		}
 	}
 }
