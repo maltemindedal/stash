@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/server/output/internal/ledger"
 )
 
 // outputPushLimit is how much Client output may wait for a connection that
@@ -54,7 +55,7 @@ const outputReplicaStallTimeout = 30 * time.Second
 const outputWriteThrough = 4 << 10
 
 // outputHighWater bounds what may be left to write before a connection's
-// latest Reply is out (replyBacklogLocked). Above it the connection's own
+// latest Reply is out (ledger.Ledger.Gate). Above it the connection's own
 // requests stop being read and run until the peer has read down to it, so that
 // a client that pipelines without reading cannot turn small requests into
 // unbounded Replies. What was pushed to the connection ahead of that Reply
@@ -69,11 +70,6 @@ const outputHighWater = 1 << 20
 // is also the stretch of a Replica's stream that must be accepted within
 // outputReplicaStallTimeout.
 const outputWriteChunk = 1 << 20
-
-// outputRetainedBuffer is the capacity above which a drained buffer is released
-// rather than kept for the next batch: a large Reply would otherwise leave its
-// size on every connection that asked for one.
-const outputRetainedBuffer = 2 << 20
 
 // ErrPushLimitExceeded reports that more Client output is waiting for a
 // connection that receives Pushed messages, or a Replica's stream, than it may
@@ -96,11 +92,11 @@ var errOutputClosed = fmt.Errorf("output: client output closed: %w", net.ErrClos
 // limits, and the Push budget's running total. Its lock comes after any
 // Output's.
 type Shared struct {
-	pushLimit        int64
-	replicaPushLimit int64
-	pushBudget       int64
-	writeThrough     int64
-	stallTimeout     time.Duration
+	// limits are the thresholds of every connection's Ledger, which alone
+	// compares a byte count with one.
+	limits       ledger.Limits
+	pushBudget   int64
+	stallTimeout time.Duration
 
 	// total is the output waiting for the connections in pushers.
 	total atomic.Int64
@@ -117,7 +113,7 @@ type Limit func(*Shared)
 
 // ReplicaPushLimit bounds what waits for a Replica behind its latest Reply.
 func ReplicaPushLimit(bytes int64) Limit {
-	return func(s *Shared) { s.replicaPushLimit = bytes }
+	return func(s *Shared) { s.limits.ReplicaPushLimit = bytes }
 }
 
 // StallTimeout is how long a Replica's socket may take nothing of what it
@@ -130,12 +126,16 @@ func StallTimeout(timeout time.Duration) Limit {
 // limits. A test that cannot wait for those, or queue as much, replaces them.
 func NewShared(limits ...Limit) *Shared {
 	shared := &Shared{
-		pushLimit:        outputPushLimit,
-		replicaPushLimit: outputReplicaPushLimit,
-		pushBudget:       outputPushBudget,
-		writeThrough:     outputWriteThrough,
-		stallTimeout:     outputReplicaStallTimeout,
-		pushers:          make(map[*Output]struct{}),
+		limits: ledger.Limits{
+			HighWater:        outputHighWater,
+			WriteThrough:     outputWriteThrough,
+			Chunk:            outputWriteChunk,
+			PushLimit:        outputPushLimit,
+			ReplicaPushLimit: outputReplicaPushLimit,
+		},
+		pushBudget:   outputPushBudget,
+		stallTimeout: outputReplicaStallTimeout,
+		pushers:      make(map[*Output]struct{}),
 	}
 	for _, limit := range limits {
 		limit(shared)
@@ -197,38 +197,17 @@ const (
 // takes a pusher's lock.
 type Output struct {
 	mu sync.Mutex
-	// ahead are whole buffers waiting to be written before queued, in order, and
-	// aheadBytes is how many bytes they hold. A large Reply is queued here
-	// without being copied (Reply), behind the buffer that was queued until then.
-	// A Flush that finds one here seals what is queued behind it too
-	// (sealBatchLocked).
-	ahead      [][]byte
-	aheadBytes int
-	// queued is what waits to be written after ahead, appended under mu.
-	queued []byte
-	// held are the Pushed messages waiting behind the current request's Reply.
-	held []byte
-	// inflight is the batch being written; inflight[sent:] is still to go. Both
-	// are written only by whoever is writing, under mu.
-	inflight []byte
-	sent     int
-	// spare is an emptied buffer kept for the next batch that is queued while
-	// another is being written.
-	spare []byte
+	// ledger counts the connection's output and decides what depends on a
+	// count: whether its requests may be read, whether its Replies are out,
+	// whether a Push fits. bytes are the bytes themselves. The two change
+	// together, under one hold of mu.
+	ledger ledger.Ledger
+	bytes  chain
 	// writing is set while a goroutine of the goroutine mode owns the socket:
 	// the connection's own, writing its Replies (flush), or the pump, which
 	// runs only while Pushed messages wait and nobody is writing.
 	writing bool
-	// written is how many bytes the socket has taken since the connection
-	// opened, and replyEnd is where the latest Reply ends, counted the same way
-	// (queueEndLocked): the Replies are all written once written has reached
-	// replyEnd. What was pushed ahead of a Reply is written before that mark is
-	// reached, and what is pushed after the latest Reply lies behind it.
-	written  int64
-	replyEnd int64
-	holding  bool
-	closed   bool
-	cause    error
+	cause   error
 	// replica holds the connection to the Replica Push limit and stall rule,
 	// and leaves it out of the Push budget.
 	replica bool
@@ -246,11 +225,12 @@ type Output struct {
 	stallWatch   *atomic.Pointer[Output]
 
 	// drained is signalled when a writer finishes, when the connection is
-	// closed, and after every write that leaves no more than outputHighWater to
-	// write before the latest Reply is out, the one that writes its last byte
-	// included.
+	// closed, and after every write that leaves the connection's requests
+	// readable (ledger.Ledger.Gate), the one that writes the last byte of its
+	// Replies included.
 	drained *sync.Cond
-	// backlog is every byte in queued, held and inflight[sent:].
+	// backlog is every byte that waits, as the Push budget reads it without
+	// the lock (Shared.enforceBudget).
 	backlog atomic.Int64
 
 	// wire is the socket of a connection served by its own goroutine, written
@@ -274,7 +254,7 @@ type Output struct {
 // writes what other connections push. Closing the Output closes wire when it
 // is an io.Closer.
 func NewBlocking(shared *Shared, wire io.Writer, logger *slog.Logger) *Output {
-	o := &Output{wire: wire, shared: shared, logger: logger}
+	o := &Output{ledger: ledger.New(shared.limits), wire: wire, shared: shared, logger: logger}
 	o.drained = sync.NewCond(&o.mu)
 	return o
 }
@@ -286,7 +266,7 @@ func NewBlocking(shared *Shared, wire io.Writer, logger *slog.Logger) *Output {
 // With a nil attention the Output is written only when its owner chooses to,
 // as a ConnMachine built without an Event loop is.
 func NewPolled(shared *Shared, attention func(), logger *slog.Logger) *Output {
-	o := &Output{attention: attention, shared: shared, logger: logger}
+	o := &Output{ledger: ledger.New(shared.limits), attention: attention, shared: shared, logger: logger}
 	o.drained = sync.NewCond(&o.mu)
 	return o
 }
@@ -318,52 +298,36 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	}
 
 	o.mu.Lock()
-	if o.closed {
+	if o.ledger.Closed() {
 		err := o.errLocked()
 		o.mu.Unlock()
 		return err
 	}
 	added := len(whole)
 	if whole != nil {
-		o.queueWholeLocked(whole)
+		o.bytes.whole(whole)
 	} else {
-		before := len(o.queued)
-		queued, err := protocol.AppendValues(o.queued, values)
-		if err != nil {
+		var err error
+		if added, err = o.bytes.reply(values); err != nil {
 			o.mu.Unlock()
 			return err
 		}
-		o.queued = queued
-		added = len(queued) - before
 	}
-	if added > 0 {
-		o.growLocked(added)
-		// Before the held Pushed messages are released, which follow the Reply.
-		o.replyEnd = o.queueEndLocked()
+	o.growLocked(added)
+	// The Pushed messages held since HoldPushes follow the Reply.
+	released := len(o.bytes.held) > 0
+	o.bytes.release()
+	o.ledger.Reply(int64(added))
+	if released {
+		// The connection's goroutine must not be the one that writes a stream
+		// of Pushed messages to a peer that may have stopped reading.
+		o.scheduleLocked()
 	}
-
-	if o.holding {
-		o.holding = false
-		if len(o.held) > 0 {
-			if len(o.held) >= outputRetainedBuffer {
-				o.queueWholeLocked(o.held)
-				o.held = nil
-			} else {
-				o.queued = append(o.queued, o.held...)
-				o.held = o.held[:0]
-				if cap(o.held) > outputRetainedBuffer {
-					o.held = nil
-				}
-			}
-			// The connection's goroutine must not be the one that writes a stream
-			// of Pushed messages to a peer that may have stopped reading.
-			o.scheduleLocked()
-		}
-	}
+	writeThrough := o.wire != nil && o.ledger.Full()
 	o.mu.Unlock()
 
-	if o.backlog.Load() >= o.shared.writeThrough {
-		return o.flush(outputHighWater)
+	if writeThrough {
+		return o.flush(false)
 	}
 	return nil
 }
@@ -389,25 +353,6 @@ func isLargeReply(values []protocol.Value) bool {
 	return size >= outputRetainedBuffer
 }
 
-// queueWholeLocked queues buffer behind everything queued without copying it.
-// What is in queued is ahead of it, so that buffer goes first.
-func (o *Output) queueWholeLocked(buffer []byte) {
-	o.sealQueuedLocked()
-	o.ahead = append(o.ahead, buffer)
-	o.aheadBytes += len(buffer)
-}
-
-// sealQueuedLocked makes what is in queued the last of the whole buffers, so
-// that what is queued from now on waits behind it in a buffer of its own.
-func (o *Output) sealQueuedLocked() {
-	if len(o.queued) == 0 {
-		return
-	}
-	o.ahead = append(o.ahead, o.queued)
-	o.aheadBytes += len(o.queued)
-	o.queued, o.spare = o.spare[:0], nil
-}
-
 // sealBatchLocked makes everything queued now the batch of a writer that
 // writes nothing queued after it began (Flush), and returns how many buffers
 // that is. Behind whole buffers, what is in queued becomes the last of them:
@@ -417,11 +362,11 @@ func (o *Output) sealQueuedLocked() {
 // in that instant rides with the batch. It is one batch either way, which is
 // what bounds the writer.
 func (o *Output) sealBatchLocked() int {
-	if len(o.ahead) == 0 {
+	if len(o.bytes.ahead) == 0 {
 		return 1
 	}
-	o.sealQueuedLocked()
-	return len(o.ahead)
+	o.bytes.seal()
+	return len(o.bytes.ahead)
 }
 
 // Push queues a frame another connection produced. It never waits. It returns
@@ -433,25 +378,15 @@ func (o *Output) Push(frame []byte) bool {
 	}
 
 	o.mu.Lock()
-	if o.closed {
+	// The Ledger holds a subscriber to its limit for everything waiting, and a
+	// Replica for its stream alone (ledger.Ledger.Push).
+	accepted, effects := o.ledger.Push(int64(len(frame)))
+	if !accepted {
+		waiting := o.ledger.Waiting()
 		o.mu.Unlock()
-		return false
-	}
-	// A subscriber is held to its limit for everything waiting, since only a
-	// client that is not reading lets pushes pile up behind its Replies. A
-	// Replica's limit is for its stream alone: the snapshot it is still being
-	// sent can be larger than the limit, and says nothing of how far behind it
-	// is. Its one Reply, the full resync, is ahead of its whole stream, so the
-	// stream is what waits behind that Reply.
-	limit := o.shared.pushLimit
-	waiting := o.backlog.Load() + int64(len(frame))
-	if o.replica {
-		limit = o.shared.replicaPushLimit
-		waiting -= o.replyBacklogLocked()
-	}
-	if waiting > limit {
-		o.mu.Unlock()
-		o.Close(fmt.Errorf("%w: %d bytes against a limit of %d", ErrPushLimitExceeded, waiting, limit))
+		if effects.Close != nil {
+			o.Close(fmt.Errorf("%w: %d bytes were waiting and %d more were pushed", ErrPushLimitExceeded, waiting, len(frame)))
+		}
 		return false
 	}
 
@@ -462,12 +397,11 @@ func (o *Output) Push(frame []byte) bool {
 		o.shared.pushers[o] = struct{}{}
 		o.shared.mu.Unlock()
 	}
-	if o.holding {
-		o.held = append(o.held, frame...)
-		o.growLocked(len(frame))
+	o.growLocked(len(frame))
+	if o.ledger.Holding() {
+		o.bytes.hold(frame)
 	} else {
-		o.queued = append(o.queued, frame...)
-		o.growLocked(len(frame))
+		o.bytes.push(frame)
 		o.scheduleLocked()
 	}
 	overBudget := o.counted && o.shared.total.Load() > o.shared.pushBudget
@@ -490,7 +424,7 @@ func (o *Output) HoldPushes() {
 		return
 	}
 	o.mu.Lock()
-	o.holding = true
+	o.ledger.Hold()
 	o.mu.Unlock()
 }
 
@@ -505,7 +439,7 @@ func (o *Output) Flush() error {
 	if o == nil {
 		return nil
 	}
-	return o.flush(outputHighWater)
+	return o.flush(false)
 }
 
 // Drain returns once every Reply queued so far has been written, or the
@@ -524,7 +458,7 @@ func (o *Output) Flush() error {
 func (o *Output) Drain() {
 	// Why the connection is closed, if it is, changes nothing for a caller
 	// that is about to close it.
-	_ = o.flush(0)
+	_ = o.flush(true)
 }
 
 // Close closes the connection from any goroutine without waiting for a write in
@@ -539,15 +473,17 @@ func (o *Output) Close(cause error) {
 	}
 
 	o.mu.Lock()
-	if o.closed {
+	if o.ledger.Closed() {
 		o.mu.Unlock()
 		return
 	}
-	o.closed = true
+	waiting := o.ledger.Waiting()
+	o.ledger.Close()
 	o.cause = cause
-	waiting := o.backlog.Load()
 	o.growLocked(-int(waiting))
-	o.ahead, o.aheadBytes, o.queued, o.held = nil, 0, nil, nil
+	// A writer in the middle of a write keeps the bytes it is writing until
+	// the write returns, and no longer.
+	o.bytes.clear()
 	if o.stallWatch != nil {
 		o.stallWatch.Store(nil)
 	}
@@ -587,14 +523,14 @@ func (o *Output) EndStream() {
 	}
 
 	o.mu.Lock()
-	if o.closed || o.ending {
+	if o.ledger.Closed() || o.ending {
 		o.mu.Unlock()
 		return
 	}
 	o.ending = true
 	// A writer of the goroutine mode shuts the write side when it has written
 	// everything (write). With none at work and nothing to write, nobody would.
-	shut := o.wire != nil && !o.writing && o.pendingLocked() == 0
+	shut := o.wire != nil && !o.writing && !o.ledger.Writable()
 	if !shut {
 		o.scheduleLocked()
 	}
@@ -615,6 +551,7 @@ func (o *Output) MarkReplica() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	o.ledger.MarkReplica(unclocked)
 	o.replica = true
 	if o.counted {
 		o.counted = false
@@ -633,7 +570,9 @@ func (o *Output) Backlog() int {
 	if o == nil {
 		return 0
 	}
-	return int(o.backlog.Load())
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return int(o.ledger.Waiting())
 }
 
 // MayReadRequests reports whether the connection's own requests may be read
@@ -641,15 +580,14 @@ func (o *Output) Backlog() int {
 // latest Reply is out. What was pushed after that Reply does not count, so a
 // Replica whose stream waits still has its acknowledgements read; the Push
 // limit bounds that output instead. Both networking modes hold a connection's
-// requests back by this one rule. The lock is taken only when the whole
-// backlog is above the mark.
+// requests back by this one rule, the Ledger's Gate.
 func (o *Output) MayReadRequests() bool {
-	if o == nil || o.backlog.Load() <= outputHighWater {
+	if o == nil {
 		return true
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.replyBacklogLocked() <= outputHighWater
+	return o.ledger.Gate()
 }
 
 // Err reports why the connection was closed, or nil while it is open. A nil
@@ -661,7 +599,7 @@ func (o *Output) Err() error {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if !o.closed {
+	if !o.ledger.Closed() {
 		return nil
 	}
 	return o.errLocked()
@@ -681,7 +619,7 @@ func (o *Output) PeerClosed() bool {
 func (o *Output) isClosed() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.closed
+	return o.ledger.Closed()
 }
 
 // IsReplica reports whether the connection is a Replica's (MarkReplica).
@@ -698,27 +636,9 @@ func (o *Output) errLocked() error {
 	return errOutputClosed
 }
 
-// pendingLocked is how many bytes can be written now: everything but what is
-// held behind a Reply.
-func (o *Output) pendingLocked() int {
-	return o.aheadBytes + len(o.queued) + len(o.inflight) - o.sent
-}
-
-// queueEndLocked is where the queue ends: how many bytes have been queued for
-// writing since the connection opened, the written ones and the ones that can
-// be written now. A Pushed message that is held counts once a Reply has
-// released it.
-func (o *Output) queueEndLocked() int64 {
-	return o.written + int64(o.pendingLocked())
-}
-
-// replyBacklogLocked is how many bytes are left to write before the
-// connection's latest Reply is out: its unwritten Replies and what was pushed
-// ahead of them. It is zero once that Reply is written, however much was
-// pushed after it.
-func (o *Output) replyBacklogLocked() int64 {
-	return max(o.replyEnd-o.written, 0)
-}
+// unclocked is the time the Ledger is told while the stall rule is still this
+// file's timer (checkStall): none passes, so the Ledger gives no verdict.
+const unclocked ledger.Instant = 1
 
 // growLocked adds delta, which may be negative, to the backlog and to the Push
 // budget's total when the connection counts toward it.
@@ -735,7 +655,7 @@ func (o *Output) growLocked(delta int) {
 // offeredLocked reports whether the socket is being offered a batch that it has
 // not taken all of.
 func (o *Output) offeredLocked() bool {
-	return o.sent < len(o.inflight)
+	return o.bytes.offered()
 }
 
 // countStallLocked starts the Replica stall rule's count for the batch on
@@ -745,7 +665,7 @@ func (o *Output) offeredLocked() bool {
 // the stall timeout (armStallLocked): the attach cut of a PSYNC marks a
 // connection a Replica's even when it has closed meanwhile.
 func (o *Output) countStallLocked() {
-	if o.closed {
+	if o.ledger.Closed() {
 		return
 	}
 	o.lastProgress = time.Now()
@@ -795,7 +715,7 @@ func (o *Output) armStallLocked(wait time.Duration) {
 func (o *Output) checkStall() {
 	o.mu.Lock()
 	o.stall = stallIdle
-	if o.closed || !o.offeredLocked() {
+	if o.ledger.Closed() || !o.offeredLocked() {
 		o.mu.Unlock()
 		return
 	}
@@ -837,14 +757,14 @@ type Status struct {
 }
 
 func (o *Output) statusLocked() Status {
-	if o.closed {
+	if o.ledger.Closed() {
 		return Status{Closed: o.errLocked()}
 	}
-	pending := o.pendingLocked()
+	writable := o.ledger.Writable()
 	return Status{
-		MayRead:     o.replyBacklogLocked() <= outputHighWater,
-		WantWrite:   pending > 0,
-		EndOfStream: o.ending && pending == 0,
+		MayRead:     o.ledger.Gate(),
+		WantWrite:   writable,
+		EndOfStream: o.ending && !writable,
 	}
 }
 
@@ -885,15 +805,15 @@ var errMoreQueued = errors.New("output: more output was queued during the write"
 func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 	for {
 		o.mu.Lock()
-		if o.closed {
+		if o.ledger.Closed() {
 			status := o.statusLocked()
 			o.stopWritingLocked()
 			o.mu.Unlock()
 			return status, status.Closed
 		}
-		if o.sent == len(o.inflight) {
+		if !o.bytes.offered() {
 			switch {
-			case len(o.ahead) == 0 && len(o.queued) == 0:
+			case !o.ledger.Writable():
 				status := o.statusLocked()
 				o.stopWritingLocked()
 				o.mu.Unlock()
@@ -904,17 +824,8 @@ func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 			case buffers == 0:
 				o.mu.Unlock()
 				return Status{}, errMoreQueued
-			case len(o.ahead) > 0:
-				o.inflight, o.sent = o.ahead[0], 0
-				o.aheadBytes -= len(o.inflight)
-				// Moved down, not resliced, so that the list keeps its array for
-				// the next large Reply.
-				rest := copy(o.ahead, o.ahead[1:])
-				o.ahead[rest] = nil
-				o.ahead = o.ahead[:rest]
-			default:
-				o.inflight, o.queued, o.spare, o.sent = o.queued, o.spare[:0], nil, 0
 			}
+			o.bytes.offer()
 			if buffers > 0 {
 				buffers--
 			}
@@ -922,7 +833,7 @@ func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 				o.countStallLocked()
 			}
 		}
-		chunk := o.inflight[o.sent:]
+		chunk := o.bytes.inflight[o.bytes.sent:]
 		if len(chunk) > outputWriteChunk {
 			chunk = chunk[:outputWriteChunk]
 		}
@@ -931,36 +842,25 @@ func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 		n, err := w.Write(chunk)
 
 		o.mu.Lock()
-		o.sent += n
-		if o.sent == len(o.inflight) {
-			// The batch is written. Its buffer is kept for the next one unless a
-			// large Reply grew it: the connection may stay idle. Nothing queued
-			// meanwhile means the next batch fills this same buffer, the one in
-			// the processor's cache, and the other stays spare; a client that
-			// reads each pipeline's replies before it sends the next then uses
-			// one buffer, not two in turn.
-			written := o.inflight[:0]
-			if cap(written) > outputRetainedBuffer {
-				written = nil
-			}
-			o.inflight, o.sent = nil, 0
-			if len(o.queued) == 0 && !o.closed {
-				o.queued, o.spare = written, o.queued
-			} else {
-				o.spare = written
-			}
+		if o.ledger.Closed() {
+			// Close dropped what was being written with everything else.
+			status := o.statusLocked()
+			o.stopWritingLocked()
+			o.mu.Unlock()
+			return status, status.Closed
 		}
-		if n > 0 && !o.closed {
+		o.bytes.drop(n)
+		o.ledger.Took(int64(n), unclocked)
+		if n > 0 {
 			if o.replica {
 				o.lastProgress = time.Now()
 			}
 			o.growLocked(-n)
-			o.written += int64(n)
-			if o.replyBacklogLocked() <= outputHighWater {
+			if o.ledger.Gate() {
 				o.drained.Broadcast()
 			}
 		}
-		if o.stall == stallDue && !o.closed {
+		if o.stall == stallDue {
 			// This was the try the stall rule asked for. A socket that took
 			// some of the batch has the stall timeout again for the rest.
 			o.stall = stallIdle
@@ -1018,32 +918,32 @@ func (o *Output) startPumpLocked() {
 	go o.pump()
 }
 
-// flush is Flush, which waits for another writer while more than mark is left
-// to write before the connection's latest Reply is out, and with a mark of
-// zero Drain. The Event loop writes its connections itself, so there it does
-// nothing.
-func (o *Output) flush(mark int64) error {
+// flush is Flush, which waits for another writer while the connection's
+// requests may not be read (ledger.Ledger.Gate), or Drain, which waits for it
+// until the Replies are out (ledger.Ledger.RepliesOut). The Event loop writes
+// its connections itself, so there it does nothing.
+func (o *Output) flush(drain bool) error {
 	if o.wire == nil {
 		return nil
 	}
 
 	o.mu.Lock()
 	// Another goroutine may have the socket, and then writes the Replies queued
-	// here with everything else. This one waits for it while more than mark is
-	// left to write before its latest Reply is out, and no longer. For Flush
-	// that is only backpressure on the connection's own requests. What is
-	// pushed after that Reply never makes it wait: its goroutine reads the
-	// peer's requests, which for a Replica that has fallen behind are the
-	// acknowledgements that show how far.
-	for o.writing && !o.closed && o.replyBacklogLocked() > mark {
+	// here with everything else. This one waits for it until the Ledger says
+	// it may go on, and no longer. For Flush that is only backpressure on the
+	// connection's own requests. What is pushed after its latest Reply never
+	// makes it wait: its goroutine reads the peer's requests, which for a
+	// Replica that has fallen behind are the acknowledgements that show how
+	// far.
+	for o.writing && !o.ledger.Closed() && !o.mayGoOnLocked(drain) {
 		o.drained.Wait()
 	}
-	if o.closed {
+	if o.ledger.Closed() {
 		err := o.errLocked()
 		o.mu.Unlock()
 		return err
 	}
-	if o.writing || o.pendingLocked() == 0 {
+	if o.writing || !o.ledger.Writable() {
 		o.mu.Unlock()
 		return nil
 	}
@@ -1060,6 +960,16 @@ func (o *Output) flush(mark int64) error {
 	return o.writeOut(batch)
 }
 
+// mayGoOnLocked reports whether the connection's goroutine need not wait for
+// another writer any longer: for a Drain once its Replies are out, otherwise
+// once its requests may be read.
+func (o *Output) mayGoOnLocked(drain bool) bool {
+	if drain {
+		return o.ledger.RepliesOut()
+	}
+	return o.ledger.Gate()
+}
+
 // writeOut is write to the socket of the goroutine mode, by the goroutine that
 // set writing. It hands the socket to the pump when more was queued than it
 // was to write, and closes the connection when the write fails.
@@ -1067,7 +977,7 @@ func (o *Output) writeOut(buffers int) error {
 	_, err := o.write(o.wire, buffers)
 	if errors.Is(err, errMoreQueued) {
 		o.mu.Lock()
-		if o.closed {
+		if o.ledger.Closed() {
 			o.stopWritingLocked()
 		} else {
 			o.startPumpLocked()

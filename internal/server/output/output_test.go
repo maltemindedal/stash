@@ -126,7 +126,7 @@ func newLoopOutput(shared *Shared) *Output {
 // decides when the connection's goroutine writes (Flush, Drain).
 func queuedReplies() *Shared {
 	shared := NewShared()
-	shared.writeThrough = math.MaxInt64
+	shared.limits.WriteThrough = math.MaxInt64
 	return shared
 }
 
@@ -334,7 +334,7 @@ func TestPushesHeldByARequestFollowItsReply(t *testing.T) {
 
 func TestAPushPastThePushLimitClosesTheConnection(t *testing.T) {
 	shared := NewShared()
-	shared.pushLimit = 64
+	shared.limits.PushLimit = 64
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(shared, wire)
 
@@ -365,8 +365,8 @@ func TestAPushPastThePushLimitClosesTheConnection(t *testing.T) {
 
 func TestThePushBudgetClosesTheConnectionWithTheMostWaiting(t *testing.T) {
 	shared := NewShared()
-	shared.pushLimit = 100
-	shared.replicaPushLimit = 1000
+	shared.limits.PushLimit = 100
+	shared.limits.ReplicaPushLimit = 1000
 	shared.pushBudget = 150
 
 	open := func() (*Output, *outputWire) {
@@ -998,7 +998,7 @@ func TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			shared := NewShared()
-			shared.pushLimit = outputHighWater
+			shared.limits.PushLimit = outputHighWater
 			out := newGoroutineOutput(shared, newStalledOutputWire())
 			defer out.Close(nil)
 
@@ -1085,7 +1085,7 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 // synchronise again from the start, for ever.
 func TestAReplicasSnapshotReplyIsNotCountedAgainstItsStreamLimit(t *testing.T) {
 	shared := NewShared()
-	shared.replicaPushLimit = 1000
+	shared.limits.ReplicaPushLimit = 1000
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(shared, wire)
 	defer out.Close(nil)

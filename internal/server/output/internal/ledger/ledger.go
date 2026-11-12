@@ -212,6 +212,10 @@ func (l *Ledger) Hold() {
 	}
 }
 
+// Holding reports whether a Push accepted now waits for the current request's
+// Reply. The Output asks it to know where the message's bytes go.
+func (l *Ledger) Holding() bool { return l.holding }
+
 // MarkReplica makes the connection a Replica's. A socket that is being
 // offered bytes at that moment has StallTimeout from now to take some.
 func (l *Ledger) MarkReplica(now Instant) Effects {

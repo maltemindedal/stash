@@ -61,7 +61,7 @@ func TestAnOutputRetainsTheWriteBufferTheEventLoopFills(t *testing.T) {
 
 	// drain flushes everything and returns the identity of the buffer it emptied.
 	drain := func() *byte {
-		identity := bufferIdentity(out.queued)
+		identity := bufferIdentity(out.bytes.queued)
 		serviceUntilWritten(t, out, io.Discard)
 		return identity
 	}
@@ -122,7 +122,7 @@ func TestAnOutputReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
 				t.Fatalf("peer received %d bytes, want %d", peer.total, wantTotal)
 			}
 
-			got := max(cap(out.queued), cap(out.inflight), cap(out.spare))
+			got := max(cap(out.bytes.queued), cap(out.bytes.inflight), cap(out.bytes.spare))
 			if tt.wantReleased && got > idleBufferCapBound {
 				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want at most %d", got, idleBufferCapBound)
 			}
@@ -172,8 +172,8 @@ func TestAnOutputKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *testing
 				}
 				// The identity is taken while the replies are buffered, since a buffer
 				// that has drained is empty.
-				identities = append(identities, bufferIdentity(out.queued))
-				caps = append(caps, cap(out.queued))
+				identities = append(identities, bufferIdentity(out.bytes.queued))
+				caps = append(caps, cap(out.bytes.queued))
 				serviceUntilWritten(t, out, io.Discard)
 			}
 

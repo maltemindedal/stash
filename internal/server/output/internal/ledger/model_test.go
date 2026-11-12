@@ -38,6 +38,7 @@ type machine interface {
 	Reply(n int64) Effects
 	Push(n int64) (bool, Effects)
 	Hold()
+	Holding() bool
 	MarkReplica(now Instant) Effects
 	Take(role Role, now Instant) (int64, Effects)
 	Took(n int64, now Instant) Effects
@@ -178,6 +179,9 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 		w.closed, w.wire, w.held, w.holding = true, "", "", false
 	}
 
+	if got := w.m.Holding(); got != w.holding {
+		return fmt.Sprintf("Holding() = %v, want %v: a Pushed message would go to the wrong side of the next Reply", got, w.holding)
+	}
 	if got := w.m.Closed(); got != w.closed {
 		return fmt.Sprintf("Closed() = %v, want %v", got, w.closed)
 	}
@@ -493,7 +497,8 @@ func (c *called) Push(n int64) (bool, Effects) {
 	c.calls["Push"]++
 	return c.Ledger.Push(n)
 }
-func (c *called) Hold() { c.calls["Hold"]++; c.Ledger.Hold() }
+func (c *called) Hold()         { c.calls["Hold"]++; c.Ledger.Hold() }
+func (c *called) Holding() bool { c.calls["Holding"]++; return c.Ledger.Holding() }
 func (c *called) MarkReplica(now Instant) Effects {
 	c.calls["MarkReplica"]++
 	return c.Ledger.MarkReplica(now)
