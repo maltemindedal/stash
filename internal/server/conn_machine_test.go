@@ -9,10 +9,12 @@ import (
 	"io"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 func echoRunner(t *testing.T) (ConnCommandRunner, *[]protocol.Value) {
@@ -545,8 +547,7 @@ func TestConnMachineWriteBufferLimitClosesOnOversizedResponses(t *testing.T) {
 	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
 		return []protocol.Value{protocol.BulkString{Data: bytes.Repeat([]byte("x"), 64)}}, nil
 	}
-	machine := NewConnMachine(nil)
-	machine.maxWriteBuffer = 32
+	machine, _ := newConnMachineWithReplyLimit(32)
 
 	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
 		t.Fatalf("Feed() error = %v", err)
@@ -556,6 +557,51 @@ func TestConnMachineWriteBufferLimitClosesOnOversizedResponses(t *testing.T) {
 	}
 	if machine.State() != ConnStateClosed {
 		t.Fatalf("State() = %d, want ConnStateClosed", machine.State())
+	}
+}
+
+// newConnMachineWithReplyLimit returns a machine, and its Output, that holds
+// no more than limit bytes before its latest Reply is out, where a server's
+// connections hold 512 MiB.
+func newConnMachineWithReplyLimit(limit int64) (*ConnMachine, *output.Output) {
+	out := output.NewPolled(output.NewShared(output.ReplyLimit(limit)), nil, discardLogger)
+	state := &ClientState{ID: 1}
+	state.BindOutput(out)
+	return NewConnMachine(state), out
+}
+
+// TestConnMachineWriteBufferLimitCountsOnlyWhatIsLeftBeforeTheLatestReply
+// queues a Reply that fits the limit on a connection with more than the limit
+// waiting in all, because of what was pushed to it behind the Reply: the stream
+// a Replica is sent while its full resync reply is produced, which that reply
+// releases. The limit is for Replies a client asks for without reading them.
+// It used to count everything that waited, so it closed a Replica whose
+// snapshot and stream together passed it, though each was within its own
+// limit, the stream's being the Replica Push limit.
+func TestConnMachineWriteBufferLimitCountsOnlyWhatIsLeftBeforeTheLatestReply(t *testing.T) {
+	const limit = 64
+	reply := protocol.BulkString{Data: bytes.Repeat([]byte("x"), 32)}
+	stream := strings.Repeat("s", 48)
+	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
+		return []protocol.Value{reply}, nil
+	}
+	machine, out := newConnMachineWithReplyLimit(limit)
+
+	out.HoldPushes()
+	if !out.Push([]byte(stream)) {
+		t.Fatalf("Push() = false, want the stream held: %v", out.Err())
+	}
+	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v with a %d byte reply and %d bytes pushed behind it, against a limit of %d on what is left to write before the reply is out; want both queued", err, len(reply.Data), len(stream), limit)
+	}
+	if machine.State() != ConnStateActive {
+		t.Fatalf("State() = %d, want the connection open", machine.State())
+	}
+	if got, want := string(flushAll(t, machine)), "$32\r\n"+string(reply.Data)+"\r\n"+stream; got != want {
+		t.Fatalf("flushed output = %q, want the reply and then the stream, %q", got, want)
 	}
 }
 
@@ -922,142 +968,6 @@ func TestConnMachineKeepsItsReadBufferWhileOrdinaryRequestsKeepArriving(t *testi
 	}
 }
 
-// countingDiscard drops what it is written and counts it. It accepts at most
-// limit bytes per Write, like a transport that applies backpressure.
-type countingDiscard struct {
-	limit int
-	total int
-}
-
-func (w *countingDiscard) Write(p []byte) (int, error) {
-	n := min(len(p), w.limit)
-	w.total += n
-	return n, nil
-}
-
-func TestConnMachineReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
-	// A connection that once sent a large value must not keep the buffer it grew
-	// to hold the reply once the reply has drained. A reply the machine would
-	// keep working memory for is kept, so the next one needs no new buffer.
-	tests := []struct {
-		name         string
-		replySize    int
-		writeLimit   int
-		wantReleased bool
-	}{
-		{name: "a large reply the peer accepts in one write", replySize: 32 << 20, writeLimit: 1 << 30, wantReleased: true},
-		{name: "a large reply the peer accepts a megabyte at a time", replySize: 32 << 20, writeLimit: 1 << 20, wantReleased: true},
-		{name: "a reply just over what the machine keeps", replySize: outputRetainedBuffer + 1, writeLimit: 1 << 30, wantReleased: true},
-		{name: "a reply of a megabyte keeps its buffer for the next one", replySize: 1 << 20, writeLimit: 1 << 30, wantReleased: false},
-		{name: "a small reply keeps its buffer for the next one", replySize: 1 << 10, writeLimit: 1 << 30, wantReleased: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reply := bytes.Repeat([]byte("x"), tt.replySize)
-			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
-				return []protocol.Value{protocol.BulkString{Data: reply}}, nil
-			}
-			machine := NewConnMachine(nil)
-			peer := &countingDiscard{limit: tt.writeLimit}
-
-			if err := machine.Feed(machineFrame("GET", "k")); err != nil {
-				t.Fatalf("Feed() error = %v", err)
-			}
-			if err := machine.ProcessPending(context.Background(), run); err != nil {
-				t.Fatalf("ProcessPending() error = %v", err)
-			}
-			if got := machine.PendingOutputBytes(); got < tt.replySize {
-				t.Fatalf("PendingOutputBytes() = %d, want the %d byte reply buffered", got, tt.replySize)
-			}
-
-			for machine.HasPendingOutput() {
-				if err := machine.Flush(peer); err != nil {
-					t.Fatalf("Flush() error = %v", err)
-				}
-			}
-			wantTotal := len(fmt.Sprintf("$%d\r\n", tt.replySize)) + tt.replySize + len("\r\n")
-			if peer.total != wantTotal {
-				t.Fatalf("peer received %d bytes, want %d", peer.total, wantTotal)
-			}
-
-			got := max(cap(machine.out.queued), cap(machine.out.inflight), cap(machine.out.spare))
-			if tt.wantReleased && got > idleBufferCapBound {
-				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want at most %d", got, idleBufferCapBound)
-			}
-			if !tt.wantReleased && (got == 0 || got > outputRetainedBuffer) {
-				t.Fatalf("write buffer capacity after the reply drained = %d bytes, want it kept for reuse and at most %d", got, outputRetainedBuffer)
-			}
-
-			// The released buffer is still good for the next output.
-			if !machine.out.Push([]byte("+later\r\n")) {
-				t.Fatal("Push() = false, want the later frame queued")
-			}
-			for machine.HasPendingOutput() {
-				if err := machine.Flush(peer); err != nil {
-					t.Fatalf("Flush() error = %v", err)
-				}
-			}
-			if peer.total != wantTotal+len("+later\r\n") {
-				t.Fatalf("peer received %d bytes after the later push, want %d", peer.total, wantTotal+len("+later\r\n"))
-			}
-		})
-	}
-}
-
-func TestConnMachineKeepsItsWriteBufferWhilePipelinedRepliesKeepDraining(t *testing.T) {
-	// A client that sends a pipeline of requests and reads all the replies before
-	// the next pipeline drains the buffer completely each time. That buffer is
-	// working memory, so replacing it after every pipeline would cost an
-	// allocation and a copy per pipeline.
-	tests := []struct {
-		name      string
-		count     int
-		replySize int
-	}{
-		{name: "100 replies of 1 KiB", count: 100, replySize: 1 << 10},
-		{name: "16 replies of 4 KiB", count: 16, replySize: 4 << 10},
-		{name: "16 replies of 64 KiB", count: 16, replySize: 64 << 10},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reply := bytes.Repeat([]byte("x"), tt.replySize)
-			run := func(context.Context, protocol.Value) ([]protocol.Value, error) {
-				return []protocol.Value{protocol.BulkString{Data: reply}}, nil
-			}
-			pipeline := bytes.Repeat(machineFrame("GET", "k"), tt.count)
-			machine := NewConnMachine(nil)
-
-			var identities []*byte
-			var caps []int
-			for round := 0; round < 20; round++ {
-				if err := machine.Feed(pipeline); err != nil {
-					t.Fatalf("Feed() error = %v", err)
-				}
-				if err := machine.ProcessPending(context.Background(), run); err != nil {
-					t.Fatalf("ProcessPending() error = %v", err)
-				}
-				// The identity is taken while the replies are buffered, since a buffer
-				// that has drained is empty.
-				identities = append(identities, bufferIdentity(machine.out.queued))
-				caps = append(caps, cap(machine.out.queued))
-				for machine.HasPendingOutput() {
-					if err := machine.Flush(io.Discard); err != nil {
-						t.Fatalf("Flush() error = %v", err)
-					}
-				}
-			}
-
-			// The output fills one buffer while it writes the other, so two buffers
-			// serve every pipeline; a third would be an allocation per pipeline.
-			if distinct := distinctBuffers(identities); distinct > 2 {
-				t.Fatalf("the output used %d buffers in %d pipelines (capacities %v)", distinct, len(identities), caps)
-			}
-		})
-	}
-}
-
 // liveHeapBytes reports the heap still reachable after a full collection.
 func liveHeapBytes() uint64 {
 	runtime.GC()
@@ -1089,13 +999,4 @@ func TestConnMachineReleasesAProcessedRequestWhileTheConnectionIdles(t *testing.
 	if after > before && after-before > valueSize/2 {
 		t.Fatalf("the idle machine keeps %d bytes reachable after a %d byte request has run, want it released", after-before, valueSize)
 	}
-}
-
-// distinctBuffers counts the different backing arrays among identities.
-func distinctBuffers(identities []*byte) int {
-	seen := make(map[*byte]struct{}, len(identities))
-	for _, identity := range identities {
-		seen[identity] = struct{}{}
-	}
-	return len(seen)
 }

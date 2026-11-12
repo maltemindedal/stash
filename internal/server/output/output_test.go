@@ -1,10 +1,12 @@
-package server
+package output
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -16,7 +18,8 @@ import (
 
 // outputWire is the socket of a connection served by its own goroutine, in
 // memory. While stalled, a write to it blocks, as a write to a peer that
-// stopped reading does, until the wire is closed.
+// stopped reading does, until the wire is closed or the write's deadline
+// passes.
 type outputWire struct {
 	mu         sync.Mutex
 	received   bytes.Buffer
@@ -29,10 +32,58 @@ type outputWire struct {
 	closed     chan struct{}
 	closeOnce  sync.Once
 	writeErr   error
+	// deadline is the write deadline, and deadlineSet is closed when it
+	// changes, so that a write that is blocked learns of it.
+	deadline    time.Time
+	deadlineSet chan struct{}
 }
 
 func newOutputWire() *outputWire {
-	return &outputWire{writeBegun: make(chan struct{}), closed: make(chan struct{})}
+	return &outputWire{writeBegun: make(chan struct{}), closed: make(chan struct{}), deadlineSet: make(chan struct{})}
+}
+
+// SetWriteDeadline ends a stalled write at t, as a net.Conn's does: also one
+// that began before the deadline was set.
+func (w *outputWire) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.deadline = t
+	close(w.deadlineSet)
+	w.deadlineSet = make(chan struct{})
+	return nil
+}
+
+// stall blocks until the wire is closed or its write deadline passes, and
+// returns what a write that took nothing until then returns.
+func (w *outputWire) stall() error {
+	for {
+		w.mu.Lock()
+		deadline, changed := w.deadline, w.deadlineSet
+		w.mu.Unlock()
+
+		var due <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			due = timer.C
+		}
+		select {
+		case <-w.closed:
+		case <-due:
+		case <-changed:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		select {
+		case <-w.closed:
+			return net.ErrClosed
+		default:
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return os.ErrDeadlineExceeded
+		}
+	}
 }
 
 func newStalledOutputWire() *outputWire {
@@ -50,8 +101,7 @@ func (w *outputWire) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	if stalled {
-		<-w.closed
-		return 0, net.ErrClosed
+		return 0, w.stall()
 	}
 
 	w.mu.Lock()
@@ -107,10 +157,35 @@ func (w *outputWire) isClosed() bool {
 	}
 }
 
-// newGoroutineOutput returns an Output written by the goroutine-mode driver to
-// wire, under the limits in shared.
-func newGoroutineOutput(shared *outputs, wire *outputWire) *Output {
-	return newOutput(shared, &goroutineOutputDriver{wire: wire}, discardLogger)
+// newGoroutineOutput returns the Output of a connection served by its own
+// goroutine, which writes to wire, under the limits in shared.
+func newGoroutineOutput(shared *Shared, wire *outputWire) *Output {
+	return NewBlocking(shared, wire, discardLogger)
+}
+
+// newLoopOutput returns the Output of a connection the Event loop serves,
+// under the limits in shared, with no loop behind it: it is written when the
+// test calls Service.
+func newLoopOutput(shared *Shared) *Output {
+	return NewPolled(shared, nil, discardLogger)
+}
+
+// backlog is how many bytes wait for the connection, as its Ledger counts
+// them. The package exports no count: outside it a caller asks a question
+// (Status, MayReadRequests).
+func (o *Output) backlog() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return int(o.ledger.Waiting())
+}
+
+// queuedReplies are the limits of a server whose connections never write a
+// Reply through: a Reply only queues, however much waits, so that a test
+// decides when the connection's goroutine writes (Flush, Drain).
+func queuedReplies() *Shared {
+	shared := NewShared()
+	shared.limits.WriteThrough = math.MaxInt64
+	return shared
 }
 
 // waitForOutput polls until done reports true, and fails the test with what it
@@ -145,7 +220,7 @@ func within(t *testing.T, what string, call func()) {
 
 func TestPipelinedRepliesLeaveInOneWrite(t *testing.T) {
 	wire := newOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(NewShared(), wire)
 
 	for i := 0; i < 50; i++ {
 		if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
@@ -165,7 +240,7 @@ func TestPipelinedRepliesLeaveInOneWrite(t *testing.T) {
 	if got := wire.writeCount(); got != 1 {
 		t.Fatalf("the socket was written %d times, want the 50 replies in one write", got)
 	}
-	if got := out.Backlog(); got != 0 {
+	if got := out.backlog(); got != 0 {
 		t.Fatalf("Backlog() = %d after the flush, want 0", got)
 	}
 	// Nothing queued is not an error.
@@ -174,9 +249,76 @@ func TestPipelinedRepliesLeaveInOneWrite(t *testing.T) {
 	}
 }
 
+// TestAReplyWritesThroughOnceEnoughIsWaiting is a connection's goroutine
+// running a pipeline whose Replies add up to more than outputWriteThrough. The
+// first ones wait for its next read. The Reply that brings what is waiting to
+// the mark writes them all, without a Flush.
+func TestAReplyWritesThroughOnceEnoughIsWaiting(t *testing.T) {
+	wire := newOutputWire()
+	out := newGoroutineOutput(NewShared(), wire)
+	defer out.Close(nil)
+
+	reply := protocol.BulkString{Data: make([]byte, outputWriteThrough/4)}
+	encoded, err := protocol.EncodeValues([]protocol.Value{reply})
+	if err != nil {
+		t.Fatalf("EncodeValues() error = %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := out.Reply(reply); err != nil {
+			t.Fatalf("Reply() error = %v", err)
+		}
+	}
+	if got := wire.writeCount(); got != 0 {
+		t.Fatalf("the socket was written %d times with %d bytes waiting, want the replies held back below %d", got, out.backlog(), outputWriteThrough)
+	}
+
+	if err := out.Reply(reply); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	if got, want := len(wire.sent()), 4*len(encoded); got != want {
+		t.Fatalf("%d bytes were written when the Reply that reached %d bytes waiting returned, want all %d", got, outputWriteThrough, want)
+	}
+	if got := wire.writeCount(); got != 1 {
+		t.Fatalf("the socket was written %d times, want the four replies in one write", got)
+	}
+}
+
+// TestAReplyThatWritesThroughWaitsAsAFlushDoes is a subscriber that reads
+// nothing, with twice the high-water mark of messages waiting ahead of its
+// next Reply. That Reply writes through, so the connection's goroutine waits
+// in it as it would in Flush, and its next request is not run. It waits until
+// the connection is closed.
+func TestAReplyThatWritesThroughWaitsAsAFlushDoes(t *testing.T) {
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(NewShared(), wire)
+	defer out.Close(nil)
+
+	if !out.Push(make([]byte, 2*outputHighWater)) {
+		t.Fatalf("Push() = false, want the messages queued: %v", out.Err())
+	}
+	<-wire.writeBegun // the pump has the socket
+	replied := make(chan error, 1)
+	go func() { replied <- out.Reply(protocol.SimpleString{Value: "PONG"}) }()
+	select {
+	case err := <-replied:
+		t.Fatalf("Reply() returned %v with more than 1 MiB to write before it is out, to a peer that is not reading, want it to wait", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	out.Close(nil)
+	select {
+	case err := <-replied:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Reply() error = %v after the connection was closed, want why it was closed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reply() still waiting after the connection was closed")
+	}
+}
+
 func TestAPushNeverWaitsForAStalledConnection(t *testing.T) {
 	wire := newStalledOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(NewShared(), wire)
 	defer out.Close(nil)
 
 	within(t, "a push to a connection that stopped reading", func() {
@@ -188,7 +330,7 @@ func TestAPushNeverWaitsForAStalledConnection(t *testing.T) {
 		}
 	})
 	<-wire.writeBegun
-	if got, want := out.Backlog(), 1000*len("+message\r\n"); got != want {
+	if got, want := out.backlog(), 1000*len("+message\r\n"); got != want {
 		t.Fatalf("Backlog() = %d, want the %d bytes pushed still waiting", got, want)
 	}
 
@@ -218,7 +360,7 @@ func TestPushesHeldByARequestFollowItsReply(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			wire := newOutputWire()
-			out := newGoroutineOutput(newOutputs(), wire)
+			out := newGoroutineOutput(NewShared(), wire)
 
 			// Held first, so that nothing is written before the reply is queued.
 			out.HoldPushes()
@@ -249,8 +391,8 @@ func TestPushesHeldByARequestFollowItsReply(t *testing.T) {
 }
 
 func TestAPushPastThePushLimitClosesTheConnection(t *testing.T) {
-	shared := newOutputs()
-	shared.pushLimit = 64
+	shared := NewShared()
+	shared.limits.PushLimit = 64
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(shared, wire)
 
@@ -265,24 +407,24 @@ func TestAPushPastThePushLimitClosesTheConnection(t *testing.T) {
 	if out.Push([]byte("+message\r\n")) {
 		t.Fatal("Push() = true with more than the push limit waiting, want the connection closed")
 	}
-	if err := out.Err(); !errors.Is(err, errPushLimitExceeded) {
-		t.Fatalf("Err() = %v, want errPushLimitExceeded", err)
+	if err := out.Err(); !errors.Is(err, ErrPushLimitExceeded) {
+		t.Fatalf("Err() = %v, want ErrPushLimitExceeded", err)
 	}
 	if !wire.isClosed() {
 		t.Fatal("the socket is open, want it closed with the Output")
 	}
-	if got := out.Backlog(); got != 0 {
+	if got := out.backlog(); got != 0 {
 		t.Fatalf("Backlog() = %d after the close, want what was waiting dropped", got)
 	}
-	if err := out.Reply(protocol.SimpleString{Value: "OK"}); !errors.Is(err, errPushLimitExceeded) {
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); !errors.Is(err, ErrPushLimitExceeded) {
 		t.Fatalf("Reply() after the close error = %v, want why it was closed", err)
 	}
 }
 
 func TestThePushBudgetClosesTheConnectionWithTheMostWaiting(t *testing.T) {
-	shared := newOutputs()
-	shared.pushLimit = 100
-	shared.replicaPushLimit = 1000
+	shared := NewShared()
+	shared.limits.PushLimit = 100
+	shared.limits.ReplicaPushLimit = 1000
 	shared.pushBudget = 150
 
 	open := func() (*Output, *outputWire) {
@@ -335,8 +477,8 @@ func TestThePushBudgetClosesTheConnectionWithTheMostWaiting(t *testing.T) {
 }
 
 func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
-	shared := newOutputs()
-	shared.stallTimeout = 30 * time.Millisecond
+	const stallTimeout = 30 * time.Millisecond
+	shared := NewShared(StallTimeout(stallTimeout))
 
 	t.Run("a replica that accepts nothing is closed", func(t *testing.T) {
 		wire := newStalledOutputWire()
@@ -347,8 +489,8 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 		}
 
 		waitForOutput(t, "the stalled replica to be closed", func() bool { return out.Err() != nil })
-		if err := out.Err(); !errors.Is(err, errReplicaStalled) {
-			t.Fatalf("Err() = %v, want errReplicaStalled", err)
+		if err := out.Err(); !errors.Is(err, ErrReplicaStalled) {
+			t.Fatalf("Err() = %v, want ErrReplicaStalled", err)
 		}
 		waitForOutput(t, "the socket to be closed with the Output", wire.isClosed)
 	})
@@ -363,8 +505,8 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 			if !out.Push([]byte("stream")) {
 				t.Fatalf("Push() = false in round %d, want the stream queued: %v", round, out.Err())
 			}
-			waitForOutput(t, "the stream to be written", func() bool { return out.Backlog() == 0 })
-			time.Sleep(shared.stallTimeout)
+			waitForOutput(t, "the stream to be written", func() bool { return out.backlog() == 0 })
+			time.Sleep(stallTimeout)
 		}
 		if err := out.Err(); err != nil {
 			t.Fatalf("Err() = %v, want a replica that is keeping up left open", err)
@@ -379,7 +521,7 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 			t.Fatal("Push() = false, want the message queued")
 		}
 
-		time.Sleep(4 * shared.stallTimeout)
+		time.Sleep(4 * stallTimeout)
 		if err := out.Err(); err != nil {
 			t.Fatalf("Err() = %v, want a subscriber closed only by its limits", err)
 		}
@@ -395,8 +537,8 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 // stall timeout before it was sent a byte. Once the Reply has released the
 // stream and a writer offers it to the socket, the rule counts.
 func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *testing.T) {
-	shared := newOutputs()
-	shared.stallTimeout = 30 * time.Millisecond
+	const stallTimeout = 30 * time.Millisecond
+	shared := NewShared(StallTimeout(stallTimeout))
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(shared, wire)
 	out.MarkReplica()
@@ -405,7 +547,7 @@ func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *te
 		t.Fatal("Push() = false, want the stream held")
 	}
 
-	time.Sleep(4 * shared.stallTimeout)
+	time.Sleep(4 * stallTimeout)
 	if err := out.Err(); err != nil {
 		t.Fatalf("Err() = %v with the stream held behind a reply that has not come, want the connection open", err)
 	}
@@ -414,8 +556,8 @@ func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *te
 		t.Fatalf("Reply() error = %v", err)
 	}
 	waitForOutput(t, "the replica that takes nothing of the reply to be closed", func() bool { return out.Err() != nil })
-	if err := out.Err(); !errors.Is(err, errReplicaStalled) {
-		t.Fatalf("Err() = %v, want errReplicaStalled", err)
+	if err := out.Err(); !errors.Is(err, ErrReplicaStalled) {
+		t.Fatalf("Err() = %v, want ErrReplicaStalled", err)
 	}
 }
 
@@ -437,22 +579,26 @@ func (nothingTaken) Write([]byte) (int, error) { return 0, nil }
 func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 	tests := []struct {
 		name string
-		open func(shared *outputs) (out *Output, offer func())
+		open func(shared *Shared) (out *Output, offer func())
 	}{
-		{name: "by the goroutine mode's driver", open: func(shared *outputs) (*Output, func()) {
+		{name: "by the goroutine mode's driver", open: func(shared *Shared) (*Output, func()) {
 			out := newGoroutineOutput(shared, newStalledOutputWire())
 			// The write blocks until the stall rule closes the connection.
 			return out, func() { go func() { _ = out.Flush() }() }
 		}},
-		{name: "by the Event loop's flush", open: func(shared *outputs) (*Output, func()) {
-			state := &ClientState{ID: 1}
-			out := newOutput(shared, unscheduledOutputDriver{}, discardLogger)
-			state.BindOutput(out)
-			machine := NewConnMachine(state)
+		{name: "by the Event loop's flush", open: func(shared *Shared) (*Output, func()) {
+			out := newLoopOutput(shared)
 			return out, func() {
-				if err := machine.Flush(nothingTaken{}); err != nil {
-					t.Errorf("Flush() error = %v, want a full socket left for later", err)
+				status := out.Service(nothingTaken{})
+				if err := status.Closed; err != nil {
+					t.Errorf("Service() closed the Output: %v, want a full socket left for later", err)
 				}
+				// The Event loop tries the socket again at the time the Service
+				// asked for, and that try is the stall rule's verdict.
+				go func() {
+					time.Sleep(time.Until(status.TryAgainAt))
+					out.Service(nothingTaken{})
+				}()
 			}
 		}},
 	}
@@ -460,8 +606,8 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			shared := newOutputs()
-			shared.stallTimeout = 30 * time.Millisecond
+			const stallTimeout = 30 * time.Millisecond
+			shared := NewShared(StallTimeout(stallTimeout))
 			out, offer := tt.open(shared)
 			defer out.Close(nil)
 
@@ -469,17 +615,112 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 				t.Fatalf("Reply() error = %v", err)
 			}
 			out.MarkReplica()
-			time.Sleep(4 * shared.stallTimeout)
+			time.Sleep(4 * stallTimeout)
 			if err := out.Err(); err != nil {
 				t.Fatalf("Err() = %v with a reply queued that no writer has offered to the socket, want the connection open", err)
 			}
 
 			offer()
 			waitForOutput(t, "the replica that takes nothing of what it is offered to be closed", func() bool { return out.Err() != nil })
-			if err := out.Err(); !errors.Is(err, errReplicaStalled) {
-				t.Fatalf("Err() = %v, want errReplicaStalled", err)
+			if err := out.Err(); !errors.Is(err, ErrReplicaStalled) {
+				t.Fatalf("Err() = %v, want ErrReplicaStalled", err)
 			}
 		})
+	}
+}
+
+// tricklingWire is the socket of a replica that reads slowly: of each write it
+// takes one byte at once and nothing more until the write's deadline, when the
+// write returns with that byte taken, as a net.Conn's does. A write with no
+// deadline never returns.
+type tricklingWire struct {
+	*outputWire
+}
+
+func (w *tricklingWire) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	w.received.WriteByte(p[0])
+	w.mu.Unlock()
+	if len(p) == 1 {
+		return 1, nil
+	}
+	return 1, w.stall()
+}
+
+// TestAReplicaThatTakesPartOfWhatItIsOfferedWithinTheStallTimeIsKept offers a
+// replica served by its own goroutine a stream that its socket takes one byte
+// of in each stall timeout, as a replica on a slow link takes its snapshot.
+// The stall rule is for a socket that takes nothing. In the default mode it
+// used to close a replica whose socket had not taken a whole write, up to
+// 1 MiB, within the timeout, where the Event loop kept one that took a byte.
+func TestAReplicaThatTakesPartOfWhatItIsOfferedWithinTheStallTimeIsKept(t *testing.T) {
+	const stallTimeout = 30 * time.Millisecond
+	wire := &tricklingWire{newOutputWire()}
+	out := NewBlocking(NewShared(StallTimeout(stallTimeout)), wire, discardLogger)
+	defer out.Close(nil)
+	out.MarkReplica()
+
+	const stream = "stream"
+	if !out.Push([]byte(stream)) {
+		t.Fatal("Push() = false, want the stream queued")
+	}
+	waitForOutput(t, "the replica to be sent its whole stream, or closed", func() bool {
+		return wire.sent() == stream || out.Err() != nil
+	})
+	if err := out.Err(); err != nil {
+		t.Fatalf("Err() = %v after the replica took %q of %q, a byte within each stall timeout of %v; want it kept", err, wire.sent(), stream, stallTimeout)
+	}
+}
+
+// TestFinishClosesAConnectionWhosePeerTakesNoneOfItsLastReplies queues a Reply
+// behind a Pushed message that the pump cannot write, because the peer reads
+// nothing, and finishes the connection, as its goroutine does when the peer
+// has shut its sending side. Finish used to wait for that Reply for as long as
+// the server ran. It is held to the stall rule now: the connection is closed
+// once its socket has taken nothing for the stall timeout.
+func TestFinishClosesAConnectionWhosePeerTakesNoneOfItsLastReplies(t *testing.T) {
+	const stallTimeout = 30 * time.Millisecond
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(NewShared(StallTimeout(stallTimeout)), wire)
+
+	if !out.Push([]byte("+message\r\n")) {
+		t.Fatal("Push() = false, want the message queued")
+	}
+	<-wire.writeBegun
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+
+	within(t, "Finish(), with a peer that takes nothing", out.Finish)
+	if !wire.isClosed() {
+		t.Fatal("the socket is open after Finish, want the connection closed")
+	}
+	if err := out.Err(); !errors.Is(err, errLastRepliesNotTaken) {
+		t.Fatalf("Err() = %v, want the connection closed because its peer took none of its last replies", err)
+	}
+}
+
+// TestFinishSendsAPeerThatKeepsReadingItsLastReplies is the peer that reads
+// slowly: of each write it takes a byte within the stall timeout. Finish waits
+// for it, however long the Replies take, and closes the connection when the
+// last of them is out.
+func TestFinishSendsAPeerThatKeepsReadingItsLastReplies(t *testing.T) {
+	const stallTimeout = 30 * time.Millisecond
+	wire := &tricklingWire{newOutputWire()}
+	out := NewBlocking(NewShared(StallTimeout(stallTimeout)), wire, discardLogger)
+
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	within(t, "Finish(), with a peer that reads a byte at a time", out.Finish)
+	if got, want := wire.sent(), "+OK\r\n"; got != want {
+		t.Fatalf("the peer was sent %q before the connection was closed, want all of %q", got, want)
+	}
+	if !wire.isClosed() {
+		t.Fatal("the socket is open after Finish, want the connection closed")
 	}
 }
 
@@ -515,7 +756,7 @@ func TestAClosedReplicasOutputIsNotKeptForTheStallTimeout(t *testing.T) {
 			func() {
 				wire := newStalledOutputWire()
 				runtime.SetFinalizer(wire, func(*outputWire) { close(collected) })
-				out := newGoroutineOutput(newOutputs(), wire)
+				out := newGoroutineOutput(NewShared(), wire)
 				if tt.markedFirst {
 					out.MarkReplica()
 				}
@@ -546,7 +787,7 @@ func TestAClosedReplicasOutputIsNotKeptForTheStallTimeout(t *testing.T) {
 
 func TestCloseDoesNotWaitForAStuckWrite(t *testing.T) {
 	wire := newStalledOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(NewShared(), wire)
 
 	if err := out.Reply(protocol.SimpleString{Value: "PONG"}); err != nil {
 		t.Fatalf("Reply() error = %v", err)
@@ -581,7 +822,7 @@ func TestCloseDoesNotWaitForAStuckWrite(t *testing.T) {
 func TestAFailedWriteClosesTheConnection(t *testing.T) {
 	wire := newOutputWire()
 	wire.writeErr = errors.New("connection reset by peer")
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(NewShared(), wire)
 
 	if !out.Push([]byte("+message\r\n")) {
 		t.Fatal("Push() = false, want the message queued")
@@ -596,7 +837,7 @@ func TestAFailedWriteClosesTheConnection(t *testing.T) {
 func TestEndStreamShutsTheWriteSideAfterWhatIsQueued(t *testing.T) {
 	t.Run("with output still queued", func(t *testing.T) {
 		wire := newOutputWire()
-		out := newGoroutineOutput(newOutputs(), wire)
+		out := newGoroutineOutput(NewShared(), wire)
 		defer out.Close(nil)
 
 		out.HoldPushes()
@@ -619,7 +860,7 @@ func TestEndStreamShutsTheWriteSideAfterWhatIsQueued(t *testing.T) {
 
 	t.Run("with nothing queued", func(t *testing.T) {
 		wire := newOutputWire()
-		out := newGoroutineOutput(newOutputs(), wire)
+		out := newGoroutineOutput(NewShared(), wire)
 		defer out.Close(nil)
 
 		out.EndStream()
@@ -632,7 +873,7 @@ func TestEndStreamShutsTheWriteSideAfterWhatIsQueued(t *testing.T) {
 
 func TestConcurrentPushesAndRepliesAllArriveWhole(t *testing.T) {
 	wire := newOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(NewShared(), wire)
 	defer out.Close(nil)
 
 	const pushers, each = 4, 500
@@ -730,7 +971,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			wire := newStalledOutputWire()
-			out := newGoroutineOutput(newOutputs(), wire)
+			out := newGoroutineOutput(queuedReplies(), wire)
 			defer out.Close(nil)
 
 			tt.queue(t, out)
@@ -745,7 +986,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 						t.Fatalf("Flush() error = %v, want what is queued left to the writer", err)
 					}
 				case <-time.After(5 * time.Second):
-					t.Fatalf("Flush() was still waiting after 5s with no more than 1 MiB to write before the connection's latest reply is out, and %d bytes waiting in all", out.Backlog())
+					t.Fatalf("Flush() was still waiting after 5s with no more than 1 MiB to write before the connection's latest reply is out, and %d bytes waiting in all", out.backlog())
 				}
 				return
 			}
@@ -774,7 +1015,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 // left is the pump's to write.
 func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t *testing.T) {
 	wire := newReplyReadingWire(outputHighWater)
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := NewBlocking(queuedReplies(), wire, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -790,7 +1031,7 @@ func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t
 	go func() { flushed <- out.Flush() }()
 	select {
 	case err := <-flushed:
-		t.Fatalf("Flush() returned %v with %d bytes to write before the reply is out and none of them read, want it to wait", err, out.Backlog())
+		t.Fatalf("Flush() returned %v with %d bytes to write before the reply is out and none of them read, want it to wait", err, out.backlog())
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -801,7 +1042,7 @@ func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t
 			t.Fatalf("Flush() error = %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("Flush() was still waiting 5s after the peer read %d bytes, which left %d to write before the reply is out", wire.receivedLen(), out.Backlog())
+		t.Fatalf("Flush() was still waiting 5s after the peer read %d bytes, which left %d to write before the reply is out", wire.receivedLen(), out.backlog())
 	}
 	if got := wire.receivedLen(); got != outputHighWater {
 		t.Fatalf("the peer had read %d bytes when Flush returned, want the %d that leave the reply within the mark", got, outputHighWater)
@@ -830,7 +1071,7 @@ func TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// The peer reads the messages, and nothing of the Reply until readOn.
 			wire := newReplyReadingWire(tt.ahead)
-			out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			out := NewBlocking(queuedReplies(), wire, discardLogger)
 			defer out.Close(nil)
 			defer wire.readOn()
 
@@ -844,7 +1085,7 @@ func TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply(t *testing.T) {
 			drained := make(chan struct{})
 			go func() {
 				defer close(drained)
-				out.Drain()
+				out.drain()
 			}()
 
 			close(wire.proceed)
@@ -876,7 +1117,7 @@ func TestDrainDoesNotWaitForWhatWasPushedAfterTheLatestReply(t *testing.T) {
 	const reply, stream = "+FULLRESYNC\r\n", 2 * outputHighWater
 	wire := newReplyReadingWire(len(reply))
 	close(wire.proceed)
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := NewBlocking(NewShared(), wire, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -890,8 +1131,8 @@ func TestDrainDoesNotWaitForWhatWasPushedAfterTheLatestReply(t *testing.T) {
 	}
 	waitForOutput(t, "the replica to read its reply", func() bool { return wire.receivedLen() == len(reply) })
 
-	within(t, "Drain() with the latest reply written and 2 MiB of the stream waiting", out.Drain)
-	if got := out.Backlog(); got != stream {
+	within(t, "Drain() with the latest reply written and 2 MiB of the stream waiting", out.drain)
+	if got := out.backlog(); got != stream {
 		t.Fatalf("Backlog() = %d when Drain returned, want the %d bytes of the stream still waiting", got, stream)
 	}
 }
@@ -906,7 +1147,7 @@ func TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits(t *testing.T) {
 		want  error
 	}{
 		{name: "by shutdown", want: net.ErrClosed, close: func(_ *testing.T, out *Output) { out.Close(nil) }},
-		{name: "by a push past its push limit", want: errPushLimitExceeded, close: func(t *testing.T, out *Output) {
+		{name: "by a push past its push limit", want: ErrPushLimitExceeded, close: func(t *testing.T, out *Output) {
 			if out.Push(make([]byte, outputHighWater)) {
 				t.Error("Push() = true past the push limit, want the connection closed")
 			}
@@ -916,8 +1157,8 @@ func TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			shared := newOutputs()
-			shared.pushLimit = outputHighWater
+			shared := NewShared()
+			shared.limits.PushLimit = outputHighWater
 			out := newGoroutineOutput(shared, newStalledOutputWire())
 			defer out.Close(nil)
 
@@ -930,7 +1171,7 @@ func TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits(t *testing.T) {
 			drained := make(chan struct{})
 			go func() {
 				defer close(drained)
-				out.Drain()
+				out.drain()
 			}()
 			select {
 			case <-drained:
@@ -966,7 +1207,7 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 		t.Fatalf("EncodeValues() error = %v", err)
 	}
 	wire := newReplyReadingWire(len(reply))
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := NewBlocking(queuedReplies(), wire, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -993,7 +1234,7 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 			t.Fatalf("Flush() error = %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("Flush() was still waiting 5s after the replica read its %d byte reply, with %d bytes of its stream waiting behind it", len(reply), out.Backlog())
+		t.Fatalf("Flush() was still waiting 5s after the replica read its %d byte reply, with %d bytes of its stream waiting behind it", len(reply), out.backlog())
 	}
 }
 
@@ -1003,8 +1244,8 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 // whose snapshot reached the limit at its first propagated write, and it would
 // synchronise again from the start, for ever.
 func TestAReplicasSnapshotReplyIsNotCountedAgainstItsStreamLimit(t *testing.T) {
-	shared := newOutputs()
-	shared.replicaPushLimit = 1000
+	shared := NewShared()
+	shared.limits.ReplicaPushLimit = 1000
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(shared, wire)
 	defer out.Close(nil)
@@ -1024,8 +1265,8 @@ func TestAReplicasSnapshotReplyIsNotCountedAgainstItsStreamLimit(t *testing.T) {
 	if out.Push(make([]byte, 200)) {
 		t.Fatal("Push() = true with 1100 bytes of stream waiting against a limit of 1000")
 	}
-	if err := out.Err(); !errors.Is(err, errPushLimitExceeded) {
-		t.Fatalf("Err() = %v, want errPushLimitExceeded", err)
+	if err := out.Err(); !errors.Is(err, ErrPushLimitExceeded) {
+		t.Fatalf("Err() = %v, want ErrPushLimitExceeded", err)
 	}
 }
 
@@ -1048,7 +1289,7 @@ func (w *slowOutputWire) Write(p []byte) (int, error) {
 // steady writes, its acknowledgements.
 func TestAFlushLeavesWhatIsPushedMeanwhileToThePump(t *testing.T) {
 	wire := &slowOutputWire{outputWire: *newOutputWire(), delay: 2 * time.Millisecond}
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := NewBlocking(queuedReplies(), wire, discardLogger)
 	defer out.Close(nil)
 
 	if err := out.Reply(protocol.BulkString{Data: make([]byte, 8<<10)}); err != nil {
@@ -1103,7 +1344,7 @@ func (w *heldOutputWire) Write(p []byte) (int, error) {
 // the batch that was being written, then everything queued behind it.
 func TestPushesBehindASlowSocketArriveInOrderInFewWrites(t *testing.T) {
 	wire := &heldOutputWire{outputWire: newOutputWire(), released: make(chan struct{})}
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := NewBlocking(NewShared(), wire, discardLogger)
 	defer out.Close(nil)
 
 	var want strings.Builder
@@ -1144,7 +1385,7 @@ func TestOutputIsWrittenInChunksSoTheStallRuleBoundsEachStretch(t *testing.T) {
 		write func(t *testing.T, wire *outputWire)
 	}{
 		{name: "by the goroutine mode's pump", write: func(t *testing.T, wire *outputWire) {
-			out := newGoroutineOutput(newOutputs(), wire)
+			out := newGoroutineOutput(NewShared(), wire)
 			t.Cleanup(func() { out.Close(nil) })
 			if !out.Push(make([]byte, total)) {
 				t.Fatalf("Push() = false, want it queued: %v", out.Err())
@@ -1152,13 +1393,12 @@ func TestOutputIsWrittenInChunksSoTheStallRuleBoundsEachStretch(t *testing.T) {
 			waitForOutput(t, "everything pushed to be written", func() bool { return len(wire.sent()) == total })
 		}},
 		{name: "by the Event loop's flush", write: func(t *testing.T, wire *outputWire) {
-			state := &ClientState{ID: 1}
-			machine := NewConnMachine(state)
-			if !state.Output().Push(make([]byte, total)) {
-				t.Fatalf("Push() = false, want it queued: %v", state.Output().Err())
+			out := newLoopOutput(NewShared())
+			if !out.Push(make([]byte, total)) {
+				t.Fatalf("Push() = false, want it queued: %v", out.Err())
 			}
-			if err := machine.Flush(wire); err != nil {
-				t.Fatalf("Flush() error = %v", err)
+			if err := out.Service(wire).Closed; err != nil {
+				t.Fatalf("Service() closed the Output: %v", err)
 			}
 		}},
 	}
@@ -1200,7 +1440,7 @@ func TestAPushKeepsNoReferenceToItsFrame(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			wire := newOutputWire()
-			out := newGoroutineOutput(newOutputs(), wire)
+			out := newGoroutineOutput(NewShared(), wire)
 			defer out.Close(nil)
 
 			if tt.held {
@@ -1235,7 +1475,7 @@ func TestAPushKeepsNoReferenceToItsFrame(t *testing.T) {
 // that comes afterwards is refused, so nothing of it reaches the socket.
 func TestPushesHeldWhenTheConnectionClosesAreNeverWritten(t *testing.T) {
 	wire := newOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(NewShared(), wire)
 
 	out.HoldPushes()
 	if !out.Push([]byte("+held\r\n")) {
@@ -1247,7 +1487,7 @@ func TestPushesHeldWhenTheConnectionClosesAreNeverWritten(t *testing.T) {
 	if !wire.isClosed() {
 		t.Fatal("the socket is open, want it closed with the Output")
 	}
-	if got := out.Backlog(); got != 0 {
+	if got := out.backlog(); got != 0 {
 		t.Fatalf("Backlog() = %d after the close, want what was held dropped", got)
 	}
 	if out.Push([]byte("+late\r\n")) {
@@ -1272,7 +1512,7 @@ var outputDrivers = []struct {
 	open func(t *testing.T, wire *outputWire) (out *Output, send func(want int))
 }{
 	{name: "by the goroutine mode's driver", open: func(t *testing.T, wire *outputWire) (*Output, func(int)) {
-		out := newGoroutineOutput(newOutputs(), wire)
+		out := newGoroutineOutput(NewShared(), wire)
 		t.Cleanup(func() { out.Close(nil) })
 		return out, func(want int) {
 			if err := out.Flush(); err != nil {
@@ -1282,11 +1522,10 @@ var outputDrivers = []struct {
 		}
 	}},
 	{name: "by the Event loop's flush", open: func(t *testing.T, wire *outputWire) (*Output, func(int)) {
-		state := &ClientState{ID: 1}
-		machine := NewConnMachine(state)
-		return state.Output(), func(int) {
-			if err := machine.Flush(wire); err != nil {
-				t.Fatalf("Flush() error = %v", err)
+		out := newLoopOutput(NewShared())
+		return out, func(int) {
+			if err := out.Service(wire).Closed; err != nil {
+				t.Fatalf("Service() closed the Output: %v", err)
 			}
 		}
 	}},
@@ -1389,7 +1628,7 @@ func TestALargeReplyKeepsItsPlaceAmongWhatIsQueued(t *testing.T) {
 					if got := wire.sent(); got != tt.want {
 						t.Fatalf("sent %d bytes that differ from the %d queued, in the order they were queued, at byte %d", len(got), len(tt.want), firstDifference(got, tt.want))
 					}
-					waitForOutput(t, "the backlog to count everything as written", func() bool { return out.Backlog() == 0 })
+					waitForOutput(t, "the backlog to count everything as written", func() bool { return out.backlog() == 0 })
 				})
 			}
 		})
@@ -1412,7 +1651,7 @@ func firstDifference(a, b string) int {
 // took the socket, the Reply queued whole included.
 func TestAFlushWritesEveryReplyQueuedBeforeIt(t *testing.T) {
 	wire := newOutputWire()
-	out := newGoroutineOutput(newOutputs(), wire)
+	out := newGoroutineOutput(queuedReplies(), wire)
 	defer out.Close(nil)
 
 	large := protocol.BulkString{Data: make([]byte, outputRetainedBuffer)}
@@ -1524,7 +1763,7 @@ func TestAFlushWritesNothingThatWasPushedDuringIt(t *testing.T) {
 				t.Fatalf("EncodeValues() error = %v", err)
 			}
 			wire := newReplyReadingWire(len(replies))
-			out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			out := NewBlocking(queuedReplies(), wire, discardLogger)
 			defer out.Close(nil)
 			defer wire.readOn()
 
@@ -1568,20 +1807,6 @@ func TestAFlushWritesNothingThatWasPushedDuringIt(t *testing.T) {
 	}
 }
 
-// lockHoldingDriver is a driver whose schedule waits until it is released. An
-// Output calls schedule with its lock held, so a Push to an Output it drives
-// stays inside that lock, where a test can keep it.
-type lockHoldingDriver struct {
-	unscheduledOutputDriver
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (d *lockHoldingDriver) schedule(*Output) {
-	close(d.entered)
-	<-d.release
-}
-
 // allocatedBytes is how many bytes the process has allocated so far.
 func allocatedBytes() uint64 {
 	var stats runtime.MemStats
@@ -1596,12 +1821,17 @@ func allocatedBytes() uint64 {
 // replication Master pushes a Replica's stream under its own lock, where every
 // writer waits: a write waited two seconds for a 384 MiB snapshot.
 func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
-	driver := &lockHoldingDriver{entered: make(chan struct{}), release: make(chan struct{})}
-	out := newOutput(newOutputs(), driver, discardLogger)
+	// An Output asks for the Event loop's attention with its lock held, so a
+	// Push whose call for attention waits stays inside that lock.
+	entered, release := make(chan struct{}), make(chan struct{})
+	out := NewPolled(NewShared(), func() {
+		close(entered)
+		<-release
+	}, discardLogger)
 
 	pushed := make(chan bool, 1)
 	go func() { pushed <- out.Push([]byte("+write\r\n")) }()
-	<-driver.entered
+	<-entered
 
 	snapshot := protocol.BulkString{Data: make([]byte, 16<<20)}
 	before := allocatedBytes()
@@ -1617,7 +1847,7 @@ func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
 	default:
 	}
 
-	close(driver.release)
+	close(release)
 	if !<-pushed {
 		t.Fatal("Push() = false, want it queued")
 	}
@@ -1629,8 +1859,8 @@ func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
 		t.Fatalf("EncodeValues() error = %v", err)
 	}
 	wire := newOutputWire()
-	if err := out.writeTo(wire); err != nil {
-		t.Fatalf("writeTo() error = %v", err)
+	if status := out.Service(wire); status.Closed != nil || status.WantWrite {
+		t.Fatalf("Service() = %+v, want everything written to a socket that takes it", status)
 	}
 	if got := wire.sent(); got != "+write\r\n"+string(want) {
 		t.Fatalf("sent %d bytes, want the push and then the %d bytes of the reply", len(got), len(want))
@@ -1644,9 +1874,7 @@ func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
 func TestAReplyReleasesLargeHeldPushesWithoutCopyingThem(t *testing.T) {
 	const held = 8 << 20
 	wire := newOutputWire()
-	state := &ClientState{ID: 1}
-	machine := NewConnMachine(state)
-	out := state.Output()
+	out := newLoopOutput(NewShared())
 
 	out.HoldPushes()
 	frame := bytes.Repeat([]byte("s"), 1<<20)
@@ -1664,29 +1892,45 @@ func TestAReplyReleasesLargeHeldPushesWithoutCopyingThem(t *testing.T) {
 		t.Fatalf("the Reply allocated %d bytes to release %d bytes of held pushes, want them queued without a copy", allocated, held)
 	}
 
-	if err := machine.Flush(wire); err != nil {
-		t.Fatalf("Flush() error = %v", err)
+	if err := out.Service(wire).Closed; err != nil {
+		t.Fatalf("Service() closed the Output: %v", err)
 	}
 	if got, want := wire.sent(), "+OK\r\n"+strings.Repeat("s", held); got != want {
 		t.Fatalf("sent %d bytes, want the reply and then the %d bytes held behind it", len(got), held)
 	}
 }
 
-// TestAClientWithNoOutputIsAClosedConnectionToTheMaster hands the Master the
-// Output of a Client state that was never bound to a connection, which is nil,
-// as PSYNC would. Attaching it does nothing to it, it refuses the first frame
-// with the cause of a closed connection, and so the Master detaches the
-// Replica as one whose connection ended.
-func TestAClientWithNoOutputIsAClosedConnectionToTheMaster(t *testing.T) {
-	out := (&ClientState{ID: 1}).Output()
-
-	out.MarkReplica()
-	out.HoldPushes()
-	out.EndStream()
-	if out.Push([]byte("+message\r\n")) {
-		t.Fatal("Push() = true for a client with no connection, want it refused")
+// TestAReplicaOnARealSocketThatStopsReadingIsClosedByTheStallRule runs the
+// stall rule against a TCP connection, whose write deadline is what ends a
+// blocking write in the default mode: the in-memory wires above only imitate
+// one. The replica reads nothing, so its socket takes what its buffers hold
+// and then no more.
+func TestAReplicaOnARealSocketThatStopsReadingIsClosedByTheStallRule(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
 	}
-	if err := out.Err(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Err() = %v, want a closed connection's", err)
+	defer func() { _ = listener.Close() }()
+	replica, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() { _ = replica.Close() }()
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+
+	out := NewBlocking(NewShared(StallTimeout(100*time.Millisecond)), conn, discardLogger)
+	defer out.Close(nil)
+	out.MarkReplica()
+	// More than the two sockets' buffers hold, and less than the replica limit.
+	if !out.Push(make([]byte, 64<<20)) {
+		t.Fatalf("Push() = false, want the stream queued: %v", out.Err())
+	}
+
+	waitForOutput(t, "the replica that reads nothing to be closed", func() bool { return out.Err() != nil })
+	if err := out.Err(); !errors.Is(err, ErrReplicaStalled) {
+		t.Fatalf("Err() = %v, want ErrReplicaStalled", err)
 	}
 }

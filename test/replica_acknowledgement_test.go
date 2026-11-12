@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 )
 
@@ -42,21 +43,23 @@ func TestTheMasterReadsAReplicasAcknowledgementsWhileItsStreamWaits(t *testing.T
 		{name: "writes are made while the full resync reply is produced", writeDuringAttach: true},
 	}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			acknowledgeBehindAWaitingStream(t, tt.writeDuringAttach)
-		})
-	}
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				acknowledgeBehindAWaitingStream(t, cfg, tt.writeDuringAttach)
+			})
+		}
+	})
 }
 
-func acknowledgeBehindAWaitingStream(t *testing.T, writeDuringAttach bool) {
+func acknowledgeBehindAWaitingStream(t *testing.T, cfg config.Config, writeDuringAttach bool) {
 	t.Helper()
 
 	const megabyte = 1 << 20
 	const deadline = 20 * time.Second
 
-	addr, cancel, errCh := startTestServer(t, defaultTestConfig())
+	addr, cancel, errCh := startTestServer(t, cfg)
 	defer func() {
 		cancel()
 		waitForServerStop(t, errCh)
@@ -166,6 +169,22 @@ func acknowledgeBehindAWaitingStream(t *testing.T, writeDuringAttach bool) {
 	}
 	if err := protocol.WriteValue(replica, request("REPLCONF", "ACK", strconv.Itoa(upTo))); err != nil {
 		t.Fatalf("WriteValue(REPLCONF ACK) error = %v", err)
+	}
+
+	if cfg.EventLoop {
+		// WAIT does not block on the Event loop, so read the replica's offset
+		// as the master counts it: it stays 0 until the acknowledgement is read.
+		limit := time.Now().Add(deadline)
+		for {
+			fields := infoFields(t, writer, writerParser, "replication")
+			if !strings.HasSuffix(fields["slave0"], ",offset=0") && fields["slave0"] != "" {
+				return
+			}
+			if time.Now().After(limit) {
+				t.Fatalf("INFO replication slave0 = %q %v after the replica acknowledged the first %d bytes of the stream: the master has not read the acknowledgement, sent while 32 MiB more of the stream waits for the replica", fields["slave0"], deadline, upTo)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 
 	if err := writer.SetReadDeadline(time.Now().Add(deadline)); err != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/maltemindedal/stash/internal/config"
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/server"
+	"github.com/maltemindedal/stash/internal/server/output"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -154,7 +155,7 @@ func TestEveryFrameCountedWhileAReplicaAttachesIsBelowItsBaseOrSentToIt(t *testi
 				id := uint64(1000 + i)
 				stream := &replicaStream{}
 				state := newTestClientState(executor, id)
-				state.BindOutput(server.NewOutput(stream))
+				state.BindOutput(output.New(stream))
 				result, err := handle(withClient(context.Background(), state), executor, requestValue("PSYNC", "?", "-1"), true)
 				if err != nil || len(result.Responses) != 2 {
 					t.Fatalf("PSYNC: %d replies, error = %v; want the full resync reply", len(result.Responses), err)

@@ -12,6 +12,7 @@ import (
 	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/replication"
+	"github.com/maltemindedal/stash/internal/server/output"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -34,7 +35,7 @@ func MultiResponse(values ...protocol.Value) ExecuteResult {
 
 // A connection's Output is the Master's port to it once PSYNC has made the
 // connection a Replica's: a method renamed on either side is a compile error.
-var _ replication.Output = (*Output)(nil)
+var _ replication.Output = (*output.Output)(nil)
 
 // replicaDropped logs a Replica the Master detached because its Output refused
 // a frame of the stream. It is the Master's dropped handler, so it is called
@@ -59,7 +60,7 @@ func (s *Server) replicaDropped(replica *replication.Replica, cause error) {
 // Push limit allows, or it accepted nothing for the stall timeout. Anything
 // else means its connection ended.
 func replicaFellBehind(cause error) bool {
-	return errors.Is(cause, errPushLimitExceeded) || errors.Is(cause, errReplicaStalled)
+	return errors.Is(cause, output.ErrPushLimitExceeded) || errors.Is(cause, output.ErrReplicaStalled)
 }
 
 // startReplicaLink keeps the replica attached to its master (replication.Follow) until ctx

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 // ConnMachineState identifies the lifecycle phase of a connection state machine.
@@ -28,12 +30,6 @@ const (
 // exhausting memory with an oversized or never-terminated frame. It mirrors the
 // role of Redis's proto-max-bulk-len query-buffer limit.
 const defaultMaxReadBuffer = 512 * 1024 * 1024
-
-// defaultMaxWriteBuffer bounds the response bytes buffered for a client that
-// is not draining its socket, so a stalled or slow consumer is disconnected
-// instead of growing server memory without limit. It mirrors the role of
-// Redis's client-output-buffer-limit.
-const defaultMaxWriteBuffer = 512 * 1024 * 1024
 
 // retainedReadBufferCap is the capacity above which the machine releases its
 // read buffer once only a small remainder is left in it. The buffer grows to hold
@@ -86,16 +82,15 @@ type connEvent struct {
 // under its own lock.
 type ConnMachine struct {
 	client *ClientState
-	out    *Output
+	out    *output.Output
 
-	state          ConnMachineState
-	err            error
-	readBuf        []byte
-	decoder        protocol.Decoder
-	resumeAt       int
-	maxReadBuffer  int
-	maxWriteBuffer int
-	pending        []connEvent
+	state         ConnMachineState
+	err           error
+	readBuf       []byte
+	decoder       protocol.Decoder
+	resumeAt      int
+	maxReadBuffer int
+	pending       []connEvent
 
 	// requestLimits, when set, is asked before each frame is decoded what that
 	// frame may declare. decodePaused is set after a frame was decoded under
@@ -105,22 +100,24 @@ type ConnMachine struct {
 	decodePaused  bool
 }
 
+// discardLogger is the logger of an Output that no server's connection owns.
+var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
 // NewConnMachine constructs an active connection state machine bound to the
 // connection-scoped client state, writing through the Output bound to it. A
-// client with none is given one that is written only by Flush.
+// client with none is given one that is written only by Service and Flush.
 func NewConnMachine(client *ClientState) *ConnMachine {
 	out := client.Output()
 	if out == nil {
-		out = newOutput(newOutputs(), unscheduledOutputDriver{}, discardLogger)
+		out = output.NewPolled(output.NewShared(), nil, discardLogger)
 		if client != nil {
 			client.BindOutput(out)
 		}
 	}
 	return &ConnMachine{
-		client:         client,
-		out:            out,
-		maxReadBuffer:  defaultMaxReadBuffer,
-		maxWriteBuffer: defaultMaxWriteBuffer,
+		client:        client,
+		out:           out,
+		maxReadBuffer: defaultMaxReadBuffer,
 	}
 }
 
@@ -145,14 +142,15 @@ func (m *ConnMachine) PendingRequests() int {
 	return count
 }
 
-// HasPendingOutput reports whether buffered response bytes await flushing.
+// HasPendingOutput reports whether output waits for the socket.
 func (m *ConnMachine) HasPendingOutput() bool {
-	return m.PendingOutputBytes() > 0
+	return m.out.Status().WantWrite
 }
 
-// PendingOutputBytes reports how many buffered response bytes await flushing.
-func (m *ConnMachine) PendingOutputBytes() int {
-	return m.out.Backlog()
+// MayReadRequests reports whether the connection's requests may be read and
+// run, by the rule Output.MayReadRequests applies in both networking modes.
+func (m *ConnMachine) MayReadRequests() bool {
+	return m.out.MayReadRequests()
 }
 
 // Feed appends readable bytes to the read buffer and parses every complete
@@ -338,25 +336,30 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	return len(m.pending) > 0, nil
 }
 
-// Flush writes the connection's pending output to w and consumes whatever w
-// accepts, so a partial write leaves the remainder for a later call
-// (Output.writeTo). Once a closing machine has drained its parsed requests and
-// pending output, Flush completes the transition to the closed state.
+// Service writes the connection's pending output to w, consumes whatever w
+// accepts, so a partial write leaves the remainder for a later call, and
+// reports where the connection's Output stands (Output.Service). It closes the
+// machine when the Output is closed, by a failed write or from elsewhere. Once
+// a closing machine has drained its parsed requests and pending output, Service
+// completes the transition to the closed state.
+func (m *ConnMachine) Service(w io.Writer) output.Status {
+	status := m.out.Service(w)
+	switch {
+	case status.Closed != nil:
+		m.Close(status.Closed)
+	case m.state == ConnStateClosing && !status.WantWrite && len(m.pending) == 0:
+		m.Close(nil)
+	}
+	return status
+}
+
+// Flush is Service for a caller that only needs to know whether the
+// connection failed.
 func (m *ConnMachine) Flush(w io.Writer) error {
 	if m.state == ConnStateClosed {
 		return ErrConnMachineClosed
 	}
-
-	// A writer that took only part of the output is not a failed one.
-	if err := m.out.writeTo(w); err != nil && !errors.Is(err, io.ErrShortWrite) {
-		return err
-	}
-
-	if m.state == ConnStateClosing && !m.HasPendingOutput() && len(m.pending) == 0 {
-		m.Close(nil)
-	}
-
-	return nil
+	return m.Service(w).Closed
 }
 
 // Close transitions to the closed state, discards buffered input, closes the
@@ -380,13 +383,9 @@ func (m *ConnMachine) Close(err error) {
 
 // bufferResponses queues the Replies to the request that just ran, which may
 // be none: the Output releases the Pushed messages that request held either
-// way.
+// way. A Reply that leaves more to write before it is out than a connection
+// of the Event loop may hold closes the Output, which Reply reports
+// (output.ReplyLimit).
 func (m *ConnMachine) bufferResponses(values []protocol.Value) error {
-	if err := m.out.Reply(values...); err != nil {
-		return err
-	}
-	if m.PendingOutputBytes() > m.maxWriteBuffer {
-		return fmt.Errorf("server: pending output exceeds %d byte write-buffer limit", m.maxWriteBuffer)
-	}
-	return nil
+	return m.out.Reply(values...)
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/maltemindedal/stash/internal/record/recordtest"
 	"github.com/maltemindedal/stash/internal/replication"
 	"github.com/maltemindedal/stash/internal/server"
+	"github.com/maltemindedal/stash/internal/server/output"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -2384,7 +2385,7 @@ func TestExecutorPubSub(t *testing.T) {
 		state := newTestClientState(executor, 1)
 		outbound, subscriber := net.Pipe()
 		defer func() { _ = subscriber.Close() }()
-		state.BindOutput(server.NewOutput(outbound))
+		state.BindOutput(output.New(outbound))
 		defer state.Output().Close(nil)
 		ctx := withClient(context.Background(), state)
 
@@ -2594,7 +2595,7 @@ func BenchmarkExecutorPublish(b *testing.B) {
 			executor := newTestExecutor()
 			for i := 0; i < subscriberCount; i++ {
 				state := newTestClientState(executor, uint64(i+1))
-				state.BindOutput(server.NewOutput(io.Discard))
+				state.BindOutput(output.New(io.Discard))
 				ctx := withClient(context.Background(), state)
 				if _, err := handle(ctx, executor, requestValue("SUBSCRIBE", "news"), false); err != nil {
 					b.Fatalf("SUBSCRIBE error = %v", err)
@@ -3171,7 +3172,7 @@ func newTestClientState(executor *Executor, id uint64) *server.ClientState {
 func newReplicaPeerStateForExecutor(executor *Executor, id uint64, conn net.Conn) *server.ClientState {
 	state := newTestClientState(executor, id)
 	state.PromoteToReplica()
-	state.BindOutput(server.NewOutput(conn))
+	state.BindOutput(output.New(conn))
 	return state
 }
 

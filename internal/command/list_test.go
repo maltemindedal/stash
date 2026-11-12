@@ -9,6 +9,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/server"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *testing.T) {
@@ -22,7 +23,7 @@ func TestAWokenBLPopDoesNotPopForAClientThatLeftWhileItWaitedForThePusher(t *tes
 	executor, log, stream := newRecordingTestExecutor(nil)
 	client, conn := tcpPair(t)
 	state := newTestClientState(executor, 1)
-	state.BindOutput(server.NewOutput(conn))
+	state.BindOutput(output.New(conn))
 	ctx, cancel := context.WithCancel(withClient(context.Background(), state))
 	defer cancel()
 

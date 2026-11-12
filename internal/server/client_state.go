@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sort"
 	"sync"
+
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 // QueuedCommand stores command metadata queued for transactional EXEC.
@@ -30,7 +32,7 @@ type ClientState struct {
 	monitorRegistry    *MonitorRegistry
 	// out is the connection's Client output, which the registries push to. It is
 	// bound once, before the Client state is shared.
-	out *Output
+	out *output.Output
 
 	Authenticated     bool
 	Replica           bool
@@ -93,13 +95,13 @@ func (s *ClientState) SetMonitorRegistry(registry *MonitorRegistry) {
 
 // BindOutput binds the connection's Client output. It is called once, before
 // the Client state is used by a request or entered in a registry.
-func (s *ClientState) BindOutput(out *Output) {
+func (s *ClientState) BindOutput(out *output.Output) {
 	s.out = out
 }
 
 // Output returns the connection's Client output, or nil when the Client state
 // has none (a nil Client state, or one built without a connection).
-func (s *ClientState) Output() *Output {
+func (s *ClientState) Output() *output.Output {
 	if s == nil {
 		return nil
 	}

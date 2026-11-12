@@ -18,6 +18,7 @@ import (
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
 	"github.com/maltemindedal/stash/internal/replication"
+	"github.com/maltemindedal/stash/internal/server/output"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
@@ -31,8 +32,8 @@ func TestAReplicaWhoseSocketFailsIsDetachedWhenTheNextFrameIsPushed(t *testing.T
 	srv := newTestServer(t, config.Config{}, logger, storage.NewStore(), nil)
 
 	healthy := &recordingConn{}
-	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: NewOutput(healthy)})
-	failing := NewOutput(&stubConn{writeErr: errors.New("write boom")})
+	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: output.New(healthy)})
+	failing := output.New(&stubConn{writeErr: errors.New("write boom")})
 	srv.master.Add(replication.Candidate{ID: 2, ListeningPort: 6381, Out: failing})
 
 	srv.master.Propagate([]byte("+one\r\n"), true)
@@ -70,8 +71,8 @@ func TestAReplicaDetachedForRefusingAFrameIsLoggedByWhyItsOutputClosed(t *testin
 		{name: "the connection was closed", cause: net.ErrClosed, wantLog: "replica disconnected"},
 		{name: "the replica reset the connection", cause: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrClosedPipe}, wantLog: "replica disconnected"},
 		{name: "the connection was torn down", cause: nil, wantLog: "replica disconnected"},
-		{name: "its stream passed the push limit", cause: fmt.Errorf("%w: 268435457 bytes against a limit of 268435456", errPushLimitExceeded), wantLog: "dropping a replica"},
-		{name: "it accepted nothing for the stall timeout", cause: fmt.Errorf("%w of 30s", errReplicaStalled), wantLog: "dropping a replica"},
+		{name: "its stream passed the push limit", cause: fmt.Errorf("%w: 268435457 bytes against a limit of 268435456", output.ErrPushLimitExceeded), wantLog: "dropping a replica"},
+		{name: "it accepted nothing for the stall timeout", cause: fmt.Errorf("%w of 30s", output.ErrReplicaStalled), wantLog: "dropping a replica"},
 	}
 
 	for _, tt := range tests {
@@ -80,7 +81,7 @@ func TestAReplicaDetachedForRefusingAFrameIsLoggedByWhyItsOutputClosed(t *testin
 			var logs bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&logs, nil))
 			srv := newTestServer(t, config.Config{}, logger, storage.NewStore(), nil)
-			out := NewOutput(&recordingConn{})
+			out := output.New(&recordingConn{})
 			srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 			out.Close(tt.cause)
 
@@ -114,13 +115,13 @@ func TestAReplicaDetachedForRefusingAFrameIsLoggedByWhyItsOutputClosed(t *testin
 func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T) {
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), nil)
 	wire := newOutputWire()
-	out := newGoroutineOutput(srv.outputs, wire)
+	out := newGoroutineOutput(output.NewShared(), wire)
 	defer out.Close(nil)
 
 	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	srv.master.Propagate([]byte(fullResyncStreamFrame), true)
-	if got := out.Backlog(); got != len(fullResyncStreamFrame) {
-		t.Fatalf("Backlog() = %d before the reply, want the %d bytes of the write waiting", got, len(fullResyncStreamFrame))
+	if got, err := wire.sent(), out.Err(); got != "" || err != nil || out.Status().WantWrite {
+		t.Fatalf("sent %q before the reply, with Err() = %v and output for the socket = %v; want the %d bytes of the write waiting behind the reply", got, err, out.Status().WantWrite, len(fullResyncStreamFrame))
 	}
 
 	reply := attachment.Reply()
@@ -148,9 +149,8 @@ func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T)
 func TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce(t *testing.T) {
 	var logs bytes.Buffer
 	srv := newTestServer(t, config.Config{}, slog.New(slog.NewTextHandler(&logs, nil)), storage.NewStore(), nil)
-	srv.outputs.replicaPushLimit = 64
 	wire := newOutputWire()
-	out := newGoroutineOutput(srv.outputs, wire)
+	out := newGoroutineOutput(output.NewShared(output.ReplicaPushLimit(64)), wire)
 
 	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	srv.master.Propagate(make([]byte, 40), true)
@@ -162,8 +162,8 @@ func TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce(t *testing.T)
 	if !wire.isClosed() {
 		t.Fatal("the socket is open with 80 bytes of stream waiting against a limit of 64, want it closed at once")
 	}
-	if err := out.Err(); !errors.Is(err, errPushLimitExceeded) {
-		t.Fatalf("Err() = %v, want errPushLimitExceeded", err)
+	if err := out.Err(); !errors.Is(err, output.ErrPushLimitExceeded) {
+		t.Fatalf("Err() = %v, want output.ErrPushLimitExceeded", err)
 	}
 	if got := srv.master.Count(); got != 0 {
 		t.Fatalf("%d replicas registered after the limit was passed, want 0", got)
@@ -172,7 +172,7 @@ func TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce(t *testing.T)
 		t.Fatalf("logged \"dropping a replica\" %d times and \"replica disconnected\" %d times, want 1 and 0\nlogs:\n%s", dropped, disconnected, logs.String())
 	}
 
-	if err := out.Reply(attachment.Reply()...); !errors.Is(err, errPushLimitExceeded) {
+	if err := out.Reply(attachment.Reply()...); !errors.Is(err, output.ErrPushLimitExceeded) {
 		t.Fatalf("Reply() of the full resync error = %v, want it refused for the limit", err)
 	}
 	if got := wire.sent(); got != "" {
@@ -315,7 +315,7 @@ func requestFrame(parts ...string) protocol.Array {
 // race detector reports that, so this test is meaningful under -race.
 func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	srv := newTestServer(t, config.Default(), slog.New(slog.NewTextHandler(io.Discard, nil)), storage.NewStore(), stubExecutor{})
-	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: NewOutput(io.Discard)})
+	srv.master.Add(replication.Candidate{ID: 1, ListeningPort: 6380, Out: output.New(io.Discard)})
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -346,4 +346,23 @@ func TestServerStatsConcurrentWithAckUpdates(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestAClientWithNoOutputIsAClosedConnectionToTheMaster hands the Master the
+// Output of a Client state that was never bound to a connection, which is nil,
+// as PSYNC would. Attaching it does nothing to it, it refuses the first frame
+// with the cause of a closed connection, and so the Master detaches the
+// Replica as one whose connection ended.
+func TestAClientWithNoOutputIsAClosedConnectionToTheMaster(t *testing.T) {
+	out := (&ClientState{ID: 1}).Output()
+
+	out.MarkReplica()
+	out.HoldPushes()
+	out.EndStream()
+	if out.Push([]byte("+message\r\n")) {
+		t.Fatal("Push() = true for a client with no connection, want it refused")
+	}
+	if err := out.Err(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Err() = %v, want a closed connection's", err)
+	}
 }

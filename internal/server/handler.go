@@ -11,6 +11,7 @@ import (
 
 	"github.com/maltemindedal/stash/internal/protocol"
 	"github.com/maltemindedal/stash/internal/record"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net.Conn) {
@@ -32,7 +33,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	// Every byte the connection is sent goes through its Output: its Replies,
 	// written by this goroutine, and what other connections push to it.
-	out := newOutput(s.outputs, &goroutineOutputDriver{wire: conn}, logger)
+	out := output.NewBlocking(s.outputs, conn, logger)
 	state := s.getClientState(clientID)
 	if state != nil {
 		state.BindOutput(out)
@@ -47,8 +48,6 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	logger.Debug("client connected")
 	defer s.teardownClient(clientID, logger)
-	// Closes the connection, after the drain below.
-	defer out.Close(nil)
 
 	stopClose := context.AfterFunc(ctx, func() {
 		// A replica's connection stays open while shutdown sends it what is
@@ -60,12 +59,13 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 		out.Close(nil)
 	})
 	defer stopClose()
-	// Runs before the connection is closed (deferred after it): whatever replies
-	// are still queued when the handler leaves go out first. The handler waits
-	// here until they are written, by itself or by the pump. A peer that does
-	// not read them keeps it here until shutdown, or a limit on what is pushed
-	// to the connection, closes the Output.
-	defer out.Drain()
+	// The handler's one way to close its connection, and the first of its
+	// deferred calls to run, while shutdown can still close the Output: whatever
+	// replies are still queued when the handler leaves go out first. The handler
+	// waits here until they are written, by itself or by the pump, and no longer
+	// than the peer keeps taking them: one that takes none for the stall timeout
+	// is closed.
+	defer out.Finish()
 
 	// On a server that requires a password, a connection gets a limited time to
 	// authenticate. The deadline covers reads, including one that is half way
@@ -120,17 +120,11 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 			authDeadlineSet = false
 		}
 
-		if err := out.Reply(responses...); err != nil {
-			logger.Debug("failed to queue response", "error", err)
-			return
-		}
 		// Replies leave together when the handler next waits for input, unless
-		// enough of them are waiting already.
-		if out.Backlog() >= outputWriteThrough {
-			if err := out.Flush(); err != nil {
-				logger.Debug("failed to write response", "error", err)
-				return
-			}
+		// enough of them are waiting already (Output.Reply).
+		if err := out.Reply(responses...); err != nil {
+			logger.Debug("failed to write response", "error", err)
+			return
 		}
 	}
 }
@@ -159,7 +153,7 @@ func (s *Server) requestLimits(state *ClientState) protocol.Limits {
 // buffer empty is the only time the handler can block on input.
 type flushBeforeRead struct {
 	conn net.Conn
-	out  *Output
+	out  *output.Output
 }
 
 func (r flushBeforeRead) Read(p []byte) (int, error) {
