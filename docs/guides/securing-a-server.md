@@ -75,6 +75,8 @@ A client that subscribes to a channel or runs `MONITOR` and then stops reading m
 
 Replies to a client's own requests are not counted unless that client also receives pushed messages. A client that does not read its replies stops having its requests read once 1 MiB of them is waiting.
 
+A client that has sent its last request, because it shut its sending side or sent a frame that cannot be parsed, is sent the replies that are still queued and then closed. In the default mode the server waits for such a client only while it takes them: one whose socket takes nothing for 30 seconds is closed, so a client that stops reading cannot hold a connection and its goroutine until the server shuts down. In `--event-loop` mode a connection that is closing is kept until its peer has taken everything queued for it, or a limit on pushed output or shutdown closes it.
+
 ## File permissions
 
 The append-only file and snapshots are created with mode `0600`. Parent directories that Stash has to create for them get `0750`, subject to the process umask; directories that already exist are left as they are.

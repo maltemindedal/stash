@@ -78,7 +78,7 @@ func TestEventLoopClosesAReplicaThatAcceptsNothingWithinTheStallTime(t *testing.
 		t.Fatalf("Push() = false, want the stream queued: %v", conn.out.Err())
 	}
 	loop.applyQueuedWork()
-	if conn.out.Backlog() == 0 {
+	if !conn.out.Status().WantWrite {
 		t.Fatal("the socket took all 8 MiB, want output left waiting for a peer that reads nothing")
 	}
 	if loop.conns[conn.fd] != conn {
@@ -115,11 +115,11 @@ func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.
 		t.Fatalf("Push() = false, want the stream queued: %v", conn.out.Err())
 	}
 	loop.applyQueuedWork() // the loop offers the batch, and the socket takes what fits
-	if taken := stream - conn.out.Backlog(); taken == 0 || taken == stream {
-		t.Fatalf("the socket took %d of %d bytes, want part of them", taken, stream)
+	received := len(readSent(t, clientFD))
+	if received == 0 || !conn.out.Status().WantWrite {
+		t.Fatalf("the socket took %d of %d bytes and output is left waiting = %v, want part of them taken", received, stream, conn.out.Status().WantWrite)
 	}
 
-	received := 0
 	for away := 1; away <= 3; away++ {
 		// The replica reads all the while. The loop is busy elsewhere until
 		// the stall time has passed, and then comes back.
@@ -130,7 +130,6 @@ func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.
 		if err := conn.out.Err(); err != nil {
 			t.Fatalf("Err() = %v the %d. time the loop stayed away for the stall time of %v, after the replica read all %d bytes its socket was given; want the replica kept until the loop has tried its socket", err, away, stallTimeout, received)
 		}
-		before := conn.out.Backlog()
 		loop.applyQueuedWork()
 		if err := conn.out.Err(); err != nil {
 			t.Fatalf("Err() = %v after the loop came back to a socket with room, want the replica kept", err)
@@ -138,8 +137,10 @@ func TestEventLoopKeepsAReplicaThatReadsEverythingWhileTheLoopIsAway(t *testing.
 		if loop.conns[conn.fd] != conn {
 			t.Fatal("the loop closed the connection of a replica that reads everything it is sent")
 		}
-		if conn.out.Backlog() == before {
-			t.Fatalf("the loop's try wrote nothing to a socket the replica had emptied, with %d bytes waiting", before)
+		written := len(readSent(t, clientFD))
+		received += written
+		if written == 0 {
+			t.Fatalf("the loop's try wrote nothing to a socket the replica had emptied, with %d of %d bytes received", received, stream)
 		}
 	}
 }
@@ -154,7 +155,7 @@ func TestEventLoopKeepsAReplicaThatTakesItsStream(t *testing.T) {
 	chunk := make([]byte, 1<<20)
 	received := 0
 	for start := time.Now(); time.Since(start) < 4*stallTimeout; {
-		if conn.out.Backlog() < len(chunk) && !conn.out.Push(chunk) {
+		if !conn.out.Status().WantWrite && !conn.out.Push(chunk) {
 			t.Fatalf("Push() = false, want a replica that is reading kept: %v", conn.out.Err())
 		}
 		loop.applyQueuedWork()

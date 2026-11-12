@@ -9,10 +9,12 @@ import (
 	"io"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/server/output"
 )
 
 func echoRunner(t *testing.T) (ConnCommandRunner, *[]protocol.Value) {
@@ -545,8 +547,7 @@ func TestConnMachineWriteBufferLimitClosesOnOversizedResponses(t *testing.T) {
 	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
 		return []protocol.Value{protocol.BulkString{Data: bytes.Repeat([]byte("x"), 64)}}, nil
 	}
-	machine := NewConnMachine(nil)
-	machine.maxWriteBuffer = 32
+	machine, _ := newConnMachineWithReplyLimit(32)
 
 	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
 		t.Fatalf("Feed() error = %v", err)
@@ -556,6 +557,51 @@ func TestConnMachineWriteBufferLimitClosesOnOversizedResponses(t *testing.T) {
 	}
 	if machine.State() != ConnStateClosed {
 		t.Fatalf("State() = %d, want ConnStateClosed", machine.State())
+	}
+}
+
+// newConnMachineWithReplyLimit returns a machine, and its Output, that holds
+// no more than limit bytes before its latest Reply is out, where a server's
+// connections hold 512 MiB.
+func newConnMachineWithReplyLimit(limit int64) (*ConnMachine, *output.Output) {
+	out := output.NewPolled(output.NewShared(output.ReplyLimit(limit)), nil, discardLogger)
+	state := &ClientState{ID: 1}
+	state.BindOutput(out)
+	return NewConnMachine(state), out
+}
+
+// TestConnMachineWriteBufferLimitCountsOnlyWhatIsLeftBeforeTheLatestReply
+// queues a Reply that fits the limit on a connection with more than the limit
+// waiting in all, because of what was pushed to it behind the Reply: the stream
+// a Replica is sent while its full resync reply is produced, which that reply
+// releases. The limit is for Replies a client asks for without reading them.
+// It used to count everything that waited, so it closed a Replica whose
+// snapshot and stream together passed it, though each was within its own
+// limit, the stream's being the Replica Push limit.
+func TestConnMachineWriteBufferLimitCountsOnlyWhatIsLeftBeforeTheLatestReply(t *testing.T) {
+	const limit = 64
+	reply := protocol.BulkString{Data: bytes.Repeat([]byte("x"), 32)}
+	stream := strings.Repeat("s", 48)
+	run := func(_ context.Context, _ protocol.Value) ([]protocol.Value, error) {
+		return []protocol.Value{reply}, nil
+	}
+	machine, out := newConnMachineWithReplyLimit(limit)
+
+	out.HoldPushes()
+	if !out.Push([]byte(stream)) {
+		t.Fatalf("Push() = false, want the stream held: %v", out.Err())
+	}
+	if err := machine.Feed([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if err := machine.ProcessPending(context.Background(), run); err != nil {
+		t.Fatalf("ProcessPending() error = %v with a %d byte reply and %d bytes pushed behind it, against a limit of %d on what is left to write before the reply is out; want both queued", err, len(reply.Data), len(stream), limit)
+	}
+	if machine.State() != ConnStateActive {
+		t.Fatalf("State() = %d, want the connection open", machine.State())
+	}
+	if got, want := string(flushAll(t, machine)), "$32\r\n"+string(reply.Data)+"\r\n"+stream; got != want {
+		t.Fatalf("flushed output = %q, want the reply and then the stream, %q", got, want)
 	}
 }
 

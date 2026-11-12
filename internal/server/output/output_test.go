@@ -170,6 +170,15 @@ func newLoopOutput(shared *Shared) *Output {
 	return NewPolled(shared, nil, discardLogger)
 }
 
+// backlog is how many bytes wait for the connection, as its Ledger counts
+// them. The package exports no count: outside it a caller asks a question
+// (Status, MayReadRequests).
+func (o *Output) backlog() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return int(o.ledger.Waiting())
+}
+
 // queuedReplies are the limits of a server whose connections never write a
 // Reply through: a Reply only queues, however much waits, so that a test
 // decides when the connection's goroutine writes (Flush, Drain).
@@ -231,7 +240,7 @@ func TestPipelinedRepliesLeaveInOneWrite(t *testing.T) {
 	if got := wire.writeCount(); got != 1 {
 		t.Fatalf("the socket was written %d times, want the 50 replies in one write", got)
 	}
-	if got := out.Backlog(); got != 0 {
+	if got := out.backlog(); got != 0 {
 		t.Fatalf("Backlog() = %d after the flush, want 0", got)
 	}
 	// Nothing queued is not an error.
@@ -260,7 +269,7 @@ func TestAReplyWritesThroughOnceEnoughIsWaiting(t *testing.T) {
 		}
 	}
 	if got := wire.writeCount(); got != 0 {
-		t.Fatalf("the socket was written %d times with %d bytes waiting, want the replies held back below %d", got, out.Backlog(), outputWriteThrough)
+		t.Fatalf("the socket was written %d times with %d bytes waiting, want the replies held back below %d", got, out.backlog(), outputWriteThrough)
 	}
 
 	if err := out.Reply(reply); err != nil {
@@ -321,7 +330,7 @@ func TestAPushNeverWaitsForAStalledConnection(t *testing.T) {
 		}
 	})
 	<-wire.writeBegun
-	if got, want := out.Backlog(), 1000*len("+message\r\n"); got != want {
+	if got, want := out.backlog(), 1000*len("+message\r\n"); got != want {
 		t.Fatalf("Backlog() = %d, want the %d bytes pushed still waiting", got, want)
 	}
 
@@ -404,7 +413,7 @@ func TestAPushPastThePushLimitClosesTheConnection(t *testing.T) {
 	if !wire.isClosed() {
 		t.Fatal("the socket is open, want it closed with the Output")
 	}
-	if got := out.Backlog(); got != 0 {
+	if got := out.backlog(); got != 0 {
 		t.Fatalf("Backlog() = %d after the close, want what was waiting dropped", got)
 	}
 	if err := out.Reply(protocol.SimpleString{Value: "OK"}); !errors.Is(err, ErrPushLimitExceeded) {
@@ -496,7 +505,7 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 			if !out.Push([]byte("stream")) {
 				t.Fatalf("Push() = false in round %d, want the stream queued: %v", round, out.Err())
 			}
-			waitForOutput(t, "the stream to be written", func() bool { return out.Backlog() == 0 })
+			waitForOutput(t, "the stream to be written", func() bool { return out.backlog() == 0 })
 			time.Sleep(stallTimeout)
 		}
 		if err := out.Err(); err != nil {
@@ -663,6 +672,55 @@ func TestAReplicaThatTakesPartOfWhatItIsOfferedWithinTheStallTimeIsKept(t *testi
 	})
 	if err := out.Err(); err != nil {
 		t.Fatalf("Err() = %v after the replica took %q of %q, a byte within each stall timeout of %v; want it kept", err, wire.sent(), stream, stallTimeout)
+	}
+}
+
+// TestFinishClosesAConnectionWhosePeerTakesNoneOfItsLastReplies queues a Reply
+// behind a Pushed message that the pump cannot write, because the peer reads
+// nothing, and finishes the connection, as its goroutine does when the peer
+// has shut its sending side. Finish used to wait for that Reply for as long as
+// the server ran. It is held to the stall rule now: the connection is closed
+// once its socket has taken nothing for the stall timeout.
+func TestFinishClosesAConnectionWhosePeerTakesNoneOfItsLastReplies(t *testing.T) {
+	const stallTimeout = 30 * time.Millisecond
+	wire := newStalledOutputWire()
+	out := newGoroutineOutput(NewShared(StallTimeout(stallTimeout)), wire)
+
+	if !out.Push([]byte("+message\r\n")) {
+		t.Fatal("Push() = false, want the message queued")
+	}
+	<-wire.writeBegun
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+
+	within(t, "Finish(), with a peer that takes nothing", out.Finish)
+	if !wire.isClosed() {
+		t.Fatal("the socket is open after Finish, want the connection closed")
+	}
+	if err := out.Err(); !errors.Is(err, errLastRepliesNotTaken) {
+		t.Fatalf("Err() = %v, want the connection closed because its peer took none of its last replies", err)
+	}
+}
+
+// TestFinishSendsAPeerThatKeepsReadingItsLastReplies is the peer that reads
+// slowly: of each write it takes a byte within the stall timeout. Finish waits
+// for it, however long the Replies take, and closes the connection when the
+// last of them is out.
+func TestFinishSendsAPeerThatKeepsReadingItsLastReplies(t *testing.T) {
+	const stallTimeout = 30 * time.Millisecond
+	wire := &tricklingWire{newOutputWire()}
+	out := NewBlocking(NewShared(StallTimeout(stallTimeout)), wire, discardLogger)
+
+	if err := out.Reply(protocol.SimpleString{Value: "OK"}); err != nil {
+		t.Fatalf("Reply() error = %v", err)
+	}
+	within(t, "Finish(), with a peer that reads a byte at a time", out.Finish)
+	if got, want := wire.sent(), "+OK\r\n"; got != want {
+		t.Fatalf("the peer was sent %q before the connection was closed, want all of %q", got, want)
+	}
+	if !wire.isClosed() {
+		t.Fatal("the socket is open after Finish, want the connection closed")
 	}
 }
 
@@ -928,7 +986,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 						t.Fatalf("Flush() error = %v, want what is queued left to the writer", err)
 					}
 				case <-time.After(5 * time.Second):
-					t.Fatalf("Flush() was still waiting after 5s with no more than 1 MiB to write before the connection's latest reply is out, and %d bytes waiting in all", out.Backlog())
+					t.Fatalf("Flush() was still waiting after 5s with no more than 1 MiB to write before the connection's latest reply is out, and %d bytes waiting in all", out.backlog())
 				}
 				return
 			}
@@ -973,7 +1031,7 @@ func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t
 	go func() { flushed <- out.Flush() }()
 	select {
 	case err := <-flushed:
-		t.Fatalf("Flush() returned %v with %d bytes to write before the reply is out and none of them read, want it to wait", err, out.Backlog())
+		t.Fatalf("Flush() returned %v with %d bytes to write before the reply is out and none of them read, want it to wait", err, out.backlog())
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -984,7 +1042,7 @@ func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t
 			t.Fatalf("Flush() error = %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("Flush() was still waiting 5s after the peer read %d bytes, which left %d to write before the reply is out", wire.receivedLen(), out.Backlog())
+		t.Fatalf("Flush() was still waiting 5s after the peer read %d bytes, which left %d to write before the reply is out", wire.receivedLen(), out.backlog())
 	}
 	if got := wire.receivedLen(); got != outputHighWater {
 		t.Fatalf("the peer had read %d bytes when Flush returned, want the %d that leave the reply within the mark", got, outputHighWater)
@@ -1027,7 +1085,7 @@ func TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply(t *testing.T) {
 			drained := make(chan struct{})
 			go func() {
 				defer close(drained)
-				out.Drain()
+				out.drain()
 			}()
 
 			close(wire.proceed)
@@ -1073,8 +1131,8 @@ func TestDrainDoesNotWaitForWhatWasPushedAfterTheLatestReply(t *testing.T) {
 	}
 	waitForOutput(t, "the replica to read its reply", func() bool { return wire.receivedLen() == len(reply) })
 
-	within(t, "Drain() with the latest reply written and 2 MiB of the stream waiting", out.Drain)
-	if got := out.Backlog(); got != stream {
+	within(t, "Drain() with the latest reply written and 2 MiB of the stream waiting", out.drain)
+	if got := out.backlog(); got != stream {
 		t.Fatalf("Backlog() = %d when Drain returned, want the %d bytes of the stream still waiting", got, stream)
 	}
 }
@@ -1113,7 +1171,7 @@ func TestDrainReturnsWhenTheConnectionIsClosedWhileItWaits(t *testing.T) {
 			drained := make(chan struct{})
 			go func() {
 				defer close(drained)
-				out.Drain()
+				out.drain()
 			}()
 			select {
 			case <-drained:
@@ -1176,7 +1234,7 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 			t.Fatalf("Flush() error = %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("Flush() was still waiting 5s after the replica read its %d byte reply, with %d bytes of its stream waiting behind it", len(reply), out.Backlog())
+		t.Fatalf("Flush() was still waiting 5s after the replica read its %d byte reply, with %d bytes of its stream waiting behind it", len(reply), out.backlog())
 	}
 }
 
@@ -1429,7 +1487,7 @@ func TestPushesHeldWhenTheConnectionClosesAreNeverWritten(t *testing.T) {
 	if !wire.isClosed() {
 		t.Fatal("the socket is open, want it closed with the Output")
 	}
-	if got := out.Backlog(); got != 0 {
+	if got := out.backlog(); got != 0 {
 		t.Fatalf("Backlog() = %d after the close, want what was held dropped", got)
 	}
 	if out.Push([]byte("+late\r\n")) {
@@ -1570,7 +1628,7 @@ func TestALargeReplyKeepsItsPlaceAmongWhatIsQueued(t *testing.T) {
 					if got := wire.sent(); got != tt.want {
 						t.Fatalf("sent %d bytes that differ from the %d queued, in the order they were queued, at byte %d", len(got), len(tt.want), firstDifference(got, tt.want))
 					}
-					waitForOutput(t, "the backlog to count everything as written", func() bool { return out.Backlog() == 0 })
+					waitForOutput(t, "the backlog to count everything as written", func() bool { return out.backlog() == 0 })
 				})
 			}
 		})

@@ -5,7 +5,7 @@
 //
 // A Ledger holds no bytes, no lock, no clock, no socket and no timer. It is
 // told what happened (Reply, Push, Hold, Take, Took, MarkReplica, EndStream,
-// Close) with
+// Finish, Close) with
 // the sizes and the time, and answers with a decision and the Effects its
 // caller must carry out. Its caller, the Output (package output), holds the
 // lock and the bytes. The package is under output's internal directory, so
@@ -30,9 +30,10 @@
 //	its share of the Push budget  taken..end, and held, for a   Budgeted
 //	                              subscriber
 //	may this writer write, what   taken..seal or taken..end     Take
-//	has the Replica stalled       a try that took nothing       Took
+//	has the socket stalled        a try that took nothing       Took
 //	has the stream ended          taken..end is empty, after    Ended
 //	                              EndStream
+//	is a Reply too much to hold   taken..replyEnd               Reply
 //
 // No decision counts anything else, and there is no accessor for a raw
 // position: a caller cannot make a decision of its own from one. To change
@@ -102,15 +103,23 @@ type Limits struct {
 	PushLimit int64
 	// ReplicaPushLimit bounds what waits for a Replica behind its latest Reply.
 	ReplicaPushLimit int64
-	// StallTimeout is how long a Replica's socket may take nothing of what it
-	// is offered.
+	// StallTimeout is how long the socket of a Replica, or of a connection
+	// that is finishing, may take nothing of what it is offered.
 	StallTimeout Instant
+	// ReplyLimit is how much may be left to write before the latest Reply is
+	// out. A Reply that leaves more closes the connection. Zero is no limit,
+	// for a connection whose goroutine waits on the socket instead (Full).
+	ReplyLimit int64
 }
 
-// ErrStalled is the Close cause when a try of a Replica's socket took nothing,
-// StallTimeout or more after the socket last took a byte or was first offered
-// the bytes.
-var ErrStalled = errors.New("ledger: replica accepted no output within the stall timeout")
+// ErrStalled is the Close cause when a try of a socket that is held to the
+// stall rule took nothing, StallTimeout or more after the socket last took a
+// byte or was first offered the bytes.
+var ErrStalled = errors.New("ledger: socket accepted no output within the stall timeout")
+
+// ErrReplyLimit is the Close cause when a Reply leaves more than ReplyLimit to
+// write before it is out.
+var ErrReplyLimit = errors.New("ledger: more left to write before the latest reply is out than the connection's reply limit")
 
 // ErrPushLimit is the Close cause when a Push would leave more waiting than
 // the connection's Push limit.
@@ -148,6 +157,8 @@ type Ledger struct {
 
 	closed  bool
 	holding bool
+	// finishing is set once the connection has run its last request (Finish).
+	finishing bool
 	// ending is set once the stream is to end when everything queued is
 	// written (EndStream).
 	ending bool
@@ -177,7 +188,10 @@ func New(limits Limits) Ledger {
 }
 
 // Reply records n bytes of Replies to the request the connection just ran,
-// and releases what was held since Hold behind them. n may be zero.
+// and releases what was held since Hold behind them. n may be zero. A Reply
+// that leaves more than ReplyLimit to write before it is out closes the
+// connection. What it released behind it does not count: a Push limit bounds
+// that.
 func (l *Ledger) Reply(n int64) Effects {
 	if l.closed {
 		return Effects{}
@@ -190,6 +204,9 @@ func (l *Ledger) Reply(n int64) Effects {
 		l.holding = false
 		l.end += l.held
 		l.held = 0
+	}
+	if l.lim.ReplyLimit > 0 && l.aheadOfReply() > l.lim.ReplyLimit {
+		return Effects{Close: ErrReplyLimit}
 	}
 	return l.grantPusher()
 }
@@ -231,26 +248,47 @@ func (l *Ledger) Hold() {
 // Reply. The Output asks it to know where the message's bytes go.
 func (l *Ledger) Holding() bool { return l.holding }
 
-// MarkReplica makes the connection a Replica's. A socket that is being
-// offered bytes at that moment has StallTimeout from now to take some.
+// MarkReplica makes the connection a Replica's, whose socket is held to the
+// stall rule. A socket that is being offered bytes at that moment, and was not
+// held to the rule until now, has StallTimeout from now to take some.
 func (l *Ledger) MarkReplica(now Instant) Effects {
 	if l.closed {
 		return Effects{}
 	}
+	l.startCount(now)
 	l.class = Replica
-	if l.offerEnd > l.taken {
-		l.progress = now
-	}
 	return Effects{Deadline: l.deadline()}
 }
 
-// Stallable reports whether the socket is held to the stall rule, as a
-// Replica's is. Only then does the Ledger compare the times it is told with
-// Take and Took, so its caller need not read a clock for any other connection:
-// the model tells such a Ledger a time that is wrong and requires the same
-// decisions.
+// Finish records that the connection has run its last request: its owner now
+// only waits for its Replies to be out (RepliesOut) and then closes it. From
+// here on its socket is held to the stall rule, as a Replica's is, so that a
+// peer that takes none of its last Replies does not keep the connection, and
+// whoever waits for it, until the server shuts down.
+func (l *Ledger) Finish(now Instant) Effects {
+	if l.closed || l.finishing {
+		return Effects{}
+	}
+	l.startCount(now)
+	l.finishing = true
+	return Effects{Deadline: l.deadline()}
+}
+
+// startCount starts the stall count for bytes that were on offer before the
+// socket was held to the stall rule.
+func (l *Ledger) startCount(now Instant) {
+	if !l.Stallable() && l.offerEnd > l.taken {
+		l.progress = now
+	}
+}
+
+// Stallable reports whether the socket is held to the stall rule: a Replica's,
+// and that of a connection that has run its last request (Finish). Only then
+// does the Ledger compare the times it is told with Take and Took, so its
+// caller need not read a clock for any other connection: the model tells such
+// a Ledger a time that is wrong and requires the same decisions.
 func (l *Ledger) Stallable() bool {
-	return l.class == Replica
+	return l.class == Replica || l.finishing
 }
 
 // Take asks for the socket on behalf of role and returns how many bytes to

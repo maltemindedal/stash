@@ -120,8 +120,8 @@ func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T)
 
 	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	srv.master.Propagate([]byte(fullResyncStreamFrame), true)
-	if got := out.Backlog(); got != len(fullResyncStreamFrame) {
-		t.Fatalf("Backlog() = %d before the reply, want the %d bytes of the write waiting", got, len(fullResyncStreamFrame))
+	if got, err := wire.sent(), out.Err(); got != "" || err != nil || out.Status().WantWrite {
+		t.Fatalf("sent %q before the reply, with Err() = %v and output for the socket = %v; want the %d bytes of the write waiting behind the reply", got, err, out.Status().WantWrite, len(fullResyncStreamFrame))
 	}
 
 	reply := attachment.Reply()

@@ -67,6 +67,16 @@ const outputWriteThrough = 4 << 10
 // for a connection by the same rule (MayReadRequests).
 const outputHighWater = 1 << 20
 
+// outputReplyLimit bounds what may be left to write before the latest Reply of
+// a connection the Event loop serves is out. A Reply that leaves more closes
+// the connection: the loop cannot wait on a socket, so it has to hold a Reply
+// until the peer reads it, and a client that asks for more than this without
+// reading is disconnected instead of growing the server's memory. What is
+// pushed behind the Reply does not count, since the Push limits bound that.
+// A connection served by its own goroutine has no such limit: its Reply
+// waits on the socket (outputWriteThrough).
+const outputReplyLimit = 512 << 20
+
 // outputWriteChunk is the most bytes handed to a socket in one write, so that
 // the Output's lock is taken, and a Replica's stall count renewed, at least
 // that often.
@@ -84,6 +94,15 @@ var errPushBudgetExceeded = errors.New("output: closed to stay within the budget
 // ErrReplicaStalled reports that a Replica's socket took nothing of the output
 // it was offered for outputReplicaStallTimeout.
 var ErrReplicaStalled = errors.New("output: replica accepted no output within the stall timeout")
+
+// errReplyLimitExceeded reports that a Reply on the Event loop left more to
+// write before it is out than outputReplyLimit.
+var errReplyLimitExceeded = errors.New("output: a reply left more to write than the connection's write-buffer limit")
+
+// errLastRepliesNotTaken reports that the peer of a connection that had run
+// its last request took none of its last Replies for
+// outputReplicaStallTimeout.
+var errLastRepliesNotTaken = errors.New("output: peer took none of its last replies within the stall timeout")
 
 // errOutputClosed is what a closed Output reports when it was closed without a
 // cause, as an ordinary teardown closes it.
@@ -121,8 +140,14 @@ func ReplicaPushLimit(bytes int64) Limit {
 	return func(s *Shared) { s.limits.ReplicaPushLimit = bytes }
 }
 
-// StallTimeout is how long a Replica's socket may take nothing of what it
-// is offered.
+// ReplyLimit bounds what may be left to write before the latest Reply of a
+// connection the Event loop serves is out.
+func ReplyLimit(bytes int64) Limit {
+	return func(s *Shared) { s.limits.ReplyLimit = bytes }
+}
+
+// StallTimeout is how long the socket of a Replica, or of a connection that
+// has run its last request, may take nothing of what it is offered.
 func StallTimeout(timeout time.Duration) Limit {
 	return func(s *Shared) { s.limits.StallTimeout = ledger.Instant(timeout) }
 }
@@ -138,6 +163,7 @@ func NewShared(limits ...Limit) *Shared {
 			PushLimit:        outputPushLimit,
 			ReplicaPushLimit: outputReplicaPushLimit,
 			StallTimeout:     ledger.Instant(outputReplicaStallTimeout),
+			ReplyLimit:       outputReplyLimit,
 		},
 		pushBudget: outputPushBudget,
 		epoch:      time.Now(),
@@ -196,7 +222,7 @@ var ErrWouldBlock = errors.New("output: socket write would block")
 // (unlock). A method here that compares byte counts is in the wrong file.
 //
 // Who calls decides what may wait on the peer's socket. The connection's own
-// executor may: Reply, Flush and Drain, in the goroutine mode. Push,
+// executor may: Reply, Flush and Finish, in the goroutine mode. Push,
 // HoldPushes, MarkReplica, EndStream, Close and Err are for anyone and never
 // wait. Service and MayReadRequests are the Event loop's and never wait.
 //
@@ -213,7 +239,7 @@ type Output struct {
 	cause  error
 
 	// waiters wait for the Ledger to open the gate or to report the Replies
-	// out (Flush, Drain), and are woken when it says so (Effects.Signal).
+	// out (Flush, Finish), and are woken when it says so (Effects.Signal).
 	waiters *sync.Cond
 	// budgeted is what the connection last reported to the Push budget, and
 	// gateShut whether its requests may not be read: the Ledger's Budgeted and
@@ -248,7 +274,10 @@ type Output struct {
 // writes what other connections push. Closing the Output closes wire when it
 // is an io.Closer.
 func NewBlocking(shared *Shared, wire io.Writer, logger *slog.Logger) *Output {
-	o := &Output{ledger: ledger.New(shared.limits), wire: wire, shared: shared, logger: logger}
+	limits := shared.limits
+	// Its Reply waits on the socket, so no Reply is too much to hold.
+	limits.ReplyLimit = 0
+	o := &Output{ledger: ledger.New(limits), wire: wire, shared: shared, logger: logger}
 	o.waiters = sync.NewCond(&o.mu)
 	o.deadlines, _ = wire.(writeDeadliner)
 	return o
@@ -325,7 +354,14 @@ func (o *Output) causeLocked(reason error) error {
 		return fmt.Errorf("%w: %d bytes were waiting", ErrPushLimitExceeded, o.ledger.Waiting())
 	}
 	if errors.Is(reason, ledger.ErrStalled) {
-		return fmt.Errorf("%w of %v", ErrReplicaStalled, time.Duration(o.shared.limits.StallTimeout))
+		stalled := errLastRepliesNotTaken
+		if o.isReplicaLocked() {
+			stalled = ErrReplicaStalled
+		}
+		return fmt.Errorf("%w of %v", stalled, time.Duration(o.shared.limits.StallTimeout))
+	}
+	if errors.Is(reason, ledger.ErrReplyLimit) {
+		return fmt.Errorf("%w of %d bytes", errReplyLimitExceeded, o.shared.limits.ReplyLimit)
 	}
 	return reason
 }
@@ -357,9 +393,11 @@ func (o *Output) startPusherLocked() {
 // connection's own executor calls it. Replies leave together when a
 // connection's goroutine next waits for input (Flush), unless outputWriteThrough
 // is left to write before they are out: Reply then writes them out as Flush
-// does, and waits as Flush does. On the Event loop it never waits. A Push to
-// the connection takes the lock Reply holds, so a large Reply is encoded
-// before that lock is taken and queued whole (isLargeReply).
+// does, and waits as Flush does. On the Event loop it never waits, and a Reply
+// that leaves more than outputReplyLimit to write before it is out closes the
+// connection, which Reply reports. A Push to the connection takes the lock
+// Reply holds, so a large Reply is encoded before that lock is taken and
+// queued whole (isLargeReply).
 func (o *Output) Reply(values ...protocol.Value) error {
 	var whole []byte
 	if isLargeReply(values) {
@@ -395,6 +433,9 @@ func (o *Output) Reply(values ...protocol.Value) error {
 	writeThrough := o.wire != nil && o.ledger.Full()
 	o.unlock(effects)
 
+	if effects.Close != nil {
+		return o.Err()
+	}
 	if writeThrough {
 		return o.flush(false)
 	}
@@ -489,28 +530,48 @@ func (o *Output) Flush() error {
 	return o.flush(false)
 }
 
-// Drain returns once every Reply queued so far has been written, or the
-// connection is closed. It is for the connection's own goroutine when it has
-// run its last request: the Close that follows drops what is still queued.
-// Like Flush it writes its Replies when nobody has the socket. When another
-// goroutine has it, Drain waits until that one has written the latest Reply.
+// Finish is the last call of a connection's own goroutine, when it has run its
+// last request: it waits until every Reply queued so far has been written
+// (ledger.Ledger.RepliesOut), and closes the connection, which drops what is
+// still queued. It is the only way that goroutine closes its connection, so
+// there is no wait and close to put in the wrong order. Like Flush it writes
+// its Replies when nobody has the socket. When another goroutine has it,
+// Finish waits until that one has written the latest Reply.
 //
 // It does not wait for what was pushed after that Reply, beyond the write that
 // carries the Reply's last byte. The goroutine of a Replica that has been sent
 // its full resync reply therefore leaves at once, however much of its stream
-// waits. A peer that never reads keeps the goroutine here until the connection
-// is closed, by shutdown or by a limit on what is pushed to it, as a Reply to
-// a peer that never reads keeps it in Flush. The Event loop writes out a
-// closing connection itself (ConnMachine.Service), so there Drain does nothing.
-func (o *Output) Drain() {
+// waits.
+//
+// The wait is bounded. From Finish on the Ledger holds the socket to the
+// stall rule (ledger.Ledger.Finish): a peer that takes none of its last
+// Replies for outputReplicaStallTimeout is closed, where it used to keep the
+// goroutine until the server shut down. One that keeps taking them, however
+// slowly, is sent them all. The Event loop writes out a closing connection
+// itself (ConnMachine.Service), so there Finish only closes.
+func (o *Output) Finish() {
+	if o == nil {
+		return
+	}
+	o.drain()
+	o.Close(nil)
+}
+
+// drain is Finish before it closes.
+func (o *Output) drain() {
+	if o.wire == nil {
+		return
+	}
+	o.mu.Lock()
+	o.unlock(o.ledger.Finish(o.shared.now()))
 	// Why the connection is closed, if it is, changes nothing for a caller
 	// that is about to close it.
 	_ = o.flush(true)
 }
 
 // flush is Flush, which returns once the connection's requests may be read
-// (ledger.Ledger.Gate), or Drain, which returns once its Replies are out
-// (ledger.Ledger.RepliesOut). The Event loop writes its connections itself,
+// (ledger.Ledger.Gate), or the wait of Finish, which returns once its Replies
+// are out (ledger.Ledger.RepliesOut). The Event loop writes its connections itself,
 // so there it does nothing.
 func (o *Output) flush(drain bool) error {
 	if o.wire == nil {
@@ -622,16 +683,6 @@ func (o *Output) MarkReplica() {
 	o.unlock(effects)
 }
 
-// Backlog reports how many bytes of Client output wait for the connection.
-func (o *Output) Backlog() int {
-	if o == nil {
-		return 0
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return int(o.ledger.Waiting())
-}
-
 // MayReadRequests reports whether the connection's own requests may be read
 // and run: whether at most outputHighWater bytes are left to write before its
 // latest Reply is out. What was pushed after that Reply does not count, so a
@@ -741,6 +792,14 @@ func (o *Output) nowLocked() ledger.Instant {
 		return 1
 	}
 	return o.shared.now()
+}
+
+// Status reports where the connection stands without writing anything: a
+// Service that offers the socket nothing.
+func (o *Output) Status() Status {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.statusLocked(0)
 }
 
 // statusLocked is where the connection stands, as the Ledger has it. deadline

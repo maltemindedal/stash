@@ -31,12 +31,6 @@ const (
 // role of Redis's proto-max-bulk-len query-buffer limit.
 const defaultMaxReadBuffer = 512 * 1024 * 1024
 
-// defaultMaxWriteBuffer bounds the response bytes buffered for a client that
-// is not draining its socket, so a stalled or slow consumer is disconnected
-// instead of growing server memory without limit. It mirrors the role of
-// Redis's client-output-buffer-limit.
-const defaultMaxWriteBuffer = 512 * 1024 * 1024
-
 // retainedReadBufferCap is the capacity above which the machine releases its
 // read buffer once only a small remainder is left in it. The buffer grows to hold
 // one large request and would otherwise keep that capacity until the connection
@@ -90,14 +84,13 @@ type ConnMachine struct {
 	client *ClientState
 	out    *output.Output
 
-	state          ConnMachineState
-	err            error
-	readBuf        []byte
-	decoder        protocol.Decoder
-	resumeAt       int
-	maxReadBuffer  int
-	maxWriteBuffer int
-	pending        []connEvent
+	state         ConnMachineState
+	err           error
+	readBuf       []byte
+	decoder       protocol.Decoder
+	resumeAt      int
+	maxReadBuffer int
+	pending       []connEvent
 
 	// requestLimits, when set, is asked before each frame is decoded what that
 	// frame may declare. decodePaused is set after a frame was decoded under
@@ -122,10 +115,9 @@ func NewConnMachine(client *ClientState) *ConnMachine {
 		}
 	}
 	return &ConnMachine{
-		client:         client,
-		out:            out,
-		maxReadBuffer:  defaultMaxReadBuffer,
-		maxWriteBuffer: defaultMaxWriteBuffer,
+		client:        client,
+		out:           out,
+		maxReadBuffer: defaultMaxReadBuffer,
 	}
 }
 
@@ -150,20 +142,15 @@ func (m *ConnMachine) PendingRequests() int {
 	return count
 }
 
-// HasPendingOutput reports whether buffered response bytes await flushing.
+// HasPendingOutput reports whether output waits for the socket.
 func (m *ConnMachine) HasPendingOutput() bool {
-	return m.PendingOutputBytes() > 0
+	return m.out.Status().WantWrite
 }
 
 // MayReadRequests reports whether the connection's requests may be read and
 // run, by the rule Output.MayReadRequests applies in both networking modes.
 func (m *ConnMachine) MayReadRequests() bool {
 	return m.out.MayReadRequests()
-}
-
-// PendingOutputBytes reports how many buffered response bytes await flushing.
-func (m *ConnMachine) PendingOutputBytes() int {
-	return m.out.Backlog()
 }
 
 // Feed appends readable bytes to the read buffer and parses every complete
@@ -396,13 +383,9 @@ func (m *ConnMachine) Close(err error) {
 
 // bufferResponses queues the Replies to the request that just ran, which may
 // be none: the Output releases the Pushed messages that request held either
-// way.
+// way. A Reply that leaves more to write before it is out than a connection
+// of the Event loop may hold closes the Output, which Reply reports
+// (output.ReplyLimit).
 func (m *ConnMachine) bufferResponses(values []protocol.Value) error {
-	if err := m.out.Reply(values...); err != nil {
-		return err
-	}
-	if m.PendingOutputBytes() > m.maxWriteBuffer {
-		return fmt.Errorf("server: pending output exceeds %d byte write-buffer limit", m.maxWriteBuffer)
-	}
-	return nil
+	return m.out.Reply(values...)
 }

@@ -40,7 +40,7 @@ func bufferIdentity(b []byte) *byte {
 func serviceUntilWritten(t *testing.T, out *Output, w io.Writer) {
 	t.Helper()
 
-	for out.Backlog() > 0 {
+	for out.backlog() > 0 {
 		if err := out.Service(w).Closed; err != nil {
 			t.Fatalf("Service() closed the Output: %v", err)
 		}
@@ -112,7 +112,7 @@ func TestAnOutputReleasesItsWriteBufferAfterALargeReply(t *testing.T) {
 			if err := out.Reply(reply); err != nil {
 				t.Fatalf("Reply() error = %v", err)
 			}
-			if got := out.Backlog(); got < tt.replySize {
+			if got := out.backlog(); got < tt.replySize {
 				t.Fatalf("Backlog() = %d, want the %d byte reply buffered", got, tt.replySize)
 			}
 

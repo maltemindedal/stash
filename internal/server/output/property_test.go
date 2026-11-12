@@ -98,7 +98,7 @@ func TestAnOutputsBytesAreTheOnesItsLedgerCountsAndReachTheWireInOrder(t *testin
 			return driver{out: out, write: flush, sent: wire.sent, writeOut: func() {
 				flush()
 				// What was pushed is the pump's to write.
-				for out.Backlog() > 0 {
+				for out.backlog() > 0 {
 					runtime.Gosched()
 				}
 			}}

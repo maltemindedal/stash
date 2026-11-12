@@ -29,6 +29,17 @@ var modelLimits = Limits{
 	StallTimeout:     2,
 }
 
+// modelLimitsFor are the limits of a connection in one networking mode. Only
+// the Event loop's has a Reply limit: a connection's own goroutine waits on
+// the socket instead of queueing a Reply behind that much.
+func modelLimitsFor(eventLoop bool) Limits {
+	limits := modelLimits
+	if eventLoop {
+		limits.ReplyLimit = 6
+	}
+	return limits
+}
+
 // modelRepliesWaiting bounds the model: no Reply is queued above it.
 const modelRepliesWaiting = 7
 
@@ -40,6 +51,7 @@ type machine interface {
 	Hold()
 	Holding() bool
 	MarkReplica(now Instant) Effects
+	Finish(now Instant) Effects
 	Stallable() bool
 	Take(role Role, now Instant) (int64, Effects)
 	Took(n int64, now Instant) Effects
@@ -88,6 +100,8 @@ type world struct {
 	// replica is set once the connection was marked a Replica's, and
 	// subscriber once a Pushed message was accepted for one that is not.
 	replica, subscriber bool
+	// finishing is set once the connection has run its last request.
+	finishing bool
 
 	// grant is the size of the write in progress, and grantRole who makes it.
 	grant     int64
@@ -120,6 +134,12 @@ func (w world) copy() world {
 	return w
 }
 
+// stallRule reports whether the connection's socket is held to the stall rule:
+// a Replica's, and that of a connection that is finishing.
+func (w world) stallRule() bool {
+	return w.replica || w.finishing
+}
+
 func (w world) aheadOfReply() int64 {
 	return int64(strings.LastIndexByte(w.wire, 'r') + 1)
 }
@@ -137,7 +157,7 @@ func (w world) key() string {
 		extra = k.key(w.now)
 	}
 	return fmt.Sprint(
-		l.class, l.closed, l.holding, l.ending, w.ending, l.end-l.taken, max(l.replyEnd-l.taken, 0), l.held,
+		l.class, l.closed, l.holding, l.ending, w.ending, l.finishing, w.finishing, l.end-l.taken, max(l.replyEnd-l.taken, 0), l.held,
 		l.writer, max(l.seal-l.taken, 0), max(l.offerEnd-l.taken, 0), l.trying, clamp(int64(w.now-l.progress), 0, timeout+1),
 		"|", w.wire, "|", w.held, w.holding, w.closed, w.replica, w.subscriber, w.grant, w.grantRole, w.requesterHolds, w.sealLeft,
 		w.offerLeft, clamp(int64(w.now-w.since), 0, timeout+1), deadline, extra)
@@ -160,10 +180,10 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 	}
 
 	timeout := w.m.base().lim.StallTimeout
-	onOffer := w.replica && w.offerLeft > 0
+	onOffer := w.stallRule() && w.offerLeft > 0
 	switch {
 	case effects.Deadline != 0 && !onOffer:
-		return fmt.Sprintf("the deadline %d was set with %d bytes on offer and the connection a Replica's = %v: only a Replica's socket that is being offered bytes can stall", effects.Deadline, w.offerLeft, w.replica)
+		return fmt.Sprintf("the deadline %d was set with %d bytes on offer, the connection a Replica's = %v and finishing = %v: only the socket of a Replica or of a connection that is finishing can stall, while it is offered bytes", effects.Deadline, w.offerLeft, w.replica, w.finishing)
 	case effects.Deadline != 0 && effects.Deadline != w.since+timeout:
 		return fmt.Sprintf("the deadline %d was set, want %d: the stall timeout of %d after the socket last took a byte or was first offered one, at %d", effects.Deadline, w.since+timeout, timeout, w.since)
 	case kind == tookBytes && onOffer && effects.Deadline == 0 && effects.Close == nil && !before.closed:
@@ -174,12 +194,12 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 	}
 
 	stalledTry := kind == tookBytes && took == 0
-	overdue := before.replica && before.offerLeft > 0 && w.now-before.since >= timeout
+	overdue := before.stallRule() && before.offerLeft > 0 && w.now-before.since >= timeout
 	if errors.Is(effects.Close, ErrStalled) {
 		tryInProgress := kind == timerFired && before.grant > 0
 		switch {
-		case !before.replica:
-			return "a connection that is not a Replica's was closed as stalled"
+		case !before.stallRule():
+			return "a connection that is neither a Replica's nor finishing was closed as stalled"
 		case !stalledTry && !tryInProgress:
 			return "the Replica was closed as stalled with no try of its socket that took nothing: only a writer that tried the socket can say it takes nothing"
 		case !overdue:
@@ -202,8 +222,8 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 	if got := w.m.Ended(); got != ended {
 		return fmt.Sprintf("Ended() = %v with the stream to end = %v and %q left to write", got, w.ending, w.wire)
 	}
-	if got := w.m.Stallable(); got != w.replica {
-		return fmt.Sprintf("Stallable() = %v for a connection that is a Replica's = %v: the Output reads its clock for the sockets held to the stall rule and for no other", got, w.replica)
+	if got := w.m.Stallable(); got != w.stallRule() {
+		return fmt.Sprintf("Stallable() = %v for a connection that is a Replica's = %v and finishing = %v: the Output reads its clock for the sockets held to the stall rule and for no other", got, w.replica, w.finishing)
 	}
 	if got := w.m.Holding(); got != w.holding {
 		return fmt.Sprintf("Holding() = %v, want %v: a Pushed message would go to the wrong side of the next Reply", got, w.holding)
@@ -295,7 +315,7 @@ func (w world) take(role Role, name string) step {
 	}
 	next.grant, next.grantRole, next.offerLeft, next.deadline = n, role, n, effects.Deadline
 	want := Instant(0)
-	if next.replica {
+	if next.stallRule() {
 		want = next.since + modelLimits.StallTimeout
 	}
 	if effects.Deadline != want {
@@ -313,18 +333,31 @@ func (w world) steps(eventLoop bool) []step {
 	// The connection's own goroutine replies, holds and writes as the
 	// Requester, one after the other: while it has the socket it does neither
 	// of the first two.
-	if !w.requesterHolds {
+	// A connection that is finishing has run its last request.
+	if !w.requesterHolds && !w.finishing {
 		for _, n := range []int64{0, 1, 3} {
 			if int64(len(w.wire)+len(w.held))+n > modelRepliesWaiting {
 				continue
 			}
 			next := w.copy()
 			effects := next.m.Reply(n)
+			label := fmt.Sprintf("reply of %d", n)
 			if !next.closed {
+				// What the Reply releases follows it and does not count.
+				ahead, limit := int64(len(w.wire)), w.m.base().lim.ReplyLimit
+				if n > 0 {
+					ahead += n
+				} else {
+					ahead = w.aheadOfReply()
+				}
+				if over := limit > 0 && ahead > limit; errors.Is(effects.Close, ErrReplyLimit) != over {
+					out = append(out, step{label, next, fmt.Sprintf("the Reply closed the connection for its Reply limit = %v with %d bytes left to write before the latest reply is out, %d held behind it, and a limit of %d", !over, ahead, len(w.held), limit)})
+					continue
+				}
 				next.wire += strings.Repeat("r", int(n)) + next.held
 				next.held, next.holding = "", false
 			}
-			out = append(out, step{fmt.Sprintf("reply of %d", n), next, next.settle(w, queued, 0, effects)})
+			out = append(out, step{label, next, next.settle(w, queued, 0, effects)})
 		}
 		if !w.holding && !w.closed {
 			next := w.copy()
@@ -366,10 +399,10 @@ func (w world) steps(eventLoop bool) []step {
 		next := w.copy()
 		effects := next.m.MarkReplica(next.now)
 		if !next.closed {
-			next.replica, next.subscriber = true, false
-			if next.offerLeft > 0 {
+			if next.offerLeft > 0 && !next.stallRule() {
 				next.since = next.now
 			}
+			next.replica, next.subscriber = true, false
 			next.deadline = effects.Deadline
 		}
 		violation := next.settle(w, queued, 0, effects)
@@ -377,6 +410,25 @@ func (w world) steps(eventLoop bool) []step {
 			violation = fmt.Sprintf("a connection with %d bytes on offer was marked a Replica's with no deadline: nothing would try its socket again", next.offerLeft)
 		}
 		out = append(out, step{"mark as a replica", next, violation})
+	}
+
+	// The connection has run its last request. Its goroutine is not in the
+	// middle of a flush then.
+	if !w.finishing && !w.requesterHolds {
+		next := w.copy()
+		effects := next.m.Finish(next.now)
+		if !next.closed {
+			if next.offerLeft > 0 && !next.stallRule() {
+				next.since = next.now
+			}
+			next.finishing = true
+			next.deadline = effects.Deadline
+		}
+		violation := next.settle(w, queued, 0, effects)
+		if violation == "" && !next.closed && next.offerLeft > 0 && effects.Deadline == 0 {
+			violation = fmt.Sprintf("a connection with %d bytes on offer began to finish with no deadline: a peer that takes none of them would keep it for good", next.offerLeft)
+		}
+		out = append(out, step{"finish", next, violation})
 	}
 
 	if !writing {
@@ -530,7 +582,7 @@ func TestEveryReachableStateOfTheLedgerKeepsItsRules(t *testing.T) {
 	for _, mode := range networkingModes {
 		mode := mode
 		t.Run(mode.name, func(t *testing.T) {
-			ledger := New(modelLimits)
+			ledger := New(modelLimitsFor(mode.eventLoop))
 			states, trace, violation := explore(&ledger, mode.eventLoop, 0)
 			if violation != "" {
 				t.Fatalf("after\n  %s\n%s", strings.Join(trace, "\n  "), violation)
@@ -558,6 +610,10 @@ func (c *called) Push(n int64) (bool, Effects) {
 func (c *called) Hold()           { c.calls["Hold"]++; c.Ledger.Hold() }
 func (c *called) Holding() bool   { c.calls["Holding"]++; return c.Ledger.Holding() }
 func (c *called) Stallable() bool { c.calls["Stallable"]++; return c.Ledger.Stallable() }
+func (c *called) Finish(now Instant) Effects {
+	c.calls["Finish"]++
+	return c.Ledger.Finish(now)
+}
 func (c *called) MarkReplica(now Instant) Effects {
 	c.calls["MarkReplica"]++
 	return c.Ledger.MarkReplica(now)
@@ -740,6 +796,23 @@ func (m *flushWritesWhatWasPushedDuringIt) Took(n int64, now Instant) Effects {
 	return m.Ledger.Took(n, now)
 }
 
+// replyLimitCountsEverythingWaiting is ConnMachine.bufferResponses before the
+// limit became the Ledger's: a Reply closes the connection when more than the
+// limit waits for it in all, what was pushed behind the Reply included.
+type replyLimitCountsEverythingWaiting struct{ Ledger }
+
+func (m *replyLimitCountsEverythingWaiting) clone() machine { c := *m; return &c }
+func (m *replyLimitCountsEverythingWaiting) Reply(n int64) Effects {
+	limit := m.lim.ReplyLimit
+	m.lim.ReplyLimit = 0
+	effects := m.Ledger.Reply(n)
+	m.lim.ReplyLimit = limit
+	if !m.closed && m.Waiting() > limit {
+		return Effects{Close: ErrReplyLimit}
+	}
+	return effects
+}
+
 // markReplicaCountsForAClosedOutput is MarkReplica before 145fa8b: it starts
 // the stall count for the batch a closed connection's writer left unsent.
 type markReplicaCountsForAClosedOutput struct{ Ledger }
@@ -811,6 +884,13 @@ func TestTheModelRejectsEachRuleAPastCommitHadToReplace(t *testing.T) {
 			replacedBy: "145fa8b",
 			machine:    func() machine { return &markReplicaCountsForAClosedOutput{New(modelLimits)} },
 			breaks:     "a closed Ledger returned",
+		},
+		{
+			name:       "the event loop's reply limit counts everything that waits",
+			replacedBy: "the commit that made the limit the Ledger's (conn_machine.go before it)",
+			eventLoop:  true,
+			machine:    func() machine { return &replyLimitCountsEverythingWaiting{New(modelLimitsFor(true))} },
+			breaks:     "the Reply closed the connection for its Reply limit = true",
 		},
 	}
 
