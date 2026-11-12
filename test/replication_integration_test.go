@@ -118,675 +118,85 @@ func TestServerHandlesMasterReplicaHandshake(t *testing.T) {
 	})
 }
 
-func TestServerReplicaModeInitiatesHandshake(t *testing.T) {
-	t.Run("unprotected master", func(t *testing.T) {
-		masterListener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("Listen() fake master error = %v", err)
-		}
-		defer closeTestResource(t, masterListener)
+// TestAReplicaServerAttachesToItsMasterOrKeepsServingWhenRefused starts a
+// replica server against a real master and checks what the server wires into
+// its link: the port it announces is the one it listens on, and --masterauth
+// is the password it sends. A master that refuses the handshake leaves the
+// replica serving its own clients. The handshake's requests and the text of
+// each refusal are pinned over a net.Pipe in internal/replication's Link tests.
+func TestAReplicaServerAttachesToItsMasterOrKeepsServingWhenRefused(t *testing.T) {
+	tests := []struct {
+		name        string
+		requirePass string
+		masterAuth  string
+		// refusalLogged is part of the error the replica logs when the master
+		// refuses it, or empty when the replica attaches.
+		refusalLogged string
+	}{
+		{name: "an unprotected master"},
+		{name: "a protected master and the right password", requirePass: "secret", masterAuth: "secret"},
+		{name: "a protected master and no password", requirePass: "secret", refusalLogged: "NOAUTH Authentication required."},
+		{name: "a protected master and the wrong password", requirePass: "secret", masterAuth: "wrong", refusalLogged: "WRONGPASS"},
+	}
 
-		listeningPortCh := make(chan string, 1)
-		handshakeDone := make(chan struct{})
-		masterStop := make(chan struct{})
-		masterErrCh := make(chan error, 1)
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, base config.Config) {
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				masterCfg := defaultTestConfig()
+				masterCfg.RequirePass = tt.requirePass
+				master := newServer(t, masterCfg, stashlogger.New(masterCfg.LogLevel), storage.NewStore())
+				masterCtx, stopMaster := context.WithCancel(context.Background())
+				defer stopMaster()
+				masterErrCh := make(chan error, 1)
+				go func() { masterErrCh <- master.ListenAndServe(masterCtx) }()
+				masterAddr := waitForAddr(t, master)
 
-		go func() {
-			conn, err := masterListener.Accept()
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			defer closeTestResource(t, conn)
+				masterConn, masterParser := dialClient(t, masterAddr)
+				if tt.requirePass != "" {
+					assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "AUTH", tt.requirePass)
+				}
+				assertCommandResponse(t, masterConn, masterParser, protocol.SimpleString{Value: "OK"}, "SET", "from-master", "x")
 
-			parser := protocol.NewParser(conn)
-			writer := conn
+				replicaCfg := base
+				replicaCfg.ReplicaOf = masterAddr
+				replicaCfg.MasterAuth = tt.masterAuth
+				var replicaLogs synchronizedBuffer
+				replicaLogger := slog.New(slog.NewTextHandler(&replicaLogs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+				replica := newServer(t, replicaCfg, replicaLogger, storage.NewStore())
+				replicaCtx, stopReplica := context.WithCancel(context.Background())
+				defer stopReplica()
+				replicaErrCh := make(chan error, 1)
+				go func() { replicaErrCh <- replica.ListenAndServe(replicaCtx) }()
+				replicaAddr := waitForAddr(t, replica)
+				_, replicaPort, err := net.SplitHostPort(replicaAddr)
+				if err != nil {
+					t.Fatalf("SplitHostPort(%q) error = %v", replicaAddr, err)
+				}
 
-			if err := assertReplicaRequest(parser, "PING"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "PONG"}); err != nil {
-				masterErrCh <- err
-				return
-			}
+				replicaConn, replicaParser := dialClient(t, replicaAddr)
+				if tt.refusalLogged == "" {
+					assertEventuallyCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Data: []byte("x")}, 5*time.Second, "GET", "from-master")
+					waitForReplicaCount(t, master, 1, "after the replica attached")
+					if slave := infoFields(t, masterConn, masterParser, "replication")["slave0"]; !strings.Contains(slave, ",port="+replicaPort+",") {
+						t.Fatalf("the master's INFO replication lists slave0:%s, want the port %s the replica listens on", slave, replicaPort)
+					}
+				} else {
+					waitForLogFragments(t, &replicaLogs, 5*time.Second, "the link to the master failed", tt.refusalLogged)
+					assertCommandResponse(t, replicaConn, replicaParser, protocol.SimpleString{Value: "PONG"}, "PING")
+					assertCommandResponse(t, replicaConn, replicaParser, protocol.BulkString{Null: true}, "GET", "from-master")
+					if got := master.ReplicaCount(); got != 0 {
+						t.Fatalf("the master has %d replicas, want 0 after refusing the handshake", got)
+					}
+				}
 
-			replconf, err := decodeReplicaRequest(parser)
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			if replconf.Name != "REPLCONF" {
-				masterErrCh <- fmt.Errorf("second request = %q, want REPLCONF", replconf.Name)
-				return
-			}
-			if len(replconf.Args) != 2 || !strings.EqualFold(string(replconf.Args[0]), "listening-port") {
-				masterErrCh <- fmt.Errorf("REPLCONF args = %q, want listening-port <port>", replconf.Args)
-				return
-			}
-			listeningPortCh <- string(replconf.Args[1])
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "OK"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			if err := assertReplicaRequest(parser, "PSYNC", "?", "-1"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "FULLRESYNC test-replid 0"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.BulkString{Data: rdb.EmptySnapshot()}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			close(handshakeDone)
-			<-masterStop
-			masterErrCh <- nil
-		}()
-
-		cfg := defaultTestConfig()
-		cfg.ReplicaOf = masterListener.Addr().String()
-
-		logger := stashlogger.New(cfg.LogLevel)
-		store := storage.NewStore()
-		srv := newServer(t, cfg, logger, store)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		serverErrCh := make(chan error, 1)
-		go func() {
-			serverErrCh <- srv.ListenAndServe(ctx)
-		}()
-
-		replicaAddr := waitForAddr(t, srv)
-		_, replicaPortText, err := net.SplitHostPort(replicaAddr)
-		if err != nil {
-			t.Fatalf("SplitHostPort(%q) error = %v", replicaAddr, err)
-		}
-
-		select {
-		case announcedPort := <-listeningPortCh:
-			if announcedPort != replicaPortText {
-				t.Fatalf("REPLCONF listening-port = %q, want %q", announcedPort, replicaPortText)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica did not send REPLCONF in time")
-		}
-
-		select {
-		case <-handshakeDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica did not complete handshake in time")
-		}
-
-		clientConn, err := net.Dial("tcp", replicaAddr)
-		if err != nil {
-			t.Fatalf("Dial(%q) client error = %v", replicaAddr, err)
-		}
-		defer closeTestResource(t, clientConn)
-		clientParser := protocol.NewParser(clientConn)
-		assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "PONG"}, "PING")
-
-		close(masterStop)
-
-		select {
-		case err := <-masterErrCh:
-			if err != nil {
-				t.Fatalf("fake master error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("fake master did not stop within timeout")
-		}
-
-		cancel()
-		select {
-		case err := <-serverErrCh:
-			if err != nil {
-				t.Fatalf("ListenAndServe() error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica server did not stop within timeout")
+				stopReplica()
+				waitForServerStop(t, replicaErrCh)
+				stopMaster()
+				waitForServerStop(t, masterErrCh)
+			})
 		}
 	})
-
-	t.Run("protected master with masterauth", func(t *testing.T) {
-		masterListener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("Listen() fake master error = %v", err)
-		}
-		defer closeTestResource(t, masterListener)
-
-		listeningPortCh := make(chan string, 1)
-		handshakeDone := make(chan struct{})
-		masterStop := make(chan struct{})
-		masterErrCh := make(chan error, 1)
-
-		go func() {
-			conn, err := masterListener.Accept()
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			defer closeTestResource(t, conn)
-
-			parser := protocol.NewParser(conn)
-			writer := conn
-
-			if err := assertReplicaRequest(parser, "PING"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "PONG"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			if err := assertReplicaRequest(parser, "AUTH", "secret"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "OK"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			replconf, err := decodeReplicaRequest(parser)
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			if replconf.Name != "REPLCONF" {
-				masterErrCh <- fmt.Errorf("third request = %q, want REPLCONF", replconf.Name)
-				return
-			}
-			if len(replconf.Args) != 2 || !strings.EqualFold(string(replconf.Args[0]), "listening-port") {
-				masterErrCh <- fmt.Errorf("REPLCONF args = %q, want listening-port <port>", replconf.Args)
-				return
-			}
-			listeningPortCh <- string(replconf.Args[1])
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "OK"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			if err := assertReplicaRequest(parser, "PSYNC", "?", "-1"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "FULLRESYNC test-replid 0"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.BulkString{Data: rdb.EmptySnapshot()}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			close(handshakeDone)
-			<-masterStop
-			masterErrCh <- nil
-		}()
-
-		cfg := config.Default()
-		cfg.Host = "127.0.0.1"
-		cfg.Port = 0
-		cfg.LogLevel = "error"
-		cfg.EvictionInterval = 5 * time.Millisecond
-		cfg.EvictionSampleSize = 10
-		cfg.DumpPath = ""
-		cfg.ReplicaOf = masterListener.Addr().String()
-		cfg.MasterAuth = "secret"
-
-		logger := stashlogger.New(cfg.LogLevel)
-		store := storage.NewStore()
-		srv := newServer(t, cfg, logger, store)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		serverErrCh := make(chan error, 1)
-		go func() {
-			serverErrCh <- srv.ListenAndServe(ctx)
-		}()
-
-		replicaAddr := waitForAddr(t, srv)
-		_, replicaPortText, err := net.SplitHostPort(replicaAddr)
-		if err != nil {
-			t.Fatalf("SplitHostPort(%q) error = %v", replicaAddr, err)
-		}
-
-		select {
-		case announcedPort := <-listeningPortCh:
-			if announcedPort != replicaPortText {
-				t.Fatalf("REPLCONF listening-port = %q, want %q", announcedPort, replicaPortText)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica did not send authenticated REPLCONF in time")
-		}
-
-		select {
-		case <-handshakeDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica did not complete authenticated handshake in time")
-		}
-
-		clientConn, err := net.Dial("tcp", replicaAddr)
-		if err != nil {
-			t.Fatalf("Dial(%q) client error = %v", replicaAddr, err)
-		}
-		defer closeTestResource(t, clientConn)
-		clientParser := protocol.NewParser(clientConn)
-		assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "PONG"}, "PING")
-
-		close(masterStop)
-
-		select {
-		case err := <-masterErrCh:
-			if err != nil {
-				t.Fatalf("fake master error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("fake master did not stop within timeout")
-		}
-
-		cancel()
-		select {
-		case err := <-serverErrCh:
-			if err != nil {
-				t.Fatalf("ListenAndServe() error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica server did not stop within timeout")
-		}
-	})
-
-	t.Run("protected master without masterauth fails before PSYNC and keeps replica server alive", func(t *testing.T) {
-		masterListener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("Listen() fake master error = %v", err)
-		}
-		defer closeTestResource(t, masterListener)
-
-		handshakeFailed := make(chan struct{})
-		masterErrCh := make(chan error, 1)
-
-		go func() {
-			conn, err := masterListener.Accept()
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			defer closeTestResource(t, conn)
-
-			parser := protocol.NewParser(conn)
-			writer := conn
-
-			if err := assertReplicaRequest(parser, "PING"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "PONG"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			replconf, err := decodeReplicaRequest(parser)
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			if replconf.Name != "REPLCONF" {
-				masterErrCh <- fmt.Errorf("second request = %q, want REPLCONF", replconf.Name)
-				return
-			}
-			if len(replconf.Args) != 2 || !strings.EqualFold(string(replconf.Args[0]), "listening-port") {
-				masterErrCh <- fmt.Errorf("REPLCONF args = %q, want listening-port <port>", replconf.Args)
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.ErrorValue{Message: "NOAUTH Authentication required."}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			if err := assertNoFurtherReplicaRequests(conn, parser, 300*time.Millisecond); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			close(handshakeFailed)
-			masterErrCh <- nil
-		}()
-
-		var replicaLogs synchronizedBuffer
-		replicaLogger := slog.New(slog.NewTextHandler(&replicaLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		cfg := config.Default()
-		cfg.Host = "127.0.0.1"
-		cfg.Port = 0
-		cfg.LogLevel = "debug"
-		cfg.EvictionInterval = 5 * time.Millisecond
-		cfg.EvictionSampleSize = 10
-		cfg.DumpPath = ""
-		cfg.ReplicaOf = masterListener.Addr().String()
-
-		store := storage.NewStore()
-		srv := newServer(t, cfg, replicaLogger, store)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		serverErrCh := make(chan error, 1)
-		go func() {
-			serverErrCh <- srv.ListenAndServe(ctx)
-		}()
-
-		replicaAddr := waitForAddr(t, srv)
-
-		select {
-		case <-handshakeFailed:
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica did not fail unauthenticated protected-master handshake in time")
-		}
-
-		clientConn, err := net.Dial("tcp", replicaAddr)
-		if err != nil {
-			t.Fatalf("Dial(%q) client error = %v", replicaAddr, err)
-		}
-		defer closeTestResource(t, clientConn)
-		clientParser := protocol.NewParser(clientConn)
-		assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "PONG"}, "PING")
-
-		waitForLogFragments(t, &replicaLogs, 2*time.Second,
-			"replica REPLCONF failed",
-			"protected master requires replica authentication (--masterauth)",
-			"NOAUTH Authentication required.",
-		)
-		if strings.Contains(replicaLogs.String(), "replica handshake completed") {
-			t.Fatalf("replica logs unexpectedly contain completed handshake:\n%s", replicaLogs.String())
-		}
-
-		select {
-		case err := <-masterErrCh:
-			if err != nil {
-				t.Fatalf("fake master error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("fake master did not stop within timeout")
-		}
-
-		cancel()
-		select {
-		case err := <-serverErrCh:
-			if err != nil {
-				t.Fatalf("ListenAndServe() error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica server did not stop within timeout")
-		}
-	})
-
-	t.Run("protected master with wrong masterauth fails after AUTH and keeps replica server alive", func(t *testing.T) {
-		masterListener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("Listen() fake master error = %v", err)
-		}
-		defer closeTestResource(t, masterListener)
-
-		handshakeFailed := make(chan struct{})
-		masterErrCh := make(chan error, 1)
-
-		go func() {
-			conn, err := masterListener.Accept()
-			if err != nil {
-				masterErrCh <- err
-				return
-			}
-			defer closeTestResource(t, conn)
-
-			parser := protocol.NewParser(conn)
-			writer := conn
-
-			if err := assertReplicaRequest(parser, "PING"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "PONG"}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			if err := assertReplicaRequest(parser, "AUTH", "wrong"); err != nil {
-				masterErrCh <- err
-				return
-			}
-			if err := protocol.WriteValue(writer, protocol.ErrorValue{Message: "WRONGPASS invalid username-password pair or user is disabled."}); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			if err := assertNoFurtherReplicaRequests(conn, parser, 300*time.Millisecond); err != nil {
-				masterErrCh <- err
-				return
-			}
-
-			close(handshakeFailed)
-			masterErrCh <- nil
-		}()
-
-		var replicaLogs synchronizedBuffer
-		replicaLogger := slog.New(slog.NewTextHandler(&replicaLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-		cfg := config.Default()
-		cfg.Host = "127.0.0.1"
-		cfg.Port = 0
-		cfg.LogLevel = "debug"
-		cfg.EvictionInterval = 5 * time.Millisecond
-		cfg.EvictionSampleSize = 10
-		cfg.DumpPath = ""
-		cfg.ReplicaOf = masterListener.Addr().String()
-		cfg.MasterAuth = "wrong"
-
-		store := storage.NewStore()
-		srv := newServer(t, cfg, replicaLogger, store)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		serverErrCh := make(chan error, 1)
-		go func() {
-			serverErrCh <- srv.ListenAndServe(ctx)
-		}()
-
-		replicaAddr := waitForAddr(t, srv)
-
-		select {
-		case <-handshakeFailed:
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica did not fail protected-master AUTH in time")
-		}
-
-		clientConn, err := net.Dial("tcp", replicaAddr)
-		if err != nil {
-			t.Fatalf("Dial(%q) client error = %v", replicaAddr, err)
-		}
-		defer closeTestResource(t, clientConn)
-		clientParser := protocol.NewParser(clientConn)
-		assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "PONG"}, "PING")
-
-		waitForLogFragments(t, &replicaLogs, 2*time.Second,
-			"replica AUTH failed",
-			"replica AUTH rejected by master",
-			"WRONGPASS",
-		)
-		if strings.Contains(replicaLogs.String(), "replica handshake completed") {
-			t.Fatalf("replica logs unexpectedly contain completed handshake:\n%s", replicaLogs.String())
-		}
-
-		select {
-		case err := <-masterErrCh:
-			if err != nil {
-				t.Fatalf("fake master error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("fake master did not stop within timeout")
-		}
-
-		cancel()
-		select {
-		case err := <-serverErrCh:
-			if err != nil {
-				t.Fatalf("ListenAndServe() error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("replica server did not stop within timeout")
-		}
-	})
-}
-
-func TestServerReplicaFullResyncReplacesExistingData(t *testing.T) {
-	masterListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() fake master error = %v", err)
-	}
-	defer closeTestResource(t, masterListener)
-
-	handshakeDone := make(chan struct{})
-	masterStop := make(chan struct{})
-	masterErrCh := make(chan error, 1)
-	snapshot := buildTestRDB(
-		selectTestDB(0),
-		testStringEntry([]byte("fresh"), []byte("from-master")),
-	)
-
-	go func() {
-		conn, err := masterListener.Accept()
-		if err != nil {
-			masterErrCh <- err
-			return
-		}
-		defer closeTestResource(t, conn)
-
-		parser := protocol.NewParser(conn)
-		writer := conn
-
-		if err := assertReplicaRequest(parser, "PING"); err != nil {
-			masterErrCh <- err
-			return
-		}
-		if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "PONG"}); err != nil {
-			masterErrCh <- err
-			return
-		}
-
-		replconf, err := decodeReplicaRequest(parser)
-		if err != nil {
-			masterErrCh <- err
-			return
-		}
-		if replconf.Name != "REPLCONF" || len(replconf.Args) != 2 || !strings.EqualFold(string(replconf.Args[0]), "listening-port") {
-			masterErrCh <- fmt.Errorf("REPLCONF args = %q, want listening-port <port>", replconf.Args)
-			return
-		}
-		if string(replconf.Args[1]) == "0" {
-			masterErrCh <- fmt.Errorf("REPLCONF listening-port = %q, want an ephemeral non-zero port", replconf.Args[1])
-			return
-		}
-		if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "OK"}); err != nil {
-			masterErrCh <- err
-			return
-		}
-
-		if err := assertReplicaRequest(parser, "PSYNC", "?", "-1"); err != nil {
-			masterErrCh <- err
-			return
-		}
-		if err := protocol.WriteValue(writer, protocol.SimpleString{Value: "FULLRESYNC test-replid 0"}); err != nil {
-			masterErrCh <- err
-			return
-		}
-		if err := protocol.WriteValue(writer, protocol.BulkString{Data: snapshot}); err != nil {
-			masterErrCh <- err
-			return
-		}
-
-		close(handshakeDone)
-		<-masterStop
-		masterErrCh <- nil
-	}()
-
-	rdbPath := writeTempRDBFile(t, buildTestRDB(
-		selectTestDB(0),
-		testStringEntry([]byte("stale"), []byte("local")),
-	))
-
-	cfg := config.Default()
-	cfg.Host = "127.0.0.1"
-	cfg.Port = 0
-	cfg.LogLevel = "error"
-	cfg.EvictionInterval = 5 * time.Millisecond
-	cfg.EvictionSampleSize = 10
-	cfg.DumpPath = ""
-	cfg.RDBPath = rdbPath
-	cfg.ReplicaOf = masterListener.Addr().String()
-
-	logger := stashlogger.New(cfg.LogLevel)
-	store := storage.NewStore()
-	srv := newServer(t, cfg, logger, store)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	serverErrCh := make(chan error, 1)
-	go func() {
-		serverErrCh <- srv.ListenAndServe(ctx)
-	}()
-
-	replicaAddr := waitForAddr(t, srv)
-
-	select {
-	case <-handshakeDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("replica did not complete FULLRESYNC in time")
-	}
-
-	clientConn, err := net.Dial("tcp", replicaAddr)
-	if err != nil {
-		t.Fatalf("Dial(%q) client error = %v", replicaAddr, err)
-	}
-	defer closeTestResource(t, clientConn)
-	clientParser := protocol.NewParser(clientConn)
-
-	// The master finishing its write does not mean the replica has applied the
-	// snapshot yet, so wait for the master's data to appear. The keyspace is
-	// replaced as a whole, so once it has, the old local key must be gone.
-	assertEventuallyCommandResponse(t, clientConn, clientParser, protocol.BulkString{Data: []byte("from-master")}, 2*time.Second, "GET", "fresh")
-	assertCommandResponse(t, clientConn, clientParser, protocol.BulkString{Null: true}, "GET", "stale")
-
-	close(masterStop)
-
-	select {
-	case err := <-masterErrCh:
-		if err != nil {
-			t.Fatalf("fake master error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("fake master did not stop within timeout")
-	}
-
-	cancel()
-	select {
-	case err := <-serverErrCh:
-		if err != nil {
-			t.Fatalf("ListenAndServe() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("replica server did not stop within timeout")
-	}
 }
 
 func assertReplicaRequest(parser *protocol.Parser, wantName string, wantArgs ...string) error {
