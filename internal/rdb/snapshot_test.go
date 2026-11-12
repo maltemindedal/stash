@@ -262,3 +262,46 @@ func assertFileContents(t *testing.T, path string, want string) {
 		t.Fatalf("target contents = %q, want %q", string(got), want)
 	}
 }
+
+func TestSnapshotSizeIsTheLengthBuildSnapshotEncodes(t *testing.T) {
+	future := time.Now().Add(time.Hour).UnixMilli()
+	sized := func(n int) []byte { return bytes.Repeat([]byte("v"), n) }
+	key := func(n int) string { return string(bytes.Repeat([]byte("k"), n)) }
+
+	tests := []struct {
+		name    string
+		entries []storage.StringSnapshotEntry
+	}{
+		{name: "no entries"},
+		{name: "an empty key and value", entries: []storage.StringSnapshotEntry{{Key: "", Value: nil}}},
+		{name: "values at the length encoding boundaries", entries: []storage.StringSnapshotEntry{
+			{Key: "a", Value: sized(63)},
+			{Key: "b", Value: sized(64)},
+			{Key: "c", Value: sized(16383)},
+			{Key: "d", Value: sized(16384)},
+		}},
+		{name: "keys at the length encoding boundaries", entries: []storage.StringSnapshotEntry{
+			{Key: key(63), Value: []byte("x")},
+			{Key: key(64), Value: []byte("x")},
+			{Key: key(16383), Value: []byte("x")},
+			{Key: key(16384), Value: []byte("x")},
+		}},
+		{name: "entries with a future expiry", entries: []storage.StringSnapshotEntry{
+			{Key: "ttl", Value: []byte("value"), ExpiresAt: future},
+			{Key: "persistent", Value: []byte("value")},
+			{Key: "big ttl", Value: sized(16384), ExpiresAt: future},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, _ := BuildSnapshot(tt.entries)
+			if got := SnapshotSize(tt.entries); got != len(payload) {
+				t.Fatalf("SnapshotSize() = %d, want len(BuildSnapshot()) = %d", got, len(payload))
+			}
+			if allocs := testing.AllocsPerRun(10, func() { SnapshotSize(tt.entries) }); allocs != 0 {
+				t.Fatalf("SnapshotSize() allocates %v times, want 0", allocs)
+			}
+		})
+	}
+}

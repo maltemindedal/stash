@@ -157,7 +157,7 @@ func TestParserRejectsOversizedFrames(t *testing.T) {
 		},
 		{
 			name:  "bulk length just over cap",
-			input: "$536870913\r\n", // maxBulkStringLength + 1
+			input: "$536870913\r\n", // BulkStringLimit + 1
 		},
 		{
 			name:  "array count near MaxInt does not allocate",

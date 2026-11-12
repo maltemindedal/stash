@@ -161,7 +161,7 @@ func TestEventLoopSendsAWritePropagatedDuringAFullResyncAfterItsReply(t *testing
 
 	var reply []protocol.Value
 	conn.run = func(context.Context, protocol.Value) ([]protocol.Value, error) {
-		attachment := attachWithoutCut(loop.srv.master, replication.Candidate{ID: conn.clientID, Out: conn.out})
+		attachment := attachWithoutCut(t, loop.srv.master, replication.Candidate{ID: conn.clientID, Out: conn.out})
 		loop.srv.master.Propagate([]byte(fullResyncStreamFrame), false)
 		reply = attachment.Reply()
 		return reply, nil

@@ -45,6 +45,9 @@ type Master struct {
 	// that frame. When it is nil nobody is told.
 	dropped func(replica *Replica, cause error)
 
+	// snapshotLimit is the largest full resync snapshot Attach serves, in bytes.
+	snapshotLimit int
+
 	mu       sync.RWMutex
 	replicas map[uint64]*Replica
 	// registered is len(replicas), stored under mu whenever it changes, so that
@@ -130,6 +133,18 @@ func (a *Attachment) Reply() []protocol.Value {
 	}
 }
 
+// SnapshotTooLargeError is why Attach refused a Candidate: the full resync
+// snapshot of the keyspace would be Size bytes, more than the Limit a Replica
+// accepts in one bulk string.
+type SnapshotTooLargeError struct {
+	Size  int
+	Limit int
+}
+
+func (e *SnapshotTooLargeError) Error() string {
+	return fmt.Sprintf("replication: full resync snapshot of %d bytes exceeds the %d byte limit of a bulk string", e.Size, e.Limit)
+}
+
 // ReplicaInfo describes one attached Replica for INFO replication.
 type ReplicaInfo struct {
 	ID            uint64
@@ -184,9 +199,18 @@ func NewMaster(store *storage.Store, dropped func(replica *Replica, cause error)
 		store:         store,
 		logger:        logger,
 		dropped:       dropped,
+		snapshotLimit: protocol.BulkStringLimit,
 		replicas:      make(map[uint64]*Replica),
 		changed:       make(chan struct{}),
 	}
+}
+
+// SetSnapshotLimit sets the largest full resync snapshot Attach serves, in
+// bytes, which is protocol.BulkStringLimit until it is called: the most a
+// Replica accepts in one bulk string. Call it before the Master serves; tests
+// use it to refuse a small snapshot.
+func (m *Master) SetSnapshotLimit(bytes int) {
+	m.snapshotLimit = bytes
 }
 
 // ReplicationID is the Master's replication ID, which FULLRESYNC and INFO
@@ -231,8 +255,23 @@ func (m *Master) Active() bool {
 // runs, and the snapshot is encoded after the cut is released, so writers wait
 // only for the copy. If the copy panics, the attach ends and Active reports
 // what it did before.
-func (m *Master) Attach(c Candidate, cut func(startRecording func()) (release func())) *Attachment {
-	entries, stats := m.cutAndReserve(c, cut)
+//
+// When the snapshot of the copy would be larger than the snapshot limit
+// (SetSnapshotLimit), which a Replica could not read, Attach returns a
+// *SnapshotTooLargeError instead. It sizes the snapshot inside the cut, before
+// reserve, so c is never registered and its Output is told nothing, and it
+// encodes no snapshot. The attach ends and Active reports what it did before.
+func (m *Master) Attach(c Candidate, cut func(startRecording func()) (release func())) (*Attachment, error) {
+	entries, stats, tooLarge := m.cutAndReserve(c, cut)
+	if tooLarge != nil {
+		m.logger.Warn(
+			"refusing full resync: snapshot exceeds the bulk string limit",
+			"replica_id", c.ID,
+			"snapshot_size_bytes", tooLarge.Size,
+			"limit_bytes", tooLarge.Limit,
+		)
+		return nil, tooLarge
+	}
 	snapshot, written := rdb.BuildSnapshot(entries)
 	if stats.SkippedUnsupportedKeys > 0 {
 		// RDB support is scoped to DB 0 string keys, so a Master holding
@@ -251,14 +290,14 @@ func (m *Master) Attach(c Candidate, cut func(startRecording func()) (release fu
 		"snapshot_keys", written.WrittenKeys,
 	)
 
-	return &Attachment{replicationID: m.replicationID, snapshot: snapshot}
+	return &Attachment{replicationID: m.replicationID, snapshot: snapshot}, nil
 }
 
-func (m *Master) cutAndReserve(c Candidate, cut func(startRecording func()) (release func())) ([]storage.StringSnapshotEntry, storage.StringSnapshotStats) {
+func (m *Master) cutAndReserve(c Candidate, cut func(startRecording func()) (release func())) ([]storage.StringSnapshotEntry, storage.StringSnapshotStats, *SnapshotTooLargeError) {
 	release := cut(m.beginAttach)
 	defer release()
-	// Nothing below returns an error before reserve, but a panic would leave the
-	// Master counting an attach that never ends, and every write ordered.
+	// An attach that does not reach reserve, refused or panicking, must end, or
+	// the Master would count an attach that never ends, and order every write.
 	reserved := false
 	defer func() {
 		if !reserved {
@@ -267,9 +306,12 @@ func (m *Master) cutAndReserve(c Candidate, cut func(startRecording func()) (rel
 	}()
 
 	entries, stats := m.store.SnapshotStrings()
+	if size := rdb.SnapshotSize(entries); size > m.snapshotLimit {
+		return nil, stats, &SnapshotTooLargeError{Size: size, Limit: m.snapshotLimit}
+	}
 	m.reserve(c)
 	reserved = true
-	return entries, stats
+	return entries, stats, nil
 }
 
 // beginAttach records that a Replica is attaching, so Active reports true

@@ -27,10 +27,10 @@ func (l Limits) arrayElements() int {
 }
 
 func (l Limits) bulkLength() int {
-	if l.MaxBulkStringLength > 0 && l.MaxBulkStringLength < maxBulkStringLength {
+	if l.MaxBulkStringLength > 0 && l.MaxBulkStringLength < BulkStringLimit {
 		return l.MaxBulkStringLength
 	}
-	return maxBulkStringLength
+	return BulkStringLimit
 }
 
 // checkArrayLength reports an array header that declares more elements than allowed.
@@ -51,7 +51,7 @@ func (l Limits) checkBulkLength(length int) error {
 	if length <= limit {
 		return nil
 	}
-	if limit < maxBulkStringLength {
+	if limit < BulkStringLimit {
 		return fmt.Errorf("protocol: bulk string length %d exceeds %d byte limit for a client that has not authenticated", length, limit)
 	}
 	return fmt.Errorf("protocol: bulk string length %d exceeds %d byte limit", length, limit)

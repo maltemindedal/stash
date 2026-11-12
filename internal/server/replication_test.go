@@ -118,7 +118,7 @@ func TestAWritePropagatedBeforeTheFullResyncReplyIsQueuedFollowsIt(t *testing.T)
 	out := newGoroutineOutput(output.NewShared(), wire)
 	defer out.Close(nil)
 
-	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
+	attachment := attachWithoutCut(t, srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	srv.master.Propagate([]byte(fullResyncStreamFrame), true)
 	if got, err := wire.sent(), out.Err(); got != "" || err != nil || out.Status().WantWrite {
 		t.Fatalf("sent %q before the reply, with Err() = %v and output for the socket = %v; want the %d bytes of the write waiting behind the reply", got, err, out.Status().WantWrite, len(fullResyncStreamFrame))
@@ -152,7 +152,7 @@ func TestAReplicaPastItsPushLimitDuringItsFullResyncIsClosedAtOnce(t *testing.T)
 	wire := newOutputWire()
 	out := newGoroutineOutput(output.NewShared(output.ReplicaPushLimit(64)), wire)
 
-	attachment := attachWithoutCut(srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
+	attachment := attachWithoutCut(t, srv.master, replication.Candidate{ID: 1, ListeningPort: 6380, Out: out})
 	srv.master.Propagate(make([]byte, 40), true)
 	if wire.isClosed() || srv.master.Count() != 1 {
 		t.Fatalf("with 40 bytes waiting against a limit of 64: socket closed = %v, %d replicas registered; want it open and 1", wire.isClosed(), srv.master.Count())
@@ -197,11 +197,16 @@ func encodedReply(t *testing.T, values []protocol.Value) string {
 
 // attachWithoutCut attaches c as PSYNC does, but with no sequencer to cut
 // against, for tests that propagate nothing while it runs.
-func attachWithoutCut(master *replication.Master, c replication.Candidate) *replication.Attachment {
-	return master.Attach(c, func(startRecording func()) (release func()) {
+func attachWithoutCut(t testing.TB, master *replication.Master, c replication.Candidate) *replication.Attachment {
+	t.Helper()
+	attachment, err := master.Attach(c, func(startRecording func()) (release func()) {
 		startRecording()
 		return func() {}
 	})
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	return attachment
 }
 
 type stubConn struct {

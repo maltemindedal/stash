@@ -16,12 +16,14 @@ type Parser struct {
 	limits  Limits
 }
 
+// BulkStringLimit is the most bytes a bulk string may hold, in both decoders:
+// the streaming Parser refuses a longer length prefix, as the event loop's
+// read buffer does (the equivalent of Redis' proto-max-bulk-len), so a forged
+// length cannot trigger a huge make([]byte, ...) that panics or OOMs the
+// process. A Master refuses a full resync whose snapshot would not fit in one.
+const BulkStringLimit = 512 * 1024 * 1024
+
 const (
-	// maxBulkStringLength bounds a single bulk string payload the streaming
-	// Parser will allocate. It mirrors the event loop's read-buffer limit
-	// (the equivalent of Redis' proto-max-bulk-len) so a forged length prefix
-	// cannot trigger a huge make([]byte, ...) that panics or OOMs the process.
-	maxBulkStringLength = 512 * 1024 * 1024
 	// maxArrayElements bounds the declared element count of a single RESP array
 	// so a forged multibulk header cannot pre-allocate an enormous slice.
 	maxArrayElements = 1024 * 1024

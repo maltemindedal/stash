@@ -144,6 +144,9 @@ func (l *Link) fullResync(parser *protocol.Parser) error {
 		return fmt.Errorf("read FULLRESYNC line: %w", err)
 	}
 
+	if refusal, ok := value.(protocol.ErrorValue); ok {
+		return fmt.Errorf("master refused PSYNC: %s", refusal.Message)
+	}
 	line, ok := value.(protocol.SimpleString)
 	if !ok {
 		return fmt.Errorf("unexpected FULLRESYNC response type %T", value)

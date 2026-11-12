@@ -257,10 +257,21 @@ func (e *Executor) handlePSync(ctx context.Context, request *Request) (server.Ex
 	// The Master copies the snapshot and registers the replica at one attach
 	// cut, where it tells the connection's Output to hold what is pushed to it.
 	// Every write made since the cut waits there, and follows this reply.
+	// A refused attach told the Output nothing to hold, so the error is an
+	// ordinary Reply and the connection stays a client.
 	listeningPort := state.ReplicaListeningPort()
-	attachment := e.master.Attach(replication.Candidate{
+	attachment, err := e.master.Attach(replication.Candidate{
 		ID: state.ID, ListeningPort: listeningPort, Out: state.Output(),
 	}, e.seq.attachCut)
+	var tooLarge *replication.SnapshotTooLargeError
+	if errors.As(err, &tooLarge) {
+		return server.ExecuteResult{}, newRESPError("ERR", fmt.Sprintf(
+			"full resync snapshot of %d bytes exceeds the %d byte limit of a bulk string", tooLarge.Size, tooLarge.Limit,
+		), err)
+	}
+	if err != nil {
+		return server.ExecuteResult{}, err
+	}
 	state.PromoteToReplica()
 	e.logger.Info(
 		"replica registered",
