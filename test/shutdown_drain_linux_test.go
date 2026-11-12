@@ -16,7 +16,7 @@ import (
 // that stops because accepting failed, with its context still live. In the
 // default mode its clients stay connected while it sends the replica what is
 // queued, and one writes then. That write reaches no replica, and must not cut
-// the replica off: its feed, closed for the shutdown, used to refuse the write,
+// the replica off: its stream, ended for the shutdown, used to refuse the write,
 // which dropped the replica and closed its socket in the middle of the drain.
 // The event loop closes its clients when it stops accepting, and used to close
 // the replica with them.

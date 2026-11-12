@@ -1247,7 +1247,7 @@ func TestPsyncInsideMultiIsRefusedAndExecAborts(t *testing.T) {
 // returns without a reply for a client that is already a replica, the master
 // answers nothing, keeps the replica attached once, and goes on sending it the
 // same stream. It used to attach the replica a second time and send it a new
-// FULLRESYNC and snapshot while the first attachment's feed could still write
+// FULLRESYNC and snapshot while the first attachment's stream could still carry
 // writes the new snapshot already held, which the replica then applied twice.
 func TestPsyncFromAConnectionThatIsAlreadyAReplicaIsIgnored(t *testing.T) {
 	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
