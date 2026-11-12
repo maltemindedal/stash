@@ -96,34 +96,34 @@ func (c *chain) waiting() int {
 	return n
 }
 
-// seal makes what is in queued the last of the whole buffers, so that what is
-// queued from now on waits behind it in a buffer of its own.
-func (c *chain) seal() {
-	if len(c.queued) == 0 {
-		return
-	}
-	c.ahead = append(c.ahead, c.queued)
-	c.queued, c.spare = c.spare[:0], nil
-}
-
 // offered reports whether the buffer being written has bytes still to go.
 func (c *chain) offered() bool {
 	return c.sent < len(c.inflight)
 }
 
-// offer makes the next buffer of the stream the one being written. The caller
-// knows that there is one.
-func (c *chain) offer() {
-	if len(c.ahead) > 0 {
-		c.inflight, c.sent = c.ahead[0], 0
-		// Moved down, not resliced, so that the list keeps its array for the
-		// next large Reply.
-		rest := copy(c.ahead, c.ahead[1:])
-		c.ahead[rest] = nil
-		c.ahead = c.ahead[:rest]
-		return
+// next returns the bytes at the front of the stream to offer the socket, no
+// more than n of them, and fewer when the buffer they are in ends before that.
+// The caller knows that n bytes are in the stream. fresh reports that they
+// begin a buffer of which nothing was offered before.
+func (c *chain) next(n int64) (chunk []byte, fresh bool) {
+	if c.sent == len(c.inflight) {
+		fresh = true
+		if len(c.ahead) > 0 {
+			c.inflight, c.sent = c.ahead[0], 0
+			// Moved down, not resliced, so that the list keeps its array for
+			// the next large Reply.
+			rest := copy(c.ahead, c.ahead[1:])
+			c.ahead[rest] = nil
+			c.ahead = c.ahead[:rest]
+		} else {
+			c.inflight, c.queued, c.spare, c.sent = c.queued, c.spare[:0], nil, 0
+		}
 	}
-	c.inflight, c.queued, c.spare, c.sent = c.queued, c.spare[:0], nil, 0
+	chunk = c.inflight[c.sent:]
+	if int64(len(chunk)) > n {
+		chunk = chunk[:n]
+	}
+	return chunk, fresh
 }
 
 // drop removes the n bytes the socket took from the front of the stream.

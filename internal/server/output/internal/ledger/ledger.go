@@ -4,7 +4,8 @@
 // Replica's socket has stalled.
 //
 // A Ledger holds no bytes, no lock, no clock, no socket and no timer. It is
-// told what happened (Reply, Push, Hold, Take, Took, MarkReplica, Close) with
+// told what happened (Reply, Push, Hold, Take, Took, MarkReplica, EndStream,
+// Close) with
 // the sizes and the time, and answers with a decision and the Effects its
 // caller must carry out. Its caller, the Output (package output), holds the
 // lock and the bytes. The package is under output's internal directory, so
@@ -30,6 +31,8 @@
 //	                              subscriber
 //	may this writer write, what   taken..seal or taken..end     Take
 //	has the Replica stalled       a try that took nothing       Took
+//	has the stream ended          taken..end is empty, after    Ended
+//	                              EndStream
 //
 // No decision counts anything else, and there is no accessor for a raw
 // position: a caller cannot make a decision of its own from one. To change
@@ -42,8 +45,9 @@
 // goroutine and is used only under its caller's lock.
 //
 // Reply and Hold are the connection's own goroutine's, and so is the Requester
-// role. That goroutine asks for the socket (Take) until it is given nothing,
-// and calls neither Reply nor Hold in between. The model holds it to that.
+// role. That goroutine asks for the socket (Take) until it is given nothing or
+// told that it has written all it may (Took), and calls neither Reply nor Hold
+// in between. The model holds it to that.
 package ledger
 
 import "errors"
@@ -122,6 +126,12 @@ type Effects struct {
 	Signal bool
 	// Close: close the connection with this cause.
 	Close error
+	// ShutWrite: the stream to the peer has ended. EndStream was called and
+	// everything queued is written: shut the write side of the socket.
+	ShutWrite bool
+	// Released: the writer whose write this was has written all it may and no
+	// longer has the socket. It does not ask for it again.
+	Released bool
 	// Deadline: a try of the socket must end at or after this Instant even if
 	// the socket takes nothing, so that Took can give the stall verdict. A
 	// blocking writer sets it as the write deadline. The Event loop wakes then
@@ -138,6 +148,9 @@ type Ledger struct {
 
 	closed  bool
 	holding bool
+	// ending is set once the stream is to end when everything queued is
+	// written (EndStream).
+	ending bool
 
 	// taken is how many bytes the socket has accepted, end how many were
 	// queued for writing, replyEnd where the latest Reply ends. held bytes
@@ -235,9 +248,9 @@ func (l *Ledger) MarkReplica(now Instant) Effects {
 // offer it next. Zero means there is nothing for this writer: another has the
 // socket, or this one has written all it may and has given the socket up.
 //
-// A Requester may write the bytes that were queued when it took the socket. If
-// more was queued meanwhile, the socket goes to a Pusher (StartPusher). The
-// caller reports the result of the write with Took before it calls Take again.
+// A Requester may write the bytes that were queued when it took the socket. The
+// caller reports the result of the write with Took before it calls Take again,
+// and does not call it again once Took says the socket is released.
 func (l *Ledger) Take(role Role, now Instant) (n int64, effects Effects) {
 	if l.closed || l.trying {
 		return 0, Effects{}
@@ -249,21 +262,9 @@ func (l *Ledger) Take(role Role, now Instant) (n int64, effects Effects) {
 	if l.writer != role {
 		return 0, Effects{}
 	}
-	limit := l.end
-	if role == Requester {
-		limit = l.seal
-	}
-	n = min(limit-l.taken, l.lim.Chunk)
+	n = min(l.writerLimit()-l.taken, l.lim.Chunk)
 	if n <= 0 {
-		l.writer = NoWriter
-		if l.end > l.taken {
-			// Queued behind a Requester's seal, so pushed by other
-			// connections: the Requester queues nothing while it has the
-			// socket.
-			l.writer = Pusher
-			return 0, Effects{StartPusher: true}
-		}
-		return 0, Effects{}
+		return 0, Effects{StartPusher: l.release()}
 	}
 	if l.offerEnd <= l.taken {
 		// Nothing was on offer. What still is keeps the time it has had.
@@ -276,21 +277,70 @@ func (l *Ledger) Take(role Role, now Instant) (n int64, effects Effects) {
 
 // Took records that the write Take allowed has returned, and that the socket
 // accepted n bytes of it. This is the only place the stall rule is decided:
-// only a try of the socket can say that it takes nothing.
+// only a try of the socket can say that it takes nothing. A writer that has
+// now written all it may gives the socket up here (Released), so that it need
+// not ask again to be told so.
 func (l *Ledger) Took(n int64, now Instant) Effects {
 	l.trying = false
 	if l.closed {
 		return Effects{}
 	}
 	l.taken += n
-	if n > 0 {
-		l.progress = now
-		return Effects{Signal: true, Deadline: l.deadline()}
+	if n == 0 {
+		if l.class == Replica && now-l.progress >= l.lim.StallTimeout {
+			return Effects{Close: ErrStalled}
+		}
+		return Effects{Deadline: l.deadline()}
 	}
-	if l.class == Replica && now-l.progress >= l.lim.StallTimeout {
-		return Effects{Close: ErrStalled}
+	l.progress = now
+	released, startPusher := l.taken >= l.writerLimit(), false
+	if released {
+		startPusher = l.release()
 	}
-	return Effects{Deadline: l.deadline()}
+	// One literal: an Effects filled in field by field costs each caller a
+	// stalled load, which the Output's benchmarks showed.
+	return Effects{StartPusher: startPusher, Signal: true, ShutWrite: l.Ended(), Released: released, Deadline: l.deadline()}
+}
+
+// writerLimit is where what the writer that has the socket may write ends: for
+// a Requester where the stream ended when it took the socket, for a Pusher
+// where it ends now.
+func (l *Ledger) writerLimit() int64 {
+	if l.writer == Requester {
+		return l.seal
+	}
+	return l.end
+}
+
+// release takes the socket from the writer that has written all it may. What
+// is still queued then lies behind a Requester's seal, so other connections
+// pushed it: the Requester queues nothing while it has the socket. It goes to
+// a Pusher, which release reports that the caller must start.
+func (l *Ledger) release() (startPusher bool) {
+	l.writer = NoWriter
+	if l.end > l.taken {
+		l.writer = Pusher
+		return true
+	}
+	return false
+}
+
+// EndStream records that the stream to the peer ends once everything queued is
+// written. It starts no writer: whoever has the socket, or takes it for what
+// is queued, writes the last byte, and Took reports the end then. With nothing
+// to write the stream ends here.
+func (l *Ledger) EndStream() Effects {
+	if l.closed || l.ending {
+		return Effects{}
+	}
+	l.ending = true
+	return Effects{ShutWrite: l.Ended()}
+}
+
+// Ended reports whether the stream to the peer has ended: EndStream was called
+// and nothing is left to write. Held bytes are not in the stream.
+func (l *Ledger) Ended() bool {
+	return l.ending && !l.closed && l.end == l.taken
 }
 
 // Close records that the connection is closed and drops what waited for it.

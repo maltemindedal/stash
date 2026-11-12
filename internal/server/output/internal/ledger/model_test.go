@@ -42,6 +42,8 @@ type machine interface {
 	MarkReplica(now Instant) Effects
 	Take(role Role, now Instant) (int64, Effects)
 	Took(n int64, now Instant) Effects
+	EndStream() Effects
+	Ended() bool
 	Close() Effects
 	Gate() bool
 	RepliesOut() bool
@@ -80,6 +82,8 @@ type world struct {
 
 	wire, held      string
 	holding, closed bool
+	// ending is set once the stream was to end.
+	ending bool
 	// replica is set once the connection was marked a Replica's, and
 	// subscriber once a Pushed message was accepted for one that is not.
 	replica, subscriber bool
@@ -122,7 +126,7 @@ func (w world) key() string {
 		extra = k.key(w.now)
 	}
 	return fmt.Sprint(
-		l.class, l.closed, l.holding, l.end-l.taken, max(l.replyEnd-l.taken, 0), l.held,
+		l.class, l.closed, l.holding, l.ending, w.ending, l.end-l.taken, max(l.replyEnd-l.taken, 0), l.held,
 		l.writer, max(l.seal-l.taken, 0), max(l.offerEnd-l.taken, 0), l.trying, clamp(int64(w.now-l.progress), 0, timeout+1),
 		"|", w.wire, "|", w.held, w.holding, w.closed, w.replica, w.subscriber, w.grant, w.grantRole, w.requesterHolds, w.sealLeft,
 		w.offerLeft, clamp(int64(w.now-w.since), 0, timeout+1), deadline, extra)
@@ -180,6 +184,13 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 		w.closed, w.wire, w.held, w.holding = true, "", "", false
 	}
 
+	ended := w.ending && !w.closed && w.wire == ""
+	if wasEnded := before.ending && !before.closed && before.wire == ""; effects.ShutWrite != (ended && !wasEnded) {
+		return fmt.Sprintf("ShutWrite = %v with the stream to end = %v and %q left to write, where %q was left before: the write side is shut once, when the last byte queued for a stream that is to end is written", effects.ShutWrite, w.ending, w.wire, before.wire)
+	}
+	if got := w.m.Ended(); got != ended {
+		return fmt.Sprintf("Ended() = %v with the stream to end = %v and %q left to write", got, w.ending, w.wire)
+	}
 	if got := w.m.Holding(); got != w.holding {
 		return fmt.Sprintf("Holding() = %v, want %v: a Pushed message would go to the wrong side of the next Reply", got, w.holding)
 	}
@@ -402,7 +413,23 @@ func (w world) steps(eventLoop bool) []step {
 				next.sealLeft -= took
 			}
 			next.grant, next.deadline = 0, effects.Deadline
-			out = append(out, step{fmt.Sprintf("the socket takes %d of the %d it was offered", took, w.grant), next, next.settle(w, tookBytes, took, effects)})
+			violation := next.settle(w, tookBytes, took, effects)
+			// A writer that has written all it may is told so by the write that
+			// did it, and no longer has the socket.
+			done := !next.closed && took > 0 && (next.grantRole == Requester && next.sealLeft == 0 || next.grantRole == Pusher && next.wire == "")
+			switch {
+			case violation != "":
+			case effects.Released && !done:
+				violation = fmt.Sprintf("a writer was told that it has written all it may, with %q left to write and %d of that its own", next.wire, next.sealLeft)
+			case !effects.Released && done && next.grantRole == Requester:
+				violation = fmt.Sprintf("the connection's goroutine keeps the socket after it wrote all that was queued when its flush began, with %q queued since: it is writing what other connections pushed meanwhile", next.wire)
+			case !effects.Released && done:
+				violation = "a writer that has written everything was not told so: it keeps a socket it has nothing to write to"
+			}
+			if effects.Released && next.grantRole == Requester {
+				next.requesterHolds = false
+			}
+			out = append(out, step{fmt.Sprintf("the socket takes %d of the %d it was offered", took, w.grant), next, violation})
 		}
 	}
 
@@ -419,6 +446,15 @@ func (w world) steps(eventLoop bool) []step {
 			violation = next.settle(w, timerFired, 0, t.timerFired(next.now))
 		}
 		out = append(out, step{label, next, violation})
+	}
+
+	if !w.ending {
+		next := w.copy()
+		effects := next.m.EndStream()
+		if !next.closed {
+			next.ending = true
+		}
+		out = append(out, step{"end the stream", next, next.settle(w, queued, 0, effects)})
 	}
 
 	if !w.closed {
@@ -519,15 +555,17 @@ func (c *called) Took(n int64, now Instant) Effects {
 	c.calls["Took"]++
 	return c.Ledger.Took(n, now)
 }
-func (c *called) Close() Effects   { c.calls["Close"]++; return c.Ledger.Close() }
-func (c *called) Gate() bool       { c.calls["Gate"]++; return c.Ledger.Gate() }
-func (c *called) RepliesOut() bool { c.calls["RepliesOut"]++; return c.Ledger.RepliesOut() }
-func (c *called) Full() bool       { c.calls["Full"]++; return c.Ledger.Full() }
-func (c *called) Waiting() int64   { c.calls["Waiting"]++; return c.Ledger.Waiting() }
-func (c *called) Budgeted() int64  { c.calls["Budgeted"]++; return c.Ledger.Budgeted() }
-func (c *called) Writable() bool   { c.calls["Writable"]++; return c.Ledger.Writable() }
-func (c *called) Class() Class     { c.calls["Class"]++; return c.Ledger.Class() }
-func (c *called) Closed() bool     { c.calls["Closed"]++; return c.Ledger.Closed() }
+func (c *called) EndStream() Effects { c.calls["EndStream"]++; return c.Ledger.EndStream() }
+func (c *called) Ended() bool        { c.calls["Ended"]++; return c.Ledger.Ended() }
+func (c *called) Close() Effects     { c.calls["Close"]++; return c.Ledger.Close() }
+func (c *called) Gate() bool         { c.calls["Gate"]++; return c.Ledger.Gate() }
+func (c *called) RepliesOut() bool   { c.calls["RepliesOut"]++; return c.Ledger.RepliesOut() }
+func (c *called) Full() bool         { c.calls["Full"]++; return c.Ledger.Full() }
+func (c *called) Waiting() int64     { c.calls["Waiting"]++; return c.Ledger.Waiting() }
+func (c *called) Budgeted() int64    { c.calls["Budgeted"]++; return c.Ledger.Budgeted() }
+func (c *called) Writable() bool     { c.calls["Writable"]++; return c.Ledger.Writable() }
+func (c *called) Class() Class       { c.calls["Class"]++; return c.Ledger.Class() }
+func (c *called) Closed() bool       { c.calls["Closed"]++; return c.Ledger.Closed() }
 
 // TestTheModelCallsEveryExportedMethodOfTheLedger fails when the Ledger has
 // an exported method the model does not know: a decision added to ledger.go
@@ -675,15 +713,16 @@ func (m *stallTimerDoesNotAskTheWriter) timerFired(now Instant) Effects {
 }
 
 // flushWritesWhatWasPushedDuringIt is Flush before 878dcef: the connection's
-// goroutine goes on to write what was queued after it took the socket.
+// goroutine goes on to write what was queued after it took the socket. When a
+// write returns, what it may write ends where the stream ends then.
 type flushWritesWhatWasPushedDuringIt struct{ Ledger }
 
 func (m *flushWritesWhatWasPushedDuringIt) clone() machine { c := *m; return &c }
-func (m *flushWritesWhatWasPushedDuringIt) Take(role Role, now Instant) (int64, Effects) {
-	if m.writer == Requester && !m.trying {
+func (m *flushWritesWhatWasPushedDuringIt) Took(n int64, now Instant) Effects {
+	if m.writer == Requester {
 		m.seal = m.end
 	}
-	return m.Ledger.Take(role, now)
+	return m.Ledger.Took(n, now)
 }
 
 // markReplicaCountsForAClosedOutput is MarkReplica before 145fa8b: it starts

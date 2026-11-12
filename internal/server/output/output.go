@@ -134,6 +134,9 @@ func NewShared(limits ...Limit) *Shared {
 			Chunk:            outputWriteChunk,
 			PushLimit:        outputPushLimit,
 			ReplicaPushLimit: outputReplicaPushLimit,
+			// Never reached while the Ledger is told that no time passes
+			// (unclocked): the stall rule is still the timer's.
+			StallTimeout: ledger.Instant(outputReplicaStallTimeout),
 		},
 		pushBudget:   outputPushBudget,
 		stallTimeout: outputReplicaStallTimeout,
@@ -180,13 +183,19 @@ const (
 	stallCounting
 	// stallDue is the stall timeout passed with nothing taken, on a connection
 	// whose Event loop was asked to try the socket once more (checkStall). What
-	// that try takes is the verdict (write).
+	// that try takes is the verdict (writeAs).
 	stallDue
 )
 
 // Output is the Client output of one connection: its Replies and the Pushed
 // messages it receives (pub/sub messages, MONITOR events, and for a Replica
 // its stream), in the order they were produced. Safe for concurrent use.
+//
+// It has three parts. The Ledger (package ledger) decides everything that
+// depends on a count: it is told each event and answers with a decision and
+// the Effects to carry out. The chain holds the bytes. The Output holds the
+// lock, tells the Ledger, and carries out its Effects in one function
+// (unlock). A method here that compares byte counts is in the wrong file.
 //
 // Who calls decides what may wait on the peer's socket. The connection's own
 // executor may: Reply, Flush and Drain, in the goroutine mode. Push,
@@ -199,37 +208,28 @@ const (
 // takes a pusher's lock.
 type Output struct {
 	mu sync.Mutex
-	// ledger counts the connection's output and decides what depends on a
-	// count: whether its requests may be read, whether its Replies are out,
-	// whether a Push fits. bytes are the bytes themselves. The two change
-	// together, under one hold of mu.
+	// ledger counts the connection's output and decides, and bytes are the
+	// bytes themselves. The two change together, under one hold of mu.
 	ledger ledger.Ledger
 	bytes  chain
-	// writing is set while a goroutine of the goroutine mode owns the socket:
-	// the connection's own, writing its Replies (flush), or the pump, which
-	// runs only while Pushed messages wait and nobody is writing.
-	writing bool
-	cause   error
-	// ending is set once the stream is to end when everything queued has been
-	// written (EndStream).
-	ending bool
+	cause  error
 	// lastProgress is when the socket last accepted a byte, or when it was
-	// offered the batch that is inflight, and stall is where the stall rule
-	// stands on it. The rule's timer finds the Output through stallWatch, which
-	// Close empties.
+	// offered the buffer that is being written, and stall is where the stall
+	// rule stands on it. The rule's timer finds the Output through stallWatch,
+	// which Close empties.
 	lastProgress time.Time
 	stall        stallPhase
 	stallWatch   *atomic.Pointer[Output]
 
-	// drained is signalled when a writer finishes, when the connection is
-	// closed, and after every write that leaves the connection's requests
-	// readable (ledger.Ledger.Gate), the one that writes the last byte of its
-	// Replies included.
-	drained *sync.Cond
-	// budgeted is what the connection last reported to the Push budget: its
-	// Ledger's Budgeted, as of the last event (accountLocked). The budget reads
-	// it without the lock (Shared.enforceBudget).
+	// waiters wait for the Ledger to open the gate or to report the Replies
+	// out (Flush, Drain), and are woken when it says so (Effects.Signal).
+	waiters *sync.Cond
+	// budgeted is what the connection last reported to the Push budget, and
+	// gateShut whether its requests may not be read: the Ledger's Budgeted and
+	// Gate as of the last event (unlock). The budget and the Event loop read
+	// them without the lock.
 	budgeted atomic.Int64
+	gateShut atomic.Bool
 
 	// wire is the socket of a connection served by its own goroutine, written
 	// with blocking writes. It is nil for a connection the Event loop serves:
@@ -253,19 +253,19 @@ type Output struct {
 // is an io.Closer.
 func NewBlocking(shared *Shared, wire io.Writer, logger *slog.Logger) *Output {
 	o := &Output{ledger: ledger.New(shared.limits), wire: wire, shared: shared, logger: logger}
-	o.drained = sync.NewCond(&o.mu)
+	o.waiters = sync.NewCond(&o.mu)
 	return o
 }
 
 // NewPolled returns the Client output of a connection the Event loop
 // serves. The loop writes it (Service). attention tells the loop to call
-// Service for the connection: bytes were queued from elsewhere, the stream is
-// to end, the stall rule wants the socket tried, or the connection was closed.
-// With a nil attention the Output is written only when its owner chooses to,
-// as a ConnMachine built without an Event loop is.
+// Service for the connection: bytes were queued from elsewhere, the stream
+// has ended, the stall rule wants the socket tried, or the connection was
+// closed. With a nil attention the Output is written only when its owner
+// chooses to, as a ConnMachine built without an Event loop is.
 func NewPolled(shared *Shared, attention func(), logger *slog.Logger) *Output {
 	o := &Output{ledger: ledger.New(shared.limits), attention: attention, shared: shared, logger: logger}
-	o.drained = sync.NewCond(&o.mu)
+	o.waiters = sync.NewCond(&o.mu)
 	return o
 }
 
@@ -277,14 +277,81 @@ func New(w io.Writer) *Output {
 	return NewBlocking(NewShared(), w, discardLogger)
 }
 
+// unlock carries out what the Ledger answered to an event and releases mu.
+// Every event ends here, so that none can skip an effect: the wakeup, the
+// writer to start, the end of the stream, the close, and the reports of what
+// the connection counts toward the Push budget and of its gate.
+func (o *Output) unlock(effects ledger.Effects) {
+	if effects.Signal {
+		o.waiters.Broadcast()
+	}
+	if effects.StartPusher {
+		o.startPusherLocked()
+	}
+	if effects.ShutWrite && o.wire == nil && o.attention != nil {
+		// The loop shuts the write side, when its Service reports the end.
+		o.attention()
+	}
+	if budgeted, reported := o.ledger.Budgeted(), o.budgeted.Load(); budgeted != reported {
+		o.shared.total.Add(budgeted - reported)
+		o.budgeted.Store(budgeted)
+	}
+	if shut := !o.ledger.Gate(); shut != o.gateShut.Load() {
+		o.gateShut.Store(shut)
+	}
+	var cause error
+	if effects.Close != nil {
+		cause = o.causeLocked(effects.Close)
+	}
+	o.mu.Unlock()
+
+	if effects.ShutWrite && o.wire != nil {
+		o.closeWrite()
+	}
+	if cause != nil {
+		o.Close(cause)
+	}
+}
+
+// causeLocked is the Ledger's reason to close the connection as this package
+// reports it.
+func (o *Output) causeLocked(reason error) error {
+	if errors.Is(reason, ledger.ErrPushLimit) {
+		return fmt.Errorf("%w: %d bytes were waiting", ErrPushLimitExceeded, o.ledger.Waiting())
+	}
+	return reason
+}
+
+// startPusherLocked gives the socket to the writer that does not read
+// requests, as the Ledger asked: bytes were queued that the connection's own
+// executor will not write. In the goroutine mode that is the pump goroutine,
+// which writes whatever is queued and exits when nothing is left. The Event
+// loop is asked for its attention.
+func (o *Output) startPusherLocked() {
+	if o.wire == nil {
+		if o.attention != nil {
+			o.attention()
+		}
+		return
+	}
+	if o.pump == nil {
+		o.pump = func() {
+			if _, err := o.writeAs(ledger.Pusher, o.wire); err != nil {
+				o.Close(err)
+			}
+		}
+	}
+	go o.pump()
+}
+
 // Reply queues the Replies to the request the connection just ran (none is
 // allowed) and releases the Pushed messages held since HoldPushes. Only the
 // connection's own executor calls it. Replies leave together when a
 // connection's goroutine next waits for input (Flush), unless outputWriteThrough
-// is waiting already: Reply then writes them out as Flush does, and waits as
-// Flush does. On the Event loop it never waits. A Push to the connection takes
-// the lock Reply holds, so a large Reply is encoded before that lock is taken
-// and queued whole (isLargeReply).
+// is left to write before they are out: Reply then writes them out as Flush
+// does, and waits as Flush does. On the Event loop it never waits. A Push to
+// the connection takes the lock Reply holds, so a large Reply is encoded
+// before that lock is taken and queued whole (isLargeReply).
 func (o *Output) Reply(values ...protocol.Value) error {
 	var whole []byte
 	if isLargeReply(values) {
@@ -311,18 +378,14 @@ func (o *Output) Reply(values ...protocol.Value) error {
 			return err
 		}
 	}
-	// The Pushed messages held since HoldPushes follow the Reply.
-	released := len(o.bytes.held) > 0
+	// The Pushed messages held since HoldPushes follow the Reply. The Ledger
+	// starts the pump for them: the connection's goroutine must not be the one
+	// that writes a stream of Pushed messages to a peer that may have stopped
+	// reading.
 	o.bytes.release()
-	o.ledger.Reply(int64(added))
-	o.accountLocked()
-	if released {
-		// The connection's goroutine must not be the one that writes a stream
-		// of Pushed messages to a peer that may have stopped reading.
-		o.scheduleLocked()
-	}
+	effects := o.ledger.Reply(int64(added))
 	writeThrough := o.wire != nil && o.ledger.Full()
-	o.mu.Unlock()
+	o.unlock(effects)
 
 	if writeThrough {
 		return o.flush(false)
@@ -351,22 +414,6 @@ func isLargeReply(values []protocol.Value) bool {
 	return size >= outputRetainedBuffer
 }
 
-// sealBatchLocked makes everything queued now the batch of a writer that
-// writes nothing queued after it began (Flush), and returns how many buffers
-// that is. Behind whole buffers, what is in queued becomes the last of them:
-// left where it is, it would grow by what is pushed while the buffers ahead of
-// it are written. With no whole buffer the batch is queued as it is, which the
-// writer takes in one piece under its next hold of the lock: a Push that lands
-// in that instant rides with the batch. It is one batch either way, which is
-// what bounds the writer.
-func (o *Output) sealBatchLocked() int {
-	if len(o.bytes.ahead) == 0 {
-		return 1
-	}
-	o.bytes.seal()
-	return len(o.bytes.ahead)
-}
-
 // Push queues a frame another connection produced. It never waits. It returns
 // false if the connection is closed, or if this Push closed it for passing its
 // Push limit or the Push budget.
@@ -381,14 +428,9 @@ func (o *Output) Push(frame []byte) bool {
 	class := o.ledger.Class()
 	accepted, effects := o.ledger.Push(int64(len(frame)))
 	if !accepted {
-		waiting := o.ledger.Waiting()
-		o.mu.Unlock()
-		if effects.Close != nil {
-			o.Close(fmt.Errorf("%w: %d bytes were waiting and %d more were pushed", ErrPushLimitExceeded, waiting, len(frame)))
-		}
+		o.unlock(effects)
 		return false
 	}
-
 	if o.ledger.Class() != class {
 		// Its first Pushed message made the connection a subscriber.
 		o.shared.mu.Lock()
@@ -399,12 +441,10 @@ func (o *Output) Push(frame []byte) bool {
 		o.bytes.hold(frame)
 	} else {
 		o.bytes.push(frame)
-		o.scheduleLocked()
 	}
-	overBudget := o.accountLocked() > 0 && o.shared.total.Load() > o.shared.pushBudget
-	o.mu.Unlock()
+	o.unlock(effects)
 
-	if overBudget {
+	if o.budgeted.Load() > 0 && o.shared.total.Load() > o.shared.pushBudget {
 		o.shared.enforceBudget()
 		return !o.isClosed()
 	}
@@ -425,13 +465,15 @@ func (o *Output) HoldPushes() {
 	o.mu.Unlock()
 }
 
-// Flush writes out what is queued, for the connection's own goroutine: before
-// it waits for the next request and before a command blocks. When another goroutine is already writing it leaves the
-// writing to that one, and waits only while more than outputHighWater is left
-// to write before the connection's latest Reply is out: a client that does not
-// read what it is sent stops having its requests run. It reports why the
-// connection is closed, if it is. The Event loop writes its connections
-// itself, so there Flush does nothing.
+// Flush writes out the connection's Replies, for the connection's own
+// goroutine: before it waits for the next request and before a command blocks.
+// It writes what was queued when it took the socket and nothing queued after:
+// what other connections push meanwhile is the pump's to write. When another
+// goroutine is already writing it leaves the writing to that one, and waits
+// only while the connection's requests may not be read (ledger.Ledger.Gate): a
+// client that does not read what it is sent stops having its requests run. It
+// reports why the connection is closed, if it is. The Event loop writes its
+// connections itself, so there Flush does nothing.
 func (o *Output) Flush() error {
 	if o == nil {
 		return nil
@@ -442,7 +484,7 @@ func (o *Output) Flush() error {
 // Drain returns once every Reply queued so far has been written, or the
 // connection is closed. It is for the connection's own goroutine when it has
 // run its last request: the Close that follows drops what is still queued.
-// Like Flush it writes what is queued when nobody has the socket. When another
+// Like Flush it writes its Replies when nobody has the socket. When another
 // goroutine has it, Drain waits until that one has written the latest Reply.
 //
 // It does not wait for what was pushed after that Reply, beyond the write that
@@ -456,6 +498,44 @@ func (o *Output) Drain() {
 	// Why the connection is closed, if it is, changes nothing for a caller
 	// that is about to close it.
 	_ = o.flush(true)
+}
+
+// flush is Flush, which returns once the connection's requests may be read
+// (ledger.Ledger.Gate), or Drain, which returns once its Replies are out
+// (ledger.Ledger.RepliesOut). The Event loop writes its connections itself,
+// so there it does nothing.
+func (o *Output) flush(drain bool) error {
+	if o.wire == nil {
+		return nil
+	}
+	// The Ledger gives this goroutine the socket when nobody has it, for what
+	// is queued now, which is its Replies: a push would have started the pump.
+	status, err := o.writeAs(ledger.Requester, o.wire)
+	switch {
+	case err != nil:
+		o.Close(err)
+	case !drain && status.MayRead:
+		// The gate was open when the write loop stopped: the usual case, and
+		// the lock is not taken again for it.
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	// Another goroutine may have the socket, and then writes the Replies queued
+	// here with everything else. This one waits for it until the Ledger says
+	// it may go on, and no longer. For Flush that is only backpressure on the
+	// connection's own requests. What is pushed after its latest Reply never
+	// makes it wait: its goroutine reads the peer's requests, which for a
+	// Replica that has fallen behind are the acknowledgements that show how
+	// far.
+	for !o.ledger.Closed() {
+		if drain && o.ledger.RepliesOut() || !drain && o.ledger.Gate() {
+			return nil
+		}
+		o.waiters.Wait()
+	}
+	return o.errLocked()
 }
 
 // Close closes the connection from any goroutine without waiting for a write in
@@ -475,9 +555,8 @@ func (o *Output) Close(cause error) {
 		return
 	}
 	waiting := o.ledger.Waiting()
-	o.ledger.Close()
+	effects := o.ledger.Close()
 	o.cause = cause
-	o.accountLocked()
 	// A writer in the middle of a write keeps the bytes it is writing until
 	// the write returns, and no longer.
 	o.bytes.clear()
@@ -489,8 +568,7 @@ func (o *Output) Close(cause error) {
 		delete(o.shared.pushers, o)
 		o.shared.mu.Unlock()
 	}
-	o.drained.Broadcast()
-	o.mu.Unlock()
+	o.unlock(effects)
 
 	if errors.Is(cause, ErrPushLimitExceeded) || errors.Is(cause, errPushBudgetExceeded) || errors.Is(cause, ErrReplicaStalled) {
 		o.logger.Warn("closing a connection that is not keeping up with what is pushed to it", "pending_bytes", waiting, "error", cause)
@@ -511,30 +589,15 @@ func (o *Output) Close(cause error) {
 // EndStream ends the stream to the peer once everything queued has been
 // written: the write side is shut and the connection stays open for the peer to
 // close. Shutdown ends a Replica's stream this way
-// (replication.Master.EndStreams). The Event loop shuts the write side itself,
-// when a Service reports the end of the stream (Status.EndOfStream).
+// (replication.Master.EndStreams). The Ledger says when the stream has ended
+// (Effects.ShutWrite). The Event loop shuts the write side itself, when a
+// Service reports the end of the stream (Status.EndOfStream).
 func (o *Output) EndStream() {
 	if o == nil {
 		return
 	}
-
 	o.mu.Lock()
-	if o.ledger.Closed() || o.ending {
-		o.mu.Unlock()
-		return
-	}
-	o.ending = true
-	// A writer of the goroutine mode shuts the write side when it has written
-	// everything (write). With none at work and nothing to write, nobody would.
-	shut := o.wire != nil && !o.writing && !o.ledger.Writable()
-	if !shut {
-		o.scheduleLocked()
-	}
-	o.mu.Unlock()
-
-	if shut {
-		o.closeWrite()
-	}
+	o.unlock(o.ledger.EndStream())
 }
 
 // MarkReplica makes the connection a Replica's: held to the Replica Push limit
@@ -545,13 +608,11 @@ func (o *Output) MarkReplica() {
 		return
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	o.ledger.MarkReplica(unclocked)
-	o.accountLocked()
-	if o.offeredLocked() {
+	effects := o.ledger.MarkReplica(unclocked)
+	if o.bytes.offered() {
 		o.countStallLocked()
 	}
+	o.unlock(effects)
 }
 
 // Backlog reports how many bytes of Client output wait for the connection.
@@ -569,14 +630,11 @@ func (o *Output) Backlog() int {
 // latest Reply is out. What was pushed after that Reply does not count, so a
 // Replica whose stream waits still has its acknowledgements read; the Push
 // limit bounds that output instead. Both networking modes hold a connection's
-// requests back by this one rule, the Ledger's Gate.
+// requests back by this one rule, the Ledger's Gate. It is the Gate as of the
+// connection's last event, read without the lock: the Event loop asks before
+// every request.
 func (o *Output) MayReadRequests() bool {
-	if o == nil {
-		return true
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.ledger.Gate()
+	return o == nil || !o.gateShut.Load()
 }
 
 // Err reports why the connection was closed, or nil while it is open. A nil
@@ -633,29 +691,10 @@ func (o *Output) errLocked() error {
 // file's timer (checkStall): none passes, so the Ledger gives no verdict.
 const unclocked ledger.Instant = 1
 
-// accountLocked reports what the connection counts toward the Push budget
-// now, the Ledger's Budgeted, and returns it. It follows every event that
-// changes what waits for the connection or what kind of connection it is, so
-// the budget's total is derived from the Ledgers and cannot drift from them.
-func (o *Output) accountLocked() int64 {
-	budgeted := o.ledger.Budgeted()
-	if delta := budgeted - o.budgeted.Load(); delta != 0 {
-		o.budgeted.Store(budgeted)
-		o.shared.total.Add(delta)
-	}
-	return budgeted
-}
-
-// offeredLocked reports whether the socket is being offered a batch that it has
-// not taken all of.
-func (o *Output) offeredLocked() bool {
-	return o.bytes.offered()
-}
-
-// countStallLocked starts the Replica stall rule's count for the batch on
+// countStallLocked starts the Replica stall rule's count for the buffer on
 // offer: the socket has the stall timeout from now to take some of it. A closed
 // Output's socket is offered nothing, whatever its writer left unsent, so no
-// count starts for it. Its timer would hold the Output, and that batch, for
+// count starts for it. Its timer would hold the Output, and that buffer, for
 // the stall timeout (armStallLocked): the attach cut of a PSYNC marks a
 // connection a Replica's even when it has closed meanwhile.
 func (o *Output) countStallLocked() {
@@ -679,7 +718,7 @@ func (o *Output) armStallLocked(wait time.Duration) {
 	}
 	// The timer holds the Output through stallWatch, which Close empties. A
 	// timer that held the Output itself would keep a closed connection's
-	// Output reachable until it was due, and with it the batch a writer was
+	// Output reachable until it was due, and with it the buffer a writer was
 	// offering: for a Replica that left during its full resync, the snapshot.
 	// Stopping it would not do: on Go 1.21 a stopped timer can stay in the
 	// runtime's heap until its time.
@@ -692,24 +731,24 @@ func (o *Output) armStallLocked(wait time.Duration) {
 }
 
 // checkStall is the stall rule's timer. When a Replica's socket has taken
-// nothing for the stall timeout of the batch it is offered, it closes the
+// nothing for the stall timeout of the buffer it is offered, it closes the
 // Replica, or leaves that to the writer where the writer has to try the socket
 // first. Otherwise it looks again when the timeout could next have passed.
-// With no batch on offer it stops looking: the next batch starts the count
-// again (write).
+// With no buffer on offer it stops looking: the next one starts the count
+// again (writeAs).
 //
 // Only the writer can say whether the socket takes anything. In the goroutine
 // mode it has been inside a blocking write since lastProgress, so the socket
-// took nothing in that time. The Event loop tried the socket when the batch
+// took nothing in that time. The Event loop tried the socket when the buffer
 // went on offer and then went on to other work, which can be one request that
 // runs longer than the timeout. The socket may have had room for most of that
 // time, so the loop is asked to try it now (attention), and its Service closes
-// the Replica if that try takes nothing (write). An Output with nobody to ask
-// is closed here.
+// the Replica if that try takes nothing (writeAs). An Output with nobody to
+// ask is closed here.
 func (o *Output) checkStall() {
 	o.mu.Lock()
 	o.stall = stallIdle
-	if o.ledger.Closed() || !o.offeredLocked() {
+	if o.ledger.Closed() || !o.bytes.offered() {
 		o.mu.Unlock()
 		return
 	}
@@ -734,7 +773,8 @@ func (o *Output) stalledErr() error {
 }
 
 // Status is where a connection the Event loop serves stands after a Service.
-// The loop decides from it and compares no byte counts of its own.
+// Every field is a decision of the Output's Ledger. The loop decides from it
+// and compares no byte counts of its own.
 type Status struct {
 	// Closed is why the Output is closed, or nil while it is open. The loop
 	// closes the connection.
@@ -750,18 +790,6 @@ type Status struct {
 	EndOfStream bool
 }
 
-func (o *Output) statusLocked() Status {
-	if o.ledger.Closed() {
-		return Status{Closed: o.errLocked()}
-	}
-	writable := o.ledger.Writable()
-	return Status{
-		MayRead:     o.ledger.Gate(),
-		WantWrite:   writable,
-		EndOfStream: o.ending && !writable,
-	}
-}
-
 // Service writes what is queued to the socket until nothing is left or the
 // socket takes no more, and reports where the connection stands. Only the Event
 // loop calls it, with the connection's socket. A socket that accepts part of a
@@ -770,219 +798,83 @@ func (o *Output) statusLocked() Status {
 // closes the Output, as does a try the stall rule asked for (checkStall) that
 // takes nothing.
 func (o *Output) Service(socket io.Writer) Status {
-	status, err := o.write(socket, everyBuffer)
-	if status.Closed != nil || err == nil || errors.Is(err, ErrWouldBlock) || errors.Is(err, io.ErrShortWrite) {
-		return status
+	status, err := o.writeAs(ledger.Pusher, socket)
+	if err != nil && !errors.Is(err, ErrWouldBlock) && !errors.Is(err, io.ErrShortWrite) {
+		o.Close(err)
+		return Status{Closed: o.Err()}
 	}
-	o.Close(err)
-	return Status{Closed: o.Err()}
+	return status
 }
 
-// everyBuffer, as the number of buffers write is to write, has it go on until
-// nothing is queued.
-const everyBuffer = -1
+// statusLocked is where the connection stands, as the Ledger has it.
+func (o *Output) statusLocked() Status {
+	if o.ledger.Closed() {
+		return Status{Closed: o.errLocked()}
+	}
+	return Status{
+		MayRead:     o.ledger.Gate(),
+		WantWrite:   o.ledger.Writable(),
+		EndOfStream: o.ledger.Ended(),
+	}
+}
 
-// errMoreQueued is what write returns, still holding the socket (writing stays
-// set), when it has written the buffers it was asked for and more is queued.
-var errMoreQueued = errors.New("output: more output was queued during the write")
-
-// write writes what is queued to w until nothing is left or w fails, and
-// returns w's error and, for Service, where the Output stood when it stopped.
-// The caller is the only writer: the goroutine that set writing, or the Event
-// loop. It takes no more than buffers buffers of what is queued: the batch that
-// sealBatchLocked counted for a writer when it took the socket, or everyBuffer.
-// If more is queued once those are written, it returns errMoreQueued and
-// leaves writing set, for the caller to hand the socket on: what was queued
-// meanwhile was pushed by other connections. When the stall rule asked for
-// this try (checkStall) and w takes nothing, the error is ErrReplicaStalled,
-// for the caller to close the connection with.
-func (o *Output) write(w io.Writer, buffers int) (Status, error) {
+// writeAs is the one loop that writes a connection's output, for the
+// connection's goroutine (the Requester), the pump and the Event loop (the
+// Pusher). It asks the Ledger for the socket and how much to offer it (Take),
+// writes that, and reports what the socket took (Took), until the Ledger gives
+// it nothing, because another writer has the socket, or says that it has
+// written all it may (Effects.Released). A Requester is given what was queued when it took the socket and
+// nothing queued after, and the Ledger hands the socket to the pump for the
+// rest. It returns where the connection stood when it stopped, read under the
+// lock its last event held, and the write's error, which for a socket that took
+// part of a chunk without one is io.ErrShortWrite, and ErrReplicaStalled when
+// the stall rule asked for this try (checkStall) and the socket took nothing.
+func (o *Output) writeAs(role ledger.Role, w io.Writer) (Status, error) {
 	for {
 		o.mu.Lock()
-		if o.ledger.Closed() {
+		n, effects := o.ledger.Take(role, unclocked)
+		if n == 0 {
 			status := o.statusLocked()
-			o.stopWritingLocked()
-			o.mu.Unlock()
-			return status, status.Closed
+			o.unlock(effects)
+			return status, nil
 		}
-		if !o.bytes.offered() {
-			switch {
-			case !o.ledger.Writable():
-				status := o.statusLocked()
-				o.stopWritingLocked()
-				o.mu.Unlock()
-				if status.EndOfStream && o.wire != nil {
-					o.closeWrite()
-				}
-				return status, nil
-			case buffers == 0:
-				o.mu.Unlock()
-				return Status{}, errMoreQueued
-			}
-			o.bytes.offer()
-			if buffers > 0 {
-				buffers--
-			}
-			if o.isReplicaLocked() {
-				o.countStallLocked()
-			}
+		chunk, fresh := o.bytes.next(n)
+		if fresh && o.isReplicaLocked() {
+			o.countStallLocked()
 		}
-		chunk := o.bytes.inflight[o.bytes.sent:]
-		if len(chunk) > outputWriteChunk {
-			chunk = chunk[:outputWriteChunk]
-		}
-		o.mu.Unlock()
+		o.unlock(effects)
 
-		n, err := w.Write(chunk)
+		took, err := w.Write(chunk)
 
 		o.mu.Lock()
-		if o.ledger.Closed() {
-			// Close dropped what was being written with everything else.
-			status := o.statusLocked()
-			o.stopWritingLocked()
-			o.mu.Unlock()
-			return status, status.Closed
-		}
-		o.bytes.drop(n)
-		o.ledger.Took(int64(n), unclocked)
-		if n > 0 {
-			if o.isReplicaLocked() {
+		o.bytes.drop(took)
+		effects = o.ledger.Took(int64(took), unclocked)
+		if !o.ledger.Closed() {
+			if took > 0 && o.isReplicaLocked() {
 				o.lastProgress = time.Now()
 			}
-			o.accountLocked()
-			if o.ledger.Gate() {
-				o.drained.Broadcast()
+			if o.stall == stallDue {
+				// This was the try the stall rule asked for. A socket that took
+				// some of the buffer has the stall timeout again for the rest.
+				o.stall = stallIdle
+				switch {
+				case took == 0:
+					err = o.stalledErr()
+				case o.bytes.offered():
+					o.countStallLocked()
+				}
 			}
 		}
-		if o.stall == stallDue {
-			// This was the try the stall rule asked for. A socket that took
-			// some of the batch has the stall timeout again for the rest.
-			o.stall = stallIdle
-			switch {
-			case n == 0:
-				err = o.stalledErr()
-			case o.offeredLocked():
-				o.countStallLocked()
-			}
-		}
-		if err == nil && n < len(chunk) {
+		if err == nil && took < len(chunk) {
 			err = io.ErrShortWrite
 		}
-		if err != nil {
+		if err != nil || effects.Released {
 			status := o.statusLocked()
-			o.stopWritingLocked()
-			o.mu.Unlock()
+			o.unlock(effects)
 			return status, err
 		}
-		o.mu.Unlock()
+		o.unlock(effects)
 	}
-}
-
-func (o *Output) stopWritingLocked() {
-	o.writing = false
-	o.drained.Broadcast()
-}
-
-// scheduleLocked is called when bytes were queued that the connection's own
-// executor will not flush, a Pushed message or the ones a Reply released, and
-// when the stream is to end. In the goroutine mode it starts the pump unless a
-// goroutine has the socket already. The Event loop is asked for its attention.
-func (o *Output) scheduleLocked() {
-	if o.wire == nil {
-		if o.attention != nil {
-			o.attention()
-		}
-		return
-	}
-	if o.writing {
-		return
-	}
-	o.writing = true
-	o.startPumpLocked()
-}
-
-// startPumpLocked starts the pump goroutine, which writes whatever is queued
-// and exits when nothing is left. The caller has set writing.
-func (o *Output) startPumpLocked() {
-	if o.pump == nil {
-		// A failed write closes the connection (writeOut), which is all there
-		// is to do about it here.
-		o.pump = func() { _ = o.writeOut(everyBuffer) }
-	}
-	go o.pump()
-}
-
-// flush is Flush, which waits for another writer while the connection's
-// requests may not be read (ledger.Ledger.Gate), or Drain, which waits for it
-// until the Replies are out (ledger.Ledger.RepliesOut). The Event loop writes
-// its connections itself, so there it does nothing.
-func (o *Output) flush(drain bool) error {
-	if o.wire == nil {
-		return nil
-	}
-
-	o.mu.Lock()
-	// Another goroutine may have the socket, and then writes the Replies queued
-	// here with everything else. This one waits for it until the Ledger says
-	// it may go on, and no longer. For Flush that is only backpressure on the
-	// connection's own requests. What is pushed after its latest Reply never
-	// makes it wait: its goroutine reads the peer's requests, which for a
-	// Replica that has fallen behind are the acknowledgements that show how
-	// far.
-	for o.writing && !o.ledger.Closed() && !o.mayGoOnLocked(drain) {
-		o.drained.Wait()
-	}
-	if o.ledger.Closed() {
-		err := o.errLocked()
-		o.mu.Unlock()
-		return err
-	}
-	if o.writing || !o.ledger.Writable() {
-		o.mu.Unlock()
-		return nil
-	}
-	o.writing = true
-	// This goroutine writes what is queued now, which is its Replies: a push
-	// would have started the pump. What other connections push while it writes
-	// is the pump's to write. This goroutine reads the peer's requests, which
-	// for a Replica are its acknowledgements, and it would not get back to them
-	// under a steady stream of pushes, or behind the stream that was pushed
-	// while a full resync reply went out.
-	batch := o.sealBatchLocked()
-	o.mu.Unlock()
-
-	return o.writeOut(batch)
-}
-
-// mayGoOnLocked reports whether the connection's goroutine need not wait for
-// another writer any longer: for a Drain once its Replies are out, otherwise
-// once its requests may be read.
-func (o *Output) mayGoOnLocked(drain bool) bool {
-	if drain {
-		return o.ledger.RepliesOut()
-	}
-	return o.ledger.Gate()
-}
-
-// writeOut is write to the socket of the goroutine mode, by the goroutine that
-// set writing. It hands the socket to the pump when more was queued than it
-// was to write, and closes the connection when the write fails.
-func (o *Output) writeOut(buffers int) error {
-	_, err := o.write(o.wire, buffers)
-	if errors.Is(err, errMoreQueued) {
-		o.mu.Lock()
-		if o.ledger.Closed() {
-			o.stopWritingLocked()
-		} else {
-			o.startPumpLocked()
-		}
-		o.mu.Unlock()
-		return nil
-	}
-	if err != nil {
-		o.Close(err)
-	}
-	return err
 }
 
 // writeCloser is a socket whose write side can be shut on its own, as a TCP
