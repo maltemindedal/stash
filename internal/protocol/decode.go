@@ -229,7 +229,7 @@ func (d *Decoder) decodeBulkString(buf []byte) (Value, int, error) {
 	}
 	// Check the length under every limit, the default included, as the Parser
 	// does. That also keeps the size hint below from overflowing: length is at
-	// most maxBulkStringLength here.
+	// most BulkStringLimit here.
 	if err := d.limits.checkBulkLength(length); err != nil {
 		return nil, 0, err
 	}

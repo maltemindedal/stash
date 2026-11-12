@@ -239,7 +239,14 @@ func TestReplicaLinkReportsEachHandshakeRefusal(t *testing.T) {
 		{
 			name:    "PSYNC is answered with an error",
 			replies: [][]protocol.Value{{pong}, {ok}, {protocol.ErrorValue{Message: "ERR syntax error"}}},
-			wantErr: []string{"failed to consume FULLRESYNC from master", "unexpected FULLRESYNC response type"},
+			wantErr: []string{"failed to consume FULLRESYNC from master", "master refused PSYNC: ERR syntax error"},
+		},
+		{
+			name: "the Master refuses a snapshot over the bulk string limit",
+			replies: [][]protocol.Value{{pong}, {ok}, {protocol.ErrorValue{
+				Message: "ERR full resync snapshot of 629145644 bytes exceeds the 536870912 byte limit of a bulk string",
+			}}},
+			wantErr: []string{"master refused PSYNC: ERR full resync snapshot of 629145644 bytes exceeds the 536870912 byte limit of a bulk string"},
 		},
 		{
 			name:    "FULLRESYNC names an offset other than 0",

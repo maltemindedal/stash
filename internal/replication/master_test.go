@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -820,7 +822,10 @@ func TestAttachHoldsTheReplicasOutputAndRegistersItInsideItsCut(t *testing.T) {
 			registeredAtRelease = master.Count() == 1
 		}
 	}
-	attachment := master.Attach(Candidate{ID: 1, ListeningPort: 6380, Out: out}, cut)
+	attachment, err := master.Attach(Candidate{ID: 1, ListeningPort: 6380, Out: out}, cut)
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
 
 	if !activeInCut {
 		t.Fatal("Active() = false inside the cut after startRecording, want true: writes must be ordered from then on")
@@ -893,7 +898,7 @@ func TestAnAttachWhoseCopyPanicsLeavesTheMasterInactive(t *testing.T) {
 				t.Fatal("Attach() did not panic on a nil Store")
 			}
 		}()
-		master.Attach(Candidate{ID: 1, Out: out}, cut)
+		_, _ = master.Attach(Candidate{ID: 1, Out: out}, cut)
 	}()
 
 	if master.Active() || master.Count() != 0 {
@@ -904,6 +909,92 @@ func TestAnAttachWhoseCopyPanicsLeavesTheMasterInactive(t *testing.T) {
 	}
 	if got := out.asked("HoldPushes"); got != 0 {
 		t.Fatalf("the Output was told to hold %d times by an attach that failed, want never", got)
+	}
+}
+
+// TestAnAttachWhoseSnapshotExceedsTheLimitIsRefusedWithoutAReplica sizes the
+// snapshot of a Store against a limit just below, at and above it. Over the
+// limit the Master refuses with the size and the limit, encodes no snapshot,
+// registers no Replica and asks nothing of the Output, so the connection stays
+// an ordinary client with nothing held; the cut is released and Active reports
+// false again. At the limit the snapshot is served, since a Replica accepts a
+// bulk string of exactly that many bytes.
+func TestAnAttachWhoseSnapshotExceedsTheLimitIsRefusedWithoutAReplica(t *testing.T) {
+	store := storage.NewStore()
+	if err := store.Set(nil, "key", bytes.Repeat([]byte("v"), 1000), 0); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	entries, _ := store.SnapshotStrings()
+	size := rdb.SnapshotSize(entries)
+
+	tests := []struct {
+		name    string
+		limit   int
+		refused bool
+	}{
+		{name: "one byte over the limit", limit: size - 1, refused: true},
+		{name: "exactly at the limit", limit: size, refused: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			master := NewMaster(store, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+			master.SetSnapshotLimit(tt.limit)
+			out := &fakeOutput{}
+			released := false
+			cut := func(startRecording func()) (release func()) {
+				startRecording()
+				return func() { released = true }
+			}
+
+			attachment, err := master.Attach(Candidate{ID: 7, Out: out}, cut)
+
+			if !released {
+				t.Fatal("the cut was not released")
+			}
+			if !tt.refused {
+				if err != nil {
+					t.Fatalf("Attach() error = %v, want the snapshot served", err)
+				}
+				snapshot, ok := attachment.Reply()[1].(protocol.BulkString)
+				if !ok || len(snapshot.Data) != size {
+					t.Fatalf("Reply()[1] = %#v, want a snapshot of %d bytes", attachment.Reply()[1], size)
+				}
+				if master.Count() != 1 {
+					t.Fatalf("Count() = %d after a served attach, want 1", master.Count())
+				}
+				return
+			}
+
+			var tooLarge *SnapshotTooLargeError
+			if !errors.As(err, &tooLarge) || tooLarge.Size != size || tooLarge.Limit != tt.limit {
+				t.Fatalf("Attach() error = %v, want a *SnapshotTooLargeError of %d bytes over %d", err, size, tt.limit)
+			}
+			if !strings.HasPrefix(err.Error(), "replication: ") {
+				t.Fatalf("Attach() error = %q, want it to start with the package", err)
+			}
+			if attachment != nil {
+				t.Fatalf("Attach() returned an attachment %#v with its error", attachment)
+			}
+			if master.Count() != 0 || master.Active() {
+				t.Fatalf("Count() = %d and Active() = %v after a refusal, want 0 and false", master.Count(), master.Active())
+			}
+			for _, method := range []string{"MarkReplica", "HoldPushes", "Push"} {
+				if got := out.asked(method); got != 0 {
+					t.Fatalf("the Output was asked %s %d times by a refused attach, want never", method, got)
+				}
+			}
+			master.Propagate([]byte("*1\r\n$4\r\nPING\r\n"), true)
+			if got := out.asked("Push"); got != 0 {
+				t.Fatalf("a frame propagated after the refusal was pushed %d times to the refused Output, want never", got)
+			}
+			for _, want := range []string{"replica_id=7", fmt.Sprintf("snapshot_size_bytes=%d", size), fmt.Sprintf("limit_bytes=%d", tt.limit)} {
+				if !strings.Contains(logs.String(), want) {
+					t.Fatalf("the Master logged %q, want it to name %s", logs.String(), want)
+				}
+			}
+		})
 	}
 }
 

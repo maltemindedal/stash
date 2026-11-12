@@ -100,6 +100,41 @@ func BuildSnapshot(entries []storage.StringSnapshotEntry) ([]byte, SnapshotStats
 	return payload, stats
 }
 
+// SnapshotSize returns the length of the payload BuildSnapshot encodes from
+// entries, without encoding it. BuildSnapshot drops an entry that has expired
+// by the time it encodes, so the size is exact when no entry expires between
+// the two calls, and an upper bound otherwise.
+func SnapshotSize(entries []storage.StringSnapshotEntry) int {
+	if len(entries) == 0 {
+		return len(emptySnapshot)
+	}
+
+	size := len(fileHeader) + 1 + lengthSize(0) // SELECTDB 0
+	for _, entry := range entries {
+		if entry.ExpiresAt > 0 {
+			size += 1 + 8
+		}
+		size += 1 + stringSize(len(entry.Key)) + stringSize(len(entry.Value))
+	}
+	return size + 1 + 8 // EOF and its checksum
+}
+
+func stringSize(length int) int {
+	return lengthSize(uint64(length)) + length
+}
+
+// lengthSize is how many bytes appendLength writes for length.
+func lengthSize(length uint64) int {
+	switch {
+	case length < 1<<6:
+		return 1
+	case length < 1<<14:
+		return 2
+	default:
+		return 5
+	}
+}
+
 // SaveSnapshot writes an RDB snapshot to disk using a same-directory temporary
 // file and best-effort replacement of any existing target file.
 func SaveSnapshot(path string, entries []storage.StringSnapshotEntry) (stats SnapshotStats, err error) {
