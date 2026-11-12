@@ -98,12 +98,14 @@ type Shared struct {
 	pushBudget   int64
 	stallTimeout time.Duration
 
-	// total is the output waiting for the connections in pushers.
+	// total is what every connection counts toward the Push budget together:
+	// the sum of what each last reported (Output.accountLocked).
 	total atomic.Int64
 
 	mu sync.Mutex
-	// pushers are the open, non-replica connections that have received a
-	// Pushed message: the ones the budget counts and may close.
+	// pushers are the open connections that have received a Pushed message
+	// as a subscriber: the ones the budget may close. One that became a
+	// Replica's since stays listed and counts nothing.
 	pushers map[*Output]struct{}
 }
 
@@ -145,14 +147,14 @@ func NewShared(limits ...Limit) *Shared {
 
 // enforceBudget closes push-receiving connections, the one with the most
 // waiting first, until their total is back within the budget. It holds no
-// Output's lock: it reads each one's atomic backlog.
+// Output's lock: it reads what each one last reported.
 func (s *Shared) enforceBudget() {
 	for s.total.Load() > s.pushBudget {
 		var victim *Output
 		var most int64
 		s.mu.Lock()
 		for o := range s.pushers {
-			if waiting := o.backlog.Load(); waiting > most {
+			if waiting := o.budgeted.Load(); waiting > most {
 				victim, most = o, waiting
 			}
 		}
@@ -208,11 +210,6 @@ type Output struct {
 	// runs only while Pushed messages wait and nobody is writing.
 	writing bool
 	cause   error
-	// replica holds the connection to the Replica Push limit and stall rule,
-	// and leaves it out of the Push budget.
-	replica bool
-	// counted is set while the connection is one of shared.pushers.
-	counted bool
 	// ending is set once the stream is to end when everything queued has been
 	// written (EndStream).
 	ending bool
@@ -229,9 +226,10 @@ type Output struct {
 	// readable (ledger.Ledger.Gate), the one that writes the last byte of its
 	// Replies included.
 	drained *sync.Cond
-	// backlog is every byte that waits, as the Push budget reads it without
-	// the lock (Shared.enforceBudget).
-	backlog atomic.Int64
+	// budgeted is what the connection last reported to the Push budget: its
+	// Ledger's Budgeted, as of the last event (accountLocked). The budget reads
+	// it without the lock (Shared.enforceBudget).
+	budgeted atomic.Int64
 
 	// wire is the socket of a connection served by its own goroutine, written
 	// with blocking writes. It is nil for a connection the Event loop serves:
@@ -313,11 +311,11 @@ func (o *Output) Reply(values ...protocol.Value) error {
 			return err
 		}
 	}
-	o.growLocked(added)
 	// The Pushed messages held since HoldPushes follow the Reply.
 	released := len(o.bytes.held) > 0
 	o.bytes.release()
 	o.ledger.Reply(int64(added))
+	o.accountLocked()
 	if released {
 		// The connection's goroutine must not be the one that writes a stream
 		// of Pushed messages to a peer that may have stopped reading.
@@ -380,6 +378,7 @@ func (o *Output) Push(frame []byte) bool {
 	o.mu.Lock()
 	// The Ledger holds a subscriber to its limit for everything waiting, and a
 	// Replica for its stream alone (ledger.Ledger.Push).
+	class := o.ledger.Class()
 	accepted, effects := o.ledger.Push(int64(len(frame)))
 	if !accepted {
 		waiting := o.ledger.Waiting()
@@ -390,21 +389,19 @@ func (o *Output) Push(frame []byte) bool {
 		return false
 	}
 
-	if !o.replica && !o.counted {
-		o.counted = true
-		o.shared.total.Add(o.backlog.Load())
+	if o.ledger.Class() != class {
+		// Its first Pushed message made the connection a subscriber.
 		o.shared.mu.Lock()
 		o.shared.pushers[o] = struct{}{}
 		o.shared.mu.Unlock()
 	}
-	o.growLocked(len(frame))
 	if o.ledger.Holding() {
 		o.bytes.hold(frame)
 	} else {
 		o.bytes.push(frame)
 		o.scheduleLocked()
 	}
-	overBudget := o.counted && o.shared.total.Load() > o.shared.pushBudget
+	overBudget := o.accountLocked() > 0 && o.shared.total.Load() > o.shared.pushBudget
 	o.mu.Unlock()
 
 	if overBudget {
@@ -480,15 +477,14 @@ func (o *Output) Close(cause error) {
 	waiting := o.ledger.Waiting()
 	o.ledger.Close()
 	o.cause = cause
-	o.growLocked(-int(waiting))
+	o.accountLocked()
 	// A writer in the middle of a write keeps the bytes it is writing until
 	// the write returns, and no longer.
 	o.bytes.clear()
 	if o.stallWatch != nil {
 		o.stallWatch.Store(nil)
 	}
-	if o.counted {
-		o.counted = false
+	if o.ledger.Class() != ledger.Plain {
 		o.shared.mu.Lock()
 		delete(o.shared.pushers, o)
 		o.shared.mu.Unlock()
@@ -552,14 +548,7 @@ func (o *Output) MarkReplica() {
 	defer o.mu.Unlock()
 
 	o.ledger.MarkReplica(unclocked)
-	o.replica = true
-	if o.counted {
-		o.counted = false
-		o.shared.total.Add(-o.backlog.Load())
-		o.shared.mu.Lock()
-		delete(o.shared.pushers, o)
-		o.shared.mu.Unlock()
-	}
+	o.accountLocked()
 	if o.offeredLocked() {
 		o.countStallLocked()
 	}
@@ -626,7 +615,11 @@ func (o *Output) isClosed() bool {
 func (o *Output) IsReplica() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.replica
+	return o.isReplicaLocked()
+}
+
+func (o *Output) isReplicaLocked() bool {
+	return o.ledger.Class() == ledger.Replica
 }
 
 func (o *Output) errLocked() error {
@@ -640,16 +633,17 @@ func (o *Output) errLocked() error {
 // file's timer (checkStall): none passes, so the Ledger gives no verdict.
 const unclocked ledger.Instant = 1
 
-// growLocked adds delta, which may be negative, to the backlog and to the Push
-// budget's total when the connection counts toward it.
-func (o *Output) growLocked(delta int) {
-	if delta == 0 {
-		return
+// accountLocked reports what the connection counts toward the Push budget
+// now, the Ledger's Budgeted, and returns it. It follows every event that
+// changes what waits for the connection or what kind of connection it is, so
+// the budget's total is derived from the Ledgers and cannot drift from them.
+func (o *Output) accountLocked() int64 {
+	budgeted := o.ledger.Budgeted()
+	if delta := budgeted - o.budgeted.Load(); delta != 0 {
+		o.budgeted.Store(budgeted)
+		o.shared.total.Add(delta)
 	}
-	o.backlog.Add(int64(delta))
-	if o.counted {
-		o.shared.total.Add(int64(delta))
-	}
+	return budgeted
 }
 
 // offeredLocked reports whether the socket is being offered a batch that it has
@@ -829,7 +823,7 @@ func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 			if buffers > 0 {
 				buffers--
 			}
-			if o.replica {
+			if o.isReplicaLocked() {
 				o.countStallLocked()
 			}
 		}
@@ -852,10 +846,10 @@ func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 		o.bytes.drop(n)
 		o.ledger.Took(int64(n), unclocked)
 		if n > 0 {
-			if o.replica {
+			if o.isReplicaLocked() {
 				o.lastProgress = time.Now()
 			}
-			o.growLocked(-n)
+			o.accountLocked()
 			if o.ledger.Gate() {
 				o.drained.Broadcast()
 			}

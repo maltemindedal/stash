@@ -26,6 +26,8 @@
 //	write through before reading  taken..replyEnd               Full
 //	does a Push fit, subscriber   taken..end, and held          Push
 //	does a Push fit, Replica      replyEnd..end, and held       Push
+//	its share of the Push budget  taken..end, and held, for a   Budgeted
+//	                              subscriber
 //	may this writer write, what   taken..seal or taken..end     Take
 //	has the Replica stalled       a try that took nothing       Took
 //
@@ -331,6 +333,17 @@ func (l *Ledger) Full() bool {
 // decision about one connection is made from it outside this package.
 func (l *Ledger) Waiting() int64 {
 	return l.end - l.taken + l.held
+}
+
+// Budgeted is how many bytes the connection counts toward the Push budget,
+// which bounds what waits for every Subscriber together: everything that waits
+// for a Subscriber, and nothing for any other connection. A Replica has its own
+// limit, and a connection that receives no Pushed message holds only Replies.
+func (l *Ledger) Budgeted() int64 {
+	if l.class != Subscriber {
+		return 0
+	}
+	return l.Waiting()
 }
 
 // Writable reports whether a writer has anything to write, for the Event

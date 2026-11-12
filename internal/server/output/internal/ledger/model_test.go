@@ -46,6 +46,7 @@ type machine interface {
 	Gate() bool
 	RepliesOut() bool
 	Waiting() int64
+	Budgeted() int64
 	Writable() bool
 	Full() bool
 	Class() Class
@@ -194,6 +195,13 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 	}
 	if got := w.m.Class(); got != class {
 		return fmt.Sprintf("Class() = %d, want %d: marked a Replica's = %v, a Pushed message accepted before that = %v", got, class, w.replica, w.subscriber)
+	}
+	budgeted := int64(0)
+	if w.subscriber && !w.closed {
+		budgeted = int64(len(w.wire) + len(w.held))
+	}
+	if got := w.m.Budgeted(); got != budgeted {
+		return fmt.Sprintf("Budgeted() = %d, want %d: the Push budget counts everything that waits for a subscriber, here %q queued and %q held, and nothing for a Replica, a connection that was pushed nothing, or a closed one", got, budgeted, w.wire, w.held)
 	}
 	if w.closed {
 		if !w.m.Gate() || !w.m.RepliesOut() {
@@ -516,6 +524,7 @@ func (c *called) Gate() bool       { c.calls["Gate"]++; return c.Ledger.Gate() }
 func (c *called) RepliesOut() bool { c.calls["RepliesOut"]++; return c.Ledger.RepliesOut() }
 func (c *called) Full() bool       { c.calls["Full"]++; return c.Ledger.Full() }
 func (c *called) Waiting() int64   { c.calls["Waiting"]++; return c.Ledger.Waiting() }
+func (c *called) Budgeted() int64  { c.calls["Budgeted"]++; return c.Ledger.Budgeted() }
 func (c *called) Writable() bool   { c.calls["Writable"]++; return c.Ledger.Writable() }
 func (c *called) Class() Class     { c.calls["Class"]++; return c.Ledger.Class() }
 func (c *called) Closed() bool     { c.calls["Closed"]++; return c.Ledger.Closed() }
