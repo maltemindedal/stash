@@ -562,7 +562,7 @@ func TestConnMachineWriteBufferLimitClosesOnOversizedResponses(t *testing.T) {
 
 // newConnMachineWithReplyLimit returns a machine, and its Output, that holds
 // no more than limit bytes before its latest Reply is out, where a server's
-// connections hold 512 MiB.
+// connections hold 514 MiB.
 func newConnMachineWithReplyLimit(limit int64) (*ConnMachine, *output.Output) {
 	out := output.NewPolled(output.NewShared(output.ReplyLimit(limit)), nil, discardLogger)
 	state := &ClientState{ID: 1}
