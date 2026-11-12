@@ -32,7 +32,7 @@ func (s *Server) handleConnection(ctx context.Context, clientID uint64, conn net
 
 	// Every byte the connection is sent goes through its Output: its Replies,
 	// written by this goroutine, and what other connections push to it.
-	out := newOutput(s.outputs, &goroutineOutputDriver{wire: conn}, logger)
+	out := newBlockingOutput(s.outputs, conn, logger)
 	state := s.getClientState(clientID)
 	if state != nil {
 		state.BindOutput(out)

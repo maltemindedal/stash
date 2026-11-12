@@ -134,38 +134,9 @@ func (s *outputs) enforceBudget() {
 	}
 }
 
-// outputDriver is how one networking mode gets an Output's bytes to its
-// socket. The goroutine mode writes with blocking writes, from the
-// connection's own goroutine or from a pump goroutine that runs only while
-// Pushed messages wait. The Event loop writes everything itself, and is told
-// which connections have output to write.
-type outputDriver interface {
-	// schedule is called with Output.mu held when bytes were queued that the
-	// connection's own executor will not flush: a Pushed message, or the ones a
-	// Reply released. It must not block.
-	schedule(o *Output)
-	// flush is Output.Flush, which waits for another writer while more than
-	// mark is left to write before the connection's latest Reply is out, and
-	// with a mark of zero Output.Drain.
-	flush(o *Output, mark int64) error
-	// shut closes the connection, once, without waiting for a write in
-	// progress. It is called with no Output lock held.
-	shut()
-	// closeWrite ends the stream to the peer after everything queued was
-	// written: Output.EndStream.
-	closeWrite()
-	// peerClosed reports whether the peer has closed its side, when the driver
-	// can tell without reading.
-	peerClosed() bool
-	// retry asks the driver's writer to offer the socket the batch that is
-	// inflight once more, and reports whether it will. The Event loop does: its
-	// writes return at once, and it comes back to a socket that took part of a
-	// batch only when the socket can take more or when it is asked to. A writer
-	// of the goroutine mode stays inside its write for as long as a batch is on
-	// offer, so there is nothing to ask of it. It is called with Output.mu held
-	// and must not block.
-	retry(o *Output) bool
-}
+// errWouldBlock is what the Event loop's socket reports when it has taken part
+// of what it was given and can take no more now (Service).
+var errWouldBlock = errors.New("server: socket write would block")
 
 // stallPhase is where the Replica stall rule stands for an Output.
 type stallPhase uint8
@@ -175,16 +146,20 @@ const (
 	stallIdle stallPhase = iota
 	// stallCounting has a timer due to look at lastProgress (checkStall).
 	stallCounting
-	// stallDue is the stall timeout passed with nothing taken, on a driver
-	// whose writer was asked to try the socket once more (retry). What that
-	// try takes is the verdict (write).
+	// stallDue is the stall timeout passed with nothing taken, on a connection
+	// whose Event loop was asked to try the socket once more (checkStall). What
+	// that try takes is the verdict (write).
 	stallDue
 )
 
 // Output is the Client output of one connection: its Replies and the Pushed
 // messages it receives (pub/sub messages, MONITOR events, and for a Replica
-// its stream), in the order they were produced. No method but Flush and Drain
-// waits on the peer's socket. Safe for concurrent use.
+// its stream), in the order they were produced. Safe for concurrent use.
+//
+// Who calls decides what may wait on the peer's socket. The connection's own
+// executor may: Reply, Flush and Drain, in the goroutine mode. Push,
+// HoldPushes, MarkReplica, EndStream, Close and Err are for anyone and never
+// wait. Service and MayReadRequests are the Event loop's and never wait.
 //
 // Lock order: the lock of whoever pushes (a registry's, or the replication
 // Master's for a Replica's stream), then Output.mu, then the shared budget's.
@@ -210,7 +185,9 @@ type Output struct {
 	// spare is an emptied buffer kept for the next batch that is queued while
 	// another is being written.
 	spare []byte
-	// writing is set while a goroutine of the goroutine mode owns the socket.
+	// writing is set while a goroutine of the goroutine mode owns the socket:
+	// the connection's own, writing its Replies (flush), or the pump, which
+	// runs only while Pushed messages wait and nobody is writing.
 	writing bool
 	// written is how many bytes the socket has taken since the connection
 	// opened, and replyEnd is where the latest Reply ends, counted the same way
@@ -246,13 +223,40 @@ type Output struct {
 	// backlog is every byte in queued, held and inflight[sent:].
 	backlog atomic.Int64
 
-	driver outputDriver
+	// wire is the socket of a connection served by its own goroutine, written
+	// with blocking writes. It is nil for a connection the Event loop serves:
+	// the loop writes everything itself (Service), and attention, when there
+	// is one, tells it that the connection needs a Service. attention is
+	// called with mu held or not and must not block.
+	wire      io.Writer
+	attention func()
+	shutOnce  sync.Once
+	// pump is what the pump goroutine runs, built on its first start so that
+	// starting it again allocates nothing. Guarded by mu.
+	pump func()
+
 	shared *outputs
 	logger *slog.Logger
 }
 
-func newOutput(shared *outputs, driver outputDriver, logger *slog.Logger) *Output {
-	o := &Output{driver: driver, shared: shared, logger: logger}
+// newBlockingOutput returns the Client output of a connection served by its
+// own goroutine, which writes its Replies to wire (Flush). A pump goroutine
+// writes what other connections push. Closing the Output closes wire when it
+// is an io.Closer.
+func newBlockingOutput(shared *outputs, wire io.Writer, logger *slog.Logger) *Output {
+	o := &Output{wire: wire, shared: shared, logger: logger}
+	o.drained = sync.NewCond(&o.mu)
+	return o
+}
+
+// newPolledOutput returns the Client output of a connection the Event loop
+// serves. The loop writes it (Service). attention tells the loop to call
+// Service for the connection: bytes were queued from elsewhere, the stream is
+// to end, the stall rule wants the socket tried, or the connection was closed.
+// With a nil attention the Output is written only when its owner chooses to,
+// as a ConnMachine built without an Event loop is.
+func newPolledOutput(shared *outputs, attention func(), logger *slog.Logger) *Output {
+	o := &Output{attention: attention, shared: shared, logger: logger}
 	o.drained = sync.NewCond(&o.mu)
 	return o
 }
@@ -262,8 +266,7 @@ func newOutput(shared *outputs, driver outputDriver, logger *slog.Logger) *Outpu
 // The server builds each connection's Output itself; this is for code that
 // drives a Client state without a server.
 func NewOutput(w io.Writer) *Output {
-	driver := &goroutineOutputDriver{wire: w}
-	return newOutput(newOutputs(), driver, discardLogger)
+	return newBlockingOutput(newOutputs(), w, discardLogger)
 }
 
 // Reply queues the Replies to the request the connection just ran (none is
@@ -324,13 +327,13 @@ func (o *Output) Reply(values ...protocol.Value) error {
 			}
 			// The connection's goroutine must not be the one that writes a stream
 			// of Pushed messages to a peer that may have stopped reading.
-			o.driver.schedule(o)
+			o.scheduleLocked()
 		}
 	}
 	o.mu.Unlock()
 
 	if o.backlog.Load() >= o.shared.writeThrough {
-		return o.driver.flush(o, outputHighWater)
+		return o.flush(outputHighWater)
 	}
 	return nil
 }
@@ -435,7 +438,7 @@ func (o *Output) Push(frame []byte) bool {
 	} else {
 		o.queued = append(o.queued, frame...)
 		o.growLocked(len(frame))
-		o.driver.schedule(o)
+		o.scheduleLocked()
 	}
 	overBudget := o.counted && o.shared.total.Load() > o.shared.pushBudget
 	o.mu.Unlock()
@@ -472,7 +475,7 @@ func (o *Output) Flush() error {
 	if o == nil {
 		return nil
 	}
-	return o.driver.flush(o, outputHighWater)
+	return o.flush(outputHighWater)
 }
 
 // Drain returns once every Reply queued so far has been written, or the
@@ -487,16 +490,19 @@ func (o *Output) Flush() error {
 // waits. A peer that never reads keeps the goroutine here until the connection
 // is closed, by shutdown or by a limit on what is pushed to it, as a Reply to
 // a peer that never reads keeps it in Flush. The Event loop writes out a
-// closing connection itself (ConnMachine.Flush), so there Drain does nothing.
+// closing connection itself (ConnMachine.Service), so there Drain does nothing.
 func (o *Output) Drain() {
 	// Why the connection is closed, if it is, changes nothing for a caller
 	// that is about to close it.
-	_ = o.driver.flush(o, 0)
+	_ = o.flush(0)
 }
 
 // Close closes the connection from any goroutine without waiting for a write in
-// progress, and drops what was waiting for it. It never touches registries;
-// teardown abandons the Client state.
+// progress, and drops what was waiting for it. In the goroutine mode it closes
+// the socket. The Event loop owns its sockets, so there Close asks for the
+// loop's attention, and the loop closes the connection when its next Service
+// reports why (Status.Closed). It never touches registries; teardown abandons
+// the Client state.
 func (o *Output) Close(cause error) {
 	if o == nil {
 		return
@@ -527,13 +533,24 @@ func (o *Output) Close(cause error) {
 	if errors.Is(cause, errPushLimitExceeded) || errors.Is(cause, errPushBudgetExceeded) || errors.Is(cause, errReplicaStalled) {
 		o.logger.Warn("closing a connection that is not keeping up with what is pushed to it", "pending_bytes", waiting, "error", cause)
 	}
-	o.driver.shut()
+	if o.wire == nil {
+		if o.attention != nil {
+			o.attention()
+		}
+		return
+	}
+	o.shutOnce.Do(func() {
+		if closer, ok := o.wire.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	})
 }
 
 // EndStream ends the stream to the peer once everything queued has been
 // written: the write side is shut and the connection stays open for the peer to
 // close. Shutdown ends a Replica's stream this way
-// (replication.Master.EndStreams).
+// (replication.Master.EndStreams). The Event loop shuts the write side itself,
+// when a Service reports the end of the stream (Status.EndOfStream).
 func (o *Output) EndStream() {
 	if o == nil {
 		return
@@ -545,14 +562,16 @@ func (o *Output) EndStream() {
 		return
 	}
 	o.ending = true
-	idle := !o.writing && o.pendingLocked() == 0
-	if !idle {
-		o.driver.schedule(o)
+	// A writer of the goroutine mode shuts the write side when it has written
+	// everything (write). With none at work and nothing to write, nobody would.
+	shut := o.wire != nil && !o.writing && o.pendingLocked() == 0
+	if !shut {
+		o.scheduleLocked()
 	}
 	o.mu.Unlock()
 
-	if idle {
-		o.driver.closeWrite()
+	if shut {
+		o.closeWrite()
 	}
 }
 
@@ -625,7 +644,8 @@ func (o *Output) PeerClosed() bool {
 	if o == nil {
 		return false
 	}
-	return o.driver.peerClosed()
+	conn, ok := o.wire.(net.Conn)
+	return ok && peerClosed(conn)
 }
 
 func (o *Output) isClosed() bool {
@@ -739,8 +759,9 @@ func (o *Output) armStallLocked(wait time.Duration) {
 // took nothing in that time. The Event loop tried the socket when the batch
 // went on offer and then went on to other work, which can be one request that
 // runs longer than the timeout. The socket may have had room for most of that
-// time, so the loop is asked to try it now, and closes the Replica if that try
-// takes nothing (write).
+// time, so the loop is asked to try it now (attention), and its Service closes
+// the Replica if that try takes nothing (write). An Output with nobody to ask
+// is closed here.
 func (o *Output) checkStall() {
 	o.mu.Lock()
 	o.stall = stallIdle
@@ -753,8 +774,9 @@ func (o *Output) checkStall() {
 		o.mu.Unlock()
 		return
 	}
-	if o.driver.retry(o) {
+	if o.wire == nil && o.attention != nil {
 		o.stall = stallDue
+		o.attention()
 		o.mu.Unlock()
 		return
 	}
@@ -767,15 +789,49 @@ func (o *Output) stalledErr() error {
 	return fmt.Errorf("%w of %v", errReplicaStalled, o.shared.stallTimeout)
 }
 
-// writeTo writes what is queued to w until nothing is left or w fails, and
-// returns w's error. The caller is the only writer: the goroutine that set
-// writing, or the Event loop. A w that accepts part of a chunk, and reports that
-// it would block as the Event loop's does or reports nothing (io.ErrShortWrite),
-// leaves the rest for the next call. When the stall rule asked for this try
-// (checkStall) and w takes nothing, the error is errReplicaStalled, for the
-// caller to close the connection with.
-func (o *Output) writeTo(w io.Writer) error {
-	return o.write(w, everyBuffer)
+// Status is where a connection the Event loop serves stands after a Service.
+// The loop decides from it and compares no byte counts of its own.
+type Status struct {
+	// Closed is why the Output is closed, or nil while it is open. The loop
+	// closes the connection.
+	Closed error
+	// MayRead is MayReadRequests: read and run the connection's requests.
+	MayRead bool
+	// WantWrite reports that output waits which the socket did not take: ask
+	// the poller for writable. Pushed messages held behind a Reply that has
+	// not come are not waiting for the socket.
+	WantWrite bool
+	// EndOfStream reports that EndStream was called and everything is
+	// written: shut the write side.
+	EndOfStream bool
+}
+
+func (o *Output) statusLocked() Status {
+	if o.closed {
+		return Status{Closed: o.errLocked()}
+	}
+	pending := o.pendingLocked()
+	return Status{
+		MayRead:     o.replyBacklogLocked() <= outputHighWater,
+		WantWrite:   pending > 0,
+		EndOfStream: o.ending && pending == 0,
+	}
+}
+
+// Service writes what is queued to the socket until nothing is left or the
+// socket takes no more, and reports where the connection stands. Only the Event
+// loop calls it, with the connection's socket. A socket that accepts part of a
+// chunk, and reports that it would block (errWouldBlock) or reports nothing
+// (io.ErrShortWrite), leaves the rest for the next Service. Any other failure
+// closes the Output, as does a try the stall rule asked for (checkStall) that
+// takes nothing.
+func (o *Output) Service(socket io.Writer) Status {
+	status, err := o.write(socket, everyBuffer)
+	if status.Closed != nil || err == nil || errors.Is(err, errWouldBlock) || errors.Is(err, io.ErrShortWrite) {
+		return status
+	}
+	o.Close(err)
+	return Status{Closed: o.Err()}
 }
 
 // everyBuffer, as the number of buffers write is to write, has it go on until
@@ -786,33 +842,38 @@ const everyBuffer = -1
 // set), when it has written the buffers it was asked for and more is queued.
 var errMoreQueued = errors.New("server: more output was queued during the write")
 
-// write is writeTo for a writer that takes no more than buffers buffers of what
-// is queued: the batch that sealBatchLocked counted for it when it took the
-// socket, or everyBuffer. If more is queued once those are written, it returns
-// errMoreQueued and leaves writing set, for the caller to hand the socket on:
-// what was queued meanwhile was pushed by other connections.
-func (o *Output) write(w io.Writer, buffers int) error {
+// write writes what is queued to w until nothing is left or w fails, and
+// returns w's error and, for Service, where the Output stood when it stopped.
+// The caller is the only writer: the goroutine that set writing, or the Event
+// loop. It takes no more than buffers buffers of what is queued: the batch that
+// sealBatchLocked counted for a writer when it took the socket, or everyBuffer.
+// If more is queued once those are written, it returns errMoreQueued and
+// leaves writing set, for the caller to hand the socket on: what was queued
+// meanwhile was pushed by other connections. When the stall rule asked for
+// this try (checkStall) and w takes nothing, the error is errReplicaStalled,
+// for the caller to close the connection with.
+func (o *Output) write(w io.Writer, buffers int) (Status, error) {
 	for {
 		o.mu.Lock()
 		if o.closed {
-			err := o.errLocked()
+			status := o.statusLocked()
 			o.stopWritingLocked()
 			o.mu.Unlock()
-			return err
+			return status, status.Closed
 		}
 		if o.sent == len(o.inflight) {
 			switch {
 			case len(o.ahead) == 0 && len(o.queued) == 0:
-				end := o.ending
+				status := o.statusLocked()
 				o.stopWritingLocked()
 				o.mu.Unlock()
-				if end {
-					o.driver.closeWrite()
+				if status.EndOfStream && o.wire != nil {
+					o.closeWrite()
 				}
-				return nil
+				return status, nil
 			case buffers == 0:
 				o.mu.Unlock()
-				return errMoreQueued
+				return Status{}, errMoreQueued
 			case len(o.ahead) > 0:
 				o.inflight, o.sent = o.ahead[0], 0
 				o.aheadBytes -= len(o.inflight)
@@ -884,12 +945,12 @@ func (o *Output) write(w io.Writer, buffers int) error {
 			err = io.ErrShortWrite
 		}
 		if err != nil {
+			status := o.statusLocked()
 			o.stopWritingLocked()
+			o.mu.Unlock()
+			return status, err
 		}
 		o.mu.Unlock()
-		if err != nil {
-			return err
-		}
 	}
 }
 
@@ -898,38 +959,44 @@ func (o *Output) stopWritingLocked() {
 	o.drained.Broadcast()
 }
 
-// goroutineOutputDriver writes an Output with blocking writes. The
-// connection's own goroutine writes its Replies (Flush); a pump goroutine
-// writes whatever is queued when a Pushed message arrives and nobody is
-// writing, and exits when nothing is left.
-type goroutineOutputDriver struct {
-	wire     io.Writer
-	shutOnce sync.Once
-	// pump is what the pump goroutine runs, built on its first start so that
-	// starting it again allocates nothing. Guarded by Output.mu.
-	pump func()
-}
-
-func (d *goroutineOutputDriver) schedule(o *Output) {
+// scheduleLocked is called when bytes were queued that the connection's own
+// executor will not flush, a Pushed message or the ones a Reply released, and
+// when the stream is to end. In the goroutine mode it starts the pump unless a
+// goroutine has the socket already. The Event loop is asked for its attention.
+func (o *Output) scheduleLocked() {
+	if o.wire == nil {
+		if o.attention != nil {
+			o.attention()
+		}
+		return
+	}
 	if o.writing {
 		return
 	}
 	o.writing = true
-	d.startPump(o)
+	o.startPumpLocked()
 }
 
-// startPump starts the pump goroutine. The caller holds Output.mu and has set
-// writing.
-func (d *goroutineOutputDriver) startPump(o *Output) {
-	if d.pump == nil {
-		// A failed write closes the connection (write), which is all there is
-		// to do about it here.
-		d.pump = func() { _ = d.write(o, everyBuffer) }
+// startPumpLocked starts the pump goroutine, which writes whatever is queued
+// and exits when nothing is left. The caller has set writing.
+func (o *Output) startPumpLocked() {
+	if o.pump == nil {
+		// A failed write closes the connection (writeOut), which is all there
+		// is to do about it here.
+		o.pump = func() { _ = o.writeOut(everyBuffer) }
 	}
-	go d.pump()
+	go o.pump()
 }
 
-func (d *goroutineOutputDriver) flush(o *Output, mark int64) error {
+// flush is Flush, which waits for another writer while more than mark is left
+// to write before the connection's latest Reply is out, and with a mark of
+// zero Drain. The Event loop writes its connections itself, so there it does
+// nothing.
+func (o *Output) flush(mark int64) error {
+	if o.wire == nil {
+		return nil
+	}
+
 	o.mu.Lock()
 	// Another goroutine may have the socket, and then writes the Replies queued
 	// here with everything else. This one waits for it while more than mark is
@@ -960,17 +1027,20 @@ func (d *goroutineOutputDriver) flush(o *Output, mark int64) error {
 	batch := o.sealBatchLocked()
 	o.mu.Unlock()
 
-	return d.write(o, batch)
+	return o.writeOut(batch)
 }
 
-func (d *goroutineOutputDriver) write(o *Output, buffers int) error {
-	err := o.write(d.wire, buffers)
+// writeOut is write to the socket of the goroutine mode, by the goroutine that
+// set writing. It hands the socket to the pump when more was queued than it
+// was to write, and closes the connection when the write fails.
+func (o *Output) writeOut(buffers int) error {
+	_, err := o.write(o.wire, buffers)
 	if errors.Is(err, errMoreQueued) {
 		o.mu.Lock()
 		if o.closed {
 			o.stopWritingLocked()
 		} else {
-			d.startPump(o)
+			o.startPumpLocked()
 		}
 		o.mu.Unlock()
 		return nil
@@ -981,45 +1051,19 @@ func (d *goroutineOutputDriver) write(o *Output, buffers int) error {
 	return err
 }
 
-func (d *goroutineOutputDriver) shut() {
-	d.shutOnce.Do(func() {
-		if closer, ok := d.wire.(io.Closer); ok {
-			_ = closer.Close()
-		}
-	})
-}
-
 // writeCloser is a socket whose write side can be shut on its own, as a TCP
 // connection's can.
 type writeCloser interface {
 	CloseWrite() error
 }
 
-func (d *goroutineOutputDriver) closeWrite() {
-	if wire, ok := d.wire.(writeCloser); ok {
+// closeWrite ends the stream to the peer of the goroutine mode, after
+// everything queued was written (EndStream).
+func (o *Output) closeWrite() {
+	if wire, ok := o.wire.(writeCloser); ok {
 		// One that fails is closed with every other connection afterwards.
 		_ = wire.CloseWrite()
 	}
 }
-
-func (d *goroutineOutputDriver) peerClosed() bool {
-	conn, ok := d.wire.(net.Conn)
-	return ok && peerClosed(conn)
-}
-
-func (d *goroutineOutputDriver) retry(*Output) bool { return false }
-
-// unscheduledOutputDriver is the driver of an Output that only its owner
-// writes, by calling writeTo: a ConnMachine built without an Event loop. It has
-// no writer to ask for anything, so the stall rule's timer closes its Output
-// itself.
-type unscheduledOutputDriver struct{}
-
-func (unscheduledOutputDriver) schedule(*Output)           {}
-func (unscheduledOutputDriver) flush(*Output, int64) error { return nil }
-func (unscheduledOutputDriver) shut()                      {}
-func (unscheduledOutputDriver) closeWrite()                {}
-func (unscheduledOutputDriver) peerClosed() bool           { return false }
-func (unscheduledOutputDriver) retry(*Output) bool         { return false }
 
 var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))

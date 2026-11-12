@@ -107,11 +107,11 @@ type ConnMachine struct {
 
 // NewConnMachine constructs an active connection state machine bound to the
 // connection-scoped client state, writing through the Output bound to it. A
-// client with none is given one that is written only by Flush.
+// client with none is given one that is written only by Service and Flush.
 func NewConnMachine(client *ClientState) *ConnMachine {
 	out := client.Output()
 	if out == nil {
-		out = newOutput(newOutputs(), unscheduledOutputDriver{}, discardLogger)
+		out = newPolledOutput(newOutputs(), nil, discardLogger)
 		if client != nil {
 			client.BindOutput(out)
 		}
@@ -344,25 +344,30 @@ func (m *ConnMachine) ProcessNext(ctx context.Context, run ConnCommandRunner) (b
 	return len(m.pending) > 0, nil
 }
 
-// Flush writes the connection's pending output to w and consumes whatever w
-// accepts, so a partial write leaves the remainder for a later call
-// (Output.writeTo). Once a closing machine has drained its parsed requests and
-// pending output, Flush completes the transition to the closed state.
+// Service writes the connection's pending output to w, consumes whatever w
+// accepts, so a partial write leaves the remainder for a later call, and
+// reports where the connection's Output stands (Output.Service). It closes the
+// machine when the Output is closed, by a failed write or from elsewhere. Once
+// a closing machine has drained its parsed requests and pending output, Service
+// completes the transition to the closed state.
+func (m *ConnMachine) Service(w io.Writer) Status {
+	status := m.out.Service(w)
+	switch {
+	case status.Closed != nil:
+		m.Close(status.Closed)
+	case m.state == ConnStateClosing && !status.WantWrite && len(m.pending) == 0:
+		m.Close(nil)
+	}
+	return status
+}
+
+// Flush is Service for a caller that only needs to know whether the
+// connection failed.
 func (m *ConnMachine) Flush(w io.Writer) error {
 	if m.state == ConnStateClosed {
 		return ErrConnMachineClosed
 	}
-
-	// A writer that took only part of the output is not a failed one.
-	if err := m.out.writeTo(w); err != nil && !errors.Is(err, io.ErrShortWrite) {
-		return err
-	}
-
-	if m.state == ConnStateClosing && !m.HasPendingOutput() && len(m.pending) == 0 {
-		m.Close(nil)
-	}
-
-	return nil
+	return m.Service(w).Closed
 }
 
 // Close transitions to the closed state, discards buffered input, closes the

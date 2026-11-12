@@ -108,10 +108,10 @@ func (w *outputWire) isClosed() bool {
 	}
 }
 
-// newGoroutineOutput returns an Output written by the goroutine-mode driver to
-// wire, under the limits in shared.
+// newGoroutineOutput returns the Output of a connection served by its own
+// goroutine, which writes to wire, under the limits in shared.
 func newGoroutineOutput(shared *outputs, wire *outputWire) *Output {
-	return newOutput(shared, &goroutineOutputDriver{wire: wire}, discardLogger)
+	return newBlockingOutput(shared, wire, discardLogger)
 }
 
 // queuedReplies are the limits of a server whose connections never write a
@@ -523,7 +523,7 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 		}},
 		{name: "by the Event loop's flush", open: func(shared *outputs) (*Output, func()) {
 			state := &ClientState{ID: 1}
-			out := newOutput(shared, unscheduledOutputDriver{}, discardLogger)
+			out := newPolledOutput(shared, nil, discardLogger)
 			state.BindOutput(out)
 			machine := NewConnMachine(state)
 			return out, func() {
@@ -851,7 +851,7 @@ func TestAFlushBehindAStuckWriterWaitsOnlyForWhatIsAheadOfItsLatestReply(t *test
 // left is the pump's to write.
 func TestAFlushBehindPushedMessagesReturnsOnceItsReplyIsWithinTheHighWaterMark(t *testing.T) {
 	wire := newReplyReadingWire(outputHighWater)
-	out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newBlockingOutput(queuedReplies(), wire, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -907,7 +907,7 @@ func TestDrainReturnsOnlyOnceThePumpHasWrittenTheLatestReply(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// The peer reads the messages, and nothing of the Reply until readOn.
 			wire := newReplyReadingWire(tt.ahead)
-			out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			out := newBlockingOutput(queuedReplies(), wire, discardLogger)
 			defer out.Close(nil)
 			defer wire.readOn()
 
@@ -953,7 +953,7 @@ func TestDrainDoesNotWaitForWhatWasPushedAfterTheLatestReply(t *testing.T) {
 	const reply, stream = "+FULLRESYNC\r\n", 2 * outputHighWater
 	wire := newReplyReadingWire(len(reply))
 	close(wire.proceed)
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newBlockingOutput(newOutputs(), wire, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -1043,7 +1043,7 @@ func TestAFlushWaitingForItsRepliesReturnsWhenTheyAreWritten(t *testing.T) {
 		t.Fatalf("EncodeValues() error = %v", err)
 	}
 	wire := newReplyReadingWire(len(reply))
-	out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newBlockingOutput(queuedReplies(), wire, discardLogger)
 	defer out.Close(nil)
 	defer wire.readOn()
 
@@ -1125,7 +1125,7 @@ func (w *slowOutputWire) Write(p []byte) (int, error) {
 // steady writes, its acknowledgements.
 func TestAFlushLeavesWhatIsPushedMeanwhileToThePump(t *testing.T) {
 	wire := &slowOutputWire{outputWire: *newOutputWire(), delay: 2 * time.Millisecond}
-	out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newBlockingOutput(queuedReplies(), wire, discardLogger)
 	defer out.Close(nil)
 
 	if err := out.Reply(protocol.BulkString{Data: make([]byte, 8<<10)}); err != nil {
@@ -1180,7 +1180,7 @@ func (w *heldOutputWire) Write(p []byte) (int, error) {
 // the batch that was being written, then everything queued behind it.
 func TestPushesBehindASlowSocketArriveInOrderInFewWrites(t *testing.T) {
 	wire := &heldOutputWire{outputWire: newOutputWire(), released: make(chan struct{})}
-	out := newOutput(newOutputs(), &goroutineOutputDriver{wire: wire}, discardLogger)
+	out := newBlockingOutput(newOutputs(), wire, discardLogger)
 	defer out.Close(nil)
 
 	var want strings.Builder
@@ -1601,7 +1601,7 @@ func TestAFlushWritesNothingThatWasPushedDuringIt(t *testing.T) {
 				t.Fatalf("EncodeValues() error = %v", err)
 			}
 			wire := newReplyReadingWire(len(replies))
-			out := newOutput(queuedReplies(), &goroutineOutputDriver{wire: wire}, discardLogger)
+			out := newBlockingOutput(queuedReplies(), wire, discardLogger)
 			defer out.Close(nil)
 			defer wire.readOn()
 
@@ -1645,20 +1645,6 @@ func TestAFlushWritesNothingThatWasPushedDuringIt(t *testing.T) {
 	}
 }
 
-// lockHoldingDriver is a driver whose schedule waits until it is released. An
-// Output calls schedule with its lock held, so a Push to an Output it drives
-// stays inside that lock, where a test can keep it.
-type lockHoldingDriver struct {
-	unscheduledOutputDriver
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (d *lockHoldingDriver) schedule(*Output) {
-	close(d.entered)
-	<-d.release
-}
-
 // allocatedBytes is how many bytes the process has allocated so far.
 func allocatedBytes() uint64 {
 	var stats runtime.MemStats
@@ -1673,12 +1659,17 @@ func allocatedBytes() uint64 {
 // replication Master pushes a Replica's stream under its own lock, where every
 // writer waits: a write waited two seconds for a 384 MiB snapshot.
 func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
-	driver := &lockHoldingDriver{entered: make(chan struct{}), release: make(chan struct{})}
-	out := newOutput(newOutputs(), driver, discardLogger)
+	// An Output asks for the Event loop's attention with its lock held, so a
+	// Push whose call for attention waits stays inside that lock.
+	entered, release := make(chan struct{}), make(chan struct{})
+	out := newPolledOutput(newOutputs(), func() {
+		close(entered)
+		<-release
+	}, discardLogger)
 
 	pushed := make(chan bool, 1)
 	go func() { pushed <- out.Push([]byte("+write\r\n")) }()
-	<-driver.entered
+	<-entered
 
 	snapshot := protocol.BulkString{Data: make([]byte, 16<<20)}
 	before := allocatedBytes()
@@ -1694,7 +1685,7 @@ func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
 	default:
 	}
 
-	close(driver.release)
+	close(release)
 	if !<-pushed {
 		t.Fatal("Push() = false, want it queued")
 	}
@@ -1706,8 +1697,8 @@ func TestALargeReplyIsEncodedWhileAPushHoldsTheOutputsLock(t *testing.T) {
 		t.Fatalf("EncodeValues() error = %v", err)
 	}
 	wire := newOutputWire()
-	if err := out.writeTo(wire); err != nil {
-		t.Fatalf("writeTo() error = %v", err)
+	if status := out.Service(wire); status.Closed != nil || status.WantWrite {
+		t.Fatalf("Service() = %+v, want everything written to a socket that takes it", status)
 	}
 	if got := wire.sent(); got != "+write\r\n"+string(want) {
 		t.Fatalf("sent %d bytes, want the push and then the %d bytes of the reply", len(got), len(want))

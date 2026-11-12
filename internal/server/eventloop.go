@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -64,10 +63,6 @@ type poller interface {
 	// Close releases the poller resources.
 	Close() error
 }
-
-// errEventLoopWouldBlock reports that a socket write consumed only part of the
-// pending output because the kernel send buffer is full.
-var errEventLoopWouldBlock = errors.New("server: socket write would block")
 
 // serveEventLoop serves every client connection through a single goroutine
 // driven by OS readiness notifications, dispatching readable and writable
@@ -157,9 +152,10 @@ type eventLoop struct {
 	waiting atomic.Bool
 
 	mu sync.Mutex
-	// dirty are the connections the loop has been asked to write and has not
-	// written since, each listed once (eventConn.dirty): their Output was given
-	// bytes, their stream is to end, or the stall rule wants their socket tried.
+	// dirty are the connections whose Output asked for the loop's attention
+	// and has not been served since, each listed once (eventConn.dirty): it was
+	// given bytes, its stream is to end, the stall rule wants its socket
+	// tried, or it was closed.
 	dirty        []*eventConn
 	spareDirty   []*eventConn
 	closeReqs    []*eventConn
@@ -167,9 +163,9 @@ type eventLoop struct {
 }
 
 // eventConn tracks one accepted connection inside the event loop. All fields
-// are owned by the loop goroutine except out, dirty and endStream, which are
-// safe for concurrent use, and closeRequested and detached, which are guarded
-// by eventLoop.mu.
+// are owned by the loop goroutine except out and dirty, which are safe for
+// concurrent use, and closeRequested and detached, which are guarded by
+// eventLoop.mu.
 type eventConn struct {
 	fd         int
 	clientID   uint64
@@ -185,13 +181,13 @@ type eventConn struct {
 	// authTimer closes the connection if it has not authenticated in time; nil
 	// where no password is required.
 	authTimer *time.Timer
-	// dirty is set while the connection is on eventLoop.dirty.
+	// dirty is set while the connection is on eventLoop.dirty. The loop also
+	// sets it when it closes the connection (closeConn).
 	dirty atomic.Bool
-	// endStream is set when the stream to the peer is to end, as shutdown ends
-	// a replica's (loopOutputDriver.closeWrite): once the connection's output
-	// has reached the kernel, the loop shuts the write side (writeShut), and it
-	// closes the connection when the peer closes its own.
-	endStream atomic.Bool
+	// writeShut is set once the loop has shut the write side, when the stream
+	// to the peer was to end and everything was written (Status.EndOfStream),
+	// as shutdown ends a replica's. The loop closes the connection when the
+	// peer closes its own side.
 	writeShut bool
 
 	closeRequested bool
@@ -272,9 +268,8 @@ func (l *eventLoop) wakeIfWaiting() {
 	}
 }
 
-// markDirty lists conn for the loop to write: it has output the loop has not
-// been asked to write, a stream the loop has not been asked to end, or a batch
-// the stall rule wants its socket offered again. Safe for concurrent use; it
+// markDirty lists conn for the loop to serve. It is the attention the
+// connection's Output asks for (newPolledOutput). Safe for concurrent use; it
 // may be called with the connection's Output locked.
 func (l *eventLoop) markDirty(conn *eventConn) {
 	if !conn.dirty.CompareAndSwap(false, true) {
@@ -464,7 +459,7 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 
 	conn.ctx = l.ctx
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
-	conn.out = newOutput(l.srv.outputs, &loopOutputDriver{loop: l, conn: conn}, conn.logger)
+	conn.out = newPolledOutput(l.srv.outputs, func() { l.markDirty(conn) }, conn.logger)
 	state.BindOutput(conn.out)
 	conn.machine = NewConnMachine(state)
 	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
@@ -557,11 +552,10 @@ func (l *eventLoop) processConn(conn *eventConn) {
 	}()
 
 	for conn.machine.State() != ConnStateClosed {
+		// Asked without the Output's lock while little waits, which is every
+		// request of an ordinary pipeline.
 		if !conn.machine.MayReadRequests() {
-			if !l.flushOnce(conn) {
-				return
-			}
-			if !conn.machine.MayReadRequests() {
+			if status := conn.machine.Service(fdWriter{fd: conn.fd}); status.Closed != nil || !status.MayRead {
 				break
 			}
 		}
@@ -579,38 +573,27 @@ func (l *eventLoop) processConn(conn *eventConn) {
 	l.finishConnEvent(conn)
 }
 
-// flushOnce writes pending output once and reports whether the connection is
-// still usable. A full kernel send buffer is not an error; any other write
-// failure closes the connection.
-func (l *eventLoop) flushOnce(conn *eventConn) bool {
-	if err := conn.machine.Flush(fdWriter{fd: conn.fd}); err != nil && !errors.Is(err, errEventLoopWouldBlock) {
-		l.closeConn(conn, err)
-		return false
-	}
-	return true
-}
-
-// finishConnEvent flushes pending output, finishes connections whose machine
-// closed or whose peer stopped sending and has been fully served, and settles
-// the readiness interest set for the next Wait.
+// finishConnEvent serves the connection's Output once and acts on what that
+// reports: it finishes connections whose Output or machine closed, or whose
+// peer stopped sending and has been fully served, ends a stream that is
+// written, and settles the readiness interest set for the next Wait. A full
+// kernel send buffer is not a failure; any other one closed the Output.
 func (l *eventLoop) finishConnEvent(conn *eventConn) {
 	if conn.machine.State() == ConnStateClosed {
 		l.closeConn(conn, conn.machine.Err())
 		return
 	}
-	if !l.flushOnce(conn) {
-		return
-	}
+	status := conn.machine.Service(fdWriter{fd: conn.fd})
 	if conn.machine.State() == ConnStateClosed {
 		l.closeConn(conn, conn.machine.Err())
 		return
 	}
 
-	if conn.peerClosed && !conn.machine.HasPendingOutput() && conn.machine.PendingRequests() == 0 {
+	if conn.peerClosed && !status.WantWrite && conn.machine.PendingRequests() == 0 {
 		l.closeConn(conn, nil)
 		return
 	}
-	if conn.endStream.Load() && !conn.writeShut && !conn.machine.HasPendingOutput() {
+	if status.EndOfStream && !conn.writeShut {
 		// The end of the replica's stream may still be in the kernel's send
 		// queue, and closing the socket now would let the replica's next
 		// request (an acknowledgement) draw a reset that discards it. Shutting
@@ -625,8 +608,7 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 
 	// Reading stays off after EOF (level-triggered readiness would spin) and
 	// while the connection's own Replies are backed up.
-	wantRead := !conn.peerClosed && conn.machine.MayReadRequests()
-	l.setInterest(conn, wantRead, conn.machine.HasPendingOutput())
+	l.setInterest(conn, !conn.peerClosed && status.MayRead, status.WantWrite)
 }
 
 func (l *eventLoop) setInterest(conn *eventConn, wantRead, wantWrite bool) {
@@ -654,6 +636,9 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 	conn.detached = true
 	l.mu.Unlock()
 
+	// Closing the machine closes its Output, which asks for the loop's
+	// attention. Nothing is left to serve, so the connection is not listed.
+	conn.dirty.Store(true)
 	conn.machine.Close(cause)
 	if err := l.poller.Remove(conn.fd); err != nil {
 		conn.logger.Debug("failed to deregister connection from poller", "error", err)
@@ -681,15 +666,15 @@ func (l *eventLoop) cleanup() {
 }
 
 // fdWriter adapts a non-blocking socket descriptor to io.Writer for
-// ConnMachine.Flush. A full kernel send buffer surfaces as
-// errEventLoopWouldBlock with a partial byte count, leaving the remainder
-// buffered in the machine until the poller reports the socket writable.
+// Output.Service. A full kernel send buffer surfaces as errWouldBlock with a
+// partial byte count, leaving the remainder in the Output until the poller
+// reports the socket writable.
 type fdWriter struct {
 	fd int
 }
 
 // Write pushes p to the socket, retrying short writes and EINTR. It reports
-// errEventLoopWouldBlock with a partial count when the kernel send buffer fills.
+// errWouldBlock with a partial count when the kernel send buffer fills.
 func (w fdWriter) Write(p []byte) (int, error) {
 	total := 0
 	for total < len(p) {
@@ -702,47 +687,12 @@ func (w fdWriter) Write(p []byte) (int, error) {
 				continue
 			}
 			if err == syscall.EAGAIN {
-				return total, errEventLoopWouldBlock
+				return total, errWouldBlock
 			}
 			return total, err
 		}
 	}
 	return total, nil
-}
-
-// loopOutputDriver is the Event loop's side of a connection's Output: the loop
-// writes every connection itself (ConnMachine.Flush), so the driver only tells
-// it which connections were given output from elsewhere, and asks it to close
-// one, to end its stream, or to try its socket again.
-type loopOutputDriver struct {
-	loop *eventLoop
-	conn *eventConn
-}
-
-func (d *loopOutputDriver) schedule(*Output) { d.loop.markDirty(d.conn) }
-
-func (d *loopOutputDriver) flush(*Output, int64) error { return nil }
-
-func (d *loopOutputDriver) shut() { d.loop.requestClose(d.conn) }
-
-// closeWrite has the loop end the stream to the peer, now that everything
-// queued for it was written (Output.EndStream): the loop shuts the
-// connection's write side and closes it once the peer has closed its own
-// (finishConnEvent). An Output calls it again each time it finds nothing left
-// to write, so only the first call lists the connection.
-func (d *loopOutputDriver) closeWrite() {
-	if d.conn.endStream.CompareAndSwap(false, true) {
-		d.loop.markDirty(d.conn)
-	}
-}
-
-func (d *loopOutputDriver) peerClosed() bool { return false }
-
-// retry lists the connection for the loop, which writes every connection on
-// its list (applyQueuedWork).
-func (d *loopOutputDriver) retry(*Output) bool {
-	d.loop.markDirty(d.conn)
-	return true
 }
 
 // eventConnHandle implements the ClientConn operations registered with the client
