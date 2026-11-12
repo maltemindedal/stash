@@ -244,6 +244,15 @@ func (l *Ledger) MarkReplica(now Instant) Effects {
 	return Effects{Deadline: l.deadline()}
 }
 
+// Stallable reports whether the socket is held to the stall rule, as a
+// Replica's is. Only then does the Ledger compare the times it is told with
+// Take and Took, so its caller need not read a clock for any other connection:
+// the model tells such a Ledger a time that is wrong and requires the same
+// decisions.
+func (l *Ledger) Stallable() bool {
+	return l.class == Replica
+}
+
 // Take asks for the socket on behalf of role and returns how many bytes to
 // offer it next. Zero means there is nothing for this writer: another has the
 // socket, or this one has written all it may and has given the socket up.
@@ -287,7 +296,7 @@ func (l *Ledger) Took(n int64, now Instant) Effects {
 	}
 	l.taken += n
 	if n == 0 {
-		if l.class == Replica && now-l.progress >= l.lim.StallTimeout {
+		if l.Stallable() && now-l.progress >= l.lim.StallTimeout {
 			return Effects{Close: ErrStalled}
 		}
 		return Effects{Deadline: l.deadline()}
@@ -423,7 +432,7 @@ func (l *Ledger) grantPusher() Effects {
 }
 
 func (l *Ledger) deadline() Instant {
-	if l.class != Replica || l.closed || l.offerEnd <= l.taken {
+	if !l.Stallable() || l.closed || l.offerEnd <= l.taken {
 		return 0
 	}
 	return l.progress + l.lim.StallTimeout

@@ -96,18 +96,11 @@ func (c *chain) waiting() int {
 	return n
 }
 
-// offered reports whether the buffer being written has bytes still to go.
-func (c *chain) offered() bool {
-	return c.sent < len(c.inflight)
-}
-
 // next returns the bytes at the front of the stream to offer the socket, no
 // more than n of them, and fewer when the buffer they are in ends before that.
-// The caller knows that n bytes are in the stream. fresh reports that they
-// begin a buffer of which nothing was offered before.
-func (c *chain) next(n int64) (chunk []byte, fresh bool) {
+// The caller knows that n bytes are in the stream.
+func (c *chain) next(n int64) []byte {
 	if c.sent == len(c.inflight) {
-		fresh = true
 		if len(c.ahead) > 0 {
 			c.inflight, c.sent = c.ahead[0], 0
 			// Moved down, not resliced, so that the list keeps its array for
@@ -119,11 +112,11 @@ func (c *chain) next(n int64) (chunk []byte, fresh bool) {
 			c.inflight, c.queued, c.spare, c.sent = c.queued, c.spare[:0], nil, 0
 		}
 	}
-	chunk = c.inflight[c.sent:]
+	chunk := c.inflight[c.sent:]
 	if int64(len(chunk)) > n {
 		chunk = chunk[:n]
 	}
-	return chunk, fresh
+	return chunk
 }
 
 // drop removes the n bytes the socket took from the front of the stream.

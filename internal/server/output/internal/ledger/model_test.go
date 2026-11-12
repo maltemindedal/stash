@@ -40,6 +40,7 @@ type machine interface {
 	Hold()
 	Holding() bool
 	MarkReplica(now Instant) Effects
+	Stallable() bool
 	Take(role Role, now Instant) (int64, Effects)
 	Took(n int64, now Instant) Effects
 	EndStream() Effects
@@ -102,6 +103,16 @@ type world struct {
 	since     Instant
 	// deadline is the latest Effects.Deadline.
 	deadline Instant
+}
+
+// told is the time the Ledger is told with a Take or a Took. The Output reads
+// its clock only for a connection whose socket is held to the stall rule, so
+// any other Ledger is told a time that is wrong, and must decide the same.
+func (w world) told() Instant {
+	if !w.m.Stallable() {
+		return 1
+	}
+	return w.now
 }
 
 func (w world) copy() world {
@@ -191,6 +202,9 @@ func (w *world) settle(before world, kind eventKind, took int64, effects Effects
 	if got := w.m.Ended(); got != ended {
 		return fmt.Sprintf("Ended() = %v with the stream to end = %v and %q left to write", got, w.ending, w.wire)
 	}
+	if got := w.m.Stallable(); got != w.replica {
+		return fmt.Sprintf("Stallable() = %v for a connection that is a Replica's = %v: the Output reads its clock for the sockets held to the stall rule and for no other", got, w.replica)
+	}
 	if got := w.m.Holding(); got != w.holding {
 		return fmt.Sprintf("Holding() = %v, want %v: a Pushed message would go to the wrong side of the next Reply", got, w.holding)
 	}
@@ -257,7 +271,7 @@ type step struct {
 // take is a writer asking for the socket.
 func (w world) take(role Role, name string) step {
 	next := w.copy()
-	n, effects := next.m.Take(role, next.now)
+	n, effects := next.m.Take(role, next.told())
 	label := fmt.Sprintf("the %s asks for the socket and is given %d", name, n)
 	if n == 0 {
 		if role == Requester {
@@ -387,7 +401,7 @@ func (w world) steps(eventLoop bool) []step {
 				continue
 			}
 			next := w.copy()
-			n, effects := next.m.Take(role, next.now)
+			n, effects := next.m.Take(role, next.told())
 			if n != 0 || effects != (Effects{}) || next.key() != w.key() {
 				out = append(out, step{"the socket is asked for during a write", next, fmt.Sprintf("Take(%d) during a write of %d bytes by %d returned %d and %+v: the bytes on offer would be offered twice", role, w.grant, w.grantRole, n, effects)})
 			}
@@ -401,7 +415,7 @@ func (w world) steps(eventLoop bool) []step {
 		}
 		for took := least; took <= w.grant; took++ {
 			next := w.copy()
-			effects := next.m.Took(took, next.now)
+			effects := next.m.Took(took, next.told())
 			if !next.closed {
 				next.wire = next.wire[took:]
 			}
@@ -541,8 +555,9 @@ func (c *called) Push(n int64) (bool, Effects) {
 	c.calls["Push"]++
 	return c.Ledger.Push(n)
 }
-func (c *called) Hold()         { c.calls["Hold"]++; c.Ledger.Hold() }
-func (c *called) Holding() bool { c.calls["Holding"]++; return c.Ledger.Holding() }
+func (c *called) Hold()           { c.calls["Hold"]++; c.Ledger.Hold() }
+func (c *called) Holding() bool   { c.calls["Holding"]++; return c.Ledger.Holding() }
+func (c *called) Stallable() bool { c.calls["Stallable"]++; return c.Ledger.Stallable() }
 func (c *called) MarkReplica(now Instant) Effects {
 	c.calls["MarkReplica"]++
 	return c.Ledger.MarkReplica(now)

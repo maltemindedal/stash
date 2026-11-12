@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,12 +42,13 @@ const outputReplicaPushLimit = 256 << 20
 const outputPushBudget = 128 << 20
 
 // outputReplicaStallTimeout is how long a Replica's socket may take nothing of
-// a batch of output it is offered before the Replica is dropped. Output that no
+// the output it is offered before the Replica is dropped. Output that no
 // writer has offered to the socket does not count, since the Replica is not
 // failing to take it: Replies that are not flushed yet, and Pushed messages
-// held behind a Reply that has not come. Nor does the time the Event loop
-// spends away from the socket: there the Replica is dropped when the loop's
-// next try after that time takes nothing either (checkStall).
+// held behind a Reply that has not come. Only a try of the socket can say that
+// it takes nothing (ledger.Ledger.Took): a blocking write that the timeout
+// ends, or the Event loop's try once the timeout has passed, however long the
+// loop was away from the socket.
 const outputReplicaStallTimeout = 30 * time.Second
 
 // outputWriteThrough is how much Client output a connection's goroutine lets
@@ -65,10 +67,9 @@ const outputWriteThrough = 4 << 10
 // for a connection by the same rule (MayReadRequests).
 const outputHighWater = 1 << 20
 
-// outputWriteChunk is the most bytes handed to a socket in one write. In the
-// goroutine mode a write blocks until the socket has taken all of it, so this
-// is also the stretch of a Replica's stream that must be accepted within
-// outputReplicaStallTimeout.
+// outputWriteChunk is the most bytes handed to a socket in one write, so that
+// the Output's lock is taken, and a Replica's stall count renewed, at least
+// that often.
 const outputWriteChunk = 1 << 20
 
 // ErrPushLimitExceeded reports that more Client output is waiting for a
@@ -80,8 +81,8 @@ var ErrPushLimitExceeded = errors.New("output: more output waiting than the conn
 // output waiting for all push-receiving connections back within the budget.
 var errPushBudgetExceeded = errors.New("output: closed to stay within the budget for pushed output")
 
-// ErrReplicaStalled reports that a Replica's socket took nothing for
-// outputReplicaStallTimeout of the output it was offered.
+// ErrReplicaStalled reports that a Replica's socket took nothing of the output
+// it was offered for outputReplicaStallTimeout.
 var ErrReplicaStalled = errors.New("output: replica accepted no output within the stall timeout")
 
 // errOutputClosed is what a closed Output reports when it was closed without a
@@ -94,9 +95,11 @@ var errOutputClosed = fmt.Errorf("output: client output closed: %w", net.ErrClos
 type Shared struct {
 	// limits are the thresholds of every connection's Ledger, which alone
 	// compares a byte count with one.
-	limits       ledger.Limits
-	pushBudget   int64
-	stallTimeout time.Duration
+	limits     ledger.Limits
+	pushBudget int64
+	// epoch is when the Shared was built. The Ledgers are told the time as
+	// nanoseconds since then (now).
+	epoch time.Time
 
 	// total is what every connection counts toward the Push budget together:
 	// the sum of what each last reported (Output.accountLocked).
@@ -121,7 +124,7 @@ func ReplicaPushLimit(bytes int64) Limit {
 // StallTimeout is how long a Replica's socket may take nothing of what it
 // is offered.
 func StallTimeout(timeout time.Duration) Limit {
-	return func(s *Shared) { s.stallTimeout = timeout }
+	return func(s *Shared) { s.limits.StallTimeout = ledger.Instant(timeout) }
 }
 
 // NewShared returns what the Outputs of one server share, with the server's
@@ -134,18 +137,27 @@ func NewShared(limits ...Limit) *Shared {
 			Chunk:            outputWriteChunk,
 			PushLimit:        outputPushLimit,
 			ReplicaPushLimit: outputReplicaPushLimit,
-			// Never reached while the Ledger is told that no time passes
-			// (unclocked): the stall rule is still the timer's.
-			StallTimeout: ledger.Instant(outputReplicaStallTimeout),
+			StallTimeout:     ledger.Instant(outputReplicaStallTimeout),
 		},
-		pushBudget:   outputPushBudget,
-		stallTimeout: outputReplicaStallTimeout,
-		pushers:      make(map[*Output]struct{}),
+		pushBudget: outputPushBudget,
+		epoch:      time.Now(),
+		pushers:    make(map[*Output]struct{}),
 	}
 	for _, limit := range limits {
 		limit(shared)
 	}
 	return shared
+}
+
+// now is the time a Ledger is told: on the monotonic clock, in nanoseconds
+// since the Shared was built, and above zero, which a Ledger reads as none.
+func (s *Shared) now() ledger.Instant {
+	return ledger.Instant(time.Since(s.epoch)) + 1
+}
+
+// timeOf is the time of an Instant a Ledger answered with.
+func (s *Shared) timeOf(at ledger.Instant) time.Time {
+	return s.epoch.Add(time.Duration(at - 1))
 }
 
 // enforceBudget closes push-receiving connections, the one with the most
@@ -173,20 +185,6 @@ func (s *Shared) enforceBudget() {
 // of what it was given and can take no more now (Service).
 var ErrWouldBlock = errors.New("output: socket write would block")
 
-// stallPhase is where the Replica stall rule stands for an Output.
-type stallPhase uint8
-
-const (
-	// stallIdle is the rule at rest: nothing is on offer to a Replica's socket.
-	stallIdle stallPhase = iota
-	// stallCounting has a timer due to look at lastProgress (checkStall).
-	stallCounting
-	// stallDue is the stall timeout passed with nothing taken, on a connection
-	// whose Event loop was asked to try the socket once more (checkStall). What
-	// that try takes is the verdict (writeAs).
-	stallDue
-)
-
 // Output is the Client output of one connection: its Replies and the Pushed
 // messages it receives (pub/sub messages, MONITOR events, and for a Replica
 // its stream), in the order they were produced. Safe for concurrent use.
@@ -213,13 +211,6 @@ type Output struct {
 	ledger ledger.Ledger
 	bytes  chain
 	cause  error
-	// lastProgress is when the socket last accepted a byte, or when it was
-	// offered the buffer that is being written, and stall is where the stall
-	// rule stands on it. The rule's timer finds the Output through stallWatch,
-	// which Close empties.
-	lastProgress time.Time
-	stall        stallPhase
-	stallWatch   *atomic.Pointer[Output]
 
 	// waiters wait for the Ledger to open the gate or to report the Replies
 	// out (Flush, Drain), and are woken when it says so (Effects.Signal).
@@ -239,6 +230,11 @@ type Output struct {
 	wire      io.Writer
 	attention func()
 	shutOnce  sync.Once
+	// deadlines is wire, when its writes can be given a deadline, as a
+	// net.Conn's can. The stall rule ends a blocking write through it
+	// (Effects.Deadline). A wire without deadlines is held to the rule only
+	// when a write to it returns.
+	deadlines writeDeadliner
 	// pump is what the pump goroutine runs, built on its first start so that
 	// starting it again allocates nothing. Guarded by mu.
 	pump func()
@@ -254,14 +250,15 @@ type Output struct {
 func NewBlocking(shared *Shared, wire io.Writer, logger *slog.Logger) *Output {
 	o := &Output{ledger: ledger.New(shared.limits), wire: wire, shared: shared, logger: logger}
 	o.waiters = sync.NewCond(&o.mu)
+	o.deadlines, _ = wire.(writeDeadliner)
 	return o
 }
 
 // NewPolled returns the Client output of a connection the Event loop
 // serves. The loop writes it (Service). attention tells the loop to call
 // Service for the connection: bytes were queued from elsewhere, the stream
-// has ended, the stall rule wants the socket tried, or the connection was
-// closed. With a nil attention the Output is written only when its owner
+// has ended, or the connection was closed. The loop also calls Service at the
+// time a Service asked for (Status.TryAgainAt). With a nil attention the Output is written only when its owner
 // chooses to, as a ConnMachine built without an Event loop is.
 func NewPolled(shared *Shared, attention func(), logger *slog.Logger) *Output {
 	o := &Output{ledger: ledger.New(shared.limits), attention: attention, shared: shared, logger: logger}
@@ -279,8 +276,10 @@ func New(w io.Writer) *Output {
 
 // unlock carries out what the Ledger answered to an event and releases mu.
 // Every event ends here, so that none can skip an effect: the wakeup, the
-// writer to start, the end of the stream, the close, and the reports of what
-// the connection counts toward the Push budget and of its gate.
+// writer to start, the end of the stream, the deadline of a blocking write, the
+// close, and the reports of what the connection counts toward the Push budget
+// and of its gate. The Event loop has no write to bound: it is told a deadline
+// as the time to call Service again (Status.TryAgainAt).
 func (o *Output) unlock(effects ledger.Effects) {
 	if effects.Signal {
 		o.waiters.Broadcast()
@@ -298,6 +297,12 @@ func (o *Output) unlock(effects ledger.Effects) {
 	}
 	if shut := !o.ledger.Gate(); shut != o.gateShut.Load() {
 		o.gateShut.Store(shut)
+	}
+	if effects.Deadline != 0 && o.deadlines != nil {
+		// It also ends a write that is in progress. A deadline that is not
+		// replaced stays on the socket: the Ledger gives one with every write
+		// of a connection it has given one before.
+		_ = o.deadlines.SetWriteDeadline(o.shared.timeOf(effects.Deadline))
 	}
 	var cause error
 	if effects.Close != nil {
@@ -318,6 +323,9 @@ func (o *Output) unlock(effects ledger.Effects) {
 func (o *Output) causeLocked(reason error) error {
 	if errors.Is(reason, ledger.ErrPushLimit) {
 		return fmt.Errorf("%w: %d bytes were waiting", ErrPushLimitExceeded, o.ledger.Waiting())
+	}
+	if errors.Is(reason, ledger.ErrStalled) {
+		return fmt.Errorf("%w of %v", ErrReplicaStalled, time.Duration(o.shared.limits.StallTimeout))
 	}
 	return reason
 }
@@ -560,9 +568,6 @@ func (o *Output) Close(cause error) {
 	// A writer in the middle of a write keeps the bytes it is writing until
 	// the write returns, and no longer.
 	o.bytes.clear()
-	if o.stallWatch != nil {
-		o.stallWatch.Store(nil)
-	}
 	if o.ledger.Class() != ledger.Plain {
 		o.shared.mu.Lock()
 		delete(o.shared.pushers, o)
@@ -608,9 +613,11 @@ func (o *Output) MarkReplica() {
 		return
 	}
 	o.mu.Lock()
-	effects := o.ledger.MarkReplica(unclocked)
-	if o.bytes.offered() {
-		o.countStallLocked()
+	effects := o.ledger.MarkReplica(o.shared.now())
+	if effects.Deadline != 0 && o.wire == nil && o.attention != nil {
+		// Its socket is being offered bytes: the loop learns from a Service
+		// when to try it again.
+		o.attention()
 	}
 	o.unlock(effects)
 }
@@ -687,91 +694,6 @@ func (o *Output) errLocked() error {
 	return errOutputClosed
 }
 
-// unclocked is the time the Ledger is told while the stall rule is still this
-// file's timer (checkStall): none passes, so the Ledger gives no verdict.
-const unclocked ledger.Instant = 1
-
-// countStallLocked starts the Replica stall rule's count for the buffer on
-// offer: the socket has the stall timeout from now to take some of it. A closed
-// Output's socket is offered nothing, whatever its writer left unsent, so no
-// count starts for it. Its timer would hold the Output, and that buffer, for
-// the stall timeout (armStallLocked): the attach cut of a PSYNC marks a
-// connection a Replica's even when it has closed meanwhile.
-func (o *Output) countStallLocked() {
-	if o.ledger.Closed() {
-		return
-	}
-	o.lastProgress = time.Now()
-	o.armStallLocked(o.shared.stallTimeout)
-}
-
-// armStallLocked has checkStall run after wait, unless it is due to run
-// already.
-func (o *Output) armStallLocked(wait time.Duration) {
-	if o.stall == stallCounting {
-		return
-	}
-	o.stall = stallCounting
-	if o.stallWatch == nil {
-		o.stallWatch = new(atomic.Pointer[Output])
-		o.stallWatch.Store(o)
-	}
-	// The timer holds the Output through stallWatch, which Close empties. A
-	// timer that held the Output itself would keep a closed connection's
-	// Output reachable until it was due, and with it the buffer a writer was
-	// offering: for a Replica that left during its full resync, the snapshot.
-	// Stopping it would not do: on Go 1.21 a stopped timer can stay in the
-	// runtime's heap until its time.
-	watch := o.stallWatch
-	time.AfterFunc(wait, func() {
-		if watched := watch.Load(); watched != nil {
-			watched.checkStall()
-		}
-	})
-}
-
-// checkStall is the stall rule's timer. When a Replica's socket has taken
-// nothing for the stall timeout of the buffer it is offered, it closes the
-// Replica, or leaves that to the writer where the writer has to try the socket
-// first. Otherwise it looks again when the timeout could next have passed.
-// With no buffer on offer it stops looking: the next one starts the count
-// again (writeAs).
-//
-// Only the writer can say whether the socket takes anything. In the goroutine
-// mode it has been inside a blocking write since lastProgress, so the socket
-// took nothing in that time. The Event loop tried the socket when the buffer
-// went on offer and then went on to other work, which can be one request that
-// runs longer than the timeout. The socket may have had room for most of that
-// time, so the loop is asked to try it now (attention), and its Service closes
-// the Replica if that try takes nothing (writeAs). An Output with nobody to
-// ask is closed here.
-func (o *Output) checkStall() {
-	o.mu.Lock()
-	o.stall = stallIdle
-	if o.ledger.Closed() || !o.bytes.offered() {
-		o.mu.Unlock()
-		return
-	}
-	if idle := time.Since(o.lastProgress); idle < o.shared.stallTimeout {
-		o.armStallLocked(o.shared.stallTimeout - idle)
-		o.mu.Unlock()
-		return
-	}
-	if o.wire == nil && o.attention != nil {
-		o.stall = stallDue
-		o.attention()
-		o.mu.Unlock()
-		return
-	}
-	o.mu.Unlock()
-
-	o.Close(o.stalledErr())
-}
-
-func (o *Output) stalledErr() error {
-	return fmt.Errorf("%w of %v", ErrReplicaStalled, o.shared.stallTimeout)
-}
-
 // Status is where a connection the Event loop serves stands after a Service.
 // Every field is a decision of the Output's Ledger. The loop decides from it
 // and compares no byte counts of its own.
@@ -788,6 +710,10 @@ type Status struct {
 	// EndOfStream reports that EndStream was called and everything is
 	// written: shut the write side.
 	EndOfStream bool
+	// TryAgainAt, unless zero, is when to call Service again even if the
+	// poller reports nothing: a Replica's socket has taken nothing of what it
+	// is offered, and the try at that time decides whether it has stalled.
+	TryAgainAt time.Time
 }
 
 // Service writes what is queued to the socket until nothing is left or the
@@ -795,8 +721,8 @@ type Status struct {
 // loop calls it, with the connection's socket. A socket that accepts part of a
 // chunk, and reports that it would block (ErrWouldBlock) or reports nothing
 // (io.ErrShortWrite), leaves the rest for the next Service. Any other failure
-// closes the Output, as does a try the stall rule asked for (checkStall) that
-// takes nothing.
+// closes the Output, as does a try of a Replica's socket that takes nothing
+// once the stall timeout has passed (Status.TryAgainAt).
 func (o *Output) Service(socket io.Writer) Status {
 	status, err := o.writeAs(ledger.Pusher, socket)
 	if err != nil && !errors.Is(err, ErrWouldBlock) && !errors.Is(err, io.ErrShortWrite) {
@@ -806,16 +732,32 @@ func (o *Output) Service(socket io.Writer) Status {
 	return status
 }
 
-// statusLocked is where the connection stands, as the Ledger has it.
-func (o *Output) statusLocked() Status {
+// nowLocked is the time to tell the Ledger with a Take or a Took. The clock is
+// read only for a connection whose socket is held to the stall rule
+// (ledger.Ledger.Stallable): the Ledger compares the times of no other, and
+// every write of every connection passes here.
+func (o *Output) nowLocked() ledger.Instant {
+	if !o.ledger.Stallable() {
+		return 1
+	}
+	return o.shared.now()
+}
+
+// statusLocked is where the connection stands, as the Ledger has it. deadline
+// is the one the Ledger answered the last write with.
+func (o *Output) statusLocked(deadline ledger.Instant) Status {
 	if o.ledger.Closed() {
 		return Status{Closed: o.errLocked()}
 	}
-	return Status{
+	status := Status{
 		MayRead:     o.ledger.Gate(),
 		WantWrite:   o.ledger.Writable(),
 		EndOfStream: o.ledger.Ended(),
 	}
+	if deadline != 0 {
+		status.TryAgainAt = o.shared.timeOf(deadline)
+	}
+	return status
 }
 
 // writeAs is the one loop that writes a connection's output, for the
@@ -823,58 +765,63 @@ func (o *Output) statusLocked() Status {
 // Pusher). It asks the Ledger for the socket and how much to offer it (Take),
 // writes that, and reports what the socket took (Took), until the Ledger gives
 // it nothing, because another writer has the socket, or says that it has
-// written all it may (Effects.Released). A Requester is given what was queued when it took the socket and
-// nothing queued after, and the Ledger hands the socket to the pump for the
-// rest. It returns where the connection stood when it stopped, read under the
-// lock its last event held, and the write's error, which for a socket that took
-// part of a chunk without one is io.ErrShortWrite, and ErrReplicaStalled when
-// the stall rule asked for this try (checkStall) and the socket took nothing.
+// written all it may (Effects.Released). A Requester is given what was queued
+// when it took the socket and nothing queued after, and the Ledger hands the
+// socket to the pump for the rest.
+//
+// The stall rule is the Ledger's answer to Took. A blocking write to a
+// Replica ends at the deadline the Ledger gave (unlock) with whatever the
+// socket took by then, which is no failure: Took closes the Replica if that
+// was nothing, and the loop goes on if not. The Event loop's write returns at
+// once, so the Status carries the deadline as the time to try again.
+//
+// It returns where the connection stood when it stopped, read under the lock
+// its last event held, and the write's error, which for a socket that took
+// part of a chunk without one is io.ErrShortWrite.
 func (o *Output) writeAs(role ledger.Role, w io.Writer) (Status, error) {
 	for {
 		o.mu.Lock()
-		n, effects := o.ledger.Take(role, unclocked)
+		n, effects := o.ledger.Take(role, o.nowLocked())
 		if n == 0 {
-			status := o.statusLocked()
+			status := o.statusLocked(0)
 			o.unlock(effects)
 			return status, nil
 		}
-		chunk, fresh := o.bytes.next(n)
-		if fresh && o.isReplicaLocked() {
-			o.countStallLocked()
-		}
+		chunk := o.bytes.next(n)
 		o.unlock(effects)
 
 		took, err := w.Write(chunk)
 
 		o.mu.Lock()
 		o.bytes.drop(took)
-		effects = o.ledger.Took(int64(took), unclocked)
-		if !o.ledger.Closed() {
-			if took > 0 && o.isReplicaLocked() {
-				o.lastProgress = time.Now()
-			}
-			if o.stall == stallDue {
-				// This was the try the stall rule asked for. A socket that took
-				// some of the buffer has the stall timeout again for the rest.
-				o.stall = stallIdle
-				switch {
-				case took == 0:
-					err = o.stalledErr()
-				case o.bytes.offered():
-					o.countStallLocked()
-				}
-			}
-		}
-		if err == nil && took < len(chunk) {
+		effects = o.ledger.Took(int64(took), o.nowLocked())
+		switch {
+		case err == nil && took < len(chunk):
 			err = io.ErrShortWrite
+		case errors.Is(err, os.ErrDeadlineExceeded) && (effects.Deadline != 0 || effects.Close != nil):
+			// The stall rule's deadline ended the write, and Took has given
+			// the verdict: closed, or another deadline for what is left.
+			err = nil
 		}
-		if err != nil || effects.Released {
-			status := o.statusLocked()
-			o.unlock(effects)
-			return status, err
+		stop := err != nil || effects.Released
+		var status Status
+		if stop {
+			status = o.statusLocked(effects.Deadline)
 		}
 		o.unlock(effects)
+		if effects.Close != nil {
+			return Status{Closed: o.Err()}, nil
+		}
+		if stop {
+			return status, err
+		}
 	}
+}
+
+// writeDeadliner is a socket whose writes can be given a deadline, as a
+// net.Conn's can.
+type writeDeadliner interface {
+	SetWriteDeadline(t time.Time) error
 }
 
 // writeCloser is a socket whose write side can be shut on its own, as a TCP

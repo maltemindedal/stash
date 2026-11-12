@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -17,7 +18,8 @@ import (
 
 // outputWire is the socket of a connection served by its own goroutine, in
 // memory. While stalled, a write to it blocks, as a write to a peer that
-// stopped reading does, until the wire is closed.
+// stopped reading does, until the wire is closed or the write's deadline
+// passes.
 type outputWire struct {
 	mu         sync.Mutex
 	received   bytes.Buffer
@@ -30,10 +32,58 @@ type outputWire struct {
 	closed     chan struct{}
 	closeOnce  sync.Once
 	writeErr   error
+	// deadline is the write deadline, and deadlineSet is closed when it
+	// changes, so that a write that is blocked learns of it.
+	deadline    time.Time
+	deadlineSet chan struct{}
 }
 
 func newOutputWire() *outputWire {
-	return &outputWire{writeBegun: make(chan struct{}), closed: make(chan struct{})}
+	return &outputWire{writeBegun: make(chan struct{}), closed: make(chan struct{}), deadlineSet: make(chan struct{})}
+}
+
+// SetWriteDeadline ends a stalled write at t, as a net.Conn's does: also one
+// that began before the deadline was set.
+func (w *outputWire) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.deadline = t
+	close(w.deadlineSet)
+	w.deadlineSet = make(chan struct{})
+	return nil
+}
+
+// stall blocks until the wire is closed or its write deadline passes, and
+// returns what a write that took nothing until then returns.
+func (w *outputWire) stall() error {
+	for {
+		w.mu.Lock()
+		deadline, changed := w.deadline, w.deadlineSet
+		w.mu.Unlock()
+
+		var due <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			due = timer.C
+		}
+		select {
+		case <-w.closed:
+		case <-due:
+		case <-changed:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		select {
+		case <-w.closed:
+			return net.ErrClosed
+		default:
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return os.ErrDeadlineExceeded
+		}
+	}
 }
 
 func newStalledOutputWire() *outputWire {
@@ -51,8 +101,7 @@ func (w *outputWire) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	if stalled {
-		<-w.closed
-		return 0, net.ErrClosed
+		return 0, w.stall()
 	}
 
 	w.mu.Lock()
@@ -419,8 +468,8 @@ func TestThePushBudgetClosesTheConnectionWithTheMostWaiting(t *testing.T) {
 }
 
 func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
-	shared := NewShared()
-	shared.stallTimeout = 30 * time.Millisecond
+	const stallTimeout = 30 * time.Millisecond
+	shared := NewShared(StallTimeout(stallTimeout))
 
 	t.Run("a replica that accepts nothing is closed", func(t *testing.T) {
 		wire := newStalledOutputWire()
@@ -448,7 +497,7 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 				t.Fatalf("Push() = false in round %d, want the stream queued: %v", round, out.Err())
 			}
 			waitForOutput(t, "the stream to be written", func() bool { return out.Backlog() == 0 })
-			time.Sleep(shared.stallTimeout)
+			time.Sleep(stallTimeout)
 		}
 		if err := out.Err(); err != nil {
 			t.Fatalf("Err() = %v, want a replica that is keeping up left open", err)
@@ -463,7 +512,7 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 			t.Fatal("Push() = false, want the message queued")
 		}
 
-		time.Sleep(4 * shared.stallTimeout)
+		time.Sleep(4 * stallTimeout)
 		if err := out.Err(); err != nil {
 			t.Fatalf("Err() = %v, want a subscriber closed only by its limits", err)
 		}
@@ -479,8 +528,8 @@ func TestAReplicaThatAcceptsNothingWithinTheStallTimeIsClosed(t *testing.T) {
 // stall timeout before it was sent a byte. Once the Reply has released the
 // stream and a writer offers it to the socket, the rule counts.
 func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *testing.T) {
-	shared := NewShared()
-	shared.stallTimeout = 30 * time.Millisecond
+	const stallTimeout = 30 * time.Millisecond
+	shared := NewShared(StallTimeout(stallTimeout))
 	wire := newStalledOutputWire()
 	out := newGoroutineOutput(shared, wire)
 	out.MarkReplica()
@@ -489,7 +538,7 @@ func TestAReplicaIsNotStalledWhileItsStreamWaitsBehindAReplyThatHasNotCome(t *te
 		t.Fatal("Push() = false, want the stream held")
 	}
 
-	time.Sleep(4 * shared.stallTimeout)
+	time.Sleep(4 * stallTimeout)
 	if err := out.Err(); err != nil {
 		t.Fatalf("Err() = %v with the stream held behind a reply that has not come, want the connection open", err)
 	}
@@ -531,9 +580,16 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 		{name: "by the Event loop's flush", open: func(shared *Shared) (*Output, func()) {
 			out := newLoopOutput(shared)
 			return out, func() {
-				if err := out.Service(nothingTaken{}).Closed; err != nil {
+				status := out.Service(nothingTaken{})
+				if err := status.Closed; err != nil {
 					t.Errorf("Service() closed the Output: %v, want a full socket left for later", err)
 				}
+				// The Event loop tries the socket again at the time the Service
+				// asked for, and that try is the stall rule's verdict.
+				go func() {
+					time.Sleep(time.Until(status.TryAgainAt))
+					out.Service(nothingTaken{})
+				}()
 			}
 		}},
 	}
@@ -541,8 +597,8 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			shared := NewShared()
-			shared.stallTimeout = 30 * time.Millisecond
+			const stallTimeout = 30 * time.Millisecond
+			shared := NewShared(StallTimeout(stallTimeout))
 			out, offer := tt.open(shared)
 			defer out.Close(nil)
 
@@ -550,7 +606,7 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 				t.Fatalf("Reply() error = %v", err)
 			}
 			out.MarkReplica()
-			time.Sleep(4 * shared.stallTimeout)
+			time.Sleep(4 * stallTimeout)
 			if err := out.Err(); err != nil {
 				t.Fatalf("Err() = %v with a reply queued that no writer has offered to the socket, want the connection open", err)
 			}
@@ -561,6 +617,52 @@ func TestAReplicaIsNotStalledByOutputItsSocketWasNotOffered(t *testing.T) {
 				t.Fatalf("Err() = %v, want ErrReplicaStalled", err)
 			}
 		})
+	}
+}
+
+// tricklingWire is the socket of a replica that reads slowly: of each write it
+// takes one byte at once and nothing more until the write's deadline, when the
+// write returns with that byte taken, as a net.Conn's does. A write with no
+// deadline never returns.
+type tricklingWire struct {
+	*outputWire
+}
+
+func (w *tricklingWire) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	w.received.WriteByte(p[0])
+	w.mu.Unlock()
+	if len(p) == 1 {
+		return 1, nil
+	}
+	return 1, w.stall()
+}
+
+// TestAReplicaThatTakesPartOfWhatItIsOfferedWithinTheStallTimeIsKept offers a
+// replica served by its own goroutine a stream that its socket takes one byte
+// of in each stall timeout, as a replica on a slow link takes its snapshot.
+// The stall rule is for a socket that takes nothing. In the default mode it
+// used to close a replica whose socket had not taken a whole write, up to
+// 1 MiB, within the timeout, where the Event loop kept one that took a byte.
+func TestAReplicaThatTakesPartOfWhatItIsOfferedWithinTheStallTimeIsKept(t *testing.T) {
+	const stallTimeout = 30 * time.Millisecond
+	wire := &tricklingWire{newOutputWire()}
+	out := NewBlocking(NewShared(StallTimeout(stallTimeout)), wire, discardLogger)
+	defer out.Close(nil)
+	out.MarkReplica()
+
+	const stream = "stream"
+	if !out.Push([]byte(stream)) {
+		t.Fatal("Push() = false, want the stream queued")
+	}
+	waitForOutput(t, "the replica to be sent its whole stream, or closed", func() bool {
+		return wire.sent() == stream || out.Err() != nil
+	})
+	if err := out.Err(); err != nil {
+		t.Fatalf("Err() = %v after the replica took %q of %q, a byte within each stall timeout of %v; want it kept", err, wire.sent(), stream, stallTimeout)
 	}
 }
 
@@ -1737,5 +1839,40 @@ func TestAReplyReleasesLargeHeldPushesWithoutCopyingThem(t *testing.T) {
 	}
 	if got, want := wire.sent(), "+OK\r\n"+strings.Repeat("s", held); got != want {
 		t.Fatalf("sent %d bytes, want the reply and then the %d bytes held behind it", len(got), held)
+	}
+}
+
+// TestAReplicaOnARealSocketThatStopsReadingIsClosedByTheStallRule runs the
+// stall rule against a TCP connection, whose write deadline is what ends a
+// blocking write in the default mode: the in-memory wires above only imitate
+// one. The replica reads nothing, so its socket takes what its buffers hold
+// and then no more.
+func TestAReplicaOnARealSocketThatStopsReadingIsClosedByTheStallRule(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+	replica, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer func() { _ = replica.Close() }()
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+
+	out := NewBlocking(NewShared(StallTimeout(100*time.Millisecond)), conn, discardLogger)
+	defer out.Close(nil)
+	out.MarkReplica()
+	// More than the two sockets' buffers hold, and less than the replica limit.
+	if !out.Push(make([]byte, 64<<20)) {
+		t.Fatalf("Push() = false, want the stream queued: %v", out.Err())
+	}
+
+	waitForOutput(t, "the replica that reads nothing to be closed", func() bool { return out.Err() != nil })
+	if err := out.Err(); !errors.Is(err, ErrReplicaStalled) {
+		t.Fatalf("Err() = %v, want ErrReplicaStalled", err)
 	}
 }

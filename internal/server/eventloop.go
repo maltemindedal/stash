@@ -155,11 +155,20 @@ type eventLoop struct {
 	mu sync.Mutex
 	// dirty are the connections whose Output asked for the loop's attention
 	// and has not been served since, each listed once (eventConn.dirty): it was
-	// given bytes, its stream is to end, the stall rule wants its socket
-	// tried, or it was closed.
+	// given bytes, its stream has ended, or it was closed.
 	dirty        []*eventConn
 	spareDirty   []*eventConn
 	resumeAccept bool
+
+	// tryAgain are the connections whose Output asked to be served again at a
+	// time, whatever the poller reports (Status.TryAgainAt): a replica's socket
+	// has taken nothing of what it is offered, and the try at that time decides
+	// whether it has stalled. wake wakes the poller at wakeAt, the earliest of
+	// those times. The timer holds the loop and no connection. All three are
+	// the loop goroutine's.
+	tryAgain map[*eventConn]time.Time
+	wake     *time.Timer
+	wakeAt   time.Time
 }
 
 // eventConn tracks one accepted connection inside the event loop. All fields
@@ -216,6 +225,7 @@ func (l *eventLoop) run(ctx context.Context) error {
 		if l.hasQueuedWork() {
 			_ = l.poller.Wake()
 		}
+		l.armWake()
 		n, err := l.poller.Wait(l.events)
 		l.waiting.Store(false)
 		if err != nil {
@@ -251,11 +261,63 @@ func (l *eventLoop) run(ctx context.Context) error {
 }
 
 // hasQueuedWork reports whether another goroutine has handed the loop work it
-// has not taken yet.
+// has not taken yet, or the time has come to serve a connection again
+// (tryAgain).
 func (l *eventLoop) hasQueuedWork() bool {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.dirty) > 0 || l.resumeAccept
+	queued := len(l.dirty) > 0 || l.resumeAccept
+	l.mu.Unlock()
+	if queued || len(l.tryAgain) == 0 {
+		return queued
+	}
+	now := time.Now()
+	for _, at := range l.tryAgain {
+		if !at.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// armWake has the poller woken when the first connection is to be served
+// again.
+func (l *eventLoop) armWake() {
+	var earliest time.Time
+	for _, at := range l.tryAgain {
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	if earliest.IsZero() || earliest.Equal(l.wakeAt) {
+		return
+	}
+	l.wakeAt = earliest
+	if l.wake == nil {
+		l.wake = time.AfterFunc(time.Until(earliest), func() { _ = l.poller.Wake() })
+		return
+	}
+	l.wake.Reset(time.Until(earliest))
+}
+
+// serveAgain serves the connections whose time to be served again has come.
+// What that Service reports lists a connection again, for a later time, or
+// closes it.
+func (l *eventLoop) serveAgain() {
+	if len(l.tryAgain) == 0 {
+		return
+	}
+	now := time.Now()
+	var due []*eventConn
+	for conn, at := range l.tryAgain {
+		if !at.After(now) {
+			due = append(due, conn)
+		}
+	}
+	for _, conn := range due {
+		if l.conns[conn.fd] == conn {
+			l.finishConnEvent(conn)
+		}
+	}
 }
 
 // wakeIfWaiting wakes the poller if the loop is waiting in it, or about to. A
@@ -281,8 +343,9 @@ func (l *eventLoop) markDirty(conn *eventConn) {
 
 // applyQueuedWork serves the connections whose Output asked for attention,
 // which writes what other connections and goroutines queued for them and
-// closes the ones whose Output was closed, and resumes accepting after a
-// descriptor-exhaustion pause.
+// closes the ones whose Output was closed, serves the ones whose time to be
+// served again has come, and resumes accepting after a descriptor-exhaustion
+// pause.
 func (l *eventLoop) applyQueuedWork() {
 	l.mu.Lock()
 	dirty := l.dirty
@@ -308,6 +371,7 @@ func (l *eventLoop) applyQueuedWork() {
 		}
 	}
 	l.spareDirty = dirty[:0]
+	l.serveAgain()
 
 	if resumeAccept && l.acceptPaused && !l.draining {
 		if err := l.poller.Set(l.listenFD, true, false); err != nil {
@@ -584,6 +648,15 @@ func (l *eventLoop) finishConnEvent(conn *eventConn) {
 		conn.writeShut = true
 	}
 
+	switch {
+	case !status.TryAgainAt.IsZero():
+		if l.tryAgain == nil {
+			l.tryAgain = make(map[*eventConn]time.Time)
+		}
+		l.tryAgain[conn] = status.TryAgainAt
+	case len(l.tryAgain) > 0:
+		delete(l.tryAgain, conn)
+	}
 	// Reading stays off after EOF (level-triggered readiness would spin) and
 	// while the connection's own Replies are backed up.
 	l.setInterest(conn, !conn.peerClosed && status.MayRead, status.WantWrite)
@@ -606,6 +679,7 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 		return
 	}
 	delete(l.conns, conn.fd)
+	delete(l.tryAgain, conn)
 	if conn.authTimer != nil {
 		conn.authTimer.Stop()
 	}
@@ -623,6 +697,9 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 }
 
 func (l *eventLoop) cleanup() {
+	if l.wake != nil {
+		l.wake.Stop()
+	}
 	conns := make([]*eventConn, 0, len(l.conns))
 	for _, conn := range l.conns {
 		conns = append(conns, conn)
