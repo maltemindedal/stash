@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -81,6 +82,45 @@ func TestAMasterRefusesAFullResyncWhoseSnapshotExceedsTheBulkStringLimit(t *test
 					}
 				}
 			})
+		}
+	})
+}
+
+// TestARefusedFullResyncDoesNotCopyTheKeyspace sends PSYNC to a master whose
+// one value is far over the snapshot limit, and measures what the process
+// allocates until the refusal arrives. The master and the test share the
+// process, so a master that copies the keyspace before it sizes the snapshot
+// allocates at least the value's bytes, and one that sizes it first allocates
+// a small fraction of them.
+func TestARefusedFullResyncDoesNotCopyTheKeyspace(t *testing.T) {
+	const valueBytes = 16 << 20
+
+	forEachNetworkingMode(t, defaultTestConfig(), func(t *testing.T, cfg config.Config) {
+		store := storage.NewStore()
+		if err := store.Set(nil, "big", bytes.Repeat([]byte("v"), valueBytes), 0); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+		entries, _ := store.SnapshotStrings()
+		refusal := protocol.ErrorValue{Message: fmt.Sprintf(
+			"ERR full resync snapshot of %d bytes exceeds the %d byte limit of a bulk string", rdb.SnapshotSize(entries), fullResyncTestLimit,
+		)}
+
+		addr := startMasterWithSnapshotLimit(t, cfg, store, slog.New(slog.NewTextHandler(&syncBuffer{}, nil)))
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial(%q) error = %v", addr, err)
+		}
+		defer closeTestResource(t, conn)
+		parser := protocol.NewParser(conn)
+		assertCommandResponse(t, conn, parser, protocol.SimpleString{Value: "OK"}, "REPLCONF", "listening-port", "6380")
+
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		assertCommandResponse(t, conn, parser, refusal, "PSYNC", "?", "-1")
+		runtime.ReadMemStats(&after)
+
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > valueBytes/4 {
+			t.Fatalf("a refused PSYNC allocated %d bytes for a keyspace of %d, want under a quarter of it", allocated, valueBytes)
 		}
 	})
 }

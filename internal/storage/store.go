@@ -567,9 +567,56 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 	s.readLockAllShards()
 	defer s.readUnlockAllShards()
 
-	stats := StringSnapshotStats{}
+	return s.copyStringsLocked(now)
+}
+
+// SnapshotStringsIf is SnapshotStrings for a caller that takes the snapshot
+// only when admit allows it, and decides from the entries' lengths. It first
+// calls measure with the key and value lengths of every entry the snapshot
+// would hold, and whether the entry expires, copying nothing; then it calls
+// admit, and copies the entries only when admit returns true. Otherwise it
+// returns no entries and false, with the same stats.
+//
+// Both passes run under one hold of the shard read locks and at one time, so
+// the entries returned are the ones measured. measure and admit run under
+// those locks and must not call the Store.
+func (s *Store) SnapshotStringsIf(measure func(keyBytes, valueBytes int, expires bool), admit func() bool) ([]StringSnapshotEntry, StringSnapshotStats, bool) {
+	now := s.now()
+
+	s.readLockAllShards()
+	defer s.readUnlockAllShards()
+
+	stats := s.eachSnapshotStringLocked(now, func(key string, value *ValueObject) {
+		measure(len(key), len(value.String), value.ExpiresAt > 0)
+	})
+	if !admit() {
+		return nil, stats, false
+	}
+	entries, stats := s.copyStringsLocked(now)
+	return entries, stats, true
+}
+
+func (s *Store) copyStringsLocked(now int64) ([]StringSnapshotEntry, StringSnapshotStats) {
 	entries := make([]StringSnapshotEntry, 0, s.totalKeyCountLocked())
 	valueArena := make([]byte, 0)
+	stats := s.eachSnapshotStringLocked(now, func(key string, value *ValueObject) {
+		var clonedValue []byte
+		valueArena, clonedValue = appendClonedBytesArena(valueArena, value.String)
+
+		entries = append(entries, StringSnapshotEntry{
+			Key:       key,
+			Value:     clonedValue,
+			ExpiresAt: value.ExpiresAt,
+		})
+	})
+
+	return entries, stats
+}
+
+// eachSnapshotStringLocked calls visit for every key a string snapshot taken
+// at now holds, and counts the keys it holds and the ones it skips.
+func (s *Store) eachSnapshotStringLocked(now int64, visit func(key string, value *ValueObject)) StringSnapshotStats {
+	stats := StringSnapshotStats{}
 	for i := range s.shards {
 		shard := &s.shards[i]
 		stats.TotalKeys += len(shard.data)
@@ -583,19 +630,12 @@ func (s *Store) SnapshotStrings() ([]StringSnapshotEntry, StringSnapshotStats) {
 				continue
 			}
 
-			var clonedValue []byte
-			valueArena, clonedValue = appendClonedBytesArena(valueArena, value.String)
-
-			entries = append(entries, StringSnapshotEntry{
-				Key:       key,
-				Value:     clonedValue,
-				ExpiresAt: value.ExpiresAt,
-			})
+			visit(key, value)
 			stats.ExportedKeys++
 		}
 	}
 
-	return entries, stats
+	return stats
 }
 
 // ReplaceWith swaps the store contents with a snapshot from another store.
