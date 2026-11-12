@@ -438,22 +438,56 @@ func TestMasterPropagatesActiveEvictionOfExpiredKey(t *testing.T) {
 		defer closeTestResource(t, clientConn)
 		clientParser := protocol.NewParser(clientConn)
 
-		// The TTL must outlive the WATCH below, so that the transaction is aborted
-		// by the eviction rather than by the SET that armed it.
-		assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "OK"}, "SET", "ephemeral", "value", "PX", "300")
+		// The key must outlive the WATCH, so that the transaction is aborted by the
+		// eviction rather than by the SET that armed the TTL. No TTL is long enough
+		// on a loaded machine, so the watcher reads the key after its WATCH: a key
+		// that is still there was watched alive. One that is gone is replaced by a
+		// new key with twice the TTL on a new connection, which watches nothing else,
+		// once the old key's DEL has left the replica's stream.
+		const attempts = 4
+		ttl := 300 * time.Millisecond
+		var (
+			key           string
+			watcherConn   net.Conn
+			watcherParser *protocol.Parser
+		)
+		for attempt := 1; ; attempt++ {
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("Dial(%q) watcher error = %v", addr, err)
+			}
+			defer closeTestResource(t, conn)
+			watcherConn, watcherParser = conn, protocol.NewParser(conn)
 
-		watcherConn, err := net.Dial("tcp", addr)
-		if err != nil {
-			t.Fatalf("Dial(%q) watcher error = %v", addr, err)
+			key = fmt.Sprintf("ephemeral-%d", attempt)
+			assertCommandResponse(t, clientConn, clientParser, protocol.SimpleString{Value: "OK"}, "SET", key, "value", "PX", fmt.Sprint(ttl.Milliseconds()))
+			assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", key)
+
+			if err := protocol.WriteValue(watcherConn, request("GET", key)); err != nil {
+				t.Fatalf("WriteValue(GET %s) error = %v", key, err)
+			}
+			got, err := watcherParser.Parse()
+			if err != nil {
+				t.Fatalf("Parse() of the GET %s reply error = %v", key, err)
+			}
+			_, expired, ok := integrationBulkStringContent(got)
+			if !ok {
+				t.Fatalf("GET %s after WATCH = %#v, want a bulk string", key, got)
+			}
+			if !expired {
+				break
+			}
+			if attempt == attempts {
+				t.Fatalf("GET %s after WATCH was null on each of %d attempts, the last with a TTL of %v: no key outlived its WATCH", key, attempts, ttl)
+			}
+			waitForPropagatedDelete(t, replicaConn, replicaParser, key)
+			ttl *= 2
 		}
-		defer closeTestResource(t, watcherConn)
-		watcherParser := protocol.NewParser(watcherConn)
-		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "WATCH", "ephemeral")
 
-		waitForPropagatedDelete(t, replicaConn, replicaParser, "ephemeral")
+		waitForPropagatedDelete(t, replicaConn, replicaParser, key)
 
 		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "OK"}, "MULTI")
-		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", "ephemeral", "again")
+		assertCommandResponse(t, watcherConn, watcherParser, protocol.SimpleString{Value: "QUEUED"}, "SET", key, "again")
 		assertCommandResponse(t, watcherConn, watcherParser, protocol.Array{Null: true}, "EXEC")
 
 		cancel()
@@ -463,7 +497,7 @@ func TestMasterPropagatesActiveEvictionOfExpiredKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadFile(%q) error = %v", aofPath, err)
 		}
-		wantFrame, err := protocol.EncodeValues([]protocol.Value{request("DEL", "ephemeral")})
+		wantFrame, err := protocol.EncodeValues([]protocol.Value{request("DEL", key)})
 		if err != nil {
 			t.Fatalf("EncodeValues() error = %v", err)
 		}
