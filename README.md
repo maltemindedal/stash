@@ -87,7 +87,7 @@ Stash is an implementation exercise, not a production datastore. The notable gap
 - **No TLS and no ACLs.** A single `--requirepass` password, sent in plaintext.
 - **RESP2-centric.** RESP3 support exists in the protocol layer (booleans, nulls) but command behavior is RESP2.
 - **RDB covers string keys only**, in both directions. A file holding anything else fails to load rather than loading in part. Use `--aof` for full-fidelity durability.
-- **Replication is partial.** Stash supports `REPLCONF`, `PSYNC`, and `WAIT`, but not partial resync, chaining, or failover.
+- **Replication is partial.** Stash supports `REPLCONF`, `PSYNC`, and `WAIT`, but not partial resync, chaining, or failover. A full resync sends the snapshot as one bulk string, so a keyspace whose snapshot is larger than 512 MiB cannot be replicated.
 - **`--maxmemory` uses approximate keyspace accounting**, not process RSS.
 - **The `--event-loop` mode is opt-in** and supported on Linux (`epoll`) and macOS (`kqueue`); other platforms fall back to goroutine-per-connection with a startup warning. In that mode, a `BLPOP` or `WAIT` that would block returns an error instead.
 
