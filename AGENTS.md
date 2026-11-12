@@ -57,10 +57,6 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 - Subject: imperative, sentence case, no `type:` prefix, no trailing period, stating the behavior change ("Refuse to start on an append-only file that is corrupt before its end"). Body: why, and how it was verified, citing other commits by short hash.
 - One atomic commit per change, each green on its own. A pure `git mv` gets its own commit so `git log --follow` keeps history.
 - Fill in `.github/pull_request_template.md`, and add what you verified and what you deliberately left out.
-- When told to merge, choose the merge method yourself and say in the PR which one and why; do not ask.
-  - Merge commit when the PR's commits are separate changes, or when a doc or commit cites one of them by hash. It is the only method that keeps those hashes, so it is also the choice when unsure.
-  - Squash when the commits are fix-ups of one change. Write the combined commit message yourself, by the subject and body rules above.
-  - Rebase for a single commit whose message already follows those rules, such as a Dependabot bump.
 
 ## Gotchas
 
