@@ -91,10 +91,6 @@ func TestDocsNameOnlyCodeThatExists(t *testing.T) {
 		if d.IsDir() && path != repoRoot && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir
 		}
-		// A design proposal names code that does not exist yet.
-		if d.IsDir() && path == filepath.Join(repoRoot, "design") {
-			return filepath.SkipDir
-		}
 		if d.IsDir() || !strings.HasSuffix(path, ".md") {
 			return nil
 		}
