@@ -75,7 +75,13 @@ const outputHighWater = 1 << 20
 // pushed behind the Reply does not count, since the Push limits bound that.
 // A connection served by its own goroutine has no such limit: its Reply
 // waits on the socket (outputWriteThrough).
-const outputReplyLimit = 512 << 20
+//
+// The limit holds the largest value a reply carries, a bulk string of
+// protocol.BulkStringLimit, behind the outputHighWater that may wait when its
+// request is run, with as much again for its framing. A master serves a
+// snapshot of up to that bulk string limit as one such reply, so no snapshot
+// it accepts is closed here.
+const outputReplyLimit = protocol.BulkStringLimit + 2*outputHighWater
 
 // outputWriteChunk is the most bytes handed to a socket in one write, so that
 // the Output's lock is taken, and a Replica's stall count renewed, at least
