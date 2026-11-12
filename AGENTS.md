@@ -57,6 +57,7 @@ for t in darwin/amd64 darwin/arm64 windows/amd64; do CGO_ENABLED=0 GOOS=${t%/*} 
 - Subject: imperative, sentence case, no `type:` prefix, no trailing period, stating the behavior change ("Refuse to start on an append-only file that is corrupt before its end"). Body: why, and how it was verified, citing other commits by short hash.
 - One atomic commit per change, each green on its own. A pure `git mv` gets its own commit so `git log --follow` keeps history.
 - Fill in `.github/pull_request_template.md`, and add what you verified and what you deliberately left out.
+- When told to merge, choose the merge method yourself and say in the PR which one and why; do not ask. Use a merge commit when the branch's commits are atomic and green on their own: it keeps their hashes, and commit bodies and this file cite commits by short hash. Squash when they are not (fixups, review rounds, a commit that is red alone) and no other commit cites them, and give the squashed commit a subject and body by the rules above. Avoid rebase merges: they rewrite every hash, as squash does, without making the history any cleaner.
 
 ## Gotchas
 
