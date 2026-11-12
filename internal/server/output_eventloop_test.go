@@ -259,8 +259,8 @@ func TestEventLoopClosesADrainingReplicasConnectionWhenAskedTo(t *testing.T) {
 
 // TestEventLoopKeepsNoConnectionItClosedOnRequest closes a replica's connection
 // from outside the loop while a batch is partly written, as the stall rule and
-// the push limits do: the Output asks the loop to close the connection, and the
-// loop does. Nothing may keep the connection after that, or the batch its
+// the push limits do: the closed Output asks for the loop's attention, and the
+// loop closes the connection. Nothing may keep the connection after that, or the batch its
 // Output was writing, which for a replica closed during its full resync is the
 // snapshot. The loop used to empty its list of such requests and leave them in
 // the array behind it, so the last connection closed this way stayed reachable
@@ -303,6 +303,25 @@ func TestEventLoopKeepsNoConnectionItClosedOnRequest(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the connection was still reachable 5s after the loop closed it on request, want nothing to keep it")
 		}
+	}
+}
+
+// TestAnEventLoopConnectionClosedBeforeItsOutputExistsIsClosedOnceItDoes closes
+// a connection through the client registry's handle before the loop has built
+// the connection's Output, as a shutdown that lands while the loop registers a
+// connection does: the registry holds the handle from the moment it names the
+// connection. The Close is kept, and the Output is closed when the handle is
+// given it.
+func TestAnEventLoopConnectionClosedBeforeItsOutputExistsIsClosedOnceItDoes(t *testing.T) {
+	handle := &eventConnHandle{conn: &eventConn{}}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	out := newPolledOutput(newOutputs(), nil, discardLogger)
+	handle.bind(out)
+	if err := out.Err(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Err() = %v after the handle closed before it was bound, want the Output closed", err)
 	}
 }
 

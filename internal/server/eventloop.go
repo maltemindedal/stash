@@ -123,10 +123,10 @@ func (s *Server) connCommandRunner(call Call, clientID uint64, conn ClientConn, 
 
 // eventLoop drives all client connections from one goroutine. Connection state
 // (ConnMachine, interest flags) is owned exclusively by that goroutine; the
-// mutex only guards the queues that other goroutines use to hand work to the
-// loop (connections with output to write, close requests, and accept
-// resumption). Whoever adds to a queue wakes the poller, but only while the
-// loop is waiting in it (wakeIfWaiting).
+// mutex only guards what other goroutines use to hand work to the loop (the
+// connections whose Output wants its attention, and accept resumption).
+// Whoever hands it work wakes the poller, but only while the loop is waiting
+// in it (wakeIfWaiting).
 type eventLoop struct {
 	srv          *Server
 	poller       poller
@@ -143,7 +143,7 @@ type eventLoop struct {
 	// queued for them, and returns drainErr once no connection is left. The
 	// server's shutdown owns the time that takes: it ends each replica's stream,
 	// waits replicaShutdownGrace for the replicas to close their connections,
-	// and then asks for every connection to be closed (Server.shutdown).
+	// and then closes every connection's Output (Server.shutdown).
 	draining bool
 	drainErr error
 
@@ -158,14 +158,14 @@ type eventLoop struct {
 	// tried, or it was closed.
 	dirty        []*eventConn
 	spareDirty   []*eventConn
-	closeReqs    []*eventConn
 	resumeAccept bool
 }
 
 // eventConn tracks one accepted connection inside the event loop. All fields
 // are owned by the loop goroutine except out and dirty, which are safe for
-// concurrent use, and closeRequested and detached, which are guarded by
-// eventLoop.mu.
+// concurrent use. Nothing but the loop closes one: whoever wants a connection
+// closed closes its Output, and the loop closes the connection when it serves
+// that Output next (finishConnEvent).
 type eventConn struct {
 	fd         int
 	clientID   uint64
@@ -189,9 +189,6 @@ type eventConn struct {
 	// as shutdown ends a replica's. The loop closes the connection when the
 	// peer closes its own side.
 	writeShut bool
-
-	closeRequested bool
-	detached       bool
 }
 
 func (l *eventLoop) run(ctx context.Context) error {
@@ -257,7 +254,7 @@ func (l *eventLoop) run(ctx context.Context) error {
 func (l *eventLoop) hasQueuedWork() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.dirty) > 0 || len(l.closeReqs) > 0 || l.resumeAccept
+	return len(l.dirty) > 0 || l.resumeAccept
 }
 
 // wakeIfWaiting wakes the poller if the loop is waiting in it, or about to. A
@@ -281,19 +278,14 @@ func (l *eventLoop) markDirty(conn *eventConn) {
 	l.wakeIfWaiting()
 }
 
-// applyQueuedWork writes the output other connections and goroutines queued,
-// applies queued close requests, and resumes accepting after a
+// applyQueuedWork serves the connections whose Output asked for attention,
+// which writes what other connections and goroutines queued for them and
+// closes the ones whose Output was closed, and resumes accepting after a
 // descriptor-exhaustion pause.
 func (l *eventLoop) applyQueuedWork() {
 	l.mu.Lock()
 	dirty := l.dirty
 	l.dirty = l.spareDirty[:0]
-	// Taken whole and not emptied in place: the array behind an emptied list
-	// would keep each connection reachable after the loop has closed it, and
-	// with it the batch its Output was writing, until a later request
-	// overwrote the entry.
-	closes := l.closeReqs
-	l.closeReqs = nil
 	resumeAccept := l.resumeAccept
 	l.resumeAccept = false
 	l.mu.Unlock()
@@ -303,6 +295,9 @@ func (l *eventLoop) applyQueuedWork() {
 	}
 
 	for i, conn := range dirty {
+		// Cleared, so that the array kept for the next list holds no
+		// connection the loop has closed, nor the batch its Output was
+		// writing.
 		dirty[i] = nil
 		// Cleared before the write, so that output queued during it lists the
 		// connection again.
@@ -312,10 +307,6 @@ func (l *eventLoop) applyQueuedWork() {
 		}
 	}
 	l.spareDirty = dirty[:0]
-
-	for _, conn := range closes {
-		l.closeConn(conn, nil)
-	}
 
 	if resumeAccept && l.acceptPaused && !l.draining {
 		if err := l.poller.Set(l.listenFD, true, false); err != nil {
@@ -333,8 +324,8 @@ func (l *eventLoop) applyQueuedWork() {
 // each connection is sent what is queued for it, has its write side shut, and
 // is closed once the replica closes its own (finishConnEvent). The loop keeps
 // no time itself. Shutdown closes whatever is still open when its grace has
-// passed (ClientRegistry.CloseAll), and run returns when no connection is
-// left.
+// passed (ClientRegistry.CloseAll closes each one's Output), and run returns
+// when no connection is left.
 func (l *eventLoop) beginDrain(cause error) {
 	l.draining = true
 	l.drainErr = cause
@@ -352,21 +343,6 @@ func (l *eventLoop) beginDrain(cause error) {
 		// replicas' connections.
 		go l.srv.shutdown()
 	}
-}
-
-// requestClose asks the loop goroutine to close conn, which it does whether or
-// not it is draining and whoever the peer is. Safe for concurrent use.
-func (l *eventLoop) requestClose(conn *eventConn) {
-	l.mu.Lock()
-	if conn.detached || conn.closeRequested {
-		l.mu.Unlock()
-		return
-	}
-	conn.closeRequested = true
-	l.closeReqs = append(l.closeReqs, conn)
-	l.mu.Unlock()
-
-	l.wakeIfWaiting()
 }
 
 // acceptReady accepts queued connections until the listener would block. A
@@ -446,7 +422,7 @@ func (l *eventLoop) pauseAccepting() {
 
 func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	conn := &eventConn{fd: fd, remoteAddr: remoteAddr, wantRead: true}
-	handle := &eventConnHandle{loop: l, conn: conn}
+	handle := &eventConnHandle{conn: conn}
 
 	clientID, state := l.srv.registerClient(handle)
 	conn.clientID = clientID
@@ -460,6 +436,7 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	conn.ctx = l.ctx
 	conn.logger = l.srv.logger.With("client_id", clientID, "remote_addr", remoteAddrText)
 	conn.out = newPolledOutput(l.srv.outputs, func() { l.markDirty(conn) }, conn.logger)
+	handle.bind(conn.out)
 	state.BindOutput(conn.out)
 	conn.machine = NewConnMachine(state)
 	conn.machine.SetRequestLimits(func() protocol.Limits { return l.srv.requestLimits(state) })
@@ -479,12 +456,12 @@ func (l *eventLoop) registerConn(fd int, remoteAddr net.Addr) {
 	conn.logger.Debug("client connected")
 
 	if l.srv.authTimeoutApplies(state) {
-		// The timer runs on its own goroutine, so it only asks the loop to close
-		// the connection; the loop does it on its next wakeup.
+		// The timer runs on its own goroutine, so it closes the connection's
+		// Output; the loop closes the connection on its next wakeup.
 		conn.authTimer = time.AfterFunc(l.srv.cfg.AuthTimeout, func() {
 			if !state.IsAuthenticated() {
 				conn.logger.Info("closing a connection that did not authenticate in time", "timeout", l.srv.cfg.AuthTimeout)
-				l.requestClose(conn)
+				conn.out.Close(nil)
 			}
 		})
 	}
@@ -632,10 +609,6 @@ func (l *eventLoop) closeConn(conn *eventConn, cause error) {
 		conn.authTimer.Stop()
 	}
 
-	l.mu.Lock()
-	conn.detached = true
-	l.mu.Unlock()
-
 	// Closing the machine closes its Output, which asks for the loop's
 	// attention. Nothing is left to serve, so the connection is not listed.
 	conn.dirty.Store(true)
@@ -697,17 +670,43 @@ func (w fdWriter) Write(p []byte) (int, error) {
 
 // eventConnHandle implements the ClientConn operations registered with the client
 // registry so shutdown and INFO connected-client counts keep working for
-// event-loop connections. Close hands the actual teardown to the loop
-// goroutine, which owns all socket I/O.
+// event-loop connections. The loop goroutine owns all socket I/O, so Close
+// closes the connection's Output and leaves the socket to the loop.
 type eventConnHandle struct {
-	loop *eventLoop
 	conn *eventConn
+
+	mu sync.Mutex
+	// out is the connection's Output once it exists (bind): the registry names
+	// the connection, and makes the handle reachable, before the Output can be
+	// built with a logger that carries that name.
+	out *Output
+	// closed is set by a Close, for a bind that comes after it.
+	closed bool
 }
 
-// Close asks the loop goroutine to tear the connection down and returns
-// immediately; the socket is still open when it returns.
+// bind gives the handle the connection's Output, and closes it if the handle
+// was closed already.
+func (h *eventConnHandle) bind(out *Output) {
+	h.mu.Lock()
+	h.out = out
+	closed := h.closed
+	h.mu.Unlock()
+
+	if closed {
+		out.Close(nil)
+	}
+}
+
+// Close closes the connection's Output, which drops what is queued for it and
+// has the loop close the connection, and returns immediately; the socket is
+// still open when it returns.
 func (h *eventConnHandle) Close() error {
-	h.loop.requestClose(h.conn)
+	h.mu.Lock()
+	h.closed = true
+	out := h.out
+	h.mu.Unlock()
+
+	out.Close(nil)
 	return nil
 }
 
