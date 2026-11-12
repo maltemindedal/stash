@@ -15,9 +15,6 @@ import (
 	"testing"
 )
 
-// repoRoot is the module root, one directory above this package.
-const repoRoot = ".."
-
 var (
 	backticked = regexp.MustCompile("`([^`\\s]+)`")
 	repoPath   = regexp.MustCompile(`^(internal|cmd|test|scripts|docs)/[\w./-]+$`)
@@ -109,7 +106,7 @@ func TestDocsNameOnlyCodeThatExists(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		scanner := bufio.NewScanner(f)
 		for line := 1; scanner.Scan(); line++ {
 			for _, m := range backticked.FindAllStringSubmatch(scanner.Text(), -1) {
