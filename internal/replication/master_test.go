@@ -1081,3 +1081,35 @@ func TestInfoReportsEachReplicaInTheMastersOffsets(t *testing.T) {
 		t.Fatalf("Info() = %+v after acknowledging 31, want %+v", info, want)
 	}
 }
+
+// TestARefusedAttachDoesNotCopyTheKeyspace refuses the snapshot of a Store
+// that holds one large value, and measures what the Master allocates to do it.
+// The refusal needs the snapshot's size alone, so it must allocate far less
+// than the value: a copy of the keyspace, which every writer would wait for
+// inside the cut, allocates at least the value's bytes.
+func TestARefusedAttachDoesNotCopyTheKeyspace(t *testing.T) {
+	const valueBytes = 16 << 20
+	store := storage.NewStore()
+	if err := store.Set(nil, "key", bytes.Repeat([]byte("v"), valueBytes), 0); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	master := NewMaster(store, nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	master.SetSnapshotLimit(valueBytes / 2)
+	cut := func(startRecording func()) (release func()) {
+		startRecording()
+		return func() {}
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := master.Attach(Candidate{ID: 1, Out: &fakeOutput{}}, cut)
+	runtime.ReadMemStats(&after)
+
+	var tooLarge *SnapshotTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("Attach() error = %v, want a *SnapshotTooLargeError", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > valueBytes/4 {
+		t.Fatalf("a refused attach allocated %d bytes for a keyspace of %d, want under a quarter of it", allocated, valueBytes)
+	}
+}

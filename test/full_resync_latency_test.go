@@ -11,12 +11,13 @@ import (
 	"github.com/maltemindedal/stash/internal/config"
 	stashlogger "github.com/maltemindedal/stash/internal/logger"
 	"github.com/maltemindedal/stash/internal/protocol"
+	"github.com/maltemindedal/stash/internal/rdb"
 	"github.com/maltemindedal/stash/internal/storage"
 )
 
 // TestAWriteDuringAFullResyncWaitsOnlyForTheSnapshotCopy writes from a client
 // while the master attaches a replica to a 100,000-key keyspace, and prints
-// the client's idle p99, the time the snapshot copy takes, and the slowest
+// the client's idle p99, the time sizing and copying the snapshot takes, and the slowest
 // write during the resync.
 //
 // PSYNC holds every stripe while it copies the snapshot, and in the default
@@ -40,7 +41,8 @@ func TestAWriteDuringAFullResyncWaitsOnlyForTheSnapshotCopy(t *testing.T) {
 		var copyTime time.Duration
 		for i := 0; i < 3; i++ {
 			start := time.Now()
-			store.SnapshotStrings()
+			var sizer rdb.SnapshotSizer
+			store.SnapshotStringsIf(sizer.Add, func() bool { return sizer.Size() > 0 })
 			copyTime = max(copyTime, time.Since(start))
 		}
 

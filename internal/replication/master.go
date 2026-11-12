@@ -253,14 +253,17 @@ func (m *Master) Active() bool {
 // request that asked to attach. That Reply releases what the Output held, so
 // the stream follows the snapshot. The Master's lock is not held while cut
 // runs, and the snapshot is encoded after the cut is released, so writers wait
-// only for the copy. If the copy panics, the attach ends and Active reports
+// only for the size pass and the copy. If the copy panics, the attach ends and Active reports
 // what it did before.
 //
-// When the snapshot of the copy would be larger than the snapshot limit
-// (SetSnapshotLimit), which a Replica could not read, Attach returns a
-// *SnapshotTooLargeError instead. It sizes the snapshot inside the cut, before
-// reserve, so c is never registered and its Output is told nothing, and it
-// encodes no snapshot. The attach ends and Active reports what it did before.
+// When the snapshot would be larger than the snapshot limit (SetSnapshotLimit),
+// which a Replica could not read, Attach returns a *SnapshotTooLargeError
+// instead. It sizes the snapshot inside the cut from the lengths of the keys
+// and values, before it copies any of them and before reserve, so a refusal
+// copies nothing, c is never registered and its Output is told nothing, and
+// no snapshot is encoded. The Store sizes and copies under one hold of its
+// locks, so the entries served are the ones that were sized. The attach ends and
+// Active reports what it did before.
 func (m *Master) Attach(c Candidate, cut func(startRecording func()) (release func())) (*Attachment, error) {
 	entries, stats, tooLarge := m.cutAndReserve(c, cut)
 	if tooLarge != nil {
@@ -305,9 +308,11 @@ func (m *Master) cutAndReserve(c Candidate, cut func(startRecording func()) (rel
 		}
 	}()
 
-	entries, stats := m.store.SnapshotStrings()
-	if size := rdb.SnapshotSize(entries); size > m.snapshotLimit {
-		return nil, stats, &SnapshotTooLargeError{Size: size, Limit: m.snapshotLimit}
+	var sizer rdb.SnapshotSizer
+	fits := func() bool { return sizer.Size() <= m.snapshotLimit }
+	entries, stats, copied := m.store.SnapshotStringsIf(sizer.Add, fits)
+	if !copied {
+		return nil, stats, &SnapshotTooLargeError{Size: sizer.Size(), Limit: m.snapshotLimit}
 	}
 	m.reserve(c)
 	reserved = true

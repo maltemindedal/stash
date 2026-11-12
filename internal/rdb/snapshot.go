@@ -105,18 +105,37 @@ func BuildSnapshot(entries []storage.StringSnapshotEntry) ([]byte, SnapshotStats
 // by the time it encodes, so the size is exact when no entry expires between
 // the two calls, and an upper bound otherwise.
 func SnapshotSize(entries []storage.StringSnapshotEntry) int {
-	if len(entries) == 0 {
+	var sizer SnapshotSizer
+	for _, entry := range entries {
+		sizer.Add(len(entry.Key), len(entry.Value), entry.ExpiresAt > 0)
+	}
+	return sizer.Size()
+}
+
+// SnapshotSizer sums the size of a snapshot from the lengths of its entries,
+// for a caller that has not copied them. The zero value is an empty snapshot.
+type SnapshotSizer struct {
+	entries    bool
+	entryBytes int
+}
+
+// Add counts one entry with a key and a value of these lengths, and with an
+// expiry or not.
+func (z *SnapshotSizer) Add(keyBytes, valueBytes int, expires bool) {
+	z.entries = true
+	if expires {
+		z.entryBytes += 1 + 8
+	}
+	z.entryBytes += 1 + stringSize(keyBytes) + stringSize(valueBytes)
+}
+
+// Size returns what SnapshotSize returns for the entries added.
+func (z *SnapshotSizer) Size() int {
+	if !z.entries {
 		return len(emptySnapshot)
 	}
-
-	size := len(fileHeader) + 1 + lengthSize(0) // SELECTDB 0
-	for _, entry := range entries {
-		if entry.ExpiresAt > 0 {
-			size += 1 + 8
-		}
-		size += 1 + stringSize(len(entry.Key)) + stringSize(len(entry.Value))
-	}
-	return size + 1 + 8 // EOF and its checksum
+	// SELECTDB 0 before the entries, EOF and its checksum after.
+	return len(fileHeader) + 1 + lengthSize(0) + z.entryBytes + 1 + 8
 }
 
 func stringSize(length int) int {

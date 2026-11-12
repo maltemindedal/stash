@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1390,6 +1392,75 @@ func assertKeyStats(t *testing.T, store *Store, total int, byKind map[ValueKind]
 		if stats.Count(kind) != byKind[kind] {
 			t.Fatalf("KeyStats().Count(%s) = %d, want %d (all stats: %+v)", kind, stats.Count(kind), byKind[kind], stats)
 		}
+	}
+}
+
+// TestStoreSnapshotStringsIfCopiesOnlyAnAdmittedSnapshot measures a keyspace
+// with a live string, an expiring one, an expired one and a list. measure sees
+// the two entries a snapshot holds, by their lengths, before admit is asked.
+// An admitted snapshot is the one SnapshotStrings returns; a refused one has
+// no entries and the same stats.
+func TestStoreSnapshotStringsIfCopiesOnlyAnAdmittedSnapshot(t *testing.T) {
+	type measured struct {
+		keyBytes, valueBytes int
+		expires              bool
+	}
+	tests := []struct {
+		name  string
+		admit bool
+	}{
+		{name: "an admitted snapshot is copied", admit: true},
+		{name: "a refused snapshot is not", admit: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, _ := newStoreWithManualClock()
+			_ = store.Set(nil, "alive", []byte("yes"), 0)
+			_ = store.Set(nil, "expiring", []byte("later"), store.deadlineAfter(time.Hour))
+			_ = store.Set(nil, "expired", []byte("gone"), store.deadlineAfter(-time.Millisecond))
+			if _, err := store.RightPush(nil, "jobs", [][]byte{[]byte("one")}); err != nil {
+				t.Fatalf("RightPush() error = %v", err)
+			}
+			wantEntries, wantStats := store.SnapshotStrings()
+
+			var seen []measured
+			seenAtAdmit := -1
+			entries, stats, copied := store.SnapshotStringsIf(
+				func(keyBytes, valueBytes int, expires bool) {
+					seen = append(seen, measured{keyBytes, valueBytes, expires})
+				},
+				func() bool {
+					seenAtAdmit = len(seen)
+					return tt.admit
+				},
+			)
+
+			sort.Slice(seen, func(i, j int) bool { return seen[i].keyBytes < seen[j].keyBytes })
+			if want := []measured{{5, 3, false}, {8, 5, true}}; !reflect.DeepEqual(seen, want) {
+				t.Fatalf("measure saw %+v, want %+v", seen, want)
+			}
+			if seenAtAdmit != 2 {
+				t.Fatalf("admit was asked after %d entries were measured, want 2", seenAtAdmit)
+			}
+			if copied != tt.admit || stats != wantStats {
+				t.Fatalf("SnapshotStringsIf() = copied %v with stats %+v, want %v with %+v", copied, stats, tt.admit, wantStats)
+			}
+			if !tt.admit {
+				if entries != nil {
+					t.Fatalf("a refused snapshot returned entries %#v", entries)
+				}
+				return
+			}
+			byKey := func(e []StringSnapshotEntry) {
+				sort.Slice(e, func(i, j int) bool { return e[i].Key < e[j].Key })
+			}
+			byKey(entries)
+			byKey(wantEntries)
+			if !reflect.DeepEqual(entries, wantEntries) {
+				t.Fatalf("SnapshotStringsIf() entries = %#v, want what SnapshotStrings returns, %#v", entries, wantEntries)
+			}
+		})
 	}
 }
 
